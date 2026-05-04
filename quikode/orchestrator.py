@@ -774,6 +774,20 @@ class Orchestrator:
                 threads = []
             to_address = self._classify_threads(task_id, threads)
 
+            # 2b. v3.5: drive PENDING_CI ↔ AWAITING_REVIEW ↔ MERGE_READY based
+            # on live CI + thread + settle-window signals. The classifier is
+            # pure (no side effects) — we transition + refresh the in-memory
+            # task_row so subsequent gates (auto-merge, notify-settled) see the
+            # new state.
+            target = self._classify_post_pr_target_state(task_row, pr_status, threads)
+            if target is not None and target.value != task_row.get("state"):
+                self.store.transition(
+                    task_id,
+                    target,
+                    note=f"poll classified state → {target.value}",
+                )
+                task_row = dict(task_row, state=target.value)
+
             # 3. Update poll timestamp regardless — throttle is on poll cadence,
             # not on whether work was found.
             self.store.set_field(task_id, last_review_poll_ts=now)
@@ -932,24 +946,92 @@ class Orchestrator:
         v = r["ts"]
         return float(v) if v is not None else None
 
+    def _classify_post_pr_target_state(
+        self,
+        task_row: Mapping[str, Any],
+        pr_status: github.PRStatus,
+        threads: list[ReviewThread],
+    ) -> State | None:
+        """Decide which post-PR state a task should be in given live signals.
+
+        Returns the target state, or None if no transition is appropriate
+        (current state isn't a post-PR state, or signals are ambiguous).
+        Does not write — caller transitions if returned state differs from
+        current.
+
+        Truth table:
+          - CI failure OR unresolved threads OR CI pending  → PENDING_CI
+          - CI green, all threads resolved, recently changed → AWAITING_REVIEW
+          - CI green, all threads resolved, settled past quiet window → MERGE_READY
+        """
+        try:
+            current = State(task_row["state"])
+        except (ValueError, KeyError):
+            return None
+        if current not in {State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_READY}:
+            return None
+
+        # CI failure or unresolved threads: not in any "ready" state. The
+        # daemon's CI-fix / review-response branches will dispatch the worker
+        # separately; here we just make sure the row reflects "not done yet."
+        ci_failed = pr_status.checks_status == "failure"
+        has_unresolved = any(not t.is_resolved for t in threads)
+        if ci_failed or has_unresolved:
+            return State.PENDING_CI
+
+        # CI not yet green: stay PENDING_CI.
+        if pr_status.checks_status not in ("success", "none"):
+            return State.PENDING_CI
+
+        # Settle window: how long since we entered a "clean" post-PR state?
+        # Once CI is green and threads are resolved, the row sits at either
+        # AWAITING_REVIEW or MERGE_READY; the entry into AWAITING_REVIEW (or
+        # directly into MERGE_READY) is the start of the settle window. A
+        # task that just had a fixup-response push will see its AWAITING_REVIEW
+        # entry timestamp reset; that's the right behavior — the new commit
+        # hasn't had time to be re-reviewed.
+        quiet_s = self.cfg.stack_settle_quiet_s
+        task_id = str(task_row["id"])
+        last_clean_entry = self._last_clean_post_pr_entry_ts(task_id)
+        if last_clean_entry is None or (time.time() - last_clean_entry) < quiet_s:
+            return State.AWAITING_REVIEW
+        return State.MERGE_READY
+
+    def _last_clean_post_pr_entry_ts(self, task_id: str) -> float | None:
+        """Most recent ts at which the task entered AWAITING_REVIEW or
+        MERGE_READY (the two "clean" post-PR states). Returns None if neither
+        appears in the audit trail.
+        """
+        r = self.store.conn.execute(
+            "SELECT MAX(ts) AS ts FROM state_log WHERE task_id = ? AND to_state IN (?, ?)",
+            (task_id, State.AWAITING_REVIEW.value, State.MERGE_READY.value),
+        ).fetchone()
+        if r is None:
+            return None
+        v = r["ts"]
+        return float(v) if v is not None else None
+
     def _maybe_notify_settled(
         self,
         task_row: Mapping[str, Any],
         pr_status: github.PRStatus,
         threads: list[ReviewThread],
     ) -> None:
-        """Ping the operator when an AWAITING_MERGE task has been quiet
-        for `cfg.notify_settled_after_s`. One ping per "settled state":
-        re-pings only fire after the task LEFT awaiting_merge (responded
-        to a thread, etc.) and re-entered.
+        """Ping the operator when a task has been MERGE_READY long enough that
+        a review without anything changing is safe. One ping per settled
+        period: re-pings only fire after the task LEFT MERGE_READY (responded
+        to a thread, CI flip, etc.) and re-entered.
+
+        Caller already gated on `state == MERGE_READY` — this just sanity-
+        checks the live PR signals match (defense against stale poll data).
 
         Gates (all required):
           - cfg.notify_settled_channel != "none"
           - PR state == OPEN, mergeable == MERGEABLE, all checks SUCCESS
           - No unresolved review threads (any author)
-          - Time-since-AWAITING_MERGE-entry >= notify_settled_after_s
+          - Time-since-MERGE_READY-entry >= notify_settled_after_s
           - last_notified_settled_ts is None OR predates the most recent
-            transition INTO awaiting_merge (means the task left + came back).
+            transition INTO merge_ready (means the task left + came back).
         """
         if self.cfg.notify_settled_channel == "none":
             return
@@ -961,10 +1043,10 @@ class Orchestrator:
             return
 
         task_id = str(task_row["id"])
-        # When did this task most recently enter AWAITING_MERGE?
+        # When did this task most recently enter MERGE_READY?
         entered = self.store.conn.execute(
             "SELECT MAX(ts) FROM state_log WHERE task_id = ? AND to_state = ?",
-            (task_id, State.PENDING_CI.value),
+            (task_id, State.MERGE_READY.value),
         ).fetchone()
         entered_ts = float(entered[0]) if entered and entered[0] else 0.0
         if not entered_ts:
@@ -975,7 +1057,7 @@ class Orchestrator:
         # Already notified for THIS settled period?
         last_notified = task_row.get("last_notified_settled_ts")
         if last_notified is not None and float(last_notified) >= entered_ts:
-            return  # already pinged for this AWAITING_MERGE period
+            return  # already pinged for this MERGE_READY period
 
         # Build + send the message.
         node = self.dag.nodes.get(task_id)
@@ -984,7 +1066,7 @@ class Orchestrator:
         n_threads = len(threads)
         round_no = task_row.get("review_round") or 0
         summary = (
-            f"AWAITING_MERGE for {int(quiet_for // 60)}min · "
+            f"MERGE_READY for {int(quiet_for // 60)}min · "
             f"{round_no} review round(s) · "
             f"{n_threads} thread(s) (all resolved)"
         )

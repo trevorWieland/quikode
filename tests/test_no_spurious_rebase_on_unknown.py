@@ -129,8 +129,9 @@ def test_orchestrator_unknown_mergeable_does_not_schedule_rebase(tmp_path):
         o._poll_review_threads(pool, futures, rrf)
 
     row = o.store.get("T-001")
-    # Still AWAITING_MERGE — no rebase fired.
-    assert row["state"] == State.PENDING_CI.value
+    # No rebase fired. The classifier transitions a clean post-PR row to
+    # AWAITING_REVIEW (CI green + no threads, within settle window).
+    assert row["state"] in (State.PENDING_CI.value, State.AWAITING_REVIEW.value)
     assert row["pre_rebase_state"] is None
     o.store.conn.close()
 
@@ -151,7 +152,8 @@ def test_orchestrator_mergeable_does_not_schedule_rebase(tmp_path):
         o._poll_review_threads(pool, futures, rrf)
 
     row = o.store.get("T-001")
-    assert row["state"] == State.PENDING_CI.value
+    # Healthy mergeable poll: classifier transitions to AWAITING_REVIEW.
+    assert row["state"] in (State.PENDING_CI.value, State.AWAITING_REVIEW.value)
     o.store.conn.close()
 
 

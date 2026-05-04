@@ -2343,9 +2343,7 @@ def briefing(
             }
 
         awaiting_merge = [_row_summary(r) for r in rows if r["state"] == State.PENDING_CI.value]
-        addressing_feedback = [
-            _row_summary(r) for r in rows if r["state"] == State.ADDRESSING_FEEDBACK.value
-        ]
+        addressing_feedback = [_row_summary(r) for r in rows if r["state"] == State.ADDRESSING_FEEDBACK.value]
         rebasing_to_main = [_row_summary(r) for r in rows if r["state"] == State.REBASING_TO_MAIN.value]
         blocked_intervention = [_row_summary(r) for r in rows if r["state"] == State.BLOCKED.value]
 
