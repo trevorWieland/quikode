@@ -71,6 +71,9 @@ class ReviewThread(BaseModel):
     path: str | None
     line: int | None
     last_comment_id: str
+    # REST integer id of the last comment, used for `/comments/{id}/replies`.
+    # Optional because old data / synthetic ReviewThread rows may lack it.
+    last_comment_database_id: int | None = None
     last_comment_author: str
     last_comment_body: str
     last_comment_created_at: float  # unix timestamp
@@ -91,6 +94,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           comments(last: 1) {
             nodes {
               id
+              databaseId
               body
               createdAt
               author { login }
@@ -199,6 +203,7 @@ def get_review_threads(repo: str, pr_number: int, *, gh_bin: str = "gh") -> list
                 continue
             last = comments[-1]
             author_login = ((last.get("author") or {}).get("login")) or ""
+            db_id = last.get("databaseId")
             threads.append(
                 ReviewThread(
                     thread_id=node.get("id") or "",
@@ -207,6 +212,7 @@ def get_review_threads(repo: str, pr_number: int, *, gh_bin: str = "gh") -> list
                     path=node.get("path"),
                     line=node.get("line"),
                     last_comment_id=last.get("id") or "",
+                    last_comment_database_id=int(db_id) if db_id is not None else None,
                     last_comment_author=author_login,
                     last_comment_body=last.get("body") or "",
                     last_comment_created_at=_parse_iso8601(last.get("createdAt") or ""),
@@ -217,6 +223,48 @@ def get_review_threads(repo: str, pr_number: int, *, gh_bin: str = "gh") -> list
             log.warning("get_review_threads: bad node, skipping: %s", e)
             continue
     return threads
+
+
+def reply_to_review_thread(
+    *,
+    repo: str,
+    pr_number: int,
+    last_comment_database_id: int,
+    body: str,
+    gh_bin: str = "gh",
+) -> bool:
+    """Post a reply on an existing review thread via REST.
+
+    GitHub's GraphQL surface doesn't have a "reply to thread" mutation; the
+    documented path is REST `POST /repos/.../pulls/{n}/comments/{id}/replies`
+    where `{id}` is the integer (databaseId) of any comment in the thread.
+
+    Returns True iff `gh api` exits 0. Best-effort: failures are logged.
+    """
+    if not last_comment_database_id or not body:
+        return False
+    cmd = [
+        gh_bin,
+        "api",
+        "-X",
+        "POST",
+        f"/repos/{repo}/pulls/{pr_number}/comments/{last_comment_database_id}/replies",
+        "-f",
+        f"body={body}",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.warning("reply_to_review_thread: subprocess error: %s", e)
+        return False
+    if r.returncode != 0:
+        log.warning(
+            "reply_to_review_thread: gh exited %d; stderr=%s",
+            r.returncode,
+            (r.stderr or "")[:300],
+        )
+        return False
+    return True
 
 
 def resolve_thread(thread_id: str, *, gh_bin: str = "gh") -> bool:

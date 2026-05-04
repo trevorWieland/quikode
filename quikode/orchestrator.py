@@ -14,7 +14,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from . import docker_env, github, github_graphql, notify, scheduler
+from . import docker_env, github, github_graphql, notify, scheduler, triage
 from .config import Config
 from .dag import DAG
 from .github_graphql import ReviewThread
@@ -822,11 +822,83 @@ class Orchestrator:
                 self.store.set_field(task_id, last_review_poll_ts=now)
                 continue
 
+            # 4b. v3.5 Phase B: in-process Python triage. For each
+            # actionable thread, call the sonnet classifier and split into
+            # CORRECT (forward to planner) / INCORRECT (auto-reply + resolve)
+            # / NEEDS_DISCUSSION (leave for human). Bounds the time spent in
+            # TRIAGING_FEEDBACK so the daemon's tick stays cheap.
+            if to_address:
+                # Mark TRIAGING_FEEDBACK so the operator can see what's going
+                # on (the row was just transitioned to PENDING_CI by the
+                # post-PR classifier above).
+                self.store.transition(
+                    task_id,
+                    State.TRIAGING_FEEDBACK,
+                    note=f"classifying {len(to_address)} thread(s)",
+                )
+                task_row = dict(task_row, state=State.TRIAGING_FEEDBACK.value)
+                plan_text = str(task_row.get("plan_text") or "")
+                outcome = triage.triage_review_threads(
+                    cfg=self.cfg,
+                    plan_text=plan_text,
+                    threads=list(to_address),
+                )
+                # Auto-reply + resolve INCORRECT threads in-process. The reply
+                # uses REST `/comments/{databaseId}/replies` so it lands as a
+                # proper thread reply (not a top-level PR comment); falls
+                # back to silent-resolve if databaseId is unavailable. The
+                # rationale is also stored on the audit row so operators can
+                # trace why a thread was auto-resolved.
+                for t, verdict in outcome.auto_resolved:
+                    if verdict.reply and t.last_comment_database_id is not None:
+                        try:
+                            github_graphql.reply_to_review_thread(
+                                repo=repo,
+                                pr_number=int(pr_number),
+                                last_comment_database_id=t.last_comment_database_id,
+                                body=verdict.reply,
+                            )
+                        except Exception as e:
+                            log.warning("auto-reply to thread %s failed: %s", t.thread_id, e)
+                    try:
+                        github_graphql.resolve_thread(t.thread_id)
+                    except Exception as e:
+                        log.warning("auto-resolve of thread %s failed: %s", t.thread_id, e)
+                    self.store.mark_thread_addressed(
+                        task_id,
+                        t.thread_id,
+                        f"auto-classifier-incorrect: {verdict.rationale[:80]}",
+                    )
+                if outcome.deferred:
+                    log.info(
+                        "task %s: %d thread(s) deferred to human review (needs_discussion)",
+                        task_id,
+                        len(outcome.deferred),
+                    )
+                if outcome.classifier_errors:
+                    log.warning(
+                        "task %s: %d classifier error(s) — those thread(s) fall through to ADDRESSING_FEEDBACK",
+                        task_id,
+                        outcome.classifier_errors,
+                    )
+                # The actionable list is the post-triage subset. If empty
+                # (e.g. all threads INCORRECT), nothing to dispatch — drop
+                # back to PENDING_CI so the next poll re-classifies.
+                to_address = outcome.actionable_threads
+                if not to_address:
+                    self.store.transition(
+                        task_id,
+                        State.PENDING_CI,
+                        note="triage handled all threads in-process; nothing to dispatch",
+                    )
+                    task_row = dict(task_row, state=State.PENDING_CI.value)
+                    continue
+
             # 5. Schedule response if work found AND slack available.
             # Reviews are gated on `max_parallel + review_response_extra_slots`
             # rather than just `max_parallel` so response cycles can dispatch
             # even when the regular-worker pool is saturated. Without this,
-            # AWAITING_MERGE PRs accumulate unresolved threads under sustained
+            # post-PR rows accumulate unresolved threads under sustained
             # parallelism and the daemon never frees a slot to address them.
             review_cap = self.cfg.max_parallel + self.cfg.review_response_extra_slots
             if to_address and len(futures) < review_cap:
@@ -840,6 +912,17 @@ class Orchestrator:
                     len(futures),
                     review_cap,
                 )
+                # If we transitioned to TRIAGING_FEEDBACK above but couldn't
+                # dispatch, drop back to PENDING_CI so the next poll re-runs
+                # the classifier from a clean state. Leaving the row at
+                # TRIAGING_FEEDBACK indefinitely would mask the pool-full
+                # condition and confuse the operator's view.
+                if task_row.get("state") == State.TRIAGING_FEEDBACK.value:
+                    self.store.transition(
+                        task_id,
+                        State.PENDING_CI,
+                        note="pool full — re-deferring to next poll",
+                    )
                 continue
 
             # 5. v3.5 polish: auto-merge a MERGE_READY task when opt-in.
