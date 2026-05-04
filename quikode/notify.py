@@ -85,15 +85,22 @@ def _http_post(
 
 
 def ntfy_send(cfg: Config, msg: SettledMessage) -> bool:
-    """POST a notification to ntfy. Title goes in the X-Title header
-    so the push notification's banner shows it; body is plain text.
-    Returns True on delivery."""
+    """POST a notification to ntfy. Title goes in the Title header so the
+    push notification's banner shows it; body is plain text.
+
+    ntfy supports the `Tags` header for emoji shortcodes (rendered by the
+    iOS/Android app) — that's how we get the ✅ in the UI without putting
+    a literal Unicode codepoint in an HTTP header. urllib uses latin-1 for
+    header encoding and can't transmit ✅ directly; this is a real bug we
+    hit live the first time we tried.
+    """
     if not cfg.notify_ntfy_topic:
         log.warning("ntfy notify requested but cfg.notify_ntfy_topic is empty")
         return False
     base = cfg.notify_ntfy_url.rstrip("/")
     url = f"{base}/{cfg.notify_ntfy_topic}"
-    title = f"✅ {msg.task_id} ready for review"
+    # Strip emoji + non-latin-1 chars from the title; rely on `Tags` for the icon.
+    title = f"{msg.task_id} ready for review".encode("ascii", "ignore").decode("ascii")
     body = msg.short_text().encode("utf-8")
     headers = {
         "Title": title,
@@ -107,12 +114,15 @@ def ntfy_send(cfg: Config, msg: SettledMessage) -> bool:
 def slack_send(cfg: Config, msg: SettledMessage) -> bool:
     """POST a notification to a Slack incoming webhook. Returns True on
     delivery. Slack expects JSON `{text: "..."}` (and optionally
-    block-kit blocks); we use the simple text form for reliability."""
+    block-kit blocks); we use the simple text form for reliability.
+
+    Slack receives JSON in the body, so emoji are fine here (unlike the
+    ntfy case where headers force latin-1)."""
     if not cfg.notify_slack_webhook_url:
         log.warning("slack notify requested but cfg.notify_slack_webhook_url is empty")
         return False
     pr_link = f"<{msg.pr_url}|{msg.task_id}>" if msg.pr_url else msg.task_id
-    text = f"✅ {pr_link} ready for review — {msg.title}\n{msg.summary}"
+    text = f":white_check_mark: {pr_link} ready for review — {msg.title}\n{msg.summary}"
     if msg.cost_usd is not None:
         text += f" · ${msg.cost_usd:.2f}"
     body = json.dumps({"text": text}).encode("utf-8")

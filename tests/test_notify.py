@@ -77,6 +77,31 @@ def test_ntfy_send_posts_to_topic_url(tmp_path):
     assert msg.pr_url in c["body"]
 
 
+def test_ntfy_send_title_is_ascii_only_for_latin1_header(tmp_path):
+    """urllib encodes HTTP headers as latin-1, which can't carry the ✅
+    emoji. The Title header must be ASCII; the emoji is delivered via
+    the `Tags` header (e.g. `white_check_mark`) which the ntfy app
+    renders in the push notification UI. Regression for the live
+    UnicodeEncodeError on first notify-test."""
+    cfg = _cfg(tmp_path)
+    captured: list[dict] = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append({"headers": dict(req.headers)})
+        return _ok_response()
+
+    with patch("quikode.notify.urllib.request.urlopen", side_effect=fake_urlopen):
+        ok = ntfy_send(cfg, _msg())
+    assert ok is True
+    title = captured[0]["headers"].get("Title", "")
+    # Pure ASCII (latin-1 safe).
+    title.encode("ascii")
+    # No raw ✅.
+    assert "✅" not in title
+    # Tags header carries the icon shortcode for app-side rendering.
+    assert "white_check_mark" in captured[0]["headers"].get("Tags", "")
+
+
 def test_ntfy_send_skips_when_topic_empty(tmp_path):
     cfg = _cfg(tmp_path, notify_ntfy_topic="")
     msg = _msg()
@@ -161,6 +186,8 @@ def test_slack_send_posts_json_text(tmp_path):
     assert "$14.20" in text
     # Slack-style link: <url|label>
     assert f"<{msg.pr_url}|R-0002>" in text
+    # Slack uses :emoji: shortcodes (not raw Unicode)
+    assert ":white_check_mark:" in text
 
 
 def test_slack_send_skips_when_url_empty(tmp_path):
