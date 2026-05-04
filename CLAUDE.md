@@ -137,6 +137,7 @@ These all blocked progress at some point and have been fixed; don't re-discover 
 ## Conventions when editing this codebase
 
 - Run `python -m pytest tests/ -q` after any change touching `quikode/`. **709 tests**; runs in <50s.
+- v3.5 state vocabulary: `AWAITING_MERGE` and `RESPONDING_TO_REVIEW` are gone. Use `PENDING_CI` (PR open, CI running), `AWAITING_REVIEW` (CI green, no positive approval yet), `MERGE_READY` (settled past quiet window — the *only* auto-merge-eligible state), `TRIAGING_FEEDBACK` (in-process Python triage), `ADDRESSING_FEEDBACK` (renamed; fixup planner + per-subtask doer). State migration in `Store._migrate` rewrites legacy values idempotently.
 - Run `ruff check quikode/ tests/` and `ruff format --check quikode/ tests/` before committing. Strict ruleset enabled — see `pyproject.toml [tool.ruff.lint]`.
 - `ty check quikode/` is configured but ty is alpha; treat advisory.
 - Don't break the running orchestrator. If quikode is mid-run when you edit, the in-memory module is already loaded — your edits affect the *next* run.
