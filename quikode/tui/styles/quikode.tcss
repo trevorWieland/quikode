@@ -19,12 +19,16 @@ Screen {
    row 2: detail panel (full width) — drilldown for the selected task
    row 3: activity + resources (split) — peripheral context
    The intent: glance at the task you care about, drop into its detail right
-   below, and let the global log + resource gauges live at the periphery. */
+   below, and let the global log + resource gauges live at the periphery.
+   Row sizing: detail-panel needs the most vertical space (subtasks lists
+   on R-* tasks routinely run 15-19 rows), so it gets 2fr. The tasks panel
+   shows ~5-10 in-flight tasks at any time and self-sizes; activity lives
+   at the bottom with a clamped height so it never crowds detail out. */
 #main-grid {
     layout: grid;
     grid-size: 2 3;
     grid-columns: 3fr 2fr;
-    grid-rows: auto 1fr auto;
+    grid-rows: auto 2fr 12;
     height: 1fr;
     min-height: 20;
 }
@@ -70,11 +74,15 @@ Screen {
 #activity-panel {
     border: solid $primary-darken-2;
     padding: 0 1;
+    height: 12;
+    overflow-y: auto;
 }
 
 #resources-panel {
     border: solid $primary-darken-2;
     padding: 0 1;
+    height: 12;
+    overflow-y: auto;
 }
 
 #command-bar {
