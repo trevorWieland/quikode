@@ -2358,18 +2358,87 @@ class TaskWorker:
                 )
                 return WorkerOutcome(State.BLOCKED, "force-push detected on branch")
 
-        # Diverged but not force-pushed. Falls through to the legacy
-        # push-fail path in `commit_subtask`, which today retries once and
-        # then BLOCKs. Tracked separately for a `pull --rebase` upgrade.
-        log.warning(
-            "task %s: branch %s diverged (ahead=%d, behind=%d) but force-push "
-            "check passed; falling through to legacy push-fail handling. "
-            "Future: pull --rebase + conflict-resolver.",
+        # Diverged but not force-pushed. Try a `git rebase origin/<branch>`
+        # to replay our local commits on top of the upstream changes.
+        # On conflict, fall back to the existing conflict-resolver agent.
+        log.info(
+            "task %s: branch %s diverged (ahead=%d, behind=%d); attempting "
+            "auto-rebase onto origin/%s",
             self.node.id,
             branch,
             ahead,
             behind,
+            branch,
         )
+        return self._rebase_diverged_branch(branch)
+
+    def _rebase_diverged_branch(self, branch: str) -> WorkerOutcome | None:
+        """Rebase the local branch onto the remote tip after an upstream
+        push diverged it. Used by `_handle_branch_divergence_if_needed`
+        when ahead>0 + behind>0 but no force-push was detected.
+
+        Distinct from `_handle_parent_rebase_if_needed` (parent-merged onto
+        main) and `_rebase_to_base_branch` (target=cfg.base_branch). Here
+        we rebase our branch onto its OWN remote tip — the upstream commits
+        came from the same branch.
+
+        On clean rebase: returns None, caller continues.
+        On conflict: invokes the conflict-resolver agent for up to N
+        iterations. On success returns None; on failure BLOCKs the task.
+        On any non-conflict rebase failure: BLOCKs.
+        """
+        # `core.editor=true` so `git rebase --continue` doesn't try to open
+        # a TTY editor that doesn't exist in the container.
+        rc, out = self._git_in_workspace(
+            ["-c", "core.editor=true", "rebase", f"{self.cfg.pr_remote}/{branch}"]
+        )
+        if rc == 0:
+            log.info("task %s: clean rebase onto origin/%s succeeded", self.node.id, branch)
+            # Force-push so the remote reflects the rebased local commits.
+            # Without this, the next regular push (e.g. from commit_subtask)
+            # would fail non-fast-forward because our commit hashes changed
+            # under the rebase.
+            self._git_in_workspace(["push", "--force-with-lease", self.cfg.pr_remote, branch])
+            return None
+        # Non-zero rc: either conflict (rebase still in progress) or hard fail.
+        if not self._rebase_in_progress():
+            # Hard fail: rebase aborted itself (e.g. detached HEAD, missing
+            # commits, ref invalid). Cannot safely continue.
+            self.store.transition(
+                self.node.id,
+                State.BLOCKED,
+                note=f"diverged-branch rebase failed (no rebase state dir): {out[:200]}",
+                last_error=f"rebase {self.cfg.pr_remote}/{branch} failed: {out[:500]}",
+            )
+            return WorkerOutcome(State.BLOCKED, "diverged-branch rebase hard-failed")
+        # Conflict — invoke the resolver agent (existing iterative flow).
+        log.info(
+            "task %s: rebase onto origin/%s hit conflicts; invoking resolver agent",
+            self.node.id,
+            branch,
+        )
+        outcome = self._spawn_conflict_resolver()
+        # `_spawn_conflict_resolver` re-runs the final checker at the end.
+        # For our case (mid-subtask divergence), that's overkill but harmless
+        # — if the rebase didn't break anything, the check will pass and
+        # the worker continues.
+        if outcome and outcome.final_state == State.BLOCKED:
+            return outcome
+        # Force-push the rebased branch so the remote reflects the merge.
+        # `--force-with-lease` is the safe form: refuses if remote was
+        # advanced again between our fetch and our push.
+        rc_p, push_out = self._git_in_workspace(
+            ["push", "--force-with-lease", self.cfg.pr_remote, branch]
+        )
+        if rc_p != 0:
+            log.warning(
+                "task %s: force-with-lease push after rebase failed: %s",
+                self.node.id,
+                push_out[:300],
+            )
+            # Don't BLOCK — the rebase work is local; the next subtask's
+            # commit/push will re-attempt. Worst case, ahead/behind delta
+            # surfaces again next checkpoint and we re-try.
         return None
 
     def _handle_parent_rebase_if_needed(self) -> WorkerOutcome | None:
