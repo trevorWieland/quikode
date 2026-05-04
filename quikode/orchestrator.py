@@ -96,7 +96,7 @@ class Orchestrator:
             # surface a count for visibility.
             review_response_futures: set[str] = set()
             while not self._stop.is_set():
-                self._check_stalls(warned)
+                self._check_stalls(warned, futures, review_response_futures)
                 now = time.time()
                 if now - last_stats_sample >= self.cfg.container_stats_sample_seconds:
                     self._sample_container_stats()
@@ -447,11 +447,27 @@ class Orchestrator:
                         )
                     break
 
-    def _check_stalls(self, warned: dict[str, float]) -> None:
-        """Warn once per stall-window when a DOING task's worktree has been quiet.
+    def _check_stalls(
+        self,
+        warned: dict[str, float],
+        futures: dict[str, Future] | None = None,
+        review_response_futures: set[str] | None = None,
+    ) -> None:
+        """Warn once per stall-window when a DOING task's worktree has been quiet,
+        AND auto-recover review-response futures that are silently stalled.
 
         Only DOING is expected to produce file edits — planner/checker/triage
         phases are read-only. We only warn during DOING.
+
+        v3 follow-up to the 2026-05-04 R-0002 / R-0015 pool-slot leaks:
+        when a `responding_to_review` task has logged ZERO agent_call
+        activity for `cfg.stall_warn_seconds` (default 1800s = 30min),
+        the future is almost certainly leaked (silently crashed before
+        the first agent invocation). We force-cancel + reset the task to
+        AWAITING_MERGE so the watcher's next tick re-dispatches against
+        a fresh pool slot. Without this, R-0002-style stalls persist
+        indefinitely (every minute of stall = $0 progress + 1 reserved
+        pool slot starving real work).
         """
         threshold = self.cfg.stall_warn_seconds
         if threshold <= 0:
@@ -478,6 +494,66 @@ class Orchestrator:
                 time.strftime("%H:%M:%S", time.localtime(mt)),
             )
             warned[row["id"]] = now
+
+        # Stalled review-response detector. Triggered by direct observation
+        # of the leak: future submitted, no agent_call ever fires, task sits
+        # in responding_to_review for 30+ min holding a pool slot.
+        if futures is None or review_response_futures is None:
+            return
+        for tid in list(review_response_futures):
+            row = self.store.get(tid)
+            if row is None:
+                continue
+            if row["state"] != State.RESPONDING_TO_REVIEW.value:
+                continue  # not stalled — task moved on
+            # Most-recent agent_call timestamp for this task.
+            last_call = self.store.conn.execute(
+                "SELECT MAX(ts) FROM agent_calls WHERE task_id = ?",
+                (tid,),
+            ).fetchone()
+            last_ts = float(last_call[0]) if last_call and last_call[0] else 0.0
+            # last_ts may be from a PRIOR review-response cycle. Compare
+            # against when this task last entered RESPONDING_TO_REVIEW.
+            entered = self.store.conn.execute(
+                "SELECT MAX(ts) FROM state_log WHERE task_id = ? AND to_state = ?",
+                (tid, State.RESPONDING_TO_REVIEW.value),
+            ).fetchone()
+            entered_ts = float(entered[0]) if entered and entered[0] else 0.0
+            # Effective "silence start" = max(entered, last agent_call). If
+            # silent since either, that's our window.
+            silence_start = max(entered_ts, last_ts)
+            silence = now - silence_start
+            if silence < threshold:
+                continue
+            log.error(
+                "task %s: review-response stalled %d min — no agent_call since %s; "
+                "resetting to AWAITING_MERGE for re-dispatch",
+                tid,
+                int(silence // 60),
+                time.strftime("%H:%M:%S", time.localtime(silence_start)),
+            )
+            # Cancel the leaked Future (best-effort — may already be in a
+            # broken state, can't .cancel() if running, but discard from
+            # tracking sets so the slot frees on the next reap pass).
+            fut = futures.get(tid)
+            if fut is not None:
+                fut.cancel()
+                # Best-effort: if cancel fails because the future is "running"
+                # (the silent-leak case), the future is wedged — drop it from
+                # `futures` directly so the slot frees. The Future object will
+                # eventually be garbage-collected; the worker thread it points
+                # to is presumably already dead.
+                futures.pop(tid, None)
+            review_response_futures.discard(tid)
+            # Reset to AWAITING_MERGE so the watcher's next tick re-dispatches.
+            self.store.transition(
+                tid,
+                State.AWAITING_MERGE,
+                note=(
+                    f"orchestrator force-recovery: review-response stalled "
+                    f"{int(silence // 60)}min, slot freed for re-dispatch"
+                ),
+            )
 
     def _all_done(self, scope: set[str]) -> bool:
         """All tasks reached a TRULY terminal state (no orchestrator work left).
