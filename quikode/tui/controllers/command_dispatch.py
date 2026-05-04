@@ -369,7 +369,7 @@ def _handle_set_model(app: QuikodeTUI, parsed: ParsedCommand) -> None:
     Examples:
       /set-model planner claude:claude-opus-4-7
       /set-model doer opencode:zai-coding-plan/glm-5.1
-      /set-model triage claude:claude-haiku-4-5-20251001
+      /set-model triage claude:claude-sonnet-4-6
     """
     if len(parsed.args) != 2:
         _toast(

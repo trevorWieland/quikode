@@ -23,7 +23,7 @@ Hot files:
 ### Carryforward from v3 base (2026-05-03 and earlier)
 
 - **Per-subtask commits + push** — each subtask commits independently; pre-commit hooks fire per slice (`worker.py:_run_subtask_set`, `tests/test_per_subtask_commit.py`).
-- **Progress-check agent** — claude-haiku monitors struggling subtasks; flatlines BLOCK them after `cfg.subtask_flatline_block_count` consecutive verdicts (`tests/test_progress_check.py`).
+- **Progress-check agent** — claude-sonnet monitors struggling subtasks; flatlines BLOCK them after `cfg.subtask_flatline_block_count` consecutive verdicts (`tests/test_progress_check.py`).
 - **AWAITING_MERGE polling + GraphQL review threads** — daemon polls open PRs every `cfg.review_poll_interval_s`, kicks off RESPONDING_TO_REVIEW worker (`orchestrator.py:_poll_review_threads`).
 - **`git rebase --onto <parent_sha>`** for stacked children when their parent squash-merges to main (`worker.py:run_rebase_to_main` and `_rebase_to_base_branch`).
 - **Daemon supervisor** — `quikode daemon start` wraps `quikode run` in a crash-restart loop with exponential backoff (`daemon.py:supervise`).
@@ -183,5 +183,5 @@ allows ~5-7 in-flight tasks; CPU is the binding constraint.
 | Checker | codex | gpt-5.3-codex |
 | Triage | claude | claude-opus-4-7 |
 | Conflict resolver | claude | claude-opus-4-7 |
-| Intent reviewer | claude | claude-haiku-4-5-20251001 |
-| Progress | claude | claude-haiku-4-5-20251001 |
+| Intent reviewer | claude | claude-sonnet-4-6 |
+| Progress | claude | claude-sonnet-4-6 |

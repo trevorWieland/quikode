@@ -17,9 +17,9 @@ parse error, transient container glitch) collapses to `uncertain`, never
 propagates as an exception. Worse than a missing signal is a crashed
 worker.
 
-Defaults to claude-haiku-4-5 (configurable via `cfg.progress.cli/model`).
-A small, fast model is right here — the input is short and the decision
-is shallow.
+Defaults to claude-sonnet-4-6 (configurable via `cfg.progress.cli/model`).
+Sonnet's reasoning is cleaner on the "is this trajectory making real
+progress vs flatlined" judgment than the older haiku default.
 """
 
 from __future__ import annotations

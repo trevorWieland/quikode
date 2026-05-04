@@ -36,7 +36,7 @@ For each ready task in the DAG:
    - **doer** (opencode glm-5.1) implements the slice
    - **checker** (codex) walks the playbook (real CI, HTTP probes, CLI invocations)
    - **triage** (claude-opus) on FAIL → loop
-   - **progress-check** (claude-haiku) intermittently judges whether the subtask is making progress, has flatlined, or it's too early to tell — BLOCKs the subtask on consecutive flatlines
+   - **progress-check** (claude-sonnet) intermittently judges whether the subtask is making progress, has flatlined, or it's too early to tell — BLOCKs the subtask on consecutive flatlines
    - on PASS: `git commit` (running pre-commit hooks per slice) + `git push`
 5. **final checker** runs the whole-spec playbook after all subtasks pass.
 6. `gh pr create` opens the PR; the daemon's review-watcher polls it every `review_poll_interval_s`.
@@ -210,5 +210,5 @@ quikode/
 | Checker | codex | gpt-5.3-codex |
 | Triage | claude | claude-opus-4-7 |
 | Conflict resolver | claude | claude-opus-4-7 |
-| Intent reviewer | claude | claude-haiku-4-5-20251001 |
-| Progress | claude | claude-haiku-4-5-20251001 |
+| Intent reviewer | claude | claude-sonnet-4-5-20251001 |
+| Progress | claude | claude-sonnet-4-5-20251001 |

@@ -48,10 +48,10 @@ def test_set_model_appends_section_when_absent(tmp_path):
     qkdir.mkdir()
     p = qkdir / "config.toml"
     p.write_text(f'repo_path = "{tmp_path}"\ndag_path = "{tmp_path / "dag.json"}"\n')
-    _set_agent_role_in_toml(p, "intent_reviewer", "claude", "claude-haiku-4-5-20251001")
+    _set_agent_role_in_toml(p, "intent_reviewer", "claude", "claude-sonnet-4-6")
     parsed = tomllib.loads(p.read_text())
     assert parsed["agents"]["intent_reviewer"]["cli"] == "claude"
-    assert parsed["agents"]["intent_reviewer"]["model"] == "claude-haiku-4-5-20251001"
+    assert parsed["agents"]["intent_reviewer"]["model"] == "claude-sonnet-4-6"
 
 
 def test_set_model_idempotent(tmp_path):
@@ -72,10 +72,10 @@ async def test_dispatch_set_model_happy_path(tmp_path):
     app = QuikodeTUI(workspace=tmp_path, poll_interval_s=0.05)
     async with app.run_test() as pilot:
         await pilot.pause()
-        app._dispatch_slash("/set-model planner claude:claude-haiku-4-5-20251001")
+        app._dispatch_slash("/set-model planner claude:claude-sonnet-4-6")
         await pilot.pause()
         cfg = load_config(tmp_path)
-        assert cfg.planner.model == "claude-haiku-4-5-20251001"
+        assert cfg.planner.model == "claude-sonnet-4-6"
         assert cfg.planner.cli.value == "claude"
 
 

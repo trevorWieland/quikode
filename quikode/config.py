@@ -529,15 +529,17 @@ class Config(BaseModel):
         description="Phase A — resolves rebase conflicts.",
     )
     intent_reviewer: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-haiku-4-5-20251001"),
-        description="Phase B — checks intent drift after dep merges. Use a fast/cheap model.",
+        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-sonnet-4-6"),
+        description=(
+            "Phase B — checks intent drift after dep merges. Sonnet for cleaner "
+            "reasoning on the 'are these two specs still compatible' judgment."
+        ),
     )
     progress: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-haiku-4-5-20251001"),
+        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-sonnet-4-6"),
         description=(
             "v3 Phase A — progress-check agent that decides whether a struggling "
-            "subtask is making progress, has flatlined, or it's too early to tell. "
-            "Use a fast/cheap model: this fires every few subtask attempts."
+            "subtask is making progress, has flatlined, or it's too early to tell."
         ),
     )
 

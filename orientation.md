@@ -160,8 +160,8 @@ defaults below.)
 | Checker | codex | gpt-5.3-codex |
 | Triage | claude | claude-opus-4-7 |
 | Conflict resolver | claude | claude-opus-4-7 |
-| Intent reviewer | claude | claude-haiku-4-5-20251001 |
-| Progress | claude | claude-haiku-4-5-20251001 |
+| Intent reviewer | claude | claude-sonnet-4-6 |
+| Progress | claude | claude-sonnet-4-6 |
 
 The user keeps glm-5.1 as doer to balance subscription usage across
 providers. Don't swap models without asking.
