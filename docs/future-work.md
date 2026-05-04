@@ -219,14 +219,54 @@ risk) is the load-bearing reason Phase 2 alone isn't sufficient.
 
 ---
 
+### 🔴 Phase B remainder — sonnet review-thread classifier + CI log parser
+
+The state-machine refactor (TRIAGING_FEEDBACK / ADDRESSING_FEEDBACK
++ PENDING_CI / AWAITING_REVIEW / MERGE_READY) shipped 2026-05-04
+evening, but the *content* of the triage step still defers to the
+fixup planner directly (passing all unresolved threads). The next
+step makes triage Python-deterministic:
+
+- `parse_ci_failure(logs) → list[CIFailure]` — pure-python pattern
+  matcher for cargo / pytest / clippy / lint output. Extract
+  (file, line, error_type, message). Failures we can't classify
+  fall through to current behavior. Replaces handing raw 80-line
+  log excerpts to the fixup planner.
+- `classify_review_thread(thread, plan, recent_diff) → ReviewVerdict`
+  — lightweight sonnet call per thread. Outputs verdict ∈
+  {correct, incorrect, needs_discussion} + a polite reply for
+  INCORRECT. Wired into `_poll_review_threads` as the entry into
+  TRIAGING_FEEDBACK: the orchestrator runs the classifier in-process
+  (no container, no future), posts auto-replies + resolves
+  INCORRECT threads via the existing GraphQL paths, and only then
+  dispatches ADDRESSING_FEEDBACK with the CORRECT subset.
+- New `quikode/triage.py` module so the logic lives outside the
+  orchestrator's poll loop and can be tested independently.
+
+Why deferred to a follow-up: the state machine + driver landing
+first means we get the operator visibility win (no more 30-min
+opaque "responding_to_review") immediately, while the classifier
+work — which involves a new sonnet prompt, host-side claude CLI
+invocation, and significant test coverage — gets its own focused
+diff. Should land within the next session.
+
+### 🟡 Triage hooks for retry-cause classification
+
+Pairs with the retry-reason taxonomy (above). The
+TRIAGING_FEEDBACK step is the natural place to record *why* a
+retry is happening — when the CI parser identifies "test
+failure: TypeError on x.py:42" that's a structurally different
+retry than "rate-limit timeout from codex CLI". Surfacing both
+flavors via the classifier makes the resulting subtask plan
+better-informed.
+
 ## Recently shipped (2026-05-04 evening additions)
 
 - **Stacking-readiness gate (Phase 1 of the stacked-diff vision)** —
   `cfg.stacking_readiness ∈ {"speculative","settled"}` and
   `cfg.stack_settle_quiet_s` (default 600s). In `settled` mode a
-  parent qualifies as a stack base only when it's been quietly in
-  AWAITING_MERGE — flapping through RESPONDING_TO_REVIEW resets the
-  timer. Closes the codex-fixup-storm rebase loop where every review
+  parent qualifies as a stack base only when it's reached MERGE_READY.
+  Closes the codex-fixup-storm rebase loop where every review
   round re-rebased every child.
 - **Resume-boost in `score_candidate`** — orphan-recovered tasks
   with subtasks already DONE or a PR open now outrank cold roots:
@@ -234,6 +274,23 @@ risk) is the load-bearing reason Phase 2 alone isn't sufficient.
   +40 so a high-fan-out fresh root with 9+ dependents still wins.
   Closes the "R-0015 was nearly done but a restart picked something
   fresh instead" footgun.
+- **Post-PR state machine refactor (Phases A + C + D)** — the
+  legacy AWAITING_MERGE / RESPONDING_TO_REVIEW pair was replaced
+  with a clean five-state model: PENDING_CI / AWAITING_REVIEW /
+  MERGE_READY (the post-PR resting states), TRIAGING_FEEDBACK /
+  ADDRESSING_FEEDBACK (the fixup pipeline). State transitions are
+  driven by `_classify_post_pr_target_state` on every poll based
+  on live CI + thread + settle-window signals. Auto-merge gate
+  and settled-task notification now require MERGE_READY, not the
+  overloaded AWAITING_MERGE catch-all. TUI labels, briefing
+  groupings, and detail-panel phase strings updated to the new
+  vocabulary. Migration in `Store._migrate` rewrites legacy values
+  idempotently. Closes the operator-visibility complaint about
+  "responding_to_review for 30 min with nothing observable."
+- **haiku → sonnet sweep** — intent-reviewer and progress-check
+  agents default to `claude-sonnet-4-6` for cleaner reasoning on
+  the spec-compatibility and trajectory judgments. User has
+  subscription capacity for the small bump in cost.
 
 - **`quikode daemon start --detach` / `-d`** — fork + `os.setsid` +
   stdio redirect to daemon.log, so an interactive shell hangup

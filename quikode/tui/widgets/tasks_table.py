@@ -35,13 +35,20 @@ _STATE_STYLE = {
     "blocked": "state-blocked",
     "failed": "state-failed",
     "aborted": "state-failed",
-    "awaiting_merge": "state-awaiting",
+    # v3.5 post-PR split: PENDING_CI shows as "running" (yellow), AWAITING_REVIEW
+    # as "awaiting" (subtler), MERGE_READY as "ready" (green). Each one is a
+    # distinct color so the operator can tell at a glance whether a PR is
+    # waiting on CI, waiting on humans, or fully cleared to land.
+    "pending_ci": "state-rebasing",
+    "awaiting_review": "state-awaiting",
+    "merge_ready": "state-merged",
     "merged": "state-merged",
     "pending": "state-pending",
-    # v3 review-loop / parent-merge transitions. addressing_feedback
-    # mirrors active-doing color (cyan); rebasing_to_main reuses the
-    # rebasing palette (yellow) so a glance signals "git surgery in
-    # flight".
+    # v3.5 post-PR feedback split: TRIAGING_FEEDBACK is the in-process Python
+    # triage step (fast); ADDRESSING_FEEDBACK is the worker-driven fixup
+    # planner + per-subtask doer. Both color as "doing" so the operator
+    # knows actual work is happening.
+    "triaging_feedback": "state-responding",
     "addressing_feedback": "state-responding",
     "rebasing_to_main": "state-rebasing",
 }

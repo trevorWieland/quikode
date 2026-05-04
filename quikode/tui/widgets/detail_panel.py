@@ -326,7 +326,15 @@ def _phase_line(snap: DetailSnapshot) -> str:
         if snap.review_round is not None and snap.review_threads_count is not None:
             parts.append(f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads")
         else:
-            parts.append("[dim]responding to review feedback[/]")
+            parts.append("[dim]fixup planner + per-subtask doer[/]")
+    elif state == "triaging_feedback":
+        parts.append("[dim]Python triage (CI parse / thread classify)[/]")
+    elif state == "pending_ci":
+        parts.append("[dim]PR open · CI running[/]")
+    elif state == "awaiting_review":
+        parts.append("[dim]CI green · awaiting review[/]")
+    elif state == "merge_ready":
+        parts.append("[dim]ready to merge[/]")
     elif note:
         parts.append(f"[dim]{note[:80]}[/]")
     if in_state:
@@ -335,25 +343,27 @@ def _phase_line(snap: DetailSnapshot) -> str:
         parts.append(f"edit [b]{edit}[/]")
     line = "  ·  ".join(parts)
     # Trailing notes — explain "why does the subtasks tab look frozen?" for
-    # the operator. AWAITING_MERGE gets its own copy: the worker has fully
-    # released this task, the daemon is the one polling.
-    if state == "awaiting_merge":
-        line += "\n[dim italic](no action required — auto-polling for reviews + merge)[/]"
+    # the operator. The post-PR states get their own copy: the worker has
+    # fully released this task, the daemon is the one polling.
+    if state in {"pending_ci", "awaiting_review", "merge_ready"}:
+        line += "\n[dim italic](no action required — auto-polling for CI + reviews)[/]"
     elif state in _WHOLE_SPEC_STATES:
         line += "\n[dim italic](whole-spec phase — subtask states below are frozen until this returns)[/]"
     return line
 
 
 def _phase_color(state: str) -> str:
-    if state in {"awaiting_merge"}:
+    if state in {"merge_ready", "merged"}:
         return "green"
-    if state in {"merged"}:
-        return "green"
+    if state == "awaiting_review":
+        return "blue"
+    if state == "pending_ci":
+        return "yellow"
     if state in {"blocked", "failed", "aborted"}:
         return "red"
-    if state == "addressing_feedback":
+    if state in {"addressing_feedback", "triaging_feedback"}:
         # Cyan to match other "agent actively working" states. Distinct from
-        # rebasing (yellow) so a glance differentiates "fixing review" from
+        # rebasing (yellow) so a glance differentiates "fixing feedback" from
         # "untangling git" at the phase-line level.
         return "cyan"
     if state == "rebasing_to_main":

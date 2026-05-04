@@ -100,10 +100,11 @@ def test_briefing_human_includes_v3_state_sections(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["briefing"])
     assert result.exit_code == 0, result.output
     out = result.output
-    # All four v3 sections render with their tasks.
-    assert "Awaiting merge" in out
+    # v3.5 post-PR groups + addressing_feedback + rebasing + blocked.
+    # PENDING_CI seed → "Pending CI" group.
+    assert "Pending CI" in out
     assert "R-AM" in out
-    assert "Responding to review" in out
+    assert "Addressing feedback" in out
     assert "R-RR" in out
     assert "round 3" in out
     assert "Rebasing onto main" in out
@@ -122,12 +123,16 @@ def test_briefing_json_groups_v3_states(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["briefing", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert "awaiting_merge" in payload
+    # v3.5 split — pending_ci replaces the legacy awaiting_merge bucket.
+    assert "pending_ci" in payload
+    assert "awaiting_review" in payload
+    assert "merge_ready" in payload
+    assert "triaging_feedback" in payload
     assert "addressing_feedback" in payload
     assert "rebasing_to_main" in payload
     assert "blocked_needs_intervention" in payload
 
-    am_ids = [r["id"] for r in payload["awaiting_merge"]]
+    am_ids = [r["id"] for r in payload["pending_ci"]]
     rr_ids = [r["id"] for r in payload["addressing_feedback"]]
     rb_ids = [r["id"] for r in payload["rebasing_to_main"]]
     bl_ids = [r["id"] for r in payload["blocked_needs_intervention"]]

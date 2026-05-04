@@ -2342,7 +2342,10 @@ def briefing(
                 "last_error": r.get("last_error"),
             }
 
-        awaiting_merge = [_row_summary(r) for r in rows if r["state"] == State.PENDING_CI.value]
+        pending_ci = [_row_summary(r) for r in rows if r["state"] == State.PENDING_CI.value]
+        awaiting_review = [_row_summary(r) for r in rows if r["state"] == State.AWAITING_REVIEW.value]
+        merge_ready = [_row_summary(r) for r in rows if r["state"] == State.MERGE_READY.value]
+        triaging_feedback = [_row_summary(r) for r in rows if r["state"] == State.TRIAGING_FEEDBACK.value]
         addressing_feedback = [_row_summary(r) for r in rows if r["state"] == State.ADDRESSING_FEEDBACK.value]
         rebasing_to_main = [_row_summary(r) for r in rows if r["state"] == State.REBASING_TO_MAIN.value]
         blocked_intervention = [_row_summary(r) for r in rows if r["state"] == State.BLOCKED.value]
@@ -2351,7 +2354,10 @@ def briefing(
             "tasks_by_state": {
                 s: sum(1 for r in rows if r["state"] == s) for s in {r["state"] for r in rows}
             },
-            "awaiting_merge": awaiting_merge,
+            "pending_ci": pending_ci,
+            "awaiting_review": awaiting_review,
+            "merge_ready": merge_ready,
+            "triaging_feedback": triaging_feedback,
             "addressing_feedback": addressing_feedback,
             "rebasing_to_main": rebasing_to_main,
             "blocked_needs_intervention": blocked_intervention,
@@ -2437,28 +2443,39 @@ def briefing(
                 + cost_str
             )
 
-    # 3. Awaiting human / blocked / v3 review-loop tasks
-    awaiting = store.in_state(State.PENDING_CI)
+    # 3. v3.5 post-PR groups: PENDING_CI / AWAITING_REVIEW / MERGE_READY +
+    # the in-process and worker-driven feedback states.
+    pending_ci = store.in_state(State.PENDING_CI)
+    awaiting_review = store.in_state(State.AWAITING_REVIEW)
+    merge_ready = store.in_state(State.MERGE_READY)
+    triaging_fb = store.in_state(State.TRIAGING_FEEDBACK)
     responding = store.in_state(State.ADDRESSING_FEEDBACK)
     rebasing = store.in_state(State.REBASING_TO_MAIN)
     blocked_only = store.in_state(State.BLOCKED)
     failed_only = store.in_state(State.FAILED)
-    if awaiting:
-        console.print("\n[bold bright_green]Awaiting merge[/]")
-        for r in awaiting:
+    awaiting = pending_ci + awaiting_review + merge_ready  # for "DAG" line below
+
+    def _print_group(label: str, color: str, rows: list, *, suffix_fn=None) -> None:
+        if not rows:
+            return
+        console.print(f"\n[bold {color}]{label}[/]")
+        for r in rows:
             cost = store.task_total_cost_usd(r["id"])
             cost_str = f"  · ${cost:.2f}" if cost else ""
-            console.print(f"  [cyan]{r['id']}[/]  PR: {r.get('pr_url') or '(local only)'}{cost_str}")
+            extra = suffix_fn(r) if suffix_fn else ""
+            console.print(f"  [cyan]{r['id']}[/]{extra}  PR: {r.get('pr_url') or '(local only)'}{cost_str}")
+
+    _print_group("Merge ready", "bright_green", merge_ready)
+    _print_group("Awaiting review (CI green)", "blue", awaiting_review)
+    _print_group("Pending CI", "yellow", pending_ci)
+    _print_group("Triaging feedback (Python)", "cyan", triaging_fb)
     if responding:
-        console.print("\n[bold cyan]Responding to review[/]")
-        for r in responding:
+
+        def _round_suffix(r: dict) -> str:
             rr = r.get("review_round")
-            round_str = f" round {rr}" if rr else ""
-            cost = store.task_total_cost_usd(r["id"])
-            cost_str = f"  · ${cost:.2f}" if cost else ""
-            console.print(
-                f"  [cyan]{r['id']}[/]{round_str}  PR: {r.get('pr_url') or '(local only)'}{cost_str}"
-            )
+            return f" round {rr}" if rr else ""
+
+        _print_group("Addressing feedback", "cyan", responding, suffix_fn=_round_suffix)
     if rebasing:
         console.print("\n[bold yellow]Rebasing onto main[/]")
         for r in rebasing:
