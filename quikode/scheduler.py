@@ -24,12 +24,20 @@ log = logging.getLogger("quikode.scheduler")
 
 
 # States where a dep is "stack-ready" — has a remote branch a child can fork off.
+# Includes the transient PROVISIONING / FIXUP_PLANNING states because the
+# parent's branch already exists on origin throughout these (the worker only
+# tears down + recreates the container, never the branch). Without these, a
+# child briefly loses stacking eligibility during the parent's review-response
+# provision window — the picker would skip it for one tick and re-evaluate
+# next loop. Cosmetic but worth fixing for cleaner picker behavior.
 STACK_READY_STATES = frozenset(
     {
         State.POLLING_CI.value,
         State.AWAITING_MERGE.value,
         State.PR_OPENING.value,
         State.RESPONDING_TO_REVIEW.value,
+        State.PROVISIONING.value,
+        State.FIXUP_PLANNING.value,
     }
 )
 

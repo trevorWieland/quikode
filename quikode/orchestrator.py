@@ -241,11 +241,17 @@ class Orchestrator:
         completed = self.store.completed_ids() & scope
         active = self.store.active_ids() & scope
         # States where a dep is "stack-ready" — has a branch we can fork off.
+        # Mirror of scheduler.STACK_READY_STATES — includes the transient
+        # PROVISIONING / FIXUP_PLANNING states so a child doesn't briefly
+        # lose stacking eligibility during the parent's review-response
+        # cycle (the parent's remote branch is unchanged throughout).
         STACK_READY = {
             State.POLLING_CI.value,
             State.AWAITING_MERGE.value,
             State.PR_OPENING.value,
             State.RESPONDING_TO_REVIEW.value,
+            State.PROVISIONING.value,
+            State.FIXUP_PLANNING.value,
         }
         candidates: list[dict] = []
         for nid in sorted(scope):

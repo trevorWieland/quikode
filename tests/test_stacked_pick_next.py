@@ -127,6 +127,40 @@ def test_pick_next_responding_to_review_is_stack_ready(tmp_path):
     o.store.conn.close()
 
 
+def test_pick_next_provisioning_is_stack_ready(tmp_path):
+    """Parent transiently in PROVISIONING (during review-response container
+    creation) → child can still be stacked. The parent's remote branch is
+    unchanged throughout PROVISIONING; only the container is being recreated."""
+    dag = _make_dag(tmp_path, [("A", []), ("B", ["A"])])
+    o = _orch(tmp_path, dag, stacking_strategy="within-milestone")
+    o.store.upsert_pending("A")
+    o.store.upsert_pending("B")
+    o.store.transition("A", State.PROVISIONING, branch="quikode/a-prov")
+
+    nxt = o._pick_next({"A", "B"}, set())
+    assert nxt == "B"
+    row_b = o.store.get("B")
+    assert row_b["parent_pr_branch"] == "quikode/a-prov"
+    o.store.conn.close()
+
+
+def test_pick_next_fixup_planning_is_stack_ready(tmp_path):
+    """Parent in FIXUP_PLANNING (mid review/CI fixup planner call) → child
+    can still be stacked. Same rationale as PROVISIONING — the parent's
+    remote branch is stable."""
+    dag = _make_dag(tmp_path, [("A", []), ("B", ["A"])])
+    o = _orch(tmp_path, dag, stacking_strategy="within-milestone")
+    o.store.upsert_pending("A")
+    o.store.upsert_pending("B")
+    o.store.transition("A", State.FIXUP_PLANNING, branch="quikode/a-fix")
+
+    nxt = o._pick_next({"A", "B"}, set())
+    assert nxt == "B"
+    row_b = o.store.get("B")
+    assert row_b["parent_pr_branch"] == "quikode/a-fix"
+    o.store.conn.close()
+
+
 def test_pick_next_stacking_off_blocks_until_merged(tmp_path):
     """With stacking_strategy=off, child waits for MERGED only — not
     AWAITING_MERGE."""
