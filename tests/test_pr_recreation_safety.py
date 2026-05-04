@@ -64,6 +64,43 @@ def _seed_child(w: TaskWorker, pr_number: int = 11) -> None:
     )
 
 
+def test_open_pr_skips_create_when_pr_already_exists(tmp_path):
+    """Idempotent re-entry into `_open_pr`: when the task row already
+    carries `pr_number` + `pr_url` (e.g. from a prior daemon run that
+    pushed but crashed before transitioning to AWAITING_MERGE, or from
+    an orphan-recovered PR_OPENING task), the worker reuses the existing
+    PR rather than calling `gh pr create` and failing with 'already
+    exists'. Regression for the 2026-05-04 R-0015 BLOCKED-on-restart bug."""
+    w = _worker(tmp_path)
+    w.store.upsert_pending("T-CHILD")
+    w.store.transition(
+        "T-CHILD",
+        State.PUSHING,
+        branch="quikode/t-child-abc",
+        pr_number=144,
+        pr_url="https://github.com/owner/repo/pull/144",
+    )
+    w.handle = MagicMock()
+    w.handle.container_name = "qk-stub"
+
+    open_pr_mock = MagicMock()
+    with (
+        patch.object(w, "_handle_parent_rebase_if_needed", return_value=None),
+        patch("quikode.worker.github.open_pr", open_pr_mock),
+    ):
+        outcome = w._open_pr()
+
+    assert outcome is None  # success
+    # `gh pr create` was NOT called.
+    open_pr_mock.assert_not_called()
+    # Row state advanced to PR_OPENING (the transition fires before the
+    # idempotent-skip check), but the existing pr_number/url are preserved.
+    row = w.store.get("T-CHILD")
+    assert row["pr_number"] == 144
+    assert row["pr_url"] == "https://github.com/owner/repo/pull/144"
+    w.store.conn.close()
+
+
 def test_open_pr_retarget_transient_then_success(tmp_path):
     """First retarget call fails, PR is queried as OPEN, retry succeeds → no new PR."""
     w = _worker(tmp_path)

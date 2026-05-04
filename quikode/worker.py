@@ -2092,6 +2092,23 @@ class TaskWorker:
         if rebase_outcome:
             return rebase_outcome
         self.store.transition(self.node.id, State.PR_OPENING)
+        # Idempotent re-entry: if this task already has a PR row in the
+        # store (from a prior run that pushed but crashed before
+        # transitioning to AWAITING_MERGE, or from a daemon restart that
+        # orphan-recovered the task post-PR-open), skip `gh pr create`
+        # and reuse the existing PR. Without this, the second pass fails
+        # with `gh: a pull request for branch X already exists` and the
+        # task BLOCKs unnecessarily — observed live on R-0015 after the
+        # 2026-05-04 daemon restart.
+        row = self._row()
+        if row.get("pr_number") and row.get("pr_url"):
+            log.info(
+                "task %s: PR #%s already exists at %s — reusing instead of re-creating",
+                self.node.id,
+                row["pr_number"],
+                row["pr_url"],
+            )
+            return None
         title = f"{self.node.id}: {self.node.title}"
         body = self._pr_body()
         # v2 Phase C: stacked PR targets the parent branch when stacking.
@@ -2099,7 +2116,6 @@ class TaskWorker:
         # were running but the flag wasn't raised in time (e.g. orchestrator
         # missed the merge event), fall back to main via ls-remote check
         # so `gh pr create` doesn't fail with "Base ref must be a branch".
-        row = self._row()
         pr_base = row.get("parent_branch") or self.cfg.base_branch
         if pr_base != self.cfg.base_branch and not self._remote_branch_exists(pr_base):
             log.info(
