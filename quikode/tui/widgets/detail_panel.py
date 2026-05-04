@@ -71,6 +71,12 @@ class DetailPanel(Container):
         self._calls_fp: tuple = ()
         self._phase_fp: tuple = ()
         self._last_task_id: str | None = None
+        # Tracks whether the user has manually moved the subtasks cursor.
+        # While False, render_snapshot auto-follows the active subtask so
+        # newly-appended fixup rows (which can fall below the visible
+        # viewport) stay in view. Set True by the App when the user
+        # arrow-keys the cursor; reset on task selection change.
+        self._user_moved_subtask_cursor = False
 
     def compose(self) -> ComposeResult:
         yield Static("", id="detail-phase")
@@ -122,14 +128,31 @@ class DetailPanel(Container):
                     sub.title[:60],
                     key=sub.subtask_id,
                 )
-            # Restore cursor to where the user had it (clamped). The active
-            # subtask is already visually distinguished by its cyan color —
-            # we don't need to chase it with the cursor too. If the user
-            # wants to follow, they'll arrow into the live row themselves.
+            # Auto-follow the active subtask UNLESS the user has manually
+            # moved the cursor (in which case respect their position). When
+            # fixup decomposition appends new subtasks past the visible
+            # viewport (e.g. F-7-* on R-0002 fell below screen), the user
+            # would otherwise have no idea they exist. Follow priority:
+            #   1. user-moved cursor → restore clamped position
+            #   2. otherwise → scroll to active subtask row (if any)
+            #   3. otherwise → leave at row 0
             if snap.subtasks:
-                target = min(prev_cursor_row, len(snap.subtasks) - 1)
+                if self._user_moved_subtask_cursor:
+                    target = min(prev_cursor_row, len(snap.subtasks) - 1)
+                elif snap.active_subtask_idx >= 0:
+                    target = snap.active_subtask_idx
+                else:
+                    # Default to last row when no active — usually the most
+                    # recently-appended fixup subtask.
+                    target = len(snap.subtasks) - 1
                 try:
                     st.move_cursor(row=max(target, 0), column=0)
+                    # Force the active row into view if the table is
+                    # scrolled away from it.
+                    try:
+                        st.scroll_to(y=max(target, 0))
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             self._subtasks_fp = sub_fp
