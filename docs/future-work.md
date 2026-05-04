@@ -143,28 +143,40 @@ PRs; ancestor-PR fixes percolate down the chain automatically.
 Phase 1 (readiness gate) shipped 2026-05-04. Phase 2 (multi-parent
 merge-base) and Phase 3 (instructional resolver) are open.
 
-### 🔴 Phase 2 — Multi-parent stacking (D depends on B + C)
+### 🟡 Phase 2 follow-up — Cascade rebase on parent advance
 
-Today `tasks.parent_task_id` is scalar; `_resolve_stack_parent`
-returns one `(task_id, branch)`. A child with two unmet parents waits
-until at least one merges. Goal: D's branch starts from a synthetic
-merge-base built by `git merge B C` into a transient
-`quikode/d-base-<6hex>`. On parent change, recreate the merge-base
-and `git rebase --onto <new_merge_base> <old_merge_base> D`.
+Phase 2 minimum-viable shipped 2026-05-04 evening: schema, store
+helpers, picker side-effects, `stacking.construct_merge_base`,
+worker provisioning hook, 14 tests. What remains:
 
-Required changes:
-- Schema: replace scalar `parent_task_id`/`parent_branch` with JSON
-  arrays. Migration drops + recreates the columns.
-- `_resolve_stack_parent` becomes `_resolve_stack_parents` returning
-  a list; `parent_pr_branch` becomes plural too.
-- New worker step `_construct_merge_base` invoked from
-  `_provision_worktree`.
-- Stack-walk helpers (`_stack_root`, `_stack_depth`,
-  `_stack_size_under_root`) become DAG walks with cycle detection
-  (cycle detection already exists for the scalar case — generalize).
-- `_schedule_rebases_for_merged_parent` and the inline
-  needs-parent-rebase checkpoints in worker.py need to handle the
-  multi-parent case (rebase = recompute merge-base + rebase --onto).
+- **Cascade rebase scheduler.** When a parent in MERGE_READY accepts
+  a new commit (e.g. fixup pushed in the addressing-feedback path),
+  every descendant relying on its merge-base needs to recompute.
+  Today the scheduler reacts to *parent merge*; extend
+  `_schedule_rebases_for_merged_parent` (or a sibling
+  `_schedule_rebases_for_parent_advance`) to fire on push, not just
+  merge, and traverse the multi-parent DAG in topo order so D
+  rebases only after B/C have themselves finished.
+- **`run_rebase_to_main` multi-parent variant.** Today the worker
+  uses `git rebase --onto <parent_sha>` against a single parent;
+  for multi-parent, rebase against the *prior* merge-base sha so
+  the child's commits replay onto the new merge-base. The store
+  already records `parent_merge_base_sha` for this reason.
+- **Stack-walk helpers as DAG walks.** `_stack_depth`,
+  `_stack_root`, `_stack_size_under_root` currently follow the
+  scalar `parent_task_id` chain. Generalize to walk
+  `parent_task_ids` (union of all paths upward). Multi-parent
+  cycle detection already covered by the scalar version's `seen`
+  set — extend to the array case.
+- **End-to-end integration test** with real git: tmp repo with
+  three branches, run `construct_merge_base`, assert a clean
+  merge tree comes out, then introduce a conflict and assert
+  the helper aborts cleanly without leaving the repo dirty.
+
+The MVP that shipped today is correct on the schema + provisioning
+fork-point; the cascade-rebase logic is the load-bearing follow-up
+that lets a multi-parent chain advance through review without
+operator intervention.
 
 ### 🔴 Phase 3 — Instructional conflict resolver
 
@@ -291,6 +303,30 @@ better-informed.
   agents default to `claude-sonnet-4-6` for cleaner reasoning on
   the spec-compatibility and trajectory judgments. User has
   subscription capacity for the small bump in cost.
+- **Phase B classifier (sonnet review-thread + CI log parser)** —
+  the in-process triage step the user's "responding_to_review is
+  broken" complaint asked for. CI logs get pattern-matched into
+  structured failures (cargo / clippy / ruff / pytest); review
+  threads get classified per-thread → CORRECT / INCORRECT /
+  NEEDS_DISCUSSION. INCORRECT threads auto-reply via REST
+  `/comments/{id}/replies` then resolve via the GraphQL mutation.
+  Only CORRECT threads reach the planner.
+- **Retry-cause classification** — new `retry_reasons` JSON column
+  on subtasks plus a 9-category classifier (doer_output_invalid,
+  checker_fail, checker_timeout, container_oom (rc=137),
+  container_vanished, agent_cli_rate_limit, pre_commit_hook_fail,
+  network_timeout, other). `quikode show <id>` renders the
+  histogram per subtask + the most-recent example. Answers "why
+  did this retry 17 times" without grepping logs.
+- **Phase 2 multi-parent stacking MVP** — schema additions
+  (`parent_task_ids`, `parent_branches`, `parent_pr_branches`,
+  `parent_merge_base_sha`, `parent_merge_base_branch`) + Store
+  helpers + picker-side stamping + worker `_construct_merge_base`
+  hook in `_provision_worktree`. When a child has > 1 stack-ready
+  parent, the worker creates a synthetic merge-base branch
+  (`quikode/<id>-base-<6hex>`) via octopus / sequential `git merge`
+  and forks the worktree off that. Single-parent path unchanged
+  for backwards compat. Cascade-rebase follow-up filed above.
 
 - **`quikode daemon start --detach` / `-d`** — fork + `os.setsid` +
   stdio redirect to daemon.log, so an interactive shell hangup

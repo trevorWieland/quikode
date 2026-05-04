@@ -527,9 +527,22 @@ class Store:
                 ("last_intent_review_ts", "REAL"),
                 ("intent_review_count", "INTEGER DEFAULT 0"),
                 ("replan_count", "INTEGER DEFAULT 0"),
-                # v2 Phase C: stacked diffs
+                # v2 Phase C: stacked diffs (single-parent scalars; v3.5
+                # adds multi-parent JSON-array equivalents below)
                 ("parent_task_id", "TEXT"),
                 ("parent_branch", "TEXT"),
+                # v3.5 Phase 2: multi-parent stacking. JSON array of strings
+                # mirroring the scalar columns above; populated alongside
+                # the scalars on every write so single-parent code paths
+                # keep working unchanged. When a child has > 1 stack-ready
+                # parent, the worker constructs a synthetic merge-base
+                # branch (`quikode/<id>-base-<6hex>`) and stores its sha in
+                # parent_merge_base_sha; the worktree forks off that.
+                ("parent_task_ids", "TEXT"),  # JSON array
+                ("parent_branches", "TEXT"),  # JSON array (local refs)
+                ("parent_pr_branches", "TEXT"),  # JSON array (remote refs)
+                ("parent_merge_base_sha", "TEXT"),
+                ("parent_merge_base_branch", "TEXT"),
                 # v2.2 resume: skip the planner agent on the next provision
                 # and reconstruct Plan from the existing subtasks rows. Set by
                 # `quikode resume <id>`; cleared by the worker on consume.
@@ -631,6 +644,26 @@ class Store:
             if name not in existing_tables:
                 with self._tx_lock:
                     self.conn.execute(ddl)
+
+        # v3.5 Phase 2: backfill parent_task_ids / parent_branches /
+        # parent_pr_branches from the legacy scalar columns when missing.
+        # Idempotent — only runs against rows where the JSON column is NULL.
+        with self._tx_lock:
+            self.conn.execute(
+                "UPDATE tasks "
+                "SET parent_task_ids = json_array(parent_task_id) "
+                "WHERE parent_task_id IS NOT NULL AND parent_task_ids IS NULL"
+            )
+            self.conn.execute(
+                "UPDATE tasks "
+                "SET parent_branches = json_array(parent_branch) "
+                "WHERE parent_branch IS NOT NULL AND parent_branches IS NULL"
+            )
+            self.conn.execute(
+                "UPDATE tasks "
+                "SET parent_pr_branches = json_array(parent_pr_branch) "
+                "WHERE parent_pr_branch IS NOT NULL AND parent_pr_branches IS NULL"
+            )
 
         # State-name migrations. Idempotent — UPDATE matches zero rows on
         # already-migrated DBs.
@@ -1059,6 +1092,101 @@ class Store:
                 (task_id, subtask_id),
             ).fetchone()
             return int(r["retries"]) if r else 0
+
+    def get_parent_task_ids(self, task_id: str) -> list[str]:
+        """Read the JSON-array parent_task_ids for a task. Falls back to the
+        scalar parent_task_id column when the array is missing (legacy rows).
+
+        Always returns a list (possibly empty) — callers that previously
+        checked `row.get("parent_task_id")` for "any parent" can switch to
+        `if get_parent_task_ids(tid):`.
+        """
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT parent_task_ids, parent_task_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        if r is None:
+            return []
+        if r["parent_task_ids"]:
+            try:
+                arr = json.loads(r["parent_task_ids"])
+                if isinstance(arr, list):
+                    return [str(x) for x in arr if x]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if r["parent_task_id"]:
+            return [str(r["parent_task_id"])]
+        return []
+
+    def get_parent_branches(self, task_id: str) -> list[str]:
+        """Read JSON-array parent_branches; falls back to scalar parent_branch."""
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT parent_branches, parent_branch FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        if r is None:
+            return []
+        if r["parent_branches"]:
+            try:
+                arr = json.loads(r["parent_branches"])
+                if isinstance(arr, list):
+                    return [str(x) for x in arr if x]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if r["parent_branch"]:
+            return [str(r["parent_branch"])]
+        return []
+
+    def set_parent_chain(
+        self,
+        task_id: str,
+        *,
+        parent_task_ids: list[str],
+        parent_branches: list[str] | None = None,
+        parent_pr_branches: list[str] | None = None,
+    ) -> None:
+        """Stamp the multi-parent linkage on a task.
+
+        Also writes the legacy scalar columns to the FIRST entry so
+        single-parent code paths keep working unchanged. Pass empty lists
+        (or None) to clear all parent linkage.
+        """
+        ids_json = json.dumps(list(parent_task_ids))
+        branches_json = json.dumps(list(parent_branches or []))
+        pr_branches_json = json.dumps(list(parent_pr_branches or []))
+        scalar_id = parent_task_ids[0] if parent_task_ids else None
+        scalar_branch = (parent_branches or [None])[0] if parent_branches else None
+        scalar_pr_branch = (parent_pr_branches or [None])[0] if parent_pr_branches else None
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET "
+                "  parent_task_ids = ?, parent_branches = ?, parent_pr_branches = ?, "
+                "  parent_task_id = ?, parent_branch = ?, parent_pr_branch = ?, "
+                "  updated_at = ? "
+                "WHERE id = ?",
+                (
+                    ids_json,
+                    branches_json,
+                    pr_branches_json,
+                    scalar_id,
+                    scalar_branch,
+                    scalar_pr_branch,
+                    time.time(),
+                    task_id,
+                ),
+            )
+
+    def set_parent_merge_base(self, task_id: str, *, branch: str | None, sha: str | None) -> None:
+        """Record the synthetic merge-base branch + sha used for multi-parent
+        stacking. Either argument may be None to clear."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET parent_merge_base_branch = ?, parent_merge_base_sha = ?, "
+                "updated_at = ? WHERE id = ?",
+                (branch, sha, time.time(), task_id),
+            )
 
     def append_retry_reason(
         self,

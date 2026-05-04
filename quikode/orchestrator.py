@@ -321,30 +321,50 @@ class Orchestrator:
         )
 
     def _apply_pick_side_effects(self, c: dict) -> None:
-        """Run any stamping/clearing required for the picked candidate. For
-        stacked children, stamp `parent_pr_branch` from the deepest unmet
-        dep's branch. For fresh roots, clear any stale parent_pr_branch
-        from a prior stacking that no longer applies."""
+        """Run any stamping/clearing required for the picked candidate.
+
+        For stacked children, stamp the full parent chain (v3.5 Phase 2):
+        `parent_task_ids` / `parent_branches` / `parent_pr_branches` JSON
+        arrays carry every unmet stack-ready parent. The legacy scalar
+        columns (`parent_task_id`, `parent_branch`, `parent_pr_branch`)
+        also get the *deepest-id* entry so single-parent code paths
+        (rebase-to-main, parent_branch lookups) keep working unchanged.
+        For multi-parent picks (>1 unmet) the worker's provisioning step
+        constructs a synthetic merge-base branch off this list.
+
+        For fresh roots, clear any stale parent linkage left over from a
+        prior stacking that no longer applies.
+        """
         nid = c["task_id"]
         row = c.get("row")
         if not c["is_stacked"]:
             if row and (row.get("parent_pr_branch") or row.get("parent_branch")):
                 self.store.clear_parent_branch(nid)
+                # Defensive: also clear the array columns + merge-base bookkeeping.
+                self.store.set_parent_chain(nid, parent_task_ids=[])
+                self.store.set_parent_merge_base(nid, branch=None, sha=None)
             return
-        # Stamp the child's stacking metadata. Deterministic deepest-id wins
-        # rule (same as `_resolve_stack_parent`).
+        # Collect the (id, branch) pairs for every unmet stack-ready parent.
+        # Sorted by id for determinism — `set_parent_chain` writes the *first*
+        # entry into the legacy scalar columns, so this also pins the
+        # "primary" parent in a stable way across re-picks.
         unmet_with_branch: list[tuple[str, str]] = []
         for d in sorted(c["unmet"]):
             pr = self.store.get(d)
             if pr and pr.get("branch"):
                 unmet_with_branch.append((d, str(pr["branch"])))
         if unmet_with_branch:
-            _, parent_branch = unmet_with_branch[-1]
-            self.store.set_field(
+            ids = [tid for tid, _ in unmet_with_branch]
+            branches = [br for _, br in unmet_with_branch]
+            self.store.set_parent_chain(
                 nid,
-                parent_pr_branch=parent_branch,
-                parent_branch=parent_branch,
+                parent_task_ids=ids,
+                parent_branches=branches,
+                parent_pr_branches=branches,
             )
+            # Reset any prior merge-base bookkeeping; the worker recomputes
+            # on the next provision when len(unmet) > 1.
+            self.store.set_parent_merge_base(nid, branch=None, sha=None)
 
     def _stack_depth(self, task_id: str) -> int:
         """Compute how deep the stacking chain is starting from `task_id`.

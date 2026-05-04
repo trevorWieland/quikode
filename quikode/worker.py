@@ -30,6 +30,7 @@ from . import (
     retry_classify,
     scheduler,
     sound,
+    stacking,
     worktree,
 )
 from .agents import build_agent
@@ -784,24 +785,59 @@ class TaskWorker:
         wt_dir = docker_env.slugify(self.node.id) + (f"-{suffix}" if suffix else "")
         wt_path = (self.cfg.worktree_root / wt_dir).resolve()
 
-        # v3 Phase C: prefer the orchestrator-stamped `parent_pr_branch`
-        # (set in `_pick_next` when scheduling a stacked child). Falls back
-        # to v2 Phase C's deps-driven resolver for the legacy case where the
-        # row was provisioned without orchestrator help (e.g. resume paths).
+        # v3.5 Phase 2: multi-parent stacking. The orchestrator stamps the
+        # full parent chain into `parent_task_ids` / `parent_branches`. When
+        # >1 parent, build a synthetic merge-base branch (`quikode/<id>-base-<6hex>`)
+        # off `git merge` of the parent tips and fork the worktree from there.
+        # When ==1, fall through to the existing single-parent path. When 0,
+        # the deps-driven resolver kicks in (covers resume paths where the
+        # orchestrator hasn't re-stamped).
         row = self.store.get(self.node.id) or {}
-        parent_pr_branch = row.get("parent_pr_branch")
-        if parent_pr_branch:
-            # Find the matching dep so we can also persist parent_task_id
-            # for traceability + the stack-depth calculation.
-            parent_task_id = None
-            for dep in self.node.depends_on:
-                dep_row = self.store.get(dep)
-                if dep_row and dep_row.get("branch") == parent_pr_branch:
-                    parent_task_id = dep
-                    break
-            parent_branch = str(parent_pr_branch)
+        parent_task_ids = self.store.get_parent_task_ids(self.node.id)
+        parent_branches = self.store.get_parent_branches(self.node.id)
+        parent_task_id: str | None = None
+        parent_branch: str | None = None
+        if len(parent_task_ids) > 1 and len(parent_branches) >= len(parent_task_ids):
+            # Build the merge-base branch off origin/main + every parent's tip.
+            worktree.fetch_base(self.cfg.repo_path, self.cfg.pr_remote, self.cfg.base_branch)
+            mb_name = stacking.compute_merge_base_branch_name(self.node.id, parent_branches)
+            mb_sha = stacking.construct_merge_base(
+                repo_path=self.cfg.repo_path,
+                parent_branches=parent_branches,
+                branch_name=mb_name,
+                base_branch=self.cfg.base_branch,
+            )
+            if mb_sha:
+                self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
+                # Use merge-base branch as the fork point; persist parent_task_id
+                # = first listed parent for legacy callers that read scalar.
+                parent_task_id = parent_task_ids[0]
+                parent_branch = mb_name
+            else:
+                log.warning(
+                    "task %s: multi-parent merge-base construction failed (conflict); "
+                    "falling back to single-parent stacking on %s",
+                    self.node.id,
+                    parent_branches[0],
+                )
+                parent_task_id = parent_task_ids[0]
+                parent_branch = parent_branches[0]
+        elif len(parent_task_ids) == 1 and len(parent_branches) >= 1:
+            parent_task_id = parent_task_ids[0]
+            parent_branch = parent_branches[0]
         else:
-            parent_task_id, parent_branch = self._resolve_stack_parent()
+            # v3 Phase C fallback: orchestrator hasn't stamped (resume paths,
+            # tests). Use the deps-driven resolver.
+            parent_pr_branch = row.get("parent_pr_branch")
+            if parent_pr_branch:
+                for dep in self.node.depends_on:
+                    dep_row = self.store.get(dep)
+                    if dep_row and dep_row.get("branch") == parent_pr_branch:
+                        parent_task_id = dep
+                        break
+                parent_branch = str(parent_pr_branch)
+            else:
+                parent_task_id, parent_branch = self._resolve_stack_parent()
         worktree.fetch_base(self.cfg.repo_path, self.cfg.pr_remote, self.cfg.base_branch)
         # Capture the main SHA at branch creation. Used by Phase A's
         # conflict resolver to compute "what landed since" and by Phase B's
