@@ -382,7 +382,7 @@ def test_daemon_status_running_fresh_heartbeat_json(tmp_path, monkeypatch):
                 "ts": time.time(),
                 "in_flight": 2,
                 "awaiting_merge": 1,
-                "responding_to_review": 0,
+                "addressing_feedback": 0,
             }
         )
     )
@@ -402,7 +402,7 @@ def test_daemon_status_stale_heartbeat_returns_2(tmp_path, monkeypatch):
     (state / "daemon.pid").write_text(f"{os.getpid()}@{time.time():.0f}\n")
     # Heartbeat 10 minutes old
     (state / "orchestrator.heartbeat").write_text(
-        json.dumps({"ts": time.time() - 600, "in_flight": 0, "awaiting_merge": 0, "responding_to_review": 0})
+        json.dumps({"ts": time.time() - 600, "in_flight": 0, "awaiting_merge": 0, "addressing_feedback": 0})
     )
     runner = CliRunner()
     res = runner.invoke(app, ["daemon", "status"])

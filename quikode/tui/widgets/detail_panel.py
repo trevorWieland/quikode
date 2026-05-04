@@ -58,7 +58,7 @@ class DetailSnapshot:
     in_state_for: str = ""
     last_worktree_edit: str = ""
     # v3 review-loop context — populated when the task is in
-    # responding_to_review so the phase line can show "round N · M threads"
+    # addressing_feedback so the phase line can show "round N · M threads"
     # without the user having to drill into the DB. Both default to None
     # for older states / pre-v3 tasks.
     review_round: int | None = None
@@ -293,7 +293,7 @@ _WHOLE_SPEC_STATES = {
     # v3 states where the worker takes the wheel for the whole spec — the
     # subtasks tab is frozen until the task either commits + pushes or
     # transitions back to AWAITING_MERGE.
-    "responding_to_review",
+    "addressing_feedback",
     "rebasing_to_main",
 }
 
@@ -319,10 +319,10 @@ def _phase_line(snap: DetailSnapshot) -> str:
         parts.append(f"[dim]{snap.title[:60]}[/]")
     parts.append(f"[{color}]{state}[/]")
     # State-specific extras: review-loop context (round / threads) takes
-    # priority over the generic state_log note when responding_to_review,
+    # priority over the generic state_log note when addressing_feedback,
     # since "round 3 · 2 threads" is more useful at-a-glance than a
     # truncated transition note.
-    if state == "responding_to_review":
+    if state == "addressing_feedback":
         if snap.review_round is not None and snap.review_threads_count is not None:
             parts.append(f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads")
         else:
@@ -351,7 +351,7 @@ def _phase_color(state: str) -> str:
         return "green"
     if state in {"blocked", "failed", "aborted"}:
         return "red"
-    if state == "responding_to_review":
+    if state == "addressing_feedback":
         # Cyan to match other "agent actively working" states. Distinct from
         # rebasing (yellow) so a glance differentiates "fixing review" from
         # "untangling git" at the phase-line level.

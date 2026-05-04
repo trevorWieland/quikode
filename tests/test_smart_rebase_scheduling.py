@@ -83,11 +83,11 @@ def _make_pool() -> MagicMock:
 
 def _seed(o: Orchestrator, pr_number: int = 0) -> None:
     o.store.upsert_pending("PARENT")
-    o.store.transition("PARENT", State.AWAITING_MERGE, branch="quikode/parent-aaa")
+    o.store.transition("PARENT", State.PENDING_CI, branch="quikode/parent-aaa")
     o.store.upsert_pending("CHILD")
     o.store.transition(
         "CHILD",
-        State.AWAITING_MERGE,
+        State.PENDING_CI,
         branch="quikode/child-bbb",
         pr_number=pr_number or None,
         pr_url=(f"https://github.com/owner/repo/pull/{pr_number}" if pr_number else None),
@@ -127,7 +127,7 @@ def test_mergeable_child_with_intact_base_skips_rebase(tmp_path):
 
     pool.submit.assert_not_called()
     row = o.store.get("CHILD")
-    assert row["state"] == State.AWAITING_MERGE.value  # untouched
+    assert row["state"] == State.PENDING_CI.value  # untouched
     assert row["parent_pr_branch"] is None  # cleared
     assert row["parent_branch"] is None
     assert (row.get("needs_parent_rebase") or 0) == 0
@@ -179,7 +179,7 @@ def test_no_pr_yet_falls_back_to_scheduling(tmp_path):
     inspect, schedule rebase so the worker handles it inline."""
     o = _orch(tmp_path)
     o.store.upsert_pending("PARENT")
-    o.store.transition("PARENT", State.AWAITING_MERGE, branch="quikode/parent-aaa")
+    o.store.transition("PARENT", State.PENDING_CI, branch="quikode/parent-aaa")
     o.store.upsert_pending("CHILD")
     o.store.transition("CHILD", State.DOING_SUBTASK, branch="quikode/child-bbb")
     o.store.set_field(

@@ -55,7 +55,7 @@ _IN_FLIGHT_STATES = {
     "conflict_resolving",
     "intent_reviewing",
     "replanning",
-    "responding_to_review",
+    "addressing_feedback",
     "rebasing_to_main",
 }
 

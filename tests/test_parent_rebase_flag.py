@@ -88,7 +88,7 @@ def _seed_parent_awaiting_merge(o: Orchestrator) -> None:
     o.store.upsert_pending("PARENT")
     o.store.transition(
         "PARENT",
-        State.AWAITING_MERGE,
+        State.PENDING_CI,
         branch="quikode/parent-aaa",
         pr_number=10,
         pr_url="https://github.com/owner/repo/pull/10",
@@ -141,7 +141,7 @@ def test_idle_child_gets_flag_and_rebase_future(tmp_path):
     worker clears it on success."""
     o = _orch(tmp_path)
     _seed_parent_awaiting_merge(o)
-    _seed_stacked_child(o, "CHILD-A", state=State.AWAITING_MERGE, pr_number=11)
+    _seed_stacked_child(o, "CHILD-A", state=State.PENDING_CI, pr_number=11)
 
     pool = _make_pool()
     futures: dict[str, Future] = {}

@@ -65,7 +65,7 @@ def _seed_merged_task(store: Store, task_id: str, *, runtime_s: float, cost_usd:
         )
         c.execute(
             "INSERT INTO state_log (task_id, from_state, to_state, ts) VALUES (?, ?, ?, ?)",
-            (task_id, State.AWAITING_MERGE.value, State.MERGED.value, now),
+            (task_id, State.PENDING_CI.value, State.MERGED.value, now),
         )
         c.execute(
             "INSERT INTO agent_calls "

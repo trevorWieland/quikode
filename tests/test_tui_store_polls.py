@@ -57,7 +57,7 @@ def test_poller_with_tasks_renders_counts_and_rows(tmp_path):
     store.upsert_pending("T-003")
     store.upsert_pending("T-004")
     store.transition("T-001", State.DOING_SUBTASK)
-    store.transition("T-002", State.AWAITING_MERGE, pr_number=42)
+    store.transition("T-002", State.PENDING_CI, pr_number=42)
     store.transition("T-003", State.BLOCKED, last_error="exhausted retry budget on S-04")
     store.transition("T-004", State.MERGED)
     store.close() if hasattr(store, "close") else None
@@ -237,7 +237,7 @@ def test_branch_or_pr_priority(tmp_path):
     _bootstrap_workspace(tmp_path)
     store = _make_store(tmp_path)
     store.upsert_pending("T-001")
-    store.transition("T-001", State.AWAITING_MERGE, branch="quikode/T-001-abc", pr_number=99)
+    store.transition("T-001", State.PENDING_CI, branch="quikode/T-001-abc", pr_number=99)
     p = StorePoller(workspace=tmp_path)
     snap = p.poll()
     row = next(r for r in snap.tasks if r.task_id == "T-001")

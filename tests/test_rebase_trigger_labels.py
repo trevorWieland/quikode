@@ -80,9 +80,9 @@ def _make_pool() -> MagicMock:
     return pool
 
 
-def _seed(o: Orchestrator, *, child_state: State = State.AWAITING_MERGE, pr_number: int = 11) -> None:
+def _seed(o: Orchestrator, *, child_state: State = State.PENDING_CI, pr_number: int = 11) -> None:
     o.store.upsert_pending("PARENT")
-    o.store.transition("PARENT", State.AWAITING_MERGE, branch="quikode/parent-aaa")
+    o.store.transition("PARENT", State.PENDING_CI, branch="quikode/parent-aaa")
     o.store.upsert_pending("CHILD")
     o.store.transition(
         "CHILD",
@@ -123,7 +123,7 @@ def test_sibling_conflict_label_via_poll(tmp_path):
     """Driving _poll_review_threads with a CONFLICTING PR for the child
     should schedule the rebase with a sibling-conflict label."""
     o = _orch(tmp_path)
-    _seed(o, child_state=State.AWAITING_MERGE, pr_number=11)
+    _seed(o, child_state=State.PENDING_CI, pr_number=11)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()

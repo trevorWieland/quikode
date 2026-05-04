@@ -174,7 +174,7 @@ def test_run_rebase_to_main_uses_onto_when_parent_resolves(tmp_path, monkeypatch
         parent_branch="quikode/parent-xyz",
         pr_number=42,
     )
-    w.store.set_pre_rebase_state("T-CHILD", State.AWAITING_MERGE.value)
+    w.store.set_pre_rebase_state("T-CHILD", State.PENDING_CI.value)
     w.handle = MagicMock(container_name="qk-stub")
 
     # Stub provision so we don't touch docker.
@@ -207,7 +207,7 @@ def test_run_rebase_to_main_uses_onto_when_parent_resolves(tmp_path, monkeypatch
     w._git_in_workspace = fake_git  # type: ignore[method-assign]
 
     outcome = w.run_rebase_to_main()
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
 
     rebase_calls = [c for c in git_calls if "rebase" in c]
     assert len(rebase_calls) == 1
@@ -230,7 +230,7 @@ def test_run_rebase_to_main_falls_back_without_parent(tmp_path, monkeypatch):
     w = _worker(tmp_path)
     w.store.upsert_pending("T-CHILD")
     w.store.transition("T-CHILD", State.REBASING_TO_MAIN, branch="quikode/t-child-abc123")
-    w.store.set_pre_rebase_state("T-CHILD", State.AWAITING_MERGE.value)
+    w.store.set_pre_rebase_state("T-CHILD", State.PENDING_CI.value)
     w.handle = MagicMock(container_name="qk-stub")
 
     monkeypatch.setattr(TaskWorker, "_provision", lambda self, provision_worktree=True: None)
@@ -249,7 +249,7 @@ def test_run_rebase_to_main_falls_back_without_parent(tmp_path, monkeypatch):
     w._git_in_workspace = fake_git  # type: ignore[method-assign]
 
     outcome = w.run_rebase_to_main()
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
 
     # No rev-parse --verify call (no parent_branch)
     assert not any(c[:2] == ["rev-parse", "--verify"] for c in git_calls)

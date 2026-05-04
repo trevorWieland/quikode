@@ -75,7 +75,7 @@ def _seed_awaiting_merge(
     pr_url: str = "https://github.com/owner/repo/pull/42",
 ) -> None:
     o.store.upsert_pending(task_id)
-    o.store.transition(task_id, State.AWAITING_MERGE, pr_number=pr_number, pr_url=pr_url)
+    o.store.transition(task_id, State.PENDING_CI, pr_number=pr_number, pr_url=pr_url)
 
 
 def _make_thread(
@@ -262,8 +262,8 @@ def test_poll_first_observation_unresolved_thread_schedules_response(tmp_path):
     assert submitted_args[0] == "R-001"
     threads_arg = submitted_args[1]
     assert len(threads_arg) == 1 and threads_arg[0].thread_id == "PRRT_1"
-    # Task transitioned to RESPONDING_TO_REVIEW synchronously.
-    assert o.store.get("R-001")["state"] == State.RESPONDING_TO_REVIEW.value
+    # Task transitioned to ADDRESSING_FEEDBACK synchronously.
+    assert o.store.get("R-001")["state"] == State.ADDRESSING_FEEDBACK.value
     o.store.conn.close()
 
 
@@ -367,9 +367,9 @@ def test_poll_dispatches_ci_fix_on_post_merge_failure(tmp_path):
     # Submitted via the ci-fix path, not the review-response path.
     args = pool.submit.call_args
     assert args[0][0] == o._run_ci_fix_response_one
-    # Task transitioned RESPONDING_TO_REVIEW with a CI-fix note.
+    # Task transitioned ADDRESSING_FEEDBACK with a CI-fix note.
     row = o.store.get("R-001")
-    assert row["state"] == State.RESPONDING_TO_REVIEW.value
+    assert row["state"] == State.ADDRESSING_FEEDBACK.value
     assert "R-001" in rrf
     o.store.conn.close()
 
@@ -391,7 +391,7 @@ def test_poll_does_not_dispatch_ci_fix_when_pool_full(tmp_path):
         o._poll_review_threads(pool, futures, rrf)
 
     pool.submit.assert_not_called()
-    assert o.store.get("R-001")["state"] == State.AWAITING_MERGE.value
+    assert o.store.get("R-001")["state"] == State.PENDING_CI.value
     o.store.conn.close()
 
 
@@ -469,7 +469,7 @@ def test_poll_dispatches_round_when_under_review_rounds_max(tmp_path):
 
     pool.submit.assert_called_once()
     row = o.store.get("R-001")
-    assert row["state"] == State.RESPONDING_TO_REVIEW.value
+    assert row["state"] == State.ADDRESSING_FEEDBACK.value
     o.store.conn.close()
 
 
@@ -495,7 +495,7 @@ def test_poll_skips_when_pool_full(tmp_path):
     # No new future submitted; R-001 stays AWAITING_MERGE.
     pool.submit.assert_not_called()
     assert "R-001" not in rrf
-    assert o.store.get("R-001")["state"] == State.AWAITING_MERGE.value
+    assert o.store.get("R-001")["state"] == State.PENDING_CI.value
     # But the thread WAS upserted into review_threads (so next tick's
     # already-stored check works correctly).
     stored = o.store.get_review_thread("R-001", "PRRT_1")
@@ -532,14 +532,14 @@ def test_poll_uses_extra_slots_for_reviews_when_workers_full(tmp_path):
     # The extra slot kicked in: pool.submit was called for the review.
     pool.submit.assert_called_once()
     assert "R-001" in rrf
-    assert o.store.get("R-001")["state"] == State.RESPONDING_TO_REVIEW.value
+    assert o.store.get("R-001")["state"] == State.ADDRESSING_FEEDBACK.value
     o.store.conn.close()
 
 
 def test_poll_no_pr_number_marks_polled(tmp_path):
     o = _orch(tmp_path)
     o.store.upsert_pending("R-001")
-    o.store.transition("R-001", State.AWAITING_MERGE, note="no diff path")
+    o.store.transition("R-001", State.PENDING_CI, note="no diff path")
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -596,7 +596,7 @@ def test_poll_resolved_thread_no_response_scheduled(tmp_path):
         o._poll_review_threads(pool, futures, rrf)
 
     pool.submit.assert_not_called()
-    assert o.store.get("R-001")["state"] == State.AWAITING_MERGE.value
+    assert o.store.get("R-001")["state"] == State.PENDING_CI.value
     o.store.conn.close()
 
 
@@ -645,12 +645,12 @@ def test_repo_identifier_falls_back_to_gh(tmp_path):
 def test_heartbeat_writes_payload(tmp_path):
     o = _orch(tmp_path)
     _seed_awaiting_merge(o)
-    o._write_heartbeat(in_flight=2, responding_to_review_futures=1)
+    o._write_heartbeat(in_flight=2, addressing_feedback_futures=1)
     hb_path = o.cfg.state_dir / "orchestrator.heartbeat"
     assert hb_path.exists()
     payload = json.loads(hb_path.read_text())
     assert payload["in_flight"] == 2
-    assert payload["responding_to_review_futures"] == 1
+    assert payload["addressing_feedback_futures"] == 1
     assert payload["awaiting_merge"] == 1
     assert "ts" in payload
     o.store.conn.close()
@@ -664,8 +664,8 @@ def test_tasks_needing_review_poll_filters_correctly(tmp_path):
     o.store.upsert_pending("A")
     o.store.upsert_pending("B")
     o.store.upsert_pending("C")
-    o.store.transition("A", State.AWAITING_MERGE)
-    o.store.transition("B", State.AWAITING_MERGE)
+    o.store.transition("A", State.PENDING_CI)
+    o.store.transition("B", State.PENDING_CI)
     o.store.transition("C", State.MERGED)
     # B has a recent poll; A has none.
     o.store.set_field("B", last_review_poll_ts=time.time())
@@ -738,7 +738,7 @@ def test_poll_conflicting_skips_when_already_in_futures(tmp_path):
     # No new future was submitted — the in-flight one stands.
     pool.submit.assert_not_called()
     # State stays AWAITING_MERGE since the already-running future will handle it.
-    assert o.store.get("R-001")["state"] == State.AWAITING_MERGE.value
+    assert o.store.get("R-001")["state"] == State.PENDING_CI.value
     o.store.conn.close()
 
 
@@ -754,7 +754,7 @@ def test_tasks_needing_review_poll_includes_blocked_with_pr(tmp_path):
     o.store.transition("BLOCKED_WITH_PR", State.BLOCKED)
     o.store.set_field("BLOCKED_WITH_PR", pr_number=42)
     o.store.transition("BLOCKED_NO_PR", State.BLOCKED)  # no pr_number
-    o.store.transition("AM_OK", State.AWAITING_MERGE)
+    o.store.transition("AM_OK", State.PENDING_CI)
     o.store.set_field("AM_OK", pr_number=43)
 
     cutoff = time.time() + 1  # everything's overdue
@@ -803,12 +803,12 @@ def test_upsert_review_thread_preserves_addressed(tmp_path):
 # ----- smoke: interleave normal task scheduling with review responses -----
 
 
-def test_pick_next_unaffected_by_responding_to_review(tmp_path):
-    """RESPONDING_TO_REVIEW is a transient active state — it should not
+def test_pick_next_unaffected_by_addressing_feedback(tmp_path):
+    """ADDRESSING_FEEDBACK is a transient active state — it should not
     look like a "ready" task to _pick_next."""
     o = _orch(tmp_path)
     o.store.upsert_pending("R-001")
-    o.store.transition("R-001", State.RESPONDING_TO_REVIEW)
+    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
     # _pick_next should not return R-001 (it's already active).
     assert o._pick_next({"R-001"}, set()) is None
     o.store.conn.close()

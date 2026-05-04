@@ -69,7 +69,7 @@ def _seed(o: Orchestrator, *, pr_number: int = 11, state_age_s: float = 3600.0) 
     o.store.upsert_pending("T")
     o.store.transition(
         "T",
-        State.AWAITING_MERGE,
+        State.MERGE_READY,
         branch="quikode/t-aaa",
         pr_number=pr_number,
         pr_url=f"https://github.com/owner/repo/pull/{pr_number}",
@@ -77,7 +77,7 @@ def _seed(o: Orchestrator, *, pr_number: int = 11, state_age_s: float = 3600.0) 
     # Backdate the state_log row so the age check passes/fails as desired.
     o.store.conn.execute(
         "UPDATE state_log SET ts = ? WHERE task_id = ? AND to_state = ?",
-        (time.time() - state_age_s, "T", State.AWAITING_MERGE.value),
+        (time.time() - state_age_s, "T", State.MERGE_READY.value),
     )
 
 

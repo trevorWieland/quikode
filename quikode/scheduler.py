@@ -11,7 +11,6 @@ orchestrator instance — they communicate through `store` + `dag` only.
 from __future__ import annotations
 
 import logging
-import time
 from typing import TYPE_CHECKING
 
 from .state import State
@@ -24,23 +23,24 @@ if TYPE_CHECKING:
 log = logging.getLogger("quikode.scheduler")
 
 
-# States where a dep is "stack-ready" — has a remote branch a child can fork off.
-# Includes the transient PROVISIONING / FIXUP_PLANNING states because the
-# parent's branch already exists on origin throughout these (the worker only
-# tears down + recreates the container, never the branch). Without these, a
-# child briefly loses stacking eligibility during the parent's review-response
-# provision window — the picker would skip it for one tick and re-evaluate
-# next loop. Cosmetic but worth fixing for cleaner picker behavior.
+# States where a dep is "stack-ready" — has a remote branch a child can fork
+# off. All three post-PR states (PENDING_CI / AWAITING_REVIEW / MERGE_READY)
+# qualify under speculative mode: the branch exists on origin throughout. Also
+# includes the transient PROVISIONING / FIXUP_PLANNING / TRIAGING_FEEDBACK /
+# ADDRESSING_FEEDBACK states — the parent's remote branch is unchanged
+# throughout (the worker only tears down + recreates the container).
 #
-# This is the "speculative" set — used by `cfg.stacking_readiness="speculative"`
-# (default). The "settled" set is just {AWAITING_MERGE} plus a quiet-time
-# predicate, evaluated by `is_parent_stack_ready`.
+# Used by `cfg.stacking_readiness="speculative"` (default). The "settled" mode
+# tightens to {MERGE_READY} only.
 STACK_READY_STATES = frozenset(
     {
         State.POLLING_CI.value,
-        State.AWAITING_MERGE.value,
+        State.PENDING_CI.value,
+        State.AWAITING_REVIEW.value,
+        State.MERGE_READY.value,
         State.PR_OPENING.value,
-        State.RESPONDING_TO_REVIEW.value,
+        State.TRIAGING_FEEDBACK.value,
+        State.ADDRESSING_FEEDBACK.value,
         State.PROVISIONING.value,
         State.FIXUP_PLANNING.value,
     }
@@ -59,32 +59,27 @@ def is_parent_stack_ready(
 
     Honors `cfg.stacking_readiness`:
 
-    - `"speculative"` (default): any state in `STACK_READY_STATES`. A parent
-      that just opened its PR is fair game; children fork immediately.
-    - `"settled"`: parent must be in AWAITING_MERGE quietly for at least
-      `cfg.stack_settle_quiet_s` (per the most recent transition INTO
-      AWAITING_MERGE, read from state_log). A flap through RESPONDING_TO_REVIEW
-      resets the quiet timer.
+    - `"speculative"` (default): any state in `STACK_READY_STATES` — children
+      fork the moment a PR exists on origin.
+    - `"settled"`: parent must be in MERGE_READY. The MERGE_READY state itself
+      already encodes "CI green, no unresolved threads, settled past the quiet
+      window" — no extra timer check needed at this layer. The
+      `cfg.stack_settle_quiet_s` knob remains as the threshold the daemon
+      uses to *enter* MERGE_READY.
 
     `parent_state` is the cached state we already read for the candidate's
-    deps — passed in to avoid an extra Store.get per evaluation.
+    deps — passed in to avoid an extra Store.get per evaluation. The
+    `parent_id` / `store` / `now` arguments are kept on the signature for
+    callers that already passed them; with the simplified settled gate they
+    are no longer used internally.
     """
+    del parent_id, store, now  # accepted for signature parity; unused now
     if parent_state is None:
         return False
     mode = getattr(cfg, "stacking_readiness", "speculative")
     if mode == "speculative":
         return parent_state in STACK_READY_STATES
-    if parent_state != State.AWAITING_MERGE.value:
-        return False
-    quiet_s = int(getattr(cfg, "stack_settle_quiet_s", 0))
-    if quiet_s <= 0:
-        return True
-    last_ts = store.last_entered_state_ts(parent_id, State.AWAITING_MERGE)
-    if last_ts is None:
-        return False
-    if now is None:
-        now = time.time()
-    return (now - last_ts) >= quiet_s
+    return parent_state == State.MERGE_READY.value
 
 
 # Resume-boost weights. Keep these visible at module top so the score

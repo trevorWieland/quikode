@@ -60,7 +60,7 @@ _IN_FLIGHT = {
     State.CONFLICT_RESOLVING.value,
     State.INTENT_REVIEWING.value,
     State.REPLANNING.value,
-    State.RESPONDING_TO_REVIEW.value,
+    State.ADDRESSING_FEEDBACK.value,
     State.REBASING_TO_MAIN.value,
 }
 

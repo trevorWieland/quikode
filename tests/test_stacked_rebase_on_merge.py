@@ -79,7 +79,7 @@ def _seed_parent_awaiting_merge(o: Orchestrator) -> None:
     o.store.upsert_pending("PARENT")
     o.store.transition(
         "PARENT",
-        State.AWAITING_MERGE,
+        State.PENDING_CI,
         branch="quikode/parent-aaa",
         pr_number=10,
         pr_url="https://github.com/owner/repo/pull/10",
@@ -166,7 +166,7 @@ def test_merged_parent_schedules_rebase_for_all_active_children(tmp_path):
     o = _orch(tmp_path)
     _seed_parent_awaiting_merge(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
-    _seed_stacked_child(o, "CHILD-B", state=State.AWAITING_MERGE, pr_number=11)
+    _seed_stacked_child(o, "CHILD-B", state=State.PENDING_CI, pr_number=11)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -180,7 +180,7 @@ def test_merged_parent_schedules_rebase_for_all_active_children(tmp_path):
     assert o.store.get("CHILD-B")["state"] == State.REBASING_TO_MAIN.value
     # CHILD-B's pre-rebase state should be AWAITING_MERGE so the rebase
     # worker restores it post-rebase.
-    assert o.store.get("CHILD-B")["pre_rebase_state"] == State.AWAITING_MERGE.value
+    assert o.store.get("CHILD-B")["pre_rebase_state"] == State.PENDING_CI.value
     o.store.conn.close()
 
 

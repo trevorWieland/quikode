@@ -512,7 +512,7 @@ def daemon_status(
                 f"heartbeat {stale_tag} age={age:.0f}s "
                 f"in_flight={hb.get('in_flight')} "
                 f"awaiting_merge={hb.get('awaiting_merge')} "
-                f"responding_to_review={hb.get('responding_to_review')}"
+                f"addressing_feedback={hb.get('addressing_feedback')}"
             )
     if not s.daemon_alive:
         raise typer.Exit(1)
@@ -1148,7 +1148,7 @@ def dag_stats(
             st = state_of(nid)
             if st == State.MERGED.value:
                 c["merged"] += 1
-            elif st == State.AWAITING_MERGE.value:
+            elif st == State.PENDING_CI.value:
                 c["awaiting"] += 1
             elif st in (State.BLOCKED.value, State.FAILED.value, State.ABORTED.value):
                 c["blocked"] += 1
@@ -1252,13 +1252,13 @@ def _build_status_table(store: Store, *, show_terminal: bool = True) -> Table:
         by_state[r["state"]] = by_state.get(r["state"], 0) + 1
     total = len(rows)
     merged = by_state.get(State.MERGED.value, 0)
-    awaiting = by_state.get(State.AWAITING_MERGE.value, 0)
+    awaiting = by_state.get(State.PENDING_CI.value, 0)
     blocked = by_state.get(State.BLOCKED.value, 0) + by_state.get(State.FAILED.value, 0)
     pct = (100 * merged // total) if total else 0
     summary = f"merged={merged}/{total} ({pct}%)  awaiting={awaiting}  blocked={blocked}  " + "  ".join(
         f"{s}={n}"
         for s, n in sorted(by_state.items())
-        if s not in (State.MERGED.value, State.AWAITING_MERGE.value, State.BLOCKED.value, State.FAILED.value)
+        if s not in (State.MERGED.value, State.PENDING_CI.value, State.BLOCKED.value, State.FAILED.value)
     )
     table = Table(title=summary, show_lines=False, expand=True)
     table.add_column("ID", no_wrap=True)
@@ -1270,7 +1270,7 @@ def _build_status_table(store: Store, *, show_terminal: bool = True) -> Table:
     table.add_column("Note", overflow="fold")
     color = {
         State.MERGED.value: "green",
-        State.AWAITING_MERGE.value: "bright_green",
+        State.PENDING_CI.value: "bright_green",
         State.BLOCKED.value: "red",
         State.FAILED.value: "red",
         State.ABORTED.value: "dim",
@@ -2328,7 +2328,7 @@ def briefing(
             )
         )
 
-        # v3 grouping: surface AWAITING_MERGE / RESPONDING_TO_REVIEW /
+        # v3 grouping: surface AWAITING_MERGE / ADDRESSING_FEEDBACK /
         # REBASING_TO_MAIN / BLOCKED separately so JSON consumers (TUI,
         # scripts) don't have to re-derive these from `tasks_by_state`.
         def _row_summary(r):
@@ -2342,9 +2342,9 @@ def briefing(
                 "last_error": r.get("last_error"),
             }
 
-        awaiting_merge = [_row_summary(r) for r in rows if r["state"] == State.AWAITING_MERGE.value]
-        responding_to_review = [
-            _row_summary(r) for r in rows if r["state"] == State.RESPONDING_TO_REVIEW.value
+        awaiting_merge = [_row_summary(r) for r in rows if r["state"] == State.PENDING_CI.value]
+        addressing_feedback = [
+            _row_summary(r) for r in rows if r["state"] == State.ADDRESSING_FEEDBACK.value
         ]
         rebasing_to_main = [_row_summary(r) for r in rows if r["state"] == State.REBASING_TO_MAIN.value]
         blocked_intervention = [_row_summary(r) for r in rows if r["state"] == State.BLOCKED.value]
@@ -2354,7 +2354,7 @@ def briefing(
                 s: sum(1 for r in rows if r["state"] == s) for s in {r["state"] for r in rows}
             },
             "awaiting_merge": awaiting_merge,
-            "responding_to_review": responding_to_review,
+            "addressing_feedback": addressing_feedback,
             "rebasing_to_main": rebasing_to_main,
             "blocked_needs_intervention": blocked_intervention,
             "in_flight": [
@@ -2440,8 +2440,8 @@ def briefing(
             )
 
     # 3. Awaiting human / blocked / v3 review-loop tasks
-    awaiting = store.in_state(State.AWAITING_MERGE)
-    responding = store.in_state(State.RESPONDING_TO_REVIEW)
+    awaiting = store.in_state(State.PENDING_CI)
+    responding = store.in_state(State.ADDRESSING_FEEDBACK)
     rebasing = store.in_state(State.REBASING_TO_MAIN)
     blocked_only = store.in_state(State.BLOCKED)
     failed_only = store.in_state(State.FAILED)
@@ -2651,7 +2651,7 @@ def dev_test(
         console.print(
             f"  [{elapsed // 60:02d}:{elapsed % 60:02d}] " + " ".join(f"{i}={s}" for i, s in states.items())
         )
-        if any(s in (State.AWAITING_MERGE.value, State.MERGED.value) for s in states.values()):
+        if any(s in (State.PENDING_CI.value, State.MERGED.value) for s in states.values()):
             proc.terminate()
             proc.wait(timeout=5)
             console.print("[bold green]PASS[/] — fixture run reached awaiting_merge")

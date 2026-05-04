@@ -83,7 +83,7 @@ def _seed_awaiting(o: Orchestrator, task_id: str) -> None:
     o.store.upsert_pending(task_id)
     o.store.transition(
         task_id,
-        State.AWAITING_MERGE,
+        State.PENDING_CI,
         branch=f"quikode/{task_id.lower()}",
         pr_number=42,
         pr_url="https://github.com/owner/repo/pull/42",
@@ -128,7 +128,7 @@ def test_trigger_after_window_fires(tmp_path):
 
     # Reset row to a state where re-scheduling is meaningful (e.g. the
     # first rebase finished and the row is back in AWAITING_MERGE).
-    o.store.transition("CHILD-A", State.AWAITING_MERGE)
+    o.store.transition("CHILD-A", State.PENDING_CI)
 
     o._schedule_rebase_to_main("CHILD-A", pool, futures, rrf, trigger_reason="sibling_conflict")
     assert pool.submit.call_count == 2, "trigger past the window should fire"
@@ -166,7 +166,7 @@ def test_window_zero_disables_coalescing(tmp_path):
 
     o._schedule_rebase_to_main("CHILD-A", pool, futures, rrf, trigger_reason="parent_merged")
     # Reset transient state so the second call has something to do.
-    o.store.transition("CHILD-A", State.AWAITING_MERGE)
+    o.store.transition("CHILD-A", State.PENDING_CI)
     o._schedule_rebase_to_main("CHILD-A", pool, futures, rrf, trigger_reason="sibling_conflict")
 
     assert pool.submit.call_count == 2, "window=0 must disable coalescing"

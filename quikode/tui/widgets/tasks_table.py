@@ -38,11 +38,11 @@ _STATE_STYLE = {
     "awaiting_merge": "state-awaiting",
     "merged": "state-merged",
     "pending": "state-pending",
-    # v3 review-loop / parent-merge transitions. responding_to_review
+    # v3 review-loop / parent-merge transitions. addressing_feedback
     # mirrors active-doing color (cyan); rebasing_to_main reuses the
     # rebasing palette (yellow) so a glance signals "git surgery in
     # flight".
-    "responding_to_review": "state-responding",
+    "addressing_feedback": "state-responding",
     "rebasing_to_main": "state-rebasing",
 }
 

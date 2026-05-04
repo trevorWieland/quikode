@@ -133,7 +133,7 @@ def test_run_rebase_to_main_blocks_on_empty_branch(tmp_path, monkeypatch):
     w.store.upsert_pending("T-X")
     w.store.transition("T-X", State.REBASING_TO_MAIN, branch="quikode/t-x-abc")
     w.store.set_field("T-X", worktree_path="/tmp/wt-x", pr_number=42)
-    w.store.set_pre_rebase_state("T-X", State.AWAITING_MERGE.value)
+    w.store.set_pre_rebase_state("T-X", State.PENDING_CI.value)
     w.handle = MagicMock(container_name="qk-stub")
 
     monkeypatch.setattr(TaskWorker, "_provision", lambda self, provision_worktree=True: None)
@@ -179,7 +179,7 @@ def test_run_rebase_to_main_proceeds_on_nonempty_branch(tmp_path, monkeypatch):
     w.store.upsert_pending("T-X")
     w.store.transition("T-X", State.REBASING_TO_MAIN, branch="quikode/t-x-abc")
     w.store.set_field("T-X", pr_number=42)
-    w.store.set_pre_rebase_state("T-X", State.AWAITING_MERGE.value)
+    w.store.set_pre_rebase_state("T-X", State.PENDING_CI.value)
     w.handle = MagicMock(container_name="qk-stub")
 
     monkeypatch.setattr(TaskWorker, "_provision", lambda self, provision_worktree=True: None)
@@ -202,7 +202,7 @@ def test_run_rebase_to_main_proceeds_on_nonempty_branch(tmp_path, monkeypatch):
     w._git_in_workspace = fake_git  # type: ignore[method-assign]
 
     outcome = w.run_rebase_to_main()
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
 
 
 # -------- _rebase_or_resolve (clean-rebase path) --------

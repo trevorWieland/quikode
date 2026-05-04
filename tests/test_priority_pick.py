@@ -11,7 +11,6 @@ don't compete here — they're dispatched separately.
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 from quikode import scheduler
@@ -112,7 +111,7 @@ def test_stacked_child_beats_fresh_root_with_no_dependents(tmp_path):
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
     o.store.upsert_pending("R-099")
-    o.store.transition("R-001", State.AWAITING_MERGE, branch="quikode/r-001-abc")
+    o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
 
     nxt = o._pick_next({"R-001", "R-002", "R-099"}, set())
     assert nxt == "R-002"
@@ -137,7 +136,7 @@ def test_high_fan_out_root_beats_stacked_with_no_unblock(tmp_path):
     o = _orch(tmp_path, dag, stacking_strategy="within-milestone")
     for nid, _ in edges:
         o.store.upsert_pending(nid)
-    o.store.transition("R-001", State.AWAITING_MERGE, branch="quikode/r-001-abc")
+    o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
     scope = {nid for nid, _ in edges}
 
     nxt = o._pick_next(scope, set())
@@ -256,22 +255,22 @@ def test_resume_boost_score_calibration(tmp_path):
 # ----- stacking readiness: speculative vs settled -----
 
 
-def test_speculative_readiness_picks_child_in_responding_to_review(tmp_path):
+def test_speculative_readiness_picks_child_in_addressing_feedback(tmp_path):
     """Default (`stacking_readiness='speculative'`): a child can stack on a
-    parent that's RESPONDING_TO_REVIEW, mirroring v2 behavior."""
+    parent that's ADDRESSING_FEEDBACK, mirroring v2 behavior."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
     dag = _make_dag(tmp_path, edges)
     o = _orch(tmp_path, dag, stacking_strategy="within-milestone")
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
-    o.store.transition("R-001", State.AWAITING_MERGE, branch="quikode/r-001-abc")
-    o.store.transition("R-001", State.RESPONDING_TO_REVIEW)
+    o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
+    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt == "R-002"
 
 
-def test_settled_readiness_skips_responding_to_review_parent(tmp_path):
-    """`stacking_readiness='settled'`: a parent in RESPONDING_TO_REVIEW is
+def test_settled_readiness_skips_addressing_feedback_parent(tmp_path):
+    """`stacking_readiness='settled'`: a parent in ADDRESSING_FEEDBACK is
     NOT eligible — child stays unpicked. Prevents the codex-fixup-storm
     from re-rebasing children on every round."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
@@ -285,14 +284,17 @@ def test_settled_readiness_skips_responding_to_review_parent(tmp_path):
     )
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
-    o.store.transition("R-001", State.AWAITING_MERGE, branch="quikode/r-001-abc")
-    o.store.transition("R-001", State.RESPONDING_TO_REVIEW)
+    o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
+    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt is None  # neither eligible: R-001 active, R-002 has un-settled parent
 
 
-def test_settled_readiness_picks_when_quiet_long_enough(tmp_path, monkeypatch):
-    """Parent in AWAITING_MERGE for >stack_settle_quiet_s qualifies."""
+def test_settled_readiness_picks_when_parent_is_merge_ready(tmp_path):
+    """v3.5: settled mode picks when parent is in MERGE_READY. The new state
+    itself encodes "CI green, no unresolved threads, settled past quiet
+    window" — the daemon's poll is what *enters* MERGE_READY (using
+    stack_settle_quiet_s as one input)."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
     dag = _make_dag(tmp_path, edges)
     o = _orch(
@@ -300,26 +302,19 @@ def test_settled_readiness_picks_when_quiet_long_enough(tmp_path, monkeypatch):
         dag,
         stacking_strategy="within-milestone",
         stacking_readiness="settled",
-        stack_settle_quiet_s=600,
     )
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
-    o.store.transition("R-001", State.AWAITING_MERGE, branch="quikode/r-001-abc")
-
-    # Force the stored ts of the AWAITING_MERGE transition to be >600s ago.
-    backdated = time.time() - 1200
-    o.store.conn.execute(
-        "UPDATE state_log SET ts = ? WHERE task_id = ? AND to_state = ?",
-        (backdated, "R-001", State.AWAITING_MERGE.value),
-    )
-    o.store.conn.commit()
-
+    o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
+    o.store.transition("R-001", State.AWAITING_REVIEW)
+    o.store.transition("R-001", State.MERGE_READY)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt == "R-002"
 
 
-def test_settled_readiness_skips_when_quiet_window_not_met(tmp_path):
-    """Parent just hit AWAITING_MERGE (within last second) — NOT settled yet."""
+def test_settled_readiness_skips_pending_ci_parent(tmp_path):
+    """Settled mode: PENDING_CI / AWAITING_REVIEW parents are ineligible —
+    only MERGE_READY qualifies."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
     dag = _make_dag(tmp_path, edges)
     o = _orch(
@@ -327,10 +322,13 @@ def test_settled_readiness_skips_when_quiet_window_not_met(tmp_path):
         dag,
         stacking_strategy="within-milestone",
         stacking_readiness="settled",
-        stack_settle_quiet_s=600,
     )
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
-    o.store.transition("R-001", State.AWAITING_MERGE, branch="quikode/r-001-abc")
+    o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
+    nxt = o._pick_next({"R-001", "R-002"}, set())
+    assert nxt is None
+    # AWAITING_REVIEW also doesn't qualify under settled.
+    o.store.transition("R-001", State.AWAITING_REVIEW)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt is None

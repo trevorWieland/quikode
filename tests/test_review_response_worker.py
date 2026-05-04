@@ -69,7 +69,7 @@ def _build_worker(tmp_path: Path) -> TaskWorker:
     wt_path.mkdir(parents=True, exist_ok=True)
     store.transition(
         "R-001",
-        State.AWAITING_MERGE,
+        State.PENDING_CI,
         branch="quikode/r-001-abc123",
         worktree_path=str(wt_path),
         pr_number=42,
@@ -121,19 +121,19 @@ def test_run_review_response_happy_path(tmp_path):
     ):
         outcome = worker.run_review_response(threads)
 
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
     assert sorted(resolve_calls) == ["PRRT_1", "PRRT_2"]
     row = worker.store.get("R-001")
     assert row["review_round"] == 1
     for tid in ["PRRT_1", "PRRT_2"]:
         stored = worker.store.get_review_thread("R-001", tid)
         assert stored["addressed_in_commit_sha"] == "deadbeef"
-    assert row["state"] == State.AWAITING_MERGE.value
+    assert row["state"] == State.PENDING_CI.value
     worker.store.conn.close()
 
 
 def test_run_review_response_transitions_through_responding(tmp_path):
-    """State log shows AWAITING_MERGE → PROVISIONING → RESPONDING_TO_REVIEW
+    """State log shows AWAITING_MERGE → PROVISIONING → ADDRESSING_FEEDBACK
     → AWAITING_MERGE (via fixup-decomposition path)."""
     worker = _build_worker(tmp_path)
     threads = [_make_thread()]
@@ -153,8 +153,8 @@ def test_run_review_response_transitions_through_responding(tmp_path):
             ("R-001",),
         ).fetchall()
     ]
-    assert State.RESPONDING_TO_REVIEW.value in log_states
-    assert log_states[-1] == State.AWAITING_MERGE.value
+    assert State.ADDRESSING_FEEDBACK.value in log_states
+    assert log_states[-1] == State.PENDING_CI.value
     worker.store.conn.close()
 
 
@@ -165,7 +165,7 @@ def test_run_review_response_empty_threads_noop(tmp_path):
     worker = _build_worker(tmp_path)
     with patch.object(worker, "_provision") as prov:
         outcome = worker.run_review_response([])
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
     prov.assert_not_called()
     worker.store.conn.close()
 
@@ -186,7 +186,7 @@ def test_run_review_response_fixup_blocked_returns_to_awaiting_merge(tmp_path):
     ):
         outcome = worker.run_review_response(threads)
 
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
     assert "fixup blocked" in outcome.note.lower()
     # No threads resolved — work didn't complete.
     resolver.assert_not_called()
@@ -211,7 +211,7 @@ def test_run_review_response_resolve_failure_still_marks_addressed(tmp_path):
     ):
         outcome = worker.run_review_response(threads)
 
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
     stored = worker.store.get_review_thread("R-001", "PRRT_1")
     assert stored["addressed_in_commit_sha"] == "deadbeef"
     worker.store.conn.close()
@@ -229,7 +229,7 @@ def test_run_review_response_crash_returns_to_awaiting_merge(tmp_path):
     ):
         outcome = worker.run_review_response(threads)
 
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
     assert "crashed" in outcome.note
     worker.store.conn.close()
 

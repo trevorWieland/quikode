@@ -101,7 +101,7 @@ def test_unblock_non_blocked_warns_but_still_prints(tmp_path, monkeypatch):
     store.upsert_pending("R-001")
     store.transition(
         "R-001",
-        State.AWAITING_MERGE,
+        State.PENDING_CI,
         branch="quikode/r-001-xyz",
         worktree_path=str(tmp_path / "wt2"),
     )

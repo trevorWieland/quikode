@@ -108,7 +108,7 @@ def test_briefing_renders_per_task_and_total_cost(tmp_path, monkeypatch):
     _cfg_path, db = _init_workspace(tmp_path)
     db.upsert_pending("T-001")
     db.upsert_pending("T-002")
-    db.transition("T-001", State.AWAITING_MERGE, branch="quikode/t-001-aaa", pr_number=1)
+    db.transition("T-001", State.PENDING_CI, branch="quikode/t-001-aaa", pr_number=1)
     db.transition("T-002", State.MERGED, branch="quikode/t-002-bbb", pr_number=2)
     _record_cost(db, "T-001", "claude", 0.42)
     _record_cost(db, "T-002", "codex", 1.05)
@@ -132,7 +132,7 @@ def test_briefing_zero_cost_omits_dollars(tmp_path, monkeypatch):
     """When cost_usd is NULL on every call, no dollar amount renders."""
     _cfg_path, db = _init_workspace(tmp_path)
     db.upsert_pending("T-001")
-    db.transition("T-001", State.AWAITING_MERGE, branch="quikode/t-001-aaa", pr_number=1)
+    db.transition("T-001", State.PENDING_CI, branch="quikode/t-001-aaa", pr_number=1)
     db.record_agent_call(
         "T-001",
         phase="planner",

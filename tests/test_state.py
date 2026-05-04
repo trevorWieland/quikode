@@ -42,7 +42,7 @@ def test_completed_and_active_ids(tmp_path: Path):
         s.upsert_pending(nid)
     s.transition("A", State.MERGED)
     s.transition("B", State.DOING)
-    s.transition("C", State.AWAITING_MERGE)
+    s.transition("C", State.PENDING_CI)
     s.transition("D", State.BLOCKED)
     # E left PENDING
     assert s.completed_ids() == {"A"}

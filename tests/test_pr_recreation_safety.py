@@ -67,7 +67,7 @@ def _seed_child(w: TaskWorker, pr_number: int = 11) -> None:
 def test_open_pr_skips_create_when_pr_already_exists(tmp_path):
     """Idempotent re-entry into `_open_pr`: when the task row already
     carries `pr_number` + `pr_url` (e.g. from a prior daemon run that
-    pushed but crashed before transitioning to AWAITING_MERGE, or from
+    pushed but crashed before transitioning to PENDING_CI, or from
     an orphan-recovered PR_OPENING task), the worker reuses the existing
     PR rather than calling `gh pr create` and failing with 'already
     exists'. Regression for the 2026-05-04 R-0015 BLOCKED-on-restart bug."""

@@ -135,5 +135,5 @@ def test_commit_push_clean_tree_no_commits_marks_no_diff(tmp_path, monkeypatch):
     outcome = w._commit_push()
 
     assert outcome is not None
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
     assert "no diff" in outcome.note

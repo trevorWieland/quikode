@@ -179,12 +179,30 @@ class State(StrEnum):
     # appended). Distinct from REPLANNING because the original spec plan
     # is preserved — fixup slices are *additive*, not replacements.
     FIXUP_PLANNING = "fixup_planning"
-    AWAITING_MERGE = "awaiting_merge"
-    # v3 Phase B: a review thread came in while the PR was awaiting merge —
-    # the daemon submitted a fresh worker slot to address it. Distinct from
-    # the normal active states because the worker is reusing the existing
-    # worktree/branch/PR, not provisioning anything new.
-    RESPONDING_TO_REVIEW = "responding_to_review"
+    # ----- post-PR-open states (v3.5: split from the legacy AWAITING_MERGE) -----
+    # The legacy AWAITING_MERGE was overloaded with three distinct conditions:
+    #   1. PR submitted, CI still running → PENDING_CI
+    #   2. CI green, no positive review approval (or recent activity) → AWAITING_REVIEW
+    #   3. CI green, no unresolved threads, settled past quiet window → MERGE_READY
+    # Splitting these surfaces the *real* readiness signal to the picker, the
+    # operator, and the auto-merge gate, instead of bundling them under one
+    # opaque "awaiting" state. The daemon's _poll_pr_loop drives the
+    # transitions based on PR/CI/review signals.
+    PENDING_CI = "pending_ci"
+    AWAITING_REVIEW = "awaiting_review"
+    MERGE_READY = "merge_ready"
+    # ----- post-PR-open response states (v3.5: split from ADDRESSING_FEEDBACK) -----
+    # Legacy ADDRESSING_FEEDBACK collapsed provisioning + Python triage +
+    # planner + per-subtask doer/checker into one opaque ~14min state; an
+    # operator could not tell which sub-step was running. Splitting:
+    #   1. TRIAGING_FEEDBACK — Python-deterministic triage (CI log parse,
+    #      review thread classifier). Fast (<60s typical). Decides which
+    #      threads need a fix vs which can be auto-replied + resolved.
+    #   2. ADDRESSING_FEEDBACK — fixup planner + per-subtask machinery.
+    #      Carries the existing FIXUP_PLANNING / DOING_SUBTASK / CHECKING_SUBTASK
+    #      sub-states for visibility.
+    TRIAGING_FEEDBACK = "triaging_feedback"
+    ADDRESSING_FEEDBACK = "addressing_feedback"
     # v3 Phase C: stacked diffs auto-rebase. When a parent task merges, any
     # child still carrying parent_pr_branch is rebased onto main and its PR
     # is retargeted. The transition is transient — children resume to their
@@ -198,7 +216,16 @@ class State(StrEnum):
     ABORTED = "aborted"
 
 
-TERMINAL = {State.MERGED, State.AWAITING_MERGE, State.BLOCKED, State.FAILED, State.ABORTED}
+# States with no active worker (briefing's "in flight" excludes these).
+TERMINAL = {
+    State.MERGED,
+    State.PENDING_CI,
+    State.AWAITING_REVIEW,
+    State.MERGE_READY,
+    State.BLOCKED,
+    State.FAILED,
+    State.ABORTED,
+}
 ACTIVE = {
     State.PROVISIONING,
     State.PLANNING,
@@ -218,9 +245,16 @@ ACTIVE = {
     State.INTENT_REVIEWING,
     State.REPLANNING,
     State.FIXUP_PLANNING,
-    State.RESPONDING_TO_REVIEW,
+    State.TRIAGING_FEEDBACK,
+    State.ADDRESSING_FEEDBACK,
     State.REBASING_TO_MAIN,
 }
+
+# Convenience set: any state where the PR is open and waiting on something
+# outside the worker (CI run, human/bot review, settle window). Replaces most
+# legacy `state == AWAITING_MERGE` checks. PENDING_CI is the most common —
+# the worker just opened the PR and CI is running.
+POST_PR_STATES = {State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_READY}
 
 
 class SubtaskState(StrEnum):
@@ -590,18 +624,41 @@ class Store:
                 with self._tx_lock:
                     self.conn.execute(ddl)
 
-        # v3 Phase B: rename `awaiting_human` rows to `awaiting_merge`. The
-        # State enum lost AWAITING_HUMAN entirely; pre-v3 DBs may still hold
-        # rows at the old value. Idempotent — UPDATE matches zero rows on
+        # State-name migrations. Idempotent — UPDATE matches zero rows on
         # already-migrated DBs.
+        #
+        # Pre-v3 (`awaiting_human`) and v3 (`awaiting_merge`, `responding_to_review`)
+        # values get rewritten to the v3.5 split:
+        #   awaiting_human       → pending_ci  (defensive default — long retired path)
+        #   awaiting_merge       → pending_ci  (v3.5 split; daemon's poll re-classifies)
+        #   responding_to_review → addressing_feedback  (semantic rename only)
+        legacy_state_map = [
+            ("awaiting_human", "pending_ci"),
+            ("awaiting_merge", "pending_ci"),
+            ("responding_to_review", "addressing_feedback"),
+        ]
         with self._tx_lock:
-            self.conn.execute("UPDATE tasks SET state = 'awaiting_merge' WHERE state = 'awaiting_human'")
-            self.conn.execute(
-                "UPDATE state_log SET to_state = 'awaiting_merge' WHERE to_state = 'awaiting_human'"
-            )
-            self.conn.execute(
-                "UPDATE state_log SET from_state = 'awaiting_merge' WHERE from_state = 'awaiting_human'"
-            )
+            for old, new in legacy_state_map:
+                self.conn.execute(
+                    "UPDATE tasks SET state = ? WHERE state = ?",
+                    (new, old),
+                )
+                self.conn.execute(
+                    "UPDATE state_log SET to_state = ? WHERE to_state = ?",
+                    (new, old),
+                )
+                self.conn.execute(
+                    "UPDATE state_log SET from_state = ? WHERE from_state = ?",
+                    (new, old),
+                )
+            # `pre_rebase_state` (column on tasks) carries the same string
+            # values; migrate it too so resumption after a rebase lands in a
+            # valid post-split state.
+            for old, new in legacy_state_map:
+                self.conn.execute(
+                    "UPDATE tasks SET pre_rebase_state = ? WHERE pre_rebase_state = ?",
+                    (new, old),
+                )
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -680,7 +737,7 @@ class Store:
 
         Reads `state_log`. Used by the stacking-readiness gate to compute "how
         long has this parent been quietly in AWAITING_MERGE?" — a parent that
-        flapped through RESPONDING_TO_REVIEW and back gets a fresh ts and
+        flapped through ADDRESSING_FEEDBACK and back gets a fresh ts and
         falls back below the quiet threshold until it stabilizes.
         """
         with self._tx_lock:
@@ -733,7 +790,7 @@ class Store:
                         State.BLOCKED.value,
                         State.FAILED.value,
                         State.ABORTED.value,
-                        State.AWAITING_MERGE.value,  # tasks waiting on merge block dependents until merged
+                        State.PENDING_CI.value,  # tasks waiting on merge block dependents until merged
                     ),
                 ).fetchall()
             }
@@ -1146,20 +1203,29 @@ class Store:
         GraphQL traffic.
 
         Includes:
-        - AWAITING_MERGE: the normal case — poll for new threads + merged.
+        - PENDING_CI / AWAITING_REVIEW / MERGE_READY: the normal case — the
+          PR is open and waiting on something; poll for new threads + merge.
+          The poll itself drives transitions between these three sub-states
+          based on CI + review-approval signals.
         - BLOCKED with a `pr_number`: the BLOCKED PR comment lists "reply
           with guidance as a review comment" as an intervention path; for
           that to actually work, the watcher keeps polling these PRs.
           On a new non-bot thread, the response cycle fires and (on
-          success) transitions the task back to AWAITING_MERGE.
+          success) transitions the task back to PENDING_CI.
         """
+        post_pr_states = (
+            State.PENDING_CI.value,
+            State.AWAITING_REVIEW.value,
+            State.MERGE_READY.value,
+        )
+        placeholders = ",".join("?" * len(post_pr_states))
         with self._tx_lock:
             rows = self.conn.execute(
-                "SELECT * FROM tasks "
-                "WHERE (state = ? OR (state = ? AND pr_number IS NOT NULL)) "
-                "AND (last_review_poll_ts IS NULL OR last_review_poll_ts < ?) "
-                "ORDER BY id",
-                (State.AWAITING_MERGE.value, State.BLOCKED.value, cutoff),
+                f"SELECT * FROM tasks "
+                f"WHERE (state IN ({placeholders}) OR (state = ? AND pr_number IS NOT NULL)) "
+                f"AND (last_review_poll_ts IS NULL OR last_review_poll_ts < ?) "
+                f"ORDER BY id",
+                (*post_pr_states, State.BLOCKED.value, cutoff),
             ).fetchall()
         return [dict(r) for r in rows]  # type: ignore[misc]
 
@@ -1346,15 +1412,20 @@ class Store:
         * final_checking → pending + resume marker
         * committing/pushing → pending + resume marker
         * pr_opening → awaiting_merge (if pr_number set) else pending + resume
-        * polling_ci → awaiting_merge (if pr_number) else pending + resume
-        * responding_to_review → awaiting_merge (let watcher re-detect)
-        * rebasing/conflict_resolving → awaiting_merge (if pr_number) else pending + resume
-        * intent_reviewing → awaiting_merge (if pr_number) else pending + resume
-        * rebasing_to_main → awaiting_merge (if pr_number) else pending + resume
+        * polling_ci → pending_ci (if pr_number) else pending + resume
+        * triaging_feedback → pending_ci (let daemon re-detect)
+        * addressing_feedback → pending_ci (let daemon re-detect)
+        * rebasing/conflict_resolving → pending_ci (if pr_number) else pending + resume
+        * intent_reviewing → pending_ci (if pr_number) else pending + resume
+        * rebasing_to_main → pending_ci (if pr_number) else pending + resume
         * replanning → pending + resume
 
         All recovery transitions also reset retry counters so the next
         attempt has a fresh budget.
+
+        PR-aware tasks land in PENDING_CI rather than the more specific
+        AWAITING_REVIEW / MERGE_READY because the daemon's poll re-derives
+        the right state from CI + review signals on its next tick.
 
         Returns list of (task_id, from_state, to_state) for caller logging.
         """
@@ -1377,7 +1448,8 @@ class Store:
             State.INTENT_REVIEWING,
             State.REPLANNING,
             State.FIXUP_PLANNING,
-            State.RESPONDING_TO_REVIEW,
+            State.TRIAGING_FEEDBACK,
+            State.ADDRESSING_FEEDBACK,
             State.REBASING_TO_MAIN,
         }
         # Subset that stays in active phases mid-implementation; any of these
@@ -1397,12 +1469,15 @@ class Store:
             State.REPLANNING,
             State.FIXUP_PLANNING,
         }
-        # States where falling back to AWAITING_MERGE only makes sense if the
+        # States where falling back to a post-PR state only makes sense if the
         # PR has actually been opened. Otherwise resume to PENDING.
+        # Lands in PENDING_CI; the daemon's poll re-classifies based on
+        # current CI + review signals.
         pr_aware = {
             State.PR_OPENING,
             State.POLLING_CI,
-            State.RESPONDING_TO_REVIEW,
+            State.TRIAGING_FEEDBACK,
+            State.ADDRESSING_FEEDBACK,
             State.REBASING,
             State.CONFLICT_RESOLVING,
             State.INTENT_REVIEWING,
@@ -1442,7 +1517,7 @@ class Store:
                 target = State.PENDING
             elif cur in pr_aware:
                 if row.get("pr_number"):
-                    target = State.AWAITING_MERGE
+                    target = State.PENDING_CI
                 else:
                     extras["resume_from_existing_subtasks"] = 1
                     target = State.PENDING

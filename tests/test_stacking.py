@@ -168,8 +168,8 @@ def test_all_done_requires_truly_terminal_states(tmp_path):
     scope = {"A", "B"}
 
     # Both AWAITING_MERGE — NOT done (review watcher must keep polling)
-    o.store.transition("A", State.AWAITING_MERGE)
-    o.store.transition("B", State.AWAITING_MERGE)
+    o.store.transition("A", State.PENDING_CI)
+    o.store.transition("B", State.PENDING_CI)
     assert o._all_done(scope) is False
 
     # One MERGED, one AWAITING_MERGE — still NOT done
@@ -181,11 +181,11 @@ def test_all_done_requires_truly_terminal_states(tmp_path):
     assert o._all_done(scope) is True
 
 
-def test_all_done_responding_to_review_blocks_exit(tmp_path):
+def test_all_done_addressing_feedback_blocks_exit(tmp_path):
     dag = _make_dag(tmp_path, [("A", [])])
     o = _orch(tmp_path, dag)
     o.store.upsert_pending("A")
-    o.store.transition("A", State.RESPONDING_TO_REVIEW)
+    o.store.transition("A", State.ADDRESSING_FEEDBACK)
     assert o._all_done({"A"}) is False
 
 

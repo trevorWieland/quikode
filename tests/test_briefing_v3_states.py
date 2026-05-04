@@ -1,7 +1,7 @@
 """`quikode briefing` surfaces v3 review-loop / rebase / blocked states.
 
 Phase D extends the briefing groups so the user can wake up and see what
-needs them: AWAITING_MERGE (just review/merge), RESPONDING_TO_REVIEW (auto-
+needs them: AWAITING_MERGE (just review/merge), ADDRESSING_FEEDBACK (auto-
 working), REBASING_TO_MAIN (auto-working), BLOCKED (needs intervention,
 with a `quikode unblock` hint).
 
@@ -59,16 +59,16 @@ def _seed_one_per_state(tmp_path):
     store.upsert_pending("R-AM")
     store.transition(
         "R-AM",
-        State.AWAITING_MERGE,
+        State.PENDING_CI,
         pr_url="https://github.com/foo/bar/pull/1",
         pr_number=1,
         branch="quikode/r-am",
     )
-    # RESPONDING_TO_REVIEW
+    # ADDRESSING_FEEDBACK
     store.upsert_pending("R-RR")
     store.transition(
         "R-RR",
-        State.RESPONDING_TO_REVIEW,
+        State.ADDRESSING_FEEDBACK,
         pr_url="https://github.com/foo/bar/pull/2",
         pr_number=2,
         branch="quikode/r-rr",
@@ -123,12 +123,12 @@ def test_briefing_json_groups_v3_states(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert "awaiting_merge" in payload
-    assert "responding_to_review" in payload
+    assert "addressing_feedback" in payload
     assert "rebasing_to_main" in payload
     assert "blocked_needs_intervention" in payload
 
     am_ids = [r["id"] for r in payload["awaiting_merge"]]
-    rr_ids = [r["id"] for r in payload["responding_to_review"]]
+    rr_ids = [r["id"] for r in payload["addressing_feedback"]]
     rb_ids = [r["id"] for r in payload["rebasing_to_main"]]
     bl_ids = [r["id"] for r in payload["blocked_needs_intervention"]]
     assert am_ids == ["R-AM"]
@@ -136,7 +136,7 @@ def test_briefing_json_groups_v3_states(tmp_path, monkeypatch):
     assert rb_ids == ["R-RB"]
     assert bl_ids == ["R-BL"]
     # review_round is preserved on the responding row.
-    assert payload["responding_to_review"][0].get("review_round") == 3
+    assert payload["addressing_feedback"][0].get("review_round") == 3
 
 
 def test_briefing_with_no_v3_states_omits_sections(tmp_path, monkeypatch):

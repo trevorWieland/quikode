@@ -137,7 +137,7 @@ class TaskWorker:
 
         Lifecycle (humans drive cadence — no per-task retry budget):
           1. PROVISIONING → reuse worktree, fresh container
-          2. RESPONDING_TO_REVIEW → fixup planner (kind=fixup-review)
+          2. ADDRESSING_FEEDBACK → fixup planner (kind=fixup-review)
           3. FIXUP_PLANNING → per-thread subtask plan emitted
           4. DOING_SUBTASK / CHECKING_SUBTASK loop, one slice per thread
              (each slice commits + pushes via per-subtask gate)
@@ -146,14 +146,14 @@ class TaskWorker:
         """
         if not threads_to_address:
             log.warning("run_review_response called with empty thread list; nothing to do")
-            return WorkerOutcome(State.AWAITING_MERGE, "no threads to address")
+            return WorkerOutcome(State.PENDING_CI, "no threads to address")
 
         try:
             # 1. provision container against existing worktree
             self._provision(provision_worktree=False)
             self.store.transition(
                 self.node.id,
-                State.RESPONDING_TO_REVIEW,
+                State.ADDRESSING_FEEDBACK,
                 note=f"addressing {len(threads_to_address)} review thread(s)",
             )
 
@@ -200,11 +200,11 @@ class TaskWorker:
                 )
                 self.store.transition(
                     self.node.id,
-                    State.AWAITING_MERGE,
+                    State.PENDING_CI,
                     note=f"review response fixup blocked: {outcome.note[:200]}",
                 )
                 return WorkerOutcome(
-                    State.AWAITING_MERGE,
+                    State.PENDING_CI,
                     f"review response fixup blocked: {outcome.note[:200]}",
                 )
 
@@ -235,11 +235,11 @@ class TaskWorker:
             self.store.increment_review_round(self.node.id)
             self.store.transition(
                 self.node.id,
-                State.AWAITING_MERGE,
+                State.PENDING_CI,
                 note=f"responded to {len(threads_to_address)} thread(s)",
             )
             return WorkerOutcome(
-                State.AWAITING_MERGE,
+                State.PENDING_CI,
                 f"responded to {len(threads_to_address)} threads",
             )
         except Exception as e:
@@ -248,11 +248,11 @@ class TaskWorker:
             # can intervene without losing the existing PR.
             self.store.transition(
                 self.node.id,
-                State.AWAITING_MERGE,
+                State.PENDING_CI,
                 note=f"review response crashed: {e}",
                 last_error=str(e)[:1000],
             )
-            return WorkerOutcome(State.AWAITING_MERGE, f"review response crashed: {e}")
+            return WorkerOutcome(State.PENDING_CI, f"review response crashed: {e}")
         finally:
             # Tear down container only — keep the worktree so subsequent
             # response cycles (or merge) can reuse it.
@@ -277,7 +277,7 @@ class TaskWorker:
             self._provision(provision_worktree=False)
             self.store.transition(
                 self.node.id,
-                State.RESPONDING_TO_REVIEW,
+                State.ADDRESSING_FEEDBACK,
                 note=f"addressing CI failure ({len(pr_status.failed_checks)} failed check(s))",
             )
             row = self._row()
@@ -309,11 +309,11 @@ class TaskWorker:
                 )
                 self.store.transition(
                     self.node.id,
-                    State.AWAITING_MERGE,
+                    State.PENDING_CI,
                     note=f"ci-fix fixup blocked: {outcome.note[:200]}",
                 )
                 return WorkerOutcome(
-                    State.AWAITING_MERGE,
+                    State.PENDING_CI,
                     f"ci-fix fixup blocked: {outcome.note[:200]}",
                 )
 
@@ -323,22 +323,22 @@ class TaskWorker:
             # up either CI-pass or another failure.
             self.store.transition(
                 self.node.id,
-                State.AWAITING_MERGE,
+                State.PENDING_CI,
                 note=f"ci-fix round {round_no} pushed {len(pr_status.failed_checks)} fix slice(s)",
             )
             return WorkerOutcome(
-                State.AWAITING_MERGE,
+                State.PENDING_CI,
                 f"ci-fix round {round_no} complete",
             )
         except Exception as e:
             log.exception("ci-fix for task %s crashed", self.node.id)
             self.store.transition(
                 self.node.id,
-                State.AWAITING_MERGE,
+                State.PENDING_CI,
                 note=f"ci-fix crashed: {e}",
                 last_error=str(e)[:1000],
             )
-            return WorkerOutcome(State.AWAITING_MERGE, f"ci-fix crashed: {e}")
+            return WorkerOutcome(State.PENDING_CI, f"ci-fix crashed: {e}")
         finally:
             if self.handle is not None:
                 docker_env.teardown(self._h)
@@ -376,9 +376,9 @@ class TaskWorker:
         try:
             pre_state = State(pre_state_str)
         except ValueError:
-            pre_state = State.AWAITING_MERGE
+            pre_state = State.PENDING_CI
         if pre_state is State.REBASING_TO_MAIN:
-            pre_state = State.AWAITING_MERGE
+            pre_state = State.PENDING_CI
 
         try:
             # 1. provision container against existing worktree
@@ -2140,11 +2140,11 @@ class TaskWorker:
                 else:
                     self.store.transition(
                         self.node.id,
-                        State.AWAITING_MERGE,
+                        State.PENDING_CI,
                         note="no diff — task already complete or doer made no changes",
                     )
                     sound.ding()
-                    return WorkerOutcome(State.AWAITING_MERGE, "no diff")
+                    return WorkerOutcome(State.PENDING_CI, "no diff")
             else:
                 # Actual hook/commit failure → triage path
                 return self._post_commit_triage_loop("commit", out)
@@ -2195,7 +2195,7 @@ class TaskWorker:
         self.store.transition(self.node.id, State.PR_OPENING)
         # Idempotent re-entry: if this task already has a PR row in the
         # store (from a prior run that pushed but crashed before
-        # transitioning to AWAITING_MERGE, or from a daemon restart that
+        # transitioning to PENDING_CI, or from a daemon restart that
         # orphan-recovered the task post-PR-open), skip `gh pr create`
         # and reuse the existing PR. Without this, the second pass fails
         # with `gh: a pull request for branch X already exists` and the
@@ -2667,9 +2667,9 @@ class TaskWorker:
             # "none" = repo has no CI configured at all (e.g. the fixture repo).
             # Treat that as passing — there's nothing to wait for.
             if status.checks_status in ("success", "none") and status.mergeable != "CONFLICTING":
-                self.store.transition(self.node.id, State.AWAITING_MERGE, note="green; awaiting merge")
+                self.store.transition(self.node.id, State.PENDING_CI, note="green; awaiting merge")
                 sound.ding()
-                return WorkerOutcome(State.AWAITING_MERGE)
+                return WorkerOutcome(State.PENDING_CI)
 
     # ----- v2 Phase C: stacked diffs -----
 
@@ -2684,9 +2684,9 @@ class TaskWorker:
             return None, None
         STACK_READY = {
             State.POLLING_CI.value,
-            State.AWAITING_MERGE.value,
+            State.PENDING_CI.value,
             State.PR_OPENING.value,
-            State.RESPONDING_TO_REVIEW.value,
+            State.ADDRESSING_FEEDBACK.value,
         }
         candidates: list[tuple[str, str]] = []
         for dep in self.node.depends_on:

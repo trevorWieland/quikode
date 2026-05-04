@@ -477,7 +477,7 @@ class Orchestrator:
         phases are read-only. We only warn during DOING.
 
         v3 follow-up to the 2026-05-04 R-0002 / R-0015 pool-slot leaks:
-        when a `responding_to_review` task has logged ZERO agent_call
+        when a `addressing_feedback` task has logged ZERO agent_call
         activity for `cfg.stall_warn_seconds` (default 1800s = 30min),
         the future is almost certainly leaked (silently crashed before
         the first agent invocation). We force-cancel + reset the task to
@@ -514,14 +514,14 @@ class Orchestrator:
 
         # Stalled review-response detector. Triggered by direct observation
         # of the leak: future submitted, no agent_call ever fires, task sits
-        # in responding_to_review for 30+ min holding a pool slot.
+        # in addressing_feedback for 30+ min holding a pool slot.
         if futures is None or review_response_futures is None:
             return
         for tid in list(review_response_futures):
             row = self.store.get(tid)
             if row is None:
                 continue
-            if row["state"] != State.RESPONDING_TO_REVIEW.value:
+            if row["state"] != State.ADDRESSING_FEEDBACK.value:
                 continue  # not stalled — task moved on
             # Most-recent agent_call timestamp for this task.
             last_call = self.store.conn.execute(
@@ -530,10 +530,10 @@ class Orchestrator:
             ).fetchone()
             last_ts = float(last_call[0]) if last_call and last_call[0] else 0.0
             # last_ts may be from a PRIOR review-response cycle. Compare
-            # against when this task last entered RESPONDING_TO_REVIEW.
+            # against when this task last entered ADDRESSING_FEEDBACK.
             entered = self.store.conn.execute(
                 "SELECT MAX(ts) FROM state_log WHERE task_id = ? AND to_state = ?",
-                (tid, State.RESPONDING_TO_REVIEW.value),
+                (tid, State.ADDRESSING_FEEDBACK.value),
             ).fetchone()
             entered_ts = float(entered[0]) if entered and entered[0] else 0.0
             # Effective "silence start" = max(entered, last agent_call). If
@@ -565,7 +565,7 @@ class Orchestrator:
             # Reset to AWAITING_MERGE so the watcher's next tick re-dispatches.
             self.store.transition(
                 tid,
-                State.AWAITING_MERGE,
+                State.PENDING_CI,
                 note=(
                     f"orchestrator force-recovery: review-response stalled "
                     f"{int(silence // 60)}min, slot freed for re-dispatch"
@@ -577,7 +577,7 @@ class Orchestrator:
 
         With v3, AWAITING_MERGE is NOT terminal: the orchestrator's review
         watcher polls those PRs for new threads + human merge. We keep the
-        loop alive on AWAITING_MERGE, RESPONDING_TO_REVIEW, REBASING_TO_MAIN,
+        loop alive on PENDING_CI, ADDRESSING_FEEDBACK, REBASING_TO_MAIN,
         CONFLICT_RESOLVING, INTENT_REVIEWING, and the subtask-loop states.
 
         The four genuine terminal states — MERGED, BLOCKED, FAILED,
@@ -624,7 +624,7 @@ class Orchestrator:
         3. Bump `last_review_poll_ts` so the throttle window is honored.
         4. If any threads need addressing AND the worker pool has slack,
            submit a `run_review_response` future. The task transitions to
-           RESPONDING_TO_REVIEW synchronously before submit so the TUI /
+           ADDRESSING_FEEDBACK synchronously before submit so the TUI /
            pick-next loop see the new state immediately.
         """
         now = time.time()
@@ -743,7 +743,7 @@ class Orchestrator:
             # v3 fix (live regression on R-0002): GitHub CI can transition
             # to FAILURE *after* the worker has handed off to AWAITING_MERGE
             # — typical sequence is response cycle pushes a fixup commit,
-            # worker exits to AWAITING_MERGE, GitHub re-runs CI, CI fails
+            # worker exits to PENDING_CI, GitHub re-runs CI, CI fails
             # post-response. Pre-v3 the worker's _poll_pr_loop caught this
             # inline; v3 needs the daemon to dispatch a CI-fix cycle.
             #
@@ -828,18 +828,18 @@ class Orchestrator:
                 )
                 continue
 
-            # 5. v3 polish: auto-merge a clean AWAITING_MERGE task when
-            # opt-in. Skips when threads are unresolved (we want the
-            # response cycle to finish first).
-            if self.cfg.auto_merge_when_clean and task_row.get("state") == State.AWAITING_MERGE.value:
+            # 5. v3.5 polish: auto-merge a MERGE_READY task when opt-in.
+            # Other post-PR states (PENDING_CI / AWAITING_REVIEW) are
+            # explicitly NOT eligible — the whole point of MERGE_READY is
+            # that it's the single state where we know it's safe to land.
+            if self.cfg.auto_merge_when_clean and task_row.get("state") == State.MERGE_READY.value:
                 self._attempt_auto_merge(task_row, pr_status, threads)
 
-            # 6. v3 settled-task notification: ping the operator when a
-            # task has been quiet long enough that it's safe to review
-            # without something changing under them. Only fires for
-            # AWAITING_MERGE; the gating logic checks all the same
-            # safety conditions as auto-merge plus the quiet-window.
-            if task_row.get("state") == State.AWAITING_MERGE.value:
+            # 6. settled-task notification: ping the operator when the
+            # task has reached MERGE_READY and stayed quiet for the notify
+            # window. PENDING_CI / AWAITING_REVIEW intentionally don't
+            # trigger — we'd be paging on incomplete state.
+            if task_row.get("state") == State.MERGE_READY.value:
                 self._maybe_notify_settled(task_row, pr_status, threads)
 
     def _attempt_auto_merge(
@@ -964,7 +964,7 @@ class Orchestrator:
         # When did this task most recently enter AWAITING_MERGE?
         entered = self.store.conn.execute(
             "SELECT MAX(ts) FROM state_log WHERE task_id = ? AND to_state = ?",
-            (task_id, State.AWAITING_MERGE.value),
+            (task_id, State.PENDING_CI.value),
         ).fetchone()
         entered_ts = float(entered[0]) if entered and entered[0] else 0.0
         if not entered_ts:
@@ -1061,10 +1061,10 @@ class Orchestrator:
         futures: dict[str, Future],
         review_response_futures: set[str],
     ) -> None:
-        """Mark the task RESPONDING_TO_REVIEW and submit a worker future."""
+        """Mark the task ADDRESSING_FEEDBACK and submit a worker future."""
         self.store.transition(
             task_id,
-            State.RESPONDING_TO_REVIEW,
+            State.ADDRESSING_FEEDBACK,
             note=f"daemon scheduled response to {len(threads)} thread(s)",
         )
         log.info("scheduling review response for task %s (%d threads)", task_id, len(threads))
@@ -1091,7 +1091,7 @@ class Orchestrator:
         with a CI-failure trigger context."""
         self.store.transition(
             task_id,
-            State.RESPONDING_TO_REVIEW,
+            State.ADDRESSING_FEEDBACK,
             note=f"daemon scheduled CI-fix for {len(pr_status.failed_checks)} failed check(s)",
         )
         log.info(
@@ -1304,7 +1304,7 @@ class Orchestrator:
         fut = pool.submit(self._run_rebase_to_main_one, task_id)
         futures[task_id] = fut
         # Track in the same set as review-response futures so the heartbeat
-        # surfaces the count under "responding_to_review_futures". Ground truth
+        # surfaces the count under "addressing_feedback_futures". Ground truth
         # lives in the store's REBASING_TO_MAIN state.
         review_response_futures.add(task_id)
 
@@ -1361,7 +1361,7 @@ class Orchestrator:
             self._repo_id_cache = repo_id
         return repo_id
 
-    def _write_heartbeat(self, in_flight: int, responding_to_review_futures: int) -> None:
+    def _write_heartbeat(self, in_flight: int, addressing_feedback_futures: int) -> None:
         """Write a small JSON liveness blob to `state_dir/orchestrator.heartbeat`.
 
         Light touch — the supervisor loop in batch 8 will use this for
@@ -1370,14 +1370,14 @@ class Orchestrator:
         """
         try:
             self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
-            awaiting_merge = len(self.store.in_state(State.AWAITING_MERGE))
-            responding = len(self.store.in_state(State.RESPONDING_TO_REVIEW))
+            awaiting_merge = len(self.store.in_state(State.PENDING_CI))
+            responding = len(self.store.in_state(State.ADDRESSING_FEEDBACK))
             payload = {
                 "ts": time.time(),
                 "in_flight": in_flight,
                 "awaiting_merge": awaiting_merge,
-                "responding_to_review": responding,
-                "responding_to_review_futures": responding_to_review_futures,
+                "addressing_feedback": responding,
+                "addressing_feedback_futures": addressing_feedback_futures,
             }
             (self.cfg.state_dir / "orchestrator.heartbeat").write_text(json.dumps(payload))
         except OSError as e:

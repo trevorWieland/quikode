@@ -2,7 +2,7 @@
 when scheduled alongside an in-flight parent.
 
 The orchestrator's `_pick_next` is the gate. When stacking is enabled and
-a parent is in a stack-ready state (AWAITING_MERGE, RESPONDING_TO_REVIEW,
+a parent is in a stack-ready state (PENDING_CI, ADDRESSING_FEEDBACK,
 PR_OPENING, POLLING_CI), the child becomes pickable AND has its
 `parent_pr_branch` + `parent_branch` stamped before scheduling so the
 worker's `_provision_worktree` branches off the parent.
@@ -66,7 +66,7 @@ def test_pick_next_stamps_parent_pr_branch_when_parent_awaiting_merge(tmp_path):
     o.store.upsert_pending("A")
     o.store.upsert_pending("B")
     # Parent A is AWAITING_MERGE with a branch.
-    o.store.transition("A", State.AWAITING_MERGE, branch="quikode/a-abc123")
+    o.store.transition("A", State.PENDING_CI, branch="quikode/a-abc123")
 
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"
@@ -111,14 +111,14 @@ def test_pick_next_does_not_return_child_when_parent_pending(tmp_path):
     o.store.conn.close()
 
 
-def test_pick_next_responding_to_review_is_stack_ready(tmp_path):
-    """Parent in RESPONDING_TO_REVIEW → child can be stacked (same
+def test_pick_next_addressing_feedback_is_stack_ready(tmp_path):
+    """Parent in ADDRESSING_FEEDBACK → child can be stacked (same
     semantics as AWAITING_MERGE)."""
     dag = _make_dag(tmp_path, [("A", []), ("B", ["A"])])
     o = _orch(tmp_path, dag, stacking_strategy="within-milestone")
     o.store.upsert_pending("A")
     o.store.upsert_pending("B")
-    o.store.transition("A", State.RESPONDING_TO_REVIEW, branch="quikode/a-resp")
+    o.store.transition("A", State.ADDRESSING_FEEDBACK, branch="quikode/a-resp")
 
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"
@@ -168,7 +168,7 @@ def test_pick_next_stacking_off_blocks_until_merged(tmp_path):
     o = _orch(tmp_path, dag, stacking_strategy="off")
     o.store.upsert_pending("A")
     o.store.upsert_pending("B")
-    o.store.transition("A", State.AWAITING_MERGE, branch="quikode/a-merge")
+    o.store.transition("A", State.PENDING_CI, branch="quikode/a-merge")
     # With stacking off, B is NOT pickable while A is unmerged.
     assert o._pick_next({"A", "B"}, set()) is None
     # Sanity: if we mark A as MERGED, B becomes pickable.

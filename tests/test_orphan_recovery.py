@@ -93,9 +93,9 @@ def test_pr_opening_with_pr_number_goes_to_awaiting_merge(tmp_path):
         pr_url="https://github.com/o/r/pull/42",
     )
     out = s.recover_orphan_tasks()
-    assert ("T-1", State.PR_OPENING.value, State.AWAITING_MERGE.value) in out
+    assert ("T-1", State.PR_OPENING.value, State.PENDING_CI.value) in out
     row = s.get("T-1")
-    assert row["state"] == State.AWAITING_MERGE.value
+    assert row["state"] == State.PENDING_CI.value
     s.conn.close()
 
 
@@ -114,17 +114,17 @@ def test_polling_ci_with_pr_number_goes_to_awaiting_merge(tmp_path):
     s = _store(tmp_path)
     _seed(s, "T-1", State.POLLING_CI, pr_number=42)
     s.recover_orphan_tasks()
-    assert s.get("T-1")["state"] == State.AWAITING_MERGE.value
+    assert s.get("T-1")["state"] == State.PENDING_CI.value
     s.conn.close()
 
 
-def test_responding_to_review_goes_to_awaiting_merge(tmp_path):
+def test_addressing_feedback_goes_to_awaiting_merge(tmp_path):
     """The watcher will re-detect the open thread on the next poll tick
     and submit a fresh review-response future."""
     s = _store(tmp_path)
-    _seed(s, "T-1", State.RESPONDING_TO_REVIEW, pr_number=42)
+    _seed(s, "T-1", State.ADDRESSING_FEEDBACK, pr_number=42)
     s.recover_orphan_tasks()
-    assert s.get("T-1")["state"] == State.AWAITING_MERGE.value
+    assert s.get("T-1")["state"] == State.PENDING_CI.value
     s.conn.close()
 
 
@@ -136,7 +136,7 @@ def test_pr_aware_states_with_pr_go_to_awaiting_merge(tmp_path, from_state):
     s = _store(tmp_path)
     _seed(s, "T-1", from_state, pr_number=42)
     s.recover_orphan_tasks()
-    assert s.get("T-1")["state"] == State.AWAITING_MERGE.value
+    assert s.get("T-1")["state"] == State.PENDING_CI.value
     s.conn.close()
 
 
@@ -159,7 +159,7 @@ def test_pr_aware_states_without_pr_resume_to_pending(tmp_path, from_state):
 
 @pytest.mark.parametrize(
     "from_state",
-    [State.PENDING, State.MERGED, State.BLOCKED, State.FAILED, State.ABORTED, State.AWAITING_MERGE],
+    [State.PENDING, State.MERGED, State.BLOCKED, State.FAILED, State.ABORTED, State.PENDING_CI],
 )
 def test_terminalish_states_unchanged(tmp_path, from_state):
     s = _store(tmp_path)
@@ -208,7 +208,7 @@ def test_recovery_returns_log_entries(tmp_path):
     out = s.recover_orphan_tasks()
     by_id = {t[0]: t for t in out}
     assert by_id["T-1"] == ("T-1", State.DOING.value, State.PENDING.value)
-    assert by_id["T-2"] == ("T-2", State.PR_OPENING.value, State.AWAITING_MERGE.value)
+    assert by_id["T-2"] == ("T-2", State.PR_OPENING.value, State.PENDING_CI.value)
     assert "T-3" not in by_id
     assert "T-4" not in by_id
     s.conn.close()

@@ -34,7 +34,11 @@ _SHORT_STATE = {
     "final_checking": "final_check",
     "conflict_resolving": "conflict_res",
     "intent_reviewing": "intent_rev",
-    "awaiting_merge": "awaiting_merge",
+    "triaging_feedback": "triaging_fb",
+    "addressing_feedback": "addressing_fb",
+    "pending_ci": "pending_ci",
+    "awaiting_review": "awaiting_rev",
+    "merge_ready": "merge_ready",
 }
 
 _NON_TERMINAL_AGGREGATES = {
@@ -56,8 +60,14 @@ _NON_TERMINAL_AGGREGATES = {
         State.CONFLICT_RESOLVING.value,
         State.INTENT_REVIEWING.value,
         State.REPLANNING.value,
+        State.TRIAGING_FEEDBACK.value,
+        State.ADDRESSING_FEEDBACK.value,
     },
-    "awaiting": {State.AWAITING_MERGE.value},
+    "awaiting": {
+        State.PENDING_CI.value,
+        State.AWAITING_REVIEW.value,
+        State.MERGE_READY.value,
+    },
     "blocked": {State.BLOCKED.value, State.FAILED.value},
     "merged": {State.MERGED.value},
 }
@@ -157,7 +167,9 @@ class StorePoller:
             "FROM tasks ORDER BY "
             "  CASE state "
             "    WHEN 'blocked' THEN 0 WHEN 'failed' THEN 0 "
-            "    WHEN 'awaiting_merge' THEN 1 "
+            "    WHEN 'merge_ready' THEN 1 "
+            "    WHEN 'awaiting_review' THEN 1 "
+            "    WHEN 'pending_ci' THEN 1 "
             "    WHEN 'merged' THEN 4 "
             "    WHEN 'aborted' THEN 4 "
             "    WHEN 'pending' THEN 3 "
@@ -384,7 +396,7 @@ class StorePoller:
             ).fetchall()
         ]
 
-        # v3 review-loop surfacing: when responding_to_review, fish round
+        # v3 review-loop surfacing: when addressing_feedback, fish round
         # count + active thread count out of intervention_request (JSON blob
         # the worker stashes when it picks up a review). Best-effort — older
         # rows may not have these fields; phase line falls back to a generic

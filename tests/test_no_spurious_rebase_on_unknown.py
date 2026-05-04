@@ -86,7 +86,7 @@ def _seed_awaiting_merge(o: Orchestrator, pr_number: int = 33) -> None:
     o.store.upsert_pending("T-001")
     o.store.transition(
         "T-001",
-        State.AWAITING_MERGE,
+        State.PENDING_CI,
         branch="quikode/t-001-abc",
         pr_number=pr_number,
         pr_url=f"https://github.com/owner/repo/pull/{pr_number}",
@@ -130,7 +130,7 @@ def test_orchestrator_unknown_mergeable_does_not_schedule_rebase(tmp_path):
 
     row = o.store.get("T-001")
     # Still AWAITING_MERGE — no rebase fired.
-    assert row["state"] == State.AWAITING_MERGE.value
+    assert row["state"] == State.PENDING_CI.value
     assert row["pre_rebase_state"] is None
     o.store.conn.close()
 
@@ -151,7 +151,7 @@ def test_orchestrator_mergeable_does_not_schedule_rebase(tmp_path):
         o._poll_review_threads(pool, futures, rrf)
 
     row = o.store.get("T-001")
-    assert row["state"] == State.AWAITING_MERGE.value
+    assert row["state"] == State.PENDING_CI.value
     o.store.conn.close()
 
 
@@ -256,7 +256,7 @@ def test_worker_poll_pr_loop_does_not_rebase_on_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(TaskWorker, "_run_intent_review", lambda self: None)
 
     outcome = w._poll_pr_loop()
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
     assert rebase_called["hit"] is False, "UNKNOWN must NOT trigger _rebase_or_resolve"
 
 
@@ -280,7 +280,7 @@ def test_worker_poll_pr_loop_does_not_rebase_on_mergeable(tmp_path, monkeypatch)
     monkeypatch.setattr(TaskWorker, "_run_intent_review", lambda self: None)
 
     outcome = w._poll_pr_loop()
-    assert outcome.final_state == State.AWAITING_MERGE
+    assert outcome.final_state == State.PENDING_CI
     assert rebase_called["hit"] is False
 
 

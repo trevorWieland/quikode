@@ -62,7 +62,7 @@ def test_reconstructs_worktree_from_branch_when_path_missing(tmp_path):
     w = _worker(tmp_path)
     w.store.upsert_pending("T-003")
     branch = "quikode/t-003-abc123"
-    w.store.transition("T-003", State.AWAITING_MERGE, branch=branch)
+    w.store.transition("T-003", State.PENDING_CI, branch=branch)
     # Build the canonical wt path matching _provision_worktree's recipe.
     expected_dir = w.cfg.worktree_root / "t-003-abc123"
     expected_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +79,7 @@ def test_existing_worktree_path_returns_stored_when_set(tmp_path):
     w.store.upsert_pending("T-003")
     real = (tmp_path / "wt" / "t-003-zzz").resolve()
     real.mkdir(parents=True, exist_ok=True)
-    w.store.transition("T-003", State.AWAITING_MERGE, worktree_path=str(real), branch="quikode/t-003-zzz")
+    w.store.transition("T-003", State.PENDING_CI, worktree_path=str(real), branch="quikode/t-003-zzz")
     assert w._existing_worktree_path() == Path(str(real))
     w.store.conn.close()
 
@@ -89,7 +89,7 @@ def test_raises_when_branch_present_but_recon_dir_missing(tmp_path):
     doesn't exist on disk → raise. Caller must handle, not crash."""
     w = _worker(tmp_path)
     w.store.upsert_pending("T-003")
-    w.store.transition("T-003", State.AWAITING_MERGE, branch="quikode/t-003-missing")
+    w.store.transition("T-003", State.PENDING_CI, branch="quikode/t-003-missing")
     try:
         w._existing_worktree_path()
     except RuntimeError as e:
@@ -102,7 +102,7 @@ def test_raises_when_branch_present_but_recon_dir_missing(tmp_path):
 def test_raises_when_branch_and_path_both_missing(tmp_path):
     w = _worker(tmp_path)
     w.store.upsert_pending("T-003")
-    w.store.transition("T-003", State.AWAITING_MERGE)  # neither
+    w.store.transition("T-003", State.PENDING_CI)  # neither
     try:
         w._existing_worktree_path()
     except RuntimeError as e:
@@ -127,7 +127,7 @@ def test_run_rebase_to_main_handles_missing_worktree_cleanly(tmp_path):
         pr_number=42,
         pr_url="https://github.com/owner/repo/pull/42",
     )
-    w.store.set_pre_rebase_state("T-003", State.AWAITING_MERGE.value)
+    w.store.set_pre_rebase_state("T-003", State.PENDING_CI.value)
     # Patch docker_env interactions to avoid real container spinups.
     with (
         patch("quikode.worker.docker_env.make_handle"),
@@ -144,7 +144,7 @@ def test_run_rebase_to_main_handles_missing_worktree_cleanly(tmp_path):
     # Row is restored to AWAITING_MERGE (the stashed pre-rebase state)
     # rather than left dangling in REBASING_TO_MAIN.
     row = w.store.get("T-003")
-    assert row["state"] == State.AWAITING_MERGE.value
+    assert row["state"] == State.PENDING_CI.value
     assert row.get("last_error")  # explanatory error captured
-    assert out.final_state == State.AWAITING_MERGE
+    assert out.final_state == State.PENDING_CI
     w.store.conn.close()
