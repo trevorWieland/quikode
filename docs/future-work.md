@@ -92,7 +92,59 @@ non-zero with a specific stderr signature. Today the worker treats this
 as a transient error (free retry, eventually capped). A dedicated
 detector + cooldown would smooth the experience.
 
+### 🟡 Retroactive ccusage outlier clamp on existing rows
+
+The 2026-05-04 cap commit (`567af2b`) prevents *new* parser outliers
+from inflating totals, but pre-fix rows persist in `agent_calls` and
+keep the briefing total roughly $585 too high (two $292.89
+misattributions on R-0008 and R-0019). A small migration —
+`UPDATE agent_calls SET cost_usd = 0 WHERE cost_usd > 50 AND ts <
+<commit_ts>` with a logged note — would make historical totals match
+post-fix reporting. Low priority but recurring eyesore in `quikode
+briefing`.
+
+### 🟡 Subtask transient-classification storm under fast-fail
+
+R-0019 S-04-api on the prior daemon run logged a checking ↔ doing
+flapping pattern: `doing → checking → doing(attempt 4) → checking
+(0s) → doing(0s) → ...` for ~80s before orphan recovery interrupted.
+Suggests the doer was exiting fast (rc != 0) before producing a real
+diff and the checker treated the verdict as transient, never
+incrementing `subtasks.retries`. The transient-cap (default 10) and
+fixup decomposition mitigate, but a tighter classifier (require
+*some* worktree edit between consecutive transient verdicts) would
+short-circuit the storm earlier and conserve agent budget.
+
+### 🟢 Daemon log rotation
+
+`daemon.log` is append-only (TODO comment in `daemon.py`). After a
+multi-week run it'll grow without bound. Size-based rotation
+(e.g., rotate at 50MB, keep last 5) is the simple fix.
+
+### 🟢 Persistent quikode-managed Monitor
+
+When operating quikode autonomously, the operator (or driving Claude
+session) sets up a tail-and-grep on `daemon.log` for state
+transitions. A `quikode tail-events` (or `tui --events`) command
+that emits one line per BLOCKED / AWAITING_MERGE / fixup-cap /
+review-cap event would let any operator wire it into their preferred
+notifier (ntfy CLI, Slack webhook, ssh+jq) without re-implementing
+the grep filter.
+
 ---
+
+## Recently shipped (2026-05-04 evening additions)
+
+- **`quikode daemon start --detach` / `-d`** — fork + `os.setsid` +
+  stdio redirect to daemon.log, so an interactive shell hangup
+  (SIGHUP) can no longer silently kill the supervisor. Parent prints
+  child pid + log path and exits 0.
+- **Heartbeat-stale watchdog** — every 5s the supervisor reads the
+  orchestrator heartbeat; two consecutive stale reads beyond
+  `cfg.daemon_heartbeat_stale_kill_s` (default 600s) trigger a
+  SIGTERM that the crash path then restarts. Closes the
+  hung-not-crashed gap where `child.wait()` blocked forever and
+  containers stayed alive doing work nobody could read.
 
 ## Recently shipped (2026-05-04 session)
 

@@ -39,7 +39,9 @@ quikode briefing                 # in-flight, awaiting, blocked, merges, cost
 quikode notify-test              # verify ntfy.sh push reaches your phone
 
 # 4. Start the daemon (Phase 3 / parallel-5 with stacking + notifications)
-quikode daemon start --max-parallel 5 --retry-failed
+#    Use --detach so the supervisor survives this shell's SIGHUP (logout,
+#    Claude session end, terminal close).
+quikode daemon start --detach --max-parallel 5 --retry-failed
 
 # 5. Monitor (in another terminal)
 quikode tui                      # mission-control; press `g` for DAG viewer

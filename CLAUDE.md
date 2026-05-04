@@ -121,6 +121,8 @@ These all blocked progress at some point and have been fixed; don't re-discover 
 22. ccusage's session-aggregate occasionally returns cumulative-since-install instead of a per-call delta when the snapshot baseline is missing. Symptom: a single call reported $292.89. Sanity cap (`_MAX_PER_CALL_COST_USD = 50`) zeros wildly-out-of-range values with a warning log.
 23. CI-failure-after-AWAITING_MERGE was unhandled by the daemon's review-watcher. v2-style worker handled CI fail inline in `_poll_pr_loop`; v3 needs `_schedule_ci_fix_response` because the worker has handed off. See `orchestrator.py`.
 24. Codex-style reviewers can find new nits indefinitely (R-0002 hit round 10 with $30+ in cycles). `cfg.review_rounds_max=15` BLOCKs the task with a "manual merge/close required" note when the cap is hit.
+25. **Foreground daemon dies on shell SIGHUP** with no supervisor exit log — a closed terminal silently kills `quikode daemon start` and leaves containers orphaned (still doing work nobody reads). Use `quikode daemon start --detach` (added 2026-05-04 evening): forks, calls `os.setsid()`, redirects stdio at the daemon log so the supervisor outlives the launching shell. See `daemon.py:detach_into_background`.
+26. **Supervisor only restarts on crash, not hang** — pre-watchdog, a hung inner orchestrator (lock contention, blocked subprocess.wait) left `child.wait()` blocking forever while heartbeat went cold. The watchdog (`daemon.py:_wait_with_watchdog`) reads heartbeat every 5s and SIGTERMs after two consecutive stale reads beyond `cfg.daemon_heartbeat_stale_kill_s` (default 600s). The crash path then handles backoff + restart. Set `daemon_heartbeat_stale_kill_s = 0` to disable.
 
 ## Active work / context
 
@@ -132,7 +134,7 @@ These all blocked progress at some point and have been fixed; don't re-discover 
 
 ## Conventions when editing this codebase
 
-- Run `python -m pytest tests/ -q` after any change touching `quikode/`. **697 tests**; runs in <45s.
+- Run `python -m pytest tests/ -q` after any change touching `quikode/`. **701 tests**; runs in <50s.
 - Run `ruff check quikode/ tests/` and `ruff format --check quikode/ tests/` before committing. Strict ruleset enabled — see `pyproject.toml [tool.ruff.lint]`.
 - `ty check quikode/` is configured but ty is alpha; treat advisory.
 - Don't break the running orchestrator. If quikode is mid-run when you edit, the in-memory module is already loaded — your edits affect the *next* run.
@@ -155,7 +157,8 @@ quikode run --max-parallel 1
 # tanren run under daemon supervisor (recommended)
 cd /home/trevor/github/quikode-runs/tanren
 quikode briefing
-quikode daemon start --max-parallel 5 --retry-failed
+# --detach so a shell hangup doesn't take the supervisor with it
+quikode daemon start --detach --max-parallel 5 --retry-failed
 quikode daemon status         # heartbeat freshness
 quikode tui                   # mission-control dashboard; press `g` for DAG viewer
 quikode notify-test           # verify settled-task ntfy delivery
