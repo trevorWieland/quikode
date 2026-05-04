@@ -132,10 +132,17 @@ class DetailPanel(Container):
             # moved the cursor (in which case respect their position). When
             # fixup decomposition appends new subtasks past the visible
             # viewport (e.g. F-7-* on R-0002 fell below screen), the user
-            # would otherwise have no idea they exist. Follow priority:
-            #   1. user-moved cursor → restore clamped position
-            #   2. otherwise → scroll to active subtask row (if any)
-            #   3. otherwise → leave at row 0
+            # would otherwise have no idea they exist.
+            #
+            # NOTE: do NOT call `scroll_to(y=...)` after `add_row()` in a
+            # tight loop — Textual's DataTable processes row additions
+            # asynchronously, and the explicit scroll fires before all
+            # rows are registered, leaving the viewport anchored at a
+            # stale row index (observed live: F-7-1/F-7-2 invisible on
+            # R-0002 even though all 18 rows were in the snapshot).
+            # `move_cursor` triggers a natural scroll-into-view via
+            # Textual's cursor-follow logic on the next render pass,
+            # which is sequenced correctly with the row additions.
             if snap.subtasks:
                 if self._user_moved_subtask_cursor:
                     target = min(prev_cursor_row, len(snap.subtasks) - 1)
@@ -146,15 +153,15 @@ class DetailPanel(Container):
                     # recently-appended fixup subtask.
                     target = len(snap.subtasks) - 1
                 try:
-                    st.move_cursor(row=max(target, 0), column=0)
-                    # Force the active row into view if the table is
-                    # scrolled away from it.
-                    try:
-                        st.scroll_to(y=max(target, 0))
-                    except Exception:
-                        pass
+                    st.move_cursor(row=max(target, 0), column=0, animate=False)
                 except Exception:
                     pass
+            # Belt-and-suspenders: explicitly mark the table dirty so
+            # Textual's next render pass sees the updated row set.
+            try:
+                st.refresh(layout=True)
+            except Exception:
+                pass
             self._subtasks_fp = sub_fp
 
         # ---- Agent calls tab ----
