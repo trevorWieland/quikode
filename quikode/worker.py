@@ -2234,8 +2234,7 @@ class TaskWorker:
             # Pure FF — operator pushed commits, we have no local-only work.
             # `git reset --hard origin/<branch>` brings us in line.
             log.info(
-                "task %s: detected upstream FF on %s (behind=%d). "
-                "Resetting --hard to origin/%s.",
+                "task %s: detected upstream FF on %s (behind=%d). Resetting --hard to origin/%s.",
                 self.node.id,
                 branch,
                 behind,

@@ -332,9 +332,7 @@ def test_progress_check_cadence_seeds_attempt_from_retries_after_resume(tmp_path
     survives multiple restart cycles, each restarting `attempt=0` and
     only ever firing the progress check at the first cadence point."""
     plan = _build_plan(["S-01"])
-    worker = _build_worker(
-        tmp_path, plan, progress_after=6, progress_every=3, hard_max=20
-    )
+    worker = _build_worker(tmp_path, plan, progress_after=6, progress_every=3, hard_max=20)
     # Persist a subtask row simulating a resume mid-stuck-subtask: retries=12.
     worker.store.update_subtask("R-001", "S-01", retries=12)
 

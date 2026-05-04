@@ -14,7 +14,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from . import docker_env, github, github_graphql, scheduler
+from . import docker_env, github, github_graphql, notify, scheduler
 from .config import Config
 from .dag import DAG
 from .github_graphql import ReviewThread
@@ -761,6 +761,14 @@ class Orchestrator:
             if self.cfg.auto_merge_when_clean and task_row.get("state") == State.AWAITING_MERGE.value:
                 self._attempt_auto_merge(task_row, pr_status, threads)
 
+            # 6. v3 settled-task notification: ping the operator when a
+            # task has been quiet long enough that it's safe to review
+            # without something changing under them. Only fires for
+            # AWAITING_MERGE; the gating logic checks all the same
+            # safety conditions as auto-merge plus the quiet-window.
+            if task_row.get("state") == State.AWAITING_MERGE.value:
+                self._maybe_notify_settled(task_row, pr_status, threads)
+
     def _attempt_auto_merge(
         self,
         task_row: Mapping[str, Any],
@@ -850,6 +858,77 @@ class Orchestrator:
             return None
         v = r["ts"]
         return float(v) if v is not None else None
+
+    def _maybe_notify_settled(
+        self,
+        task_row: Mapping[str, Any],
+        pr_status: github.PRStatus,
+        threads: list[ReviewThread],
+    ) -> None:
+        """Ping the operator when an AWAITING_MERGE task has been quiet
+        for `cfg.notify_settled_after_s`. One ping per "settled state":
+        re-pings only fire after the task LEFT awaiting_merge (responded
+        to a thread, etc.) and re-entered.
+
+        Gates (all required):
+          - cfg.notify_settled_channel != "none"
+          - PR state == OPEN, mergeable == MERGEABLE, all checks SUCCESS
+          - No unresolved review threads (any author)
+          - Time-since-AWAITING_MERGE-entry >= notify_settled_after_s
+          - last_notified_settled_ts is None OR predates the most recent
+            transition INTO awaiting_merge (means the task left + came back).
+        """
+        if self.cfg.notify_settled_channel == "none":
+            return
+        if pr_status.state != "OPEN" or pr_status.mergeable != "MERGEABLE":
+            return
+        if pr_status.checks_status not in ("success", "none"):
+            return
+        if any(not t.is_resolved for t in threads):
+            return
+
+        task_id = str(task_row["id"])
+        # When did this task most recently enter AWAITING_MERGE?
+        entered = self.store.conn.execute(
+            "SELECT MAX(ts) FROM state_log WHERE task_id = ? AND to_state = ?",
+            (task_id, State.AWAITING_MERGE.value),
+        ).fetchone()
+        entered_ts = float(entered[0]) if entered and entered[0] else 0.0
+        if not entered_ts:
+            return
+        quiet_for = time.time() - entered_ts
+        if quiet_for < self.cfg.notify_settled_after_s:
+            return
+        # Already notified for THIS settled period?
+        last_notified = task_row.get("last_notified_settled_ts")
+        if last_notified is not None and float(last_notified) >= entered_ts:
+            return  # already pinged for this AWAITING_MERGE period
+
+        # Build + send the message.
+        node = self.dag.nodes.get(task_id)
+        title = node.title if node else ""
+        cost = self.store.task_total_cost_usd(task_id)
+        n_threads = len(threads)
+        round_no = task_row.get("review_round") or 0
+        summary = (
+            f"AWAITING_MERGE for {int(quiet_for // 60)}min · "
+            f"{round_no} review round(s) · "
+            f"{n_threads} thread(s) (all resolved)"
+        )
+        msg = notify.SettledMessage(
+            task_id=task_id,
+            title=title,
+            pr_url=task_row.get("pr_url") or "",
+            summary=summary,
+            cost_usd=cost,
+        )
+        try:
+            ok = notify.notify_settled(self.cfg, msg)
+        except Exception as e:
+            log.warning("notify_settled %s raised: %s", task_id, e)
+            return
+        if ok:
+            self.store.set_field(task_id, last_notified_settled_ts=time.time())
 
     def _classify_threads(self, task_id: str, threads: list[ReviewThread]) -> list[ReviewThread]:
         """Decide which threads warrant a response cycle and upsert all of

@@ -76,6 +76,7 @@ class TaskRow(TypedDict):
     # `cfg.auto_merge_when_clean`. Audit-only — does not change state-machine
     # behavior.
     auto_merged: NotRequired[int | None]
+    last_notified_settled_ts: NotRequired[float | None]
     # rebase coalescing: timestamp of the most recent rebase trigger for
     # this task, used by `_schedule_rebase_to_main` to dedupe rapid-fire
     # triggers within `cfg.rebase_coalesce_window_s`.
@@ -292,6 +293,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- this task. Used by `_schedule_rebase_to_main` to skip extra triggers
     -- within `cfg.rebase_coalesce_window_s`.
     last_rebase_scheduled_ts REAL,
+    -- v3 settled-notification: when the daemon's review-watcher detects the
+    -- task has been quiet (AWAITING_MERGE + green + no churn for
+    -- cfg.notify_settled_after_s), it pings the configured channel and
+    -- stamps this column. Re-pings are gated on the task having LEFT
+    -- AWAITING_MERGE since the last notify (e.g. responded to a thread)
+    -- so we don't spam on every poll tick.
+    last_notified_settled_ts REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -498,6 +506,7 @@ class Store:
                 ("needs_parent_rebase", "INTEGER DEFAULT 0"),
                 # v3 polish: auto-merge audit flag
                 ("auto_merged", "INTEGER DEFAULT 0"),
+                ("last_notified_settled_ts", "REAL"),
                 # rebase coalescing: per-task last-trigger timestamp
                 ("last_rebase_scheduled_ts", "REAL"),
             ],

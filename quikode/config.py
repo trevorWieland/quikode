@@ -249,6 +249,57 @@ class Config(BaseModel):
         ),
     )
 
+    # ----- v3 settled-task notifications -----
+    notify_settled_channel: Literal["none", "ntfy", "slack", "both"] = Field(
+        default="none",
+        description=(
+            "Channel(s) for 'task settled and ready for review' pings. "
+            "'none' (default) is opt-in disabled. 'ntfy' uses ntfy.sh "
+            "(zero-auth, free, iOS/Android push apps). 'slack' uses an "
+            "incoming-webhook URL. 'both' fires on both for redundancy. "
+            "Settled = AWAITING_MERGE + green CI + no unresolved threads "
+            "+ no churn for cfg.notify_settled_after_s. Run `quikode "
+            "notify-test` after configuring to verify delivery."
+        ),
+    )
+    notify_settled_after_s: int = Field(
+        default=1800,
+        ge=60,
+        le=14400,
+        description=(
+            "Quiet window (seconds) before pinging that a task is ready "
+            "for review. Two clocks must both pass: time since the most "
+            "recent commit on the PR branch AND time since the last "
+            "review_round increment. Default 30min — short enough to ping "
+            "while context is fresh, long enough that a fresh codex cycle "
+            "won't get pinged about something that's about to change."
+        ),
+    )
+    notify_ntfy_url: str = Field(
+        default="https://ntfy.sh",
+        description=(
+            "ntfy server base URL. Public ntfy.sh is free + no auth; "
+            "self-hosted instances also work. The full URL is built as "
+            "`<url>/<topic>`."
+        ),
+    )
+    notify_ntfy_topic: str = Field(
+        default="",
+        description=(
+            "ntfy topic name. Effectively a shared secret — anyone who "
+            "knows the topic can post + subscribe. Use a long random "
+            "string (e.g. `quikode-tanren-7f3a8b9c2d`)."
+        ),
+    )
+    notify_slack_webhook_url: str = Field(
+        default="",
+        description=(
+            "Slack incoming-webhook URL. Create one at "
+            "https://api.slack.com/messaging/webhooks and paste the "
+            "result here. Empty means no Slack delivery."
+        ),
+    )
+
     # ----- v2 Resources -----
     cpu_per_task: int = Field(
         default=4,
@@ -551,6 +602,11 @@ def load_config(root: Path | None = None) -> Config:
         preempt_yield_threshold=int(raw.get("preempt_yield_threshold", defaults.preempt_yield_threshold)),
         auto_merge_when_clean=bool(raw.get("auto_merge_when_clean", defaults.auto_merge_when_clean)),
         auto_merge_min_age_s=int(raw.get("auto_merge_min_age_s", defaults.auto_merge_min_age_s)),
+        notify_settled_channel=raw.get("notify_settled_channel", defaults.notify_settled_channel),
+        notify_settled_after_s=int(raw.get("notify_settled_after_s", defaults.notify_settled_after_s)),
+        notify_ntfy_url=raw.get("notify_ntfy_url", defaults.notify_ntfy_url),
+        notify_ntfy_topic=raw.get("notify_ntfy_topic", defaults.notify_ntfy_topic),
+        notify_slack_webhook_url=raw.get("notify_slack_webhook_url", defaults.notify_slack_webhook_url),
         cpu_per_task=int(resources.get("cpu_per_task", defaults.cpu_per_task)),
         mem_per_task_gb=int(resources.get("mem_per_task_gb", defaults.mem_per_task_gb)),
         host_reserved_cpu=int(resources.get("host_reserved_cpu", defaults.host_reserved_cpu)),
