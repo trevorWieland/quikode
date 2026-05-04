@@ -178,6 +178,20 @@ class Config(BaseModel):
             "bot accounts (e.g. chatgpt-codex-connector). Plain issueComments are always ignored."
         ),
     )
+    review_rounds_max: int = Field(
+        default=15,
+        ge=1,
+        le=100,
+        description=(
+            "Maximum review-response rounds before BLOCKING the task with a "
+            "'review rounds exhausted; manual merge/close needed' note. "
+            "Without this cap, codex-style reviewers can keep finding nits "
+            "indefinitely (R-0002 hit round 10 in one observed run with "
+            "$30+ in cycles). The cap is a safety net; the typical task "
+            "settles in 1-3 rounds. Set high since the cost is low — the "
+            "cap rarely fires, but when it does, it prevents runaway."
+        ),
+    )
     review_response_extra_slots: int = Field(
         default=1,
         ge=0,
@@ -595,6 +609,7 @@ def load_config(root: Path | None = None) -> Config:
         review_response_extra_slots=int(
             raw.get("review_response_extra_slots", defaults.review_response_extra_slots)
         ),
+        review_rounds_max=int(raw.get("review_rounds_max", defaults.review_rounds_max)),
         fixup_max_rounds=int(raw.get("fixup_max_rounds", defaults.fixup_max_rounds)),
         preempt_at_subtask_boundary=bool(
             raw.get("preempt_at_subtask_boundary", defaults.preempt_at_subtask_boundary)

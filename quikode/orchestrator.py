@@ -767,7 +767,37 @@ class Orchestrator:
             # not on whether work was found.
             self.store.set_field(task_id, last_review_poll_ts=now)
 
-            # 4. Schedule response if work found AND slack available.
+            # 4. Cap on review rounds: codex-style reviewers can keep
+            # finding nits indefinitely. cfg.review_rounds_max BLOCKs
+            # the task once the count is exceeded so an operator can
+            # decide whether to merge or close. Cap fires before the
+            # round-N+1 dispatch.
+            current_round = int(task_row.get("review_round") or 0)
+            if to_address and current_round >= self.cfg.review_rounds_max:
+                log.warning(
+                    "task %s: review_rounds_max (%d) exhausted with %d unresolved thread(s); "
+                    "BLOCKING for manual merge/close",
+                    task_id,
+                    self.cfg.review_rounds_max,
+                    len(to_address),
+                )
+                self.store.transition(
+                    task_id,
+                    State.BLOCKED,
+                    note=(
+                        f"review_rounds_max ({self.cfg.review_rounds_max}) exhausted; "
+                        f"{len(to_address)} thread(s) still unresolved. "
+                        "Manual merge or close required."
+                    ),
+                    last_error=(
+                        f"review_rounds_max={self.cfg.review_rounds_max} exhausted; "
+                        f"{len(to_address)} unresolved threads remaining"
+                    ),
+                )
+                self.store.set_field(task_id, last_review_poll_ts=now)
+                continue
+
+            # 5. Schedule response if work found AND slack available.
             # Reviews are gated on `max_parallel + review_response_extra_slots`
             # rather than just `max_parallel` so response cycles can dispatch
             # even when the regular-worker pool is saturated. Without this,

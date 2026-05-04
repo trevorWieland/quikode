@@ -423,6 +423,56 @@ def test_poll_does_not_dispatch_ci_fix_when_no_failed_checks(tmp_path):
     o.store.conn.close()
 
 
+def test_poll_blocks_when_review_rounds_max_exhausted(tmp_path):
+    """When `review_round >= cfg.review_rounds_max` AND there are still
+    unresolved threads, the watcher BLOCKs the task with a clear
+    'manual merge/close' message instead of dispatching round N+1.
+    Prevents codex-find-everything-forever runaway."""
+    o = _orch(tmp_path, max_parallel=3, review_rounds_max=5)
+    _seed_awaiting_merge(o)
+    # Bump review_round to the cap.
+    o.store.set_field("R-001", review_round=5)
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    rrf: set[str] = set()
+
+    thread = _make_thread()
+    with (
+        patch("quikode.orchestrator.github.poll_pr", return_value=_open_pr_status()),
+        patch("quikode.orchestrator.github_graphql.get_review_threads", return_value=[thread]),
+    ):
+        o._poll_review_threads(pool, futures, rrf)
+
+    pool.submit.assert_not_called()
+    row = o.store.get("R-001")
+    assert row["state"] == State.BLOCKED.value
+    assert "review_rounds_max" in (row["last_error"] or "")
+    o.store.conn.close()
+
+
+def test_poll_dispatches_round_when_under_review_rounds_max(tmp_path):
+    """Under the cap, normal dispatch happens. Verifies the cap doesn't
+    fire prematurely."""
+    o = _orch(tmp_path, max_parallel=3, review_rounds_max=15)
+    _seed_awaiting_merge(o)
+    o.store.set_field("R-001", review_round=14)  # one below cap
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    rrf: set[str] = set()
+
+    thread = _make_thread()
+    with (
+        patch("quikode.orchestrator.github.poll_pr", return_value=_open_pr_status()),
+        patch("quikode.orchestrator.github_graphql.get_review_threads", return_value=[thread]),
+    ):
+        o._poll_review_threads(pool, futures, rrf)
+
+    pool.submit.assert_called_once()
+    row = o.store.get("R-001")
+    assert row["state"] == State.RESPONDING_TO_REVIEW.value
+    o.store.conn.close()
+
+
 def test_poll_skips_when_pool_full(tmp_path):
     """Unresolved threads but pool is at the hard cap (max_parallel +
     review_response_extra_slots) → no submit, log only. Re-tries next tick
