@@ -966,6 +966,12 @@ class TaskWorker:
             rebase_outcome = self._handle_parent_rebase_if_needed()
             if rebase_outcome:
                 return rebase_outcome
+            # v3 own-branch divergence: detect upstream commits to our branch
+            # (operator hand-edit, parallel workspace, force-push). Pure-FF
+            # auto-recovers via reset --hard; force-push BLOCKS cleanly.
+            divergence_outcome = self._handle_branch_divergence_if_needed()
+            if divergence_outcome:
+                return divergence_outcome
             # Resume path: a subtask already marked DONE in the store stays
             # done — don't re-run the doer/checker. Same for SKIPPED. This
             # makes `quikode resume <id>` a no-op for already-finished slices.
@@ -2149,6 +2155,128 @@ class TaskWorker:
         to detect parent-merged-and-deleted before calling `gh pr create`."""
         rc, out = self._git_in_workspace(["ls-remote", "--heads", self.cfg.pr_remote, branch])
         return rc == 0 and bool(out.strip())
+
+    def _handle_branch_divergence_if_needed(self) -> WorkerOutcome | None:
+        """Worker-side checkpoint: detect + recover from upstream commits on
+        the child's own branch (operator hand-edit, parallel quikode workspace,
+        GitHub web UI commit, etc.).
+
+        Three classes of upstream change, three actions:
+        - Pure FF (we're behind, no local commits ahead): `git reset --hard
+          origin/<branch>`. Worker continues from next pending subtask.
+        - Force-push (history rewritten, our base sha no longer reachable
+          from origin): BLOCK with a clear "manual recovery needed" note.
+        - Diverged but mergeable (both have new commits): NOT YET HANDLED
+          here — falls through to legacy push-fail path in `commit_subtask`.
+          Future improvement: `git pull --rebase` + conflict-resolver.
+
+        Best-effort: any failure in detection (network, git error) returns
+        None so downstream push surfaces it as before. This can never make
+        things worse than the legacy behavior.
+
+        Returns None on no-op or successful recovery; WorkerOutcome(BLOCKED)
+        on unrecoverable divergence (force-push only, today).
+        """
+        row = self._row()
+        branch = row.get("branch")
+        if not branch or self.handle is None:
+            return None
+        # Skip on review-response cycles where the doer pushes 4-5 mini-commits
+        # in a 5-min window — polling fetch every subtask boundary wastes time.
+        # The pre-push divergence check still catches non-FF in those cases.
+        # Heuristic: if any subtask has kind starting with 'fixup-review' AND
+        # is currently in DOING/CHECKING/TRIAGING, we're in a fast cycle.
+        active_fixup_review = self.store.conn.execute(
+            "SELECT 1 FROM subtasks WHERE task_id = ? AND kind LIKE 'fixup-review%' "
+            "AND state IN ('doing','checking','triaging') LIMIT 1",
+            (self.node.id,),
+        ).fetchone()
+        if active_fixup_review:
+            return None
+
+        # 1. fetch origin/<branch> (just our branch — no full origin fetch).
+        rc_fetch, _out = self._git_in_workspace(["fetch", self.cfg.pr_remote, branch])
+        if rc_fetch != 0:
+            # Network blip or non-existent remote (haven't pushed yet) — not
+            # a divergence, just nothing to compare against. Skip.
+            return None
+
+        # 2. Compare HEAD vs origin/<branch>.
+        rc_b, out_b = self._git_in_workspace(
+            ["rev-list", "--count", "--left-right", f"HEAD...{self.cfg.pr_remote}/{branch}"]
+        )
+        if rc_b != 0:
+            return None
+        # `--left-right` returns "<ahead>\t<behind>" — local ahead vs remote.
+        try:
+            parts = out_b.strip().splitlines()[-1].split()
+            ahead = int(parts[0]) if len(parts) >= 1 else 0
+            behind = int(parts[1]) if len(parts) >= 2 else 0
+        except (ValueError, IndexError):
+            return None
+
+        if behind == 0:
+            return None  # remote has nothing new — common case, fast path
+
+        # We're behind. Determine if it's safe to fast-forward.
+        if ahead == 0:
+            # Pure FF — operator pushed commits, we have no local-only work.
+            # `git reset --hard origin/<branch>` brings us in line.
+            log.info(
+                "task %s: detected upstream FF on %s (behind=%d). "
+                "Resetting --hard to origin/%s.",
+                self.node.id,
+                branch,
+                behind,
+                branch,
+            )
+            rc_r, _ = self._git_in_workspace(["reset", "--hard", f"{self.cfg.pr_remote}/{branch}"])
+            if rc_r != 0:
+                self.store.transition(
+                    self.node.id,
+                    State.BLOCKED,
+                    note=f"upstream FF detected on {branch} but `git reset --hard` failed",
+                )
+                return WorkerOutcome(State.BLOCKED, "upstream FF reset failed")
+            return None
+
+        # ahead > 0 AND behind > 0 — diverged. Check force-push.
+        base_ref_sha = row.get("base_ref_sha") or ""
+        if base_ref_sha:
+            rc_anc, _ = self._git_in_workspace(
+                ["merge-base", "--is-ancestor", base_ref_sha, f"{self.cfg.pr_remote}/{branch}"]
+            )
+            if rc_anc != 0:
+                # Our recorded base sha is no longer reachable from origin —
+                # a force-push rewrote history. Cannot safely auto-recover.
+                msg = (
+                    f"branch {branch} was force-pushed (history rewritten); "
+                    f"the work in this container does not match what's on the remote. "
+                    f"Use `quikode unblock {self.node.id}` to inspect, then "
+                    f"`quikode retry {self.node.id}` to start fresh."
+                )
+                log.error("task %s: %s", self.node.id, msg)
+                self.store.transition(
+                    self.node.id,
+                    State.BLOCKED,
+                    note=msg[:300],
+                    last_error=msg[:1000],
+                )
+                return WorkerOutcome(State.BLOCKED, "force-push detected on branch")
+
+        # Diverged but not force-pushed. Falls through to the legacy
+        # push-fail path in `commit_subtask`, which today retries once and
+        # then BLOCKs. Tracked separately for a `pull --rebase` upgrade.
+        log.warning(
+            "task %s: branch %s diverged (ahead=%d, behind=%d) but force-push "
+            "check passed; falling through to legacy push-fail handling. "
+            "Future: pull --rebase + conflict-resolver.",
+            self.node.id,
+            branch,
+            ahead,
+            behind,
+        )
+        return None
 
     def _handle_parent_rebase_if_needed(self) -> WorkerOutcome | None:
         """Worker-side checkpoint: if the orchestrator set
