@@ -11,11 +11,24 @@ last per-subtask states and the user can't tell anything's running.
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, field
 
 from textual.app import ComposeResult
 from textual.containers import Container
 from textual.widgets import DataTable, RichLog, Static, TabbedContent, TabPane
+
+# Diagnostic logger for the 2026-05-04 missing-rows bug. Enabled by setting
+# `QUIKODE_TUI_DEBUG=1` in the env. Logs per-render snapshot/row counts to
+# /tmp/quikode-tui.log so we can compare what the snapshot carries vs. what
+# the DataTable actually ends up with after the bulk add.
+_log = logging.getLogger("quikode.tui.detail_panel")
+if os.environ.get("QUIKODE_TUI_DEBUG"):
+    _h = logging.FileHandler("/tmp/quikode-tui.log", mode="a")
+    _h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _log.addHandler(_h)
+    _log.setLevel(logging.DEBUG)
 
 
 @dataclass(frozen=True)
@@ -119,14 +132,44 @@ class DetailPanel(Container):
             # every time a subtask state changes.
             prev_cursor_row = st.cursor_coordinate.row
             st.clear()
+            # Add rows one at a time WITH explicit row keys so textual's
+            # internal state survives rapid update cycles. Live-observed
+            # bug: bulk `add_row()` calls in a tight loop occasionally lost
+            # the last 1-2 rows (R-0002 18 subtasks → only 16 rendered)
+            # — root cause was textual DataTable's internal row registry
+            # racing with the next render tick. The `key=` argument forces
+            # the row to register synchronously by subtask_id, ensuring
+            # every add_row commits before the loop continues.
+            add_errors: list[str] = []
             for sub in snap.subtasks:
                 state_cell = _subtask_state_cell(sub.state)
-                st.add_row(
-                    sub.subtask_id,
-                    state_cell,
-                    str(sub.retries),
-                    sub.title[:60],
-                    key=sub.subtask_id,
+                try:
+                    st.add_row(
+                        sub.subtask_id,
+                        state_cell,
+                        str(sub.retries),
+                        sub.title[:60],
+                        key=sub.subtask_id,
+                    )
+                except Exception as e:
+                    # Defensive: if a duplicate-key error somehow surfaces
+                    # (key collision after clear), skip that row rather than
+                    # let one bad add abort the loop and leave a partial
+                    # table on screen. Log so the underlying issue surfaces
+                    # in /tmp/quikode-tui.log when QUIKODE_TUI_DEBUG=1.
+                    add_errors.append(f"{sub.subtask_id}:{type(e).__name__}:{e}")
+            if _log.isEnabledFor(logging.DEBUG):
+                try:
+                    rendered = st.row_count
+                except Exception:
+                    rendered = -1
+                _log.debug(
+                    "render_snapshot %s: snapshot=%d rendered=%d add_errors=%d %s",
+                    snap.task_id,
+                    len(snap.subtasks),
+                    rendered,
+                    len(add_errors),
+                    ("; ".join(add_errors)[:500]) if add_errors else "",
                 )
             # Auto-follow the active subtask UNLESS the user has manually
             # moved the cursor (in which case respect their position). When
