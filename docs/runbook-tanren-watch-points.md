@@ -69,21 +69,28 @@ tanren's repo policy is squash-merge with `--delete-branch`. This means:
 
 Don't change tanren's merge policy without thinking about both effects.
 
-## R-0001 history
+## R-0001 / R-0002 history
 
-R-0001 is the canonical first-real-task validation; revisions were
-in flight as of 2026-05-03. The PR number has shifted across attempts —
-**do not assume any specific number is current.** **Future agents should
-NOT re-attempt R-0001 from scratch.** Check first:
+R-0001 was the canonical first-real-task validation and merged into
+tanren `main`. **Future agents must not re-attempt R-0001 from
+scratch.**
+
+R-0002 (Create an organization) is the canonical review-loop /
+fixup-decomposition validation handle as of 2026-05-04. PR #143 has
+been the primary handle but the PR number can shift after auto-close
++ recreation. Always check current state:
 
 ```bash
-quikode show R-0001
-quikode subtasks R-0001
+quikode show R-0002
+quikode subtasks R-0002
+gh pr view <pr> --json state,mergeable,statusCheckRollup
 ```
 
-If R-0001 is in AWAITING_MERGE or has a fresh PR open, the right action
-is to review/merge — not retry. If it's BLOCKED, see
-`runbook-incident-response.md` "task BLOCKED" before resetting.
+If R-0002 is in AWAITING_MERGE with all CI green and threads resolved,
+the right action is review/merge (or rely on the settled-task ntfy
+ping). If it's BLOCKED with "review_rounds_max exceeded", codex has
+been finding nits forever — operator picks: merge as-is or abort with
+a reason.
 
 The DAG node count went 232 → 233 when F-0002 was added. tanren's
 roadmap will continue to grow; quikode seeds-on-demand from the DAG so
@@ -106,10 +113,12 @@ The fix is a "manual-probe runner" subagent — see `future-work.md`.
 
 tanren's `cargo build` is memory-hungry — peak ~3 GB per container.
 Plus rust-analyzer-style intermediate artifacts. With
-`mem_per_task_gb=12` (default), three parallel containers reserve 36 GB
-+ host headroom (`host_reserved_mem_gb=16`).
+`mem_per_task_gb=12` (default; tanren workspace runs at 12), five
+parallel containers reserve 60 GB + host headroom
+(`host_reserved_mem_gb=16`). On a 78 GB host that's the comfortable
+ceiling; SQLite contention rises non-linearly past ~7 in any case.
 
-Don't push `--max-parallel` past 3 unless you've checked headroom:
+Don't push `--max-parallel` past 7 unless you've checked headroom:
 
 ```bash
 quikode resources             # shows computed cap + host actuals
@@ -178,15 +187,25 @@ advancing — don't skip phases.
 - **When to advance:** a milestone's worth of independent tasks lands
   clean.
 
-### Phase 3 — Stacked diffs (`stacking_strategy = "within-milestone"`)
+### Phase 3 — Stacked diffs + parallel-5 + notifications (current)
 
-- **Scope:** dependent R-* tasks within a milestone; `--max-parallel 3`.
-- **Config change:** `.quikode/config.toml` `[stacking] strategy = "within-milestone"`.
+- **Scope:** dependent R-* tasks within a milestone; `--max-parallel 5`.
+- **Config:** `[stacking] strategy = "within-milestone"`,
+  `notify_settled_channel = "ntfy"`,
+  `preempt_at_subtask_boundary = true` (optional),
+  `review_rounds_max = 15`.
+- **Command:** `quikode daemon start --max-parallel 5 --retry-failed`.
 - **What to watch:** `--onto` rebase semantics on real tanren diffs,
-  conflict_resolver agent cost (~$0.50-1.00/call on real BDD), Bug 6+7
-  paths firing correctly when parents merge mid-flight.
-- **Success:** 3-5 stacked tasks land with auto-rebases all going clean.
-- **When to advance:** a fully-stacked milestone lands without aborts.
+  conflict_resolver agent cost (~$0.50-1.00/call on real BDD),
+  mid-flight parent-merge handling firing at 5 worker checkpoints,
+  settled-task ntfy delivering to phone, fixup decomposition cost
+  (planner+doer+commit per slice instead of monolithic doer).
+- **Success:** 5 stacked tasks land in parallel with auto-rebases
+  clean and review-response cycle ending in green CI + resolved
+  threads.
+- **When to advance:** a fully-stacked milestone lands without aborts
+  AND CI-fail-after-AWAITING_MERGE recovery has fired at least once
+  cleanly.
 
 ### Phase 4 — Auto-merge enabled (full autonomy)
 
@@ -199,20 +218,23 @@ advancing — don't skip phases.
   (zero human merge clicks).
 - **When to advance:** 24h walk-away holds clean.
 
-### Phase 5 — Scale up parallelism (`--max-parallel 8-12`)
+### Phase 5 — Scale up parallelism (`--max-parallel 7+`)
 
 - **Scope:** same as Phase 4 + scaled parallelism.
 - **Resource math:** each tanren task uses ~3GB RAM peak + ~2 effective
-  cores. With 80GB host (current) and 24 cores, the ceiling is
-  min((80-8 reserve) / 3, 24/2) ≈ 10-12 parallel. With 256GB (max
-  WSL), it's 24/2 = 12 (still CPU-bound). Set `cfg.max_parallel_auto = true`
-  to compute headroom dynamically, OR override with `--max-parallel 10`.
+  cores. With 78GB host (current) and 24 cores, the memory ceiling is
+  min((78-16 reserve) / 12, 24/2) ≈ 5 with `mem_per_task_gb=12`, or
+  ~14 if dropped to `mem_per_task_gb=4`. Going past parallel-7 also
+  requires the per-task SQLite connection refactor (see
+  `future-work.md` "Per-task SQLite connection") — single shared
+  connection becomes the bottleneck around then.
 - **Config change:** `[resources] max_parallel_auto = true` OR
-  `quikode daemon start --max-parallel 10 --retry-failed`.
+  `quikode daemon start --max-parallel 7 --retry-failed`.
 - **What to watch:** docker storage pressure (each container is ~1GB
   layer), sccache contention (warm via `quikode warm-cache` first to
   avoid 10× cold-cargo penalty), agent CLI rate limits become real
-  with 10× concurrency.
-- **Success:** 8-12 parallel tasks land with no host-resource
-  saturation alerts.
+  with 7× concurrency, SQLite `_tx_lock` p99 latency rising past
+  ~50ms.
+- **Success:** 7+ parallel tasks land with no host-resource
+  saturation alerts and no SQLite lock starvation.
 - **When to advance:** this is steady-state for tanren workflow.

@@ -131,17 +131,40 @@ manually.
 
 ## Symptom: stuck in RESPONDING_TO_REVIEW
 
-The agent is mid-fixup. The loop is unbounded by design — humans drive
-cadence. `quikode tail <id>` to peek at what the agent is doing. If
-truly stuck (agent CLI hung):
+The agent is mid-fixup. There are two failure modes worth distinguishing:
+
+**Stalled future (no agent activity):** The orchestrator's
+`_check_stalls` watches for `responding_to_review` tasks with zero
+agent_call rows in the last `cfg.stall_warn_seconds` (default 1800s).
+On detection it force-cancels the future and resets the task to
+AWAITING_MERGE so the watcher can re-dispatch on next tick. This means
+"stuck for 30+ min with no agent activity" is *self-recovering* — wait
+a tick rather than reaching for `abort`. To check:
 
 ```bash
-quikode abort <id>            # tear down container; mark ABORTED
+sqlite3 .quikode/quikode.db \
+  "SELECT phase, ts FROM agent_calls WHERE task_id = '<id>' ORDER BY ts DESC LIMIT 5;"
+```
+
+If the most recent row is fresh, the agent is mid-call (just slow).
+If it's older than 30 min, the stall detector should fire any tick
+now.
+
+**review_rounds_max hit:** `cfg.review_rounds_max` (default 15) caps
+the fixup-review cycle. When exceeded, the task BLOCKs with
+"manual merge/close required" — codex has been finding nits forever
+without converging. Operator decides: merge as-is via the GitHub UI,
+or `quikode abort <id> --reason "codex churn"` and address manually.
+
+**Genuinely hung agent CLI:**
+
+```bash
+quikode abort <id>            # per-task: kills only qk-<task-slug>-* containers
 quikode retry <id>            # back to PENDING for a fresh attempt
 ```
 
-A stuck agent CLI is usually visible in `quikode show <id>` as no new
-agent_calls rows for many minutes against a still-active state.
+`quikode abort` is workspace-safe — it matches container names by the
+`qk-<task-slug>-*` prefix and won't touch other in-flight workers.
 
 ## Symptom: subtask retrying without convergence
 
@@ -232,6 +255,55 @@ If a known cost looks wrong:
 1. Check `agent_calls.cost_usd` directly: `sqlite3 .quikode/quikode.db 'select task_id, phase, cost_usd from agent_calls order by ts desc limit 20'`.
 2. ccusage failures fall through to `None`; the column is missing for that call. The total in `quikode briefing` is the sum of non-NULL `cost_usd` rows.
 3. claude-code's stream-json envelope is preferred over ccusage when present (see the docstring in `ccusage.py`).
+4. Single-call costs > $50 are clamped to 0 with a warning log (sanity
+   cap added 2026-05-04 after a parser misattribution issued a $292
+   reading on an 86-second call). If your real call legitimately
+   exceeds $50, raise `_MAX_PER_CALL_COST_USD` — but do verify against
+   `ccusage daily` first.
+
+## Symptom: task in AWAITING_MERGE while CI is failing
+
+GitHub CI can flip to FAILURE after the worker has handed off to
+AWAITING_MERGE — typical sequence: response cycle pushes a fixup
+commit, worker exits, GitHub re-runs CI, CI fails. The daemon's
+review-watcher (`_poll_review_threads`) detects this and dispatches
+`worker.run_ci_fix_response` via `_schedule_ci_fix_response`.
+
+If `quikode show <id>` shows AWAITING_MERGE for >5 min while
+`gh pr checks <pr>` shows failures, the dispatch should fire on next
+review-watcher tick (default 60s). If it doesn't:
+
+```bash
+quikode tail <id>                          # last events
+sqlite3 .quikode/quikode.db \
+  "SELECT * FROM state_log WHERE task_id = '<id>' ORDER BY ts DESC LIMIT 5;"
+```
+
+A task that doesn't transition to RESPONDING_TO_REVIEW within ~3
+review-watcher cycles after CI fail is a bug — capture log + state.
+
+## Symptom: branch divergence (operator hand-pushed to the same branch)
+
+When the operator (or a parallel quikode workspace) pushes commits to
+the child's branch mid-task, the worker's eventual `git push` fails
+non-fast-forward and budget exhaustion BLOCKs the task.
+
+Mitigation already in place: subtask-boundary detection via
+`worker.py:_handle_branch_divergence_if_needed`. Pure FF →
+`reset --hard`. Force-push that drops the worker's commits → BLOCK
+(operator did this on purpose; don't fight it). Diverged →
+`git rebase origin/<branch>` with conflict-resolver fallback.
+
+If you find a task BLOCKED with "branch diverged force-push" in the
+state-log note, decide whose work to keep:
+
+```bash
+# Inspect what's on the remote vs the worker's worktree
+git -C .quikode/worktrees/<id> log --all --oneline -20
+git -C .quikode/worktrees/<id> diff origin/<branch> HEAD
+```
+
+Pick the side, force-push if needed, then `quikode resume <id>`.
 
 ## Symptom: task FAILED (vs BLOCKED)
 

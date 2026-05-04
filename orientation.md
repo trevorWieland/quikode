@@ -26,7 +26,7 @@ All `quikode <subcommand>` calls below assume that's your cwd.
 # 1. Confirm environment health
 cd /home/trevor/github/quikode
 source .venv/bin/activate
-python -m pytest tests/ -q       # 626 tests, <2s — must pass clean
+python -m pytest tests/ -q       # 697 tests, <45s — must pass clean
 ruff check quikode/ tests/       # must be clean
 
 # 2. Confirm host + agent CLIs are healthy
@@ -34,33 +34,41 @@ cd /home/trevor/github/quikode-runs/tanren
 quikode doctor                   # docker, gh auth, claude/codex/opencode
 quikode resources                # computed cap + host actuals
 
-# 3. Snapshot the workspace state before kicking off
-quikode briefing                 # in-flight, awaiting, blocked, recent merges, cost
-quikode show R-0002              # confirm state before retrying
+# 3. Snapshot the workspace state + verify notify delivery
+quikode briefing                 # in-flight, awaiting, blocked, merges, cost
+quikode notify-test              # verify ntfy.sh push reaches your phone
 
-# 4. Phase 1 single-task run for R-0002
-quikode daemon start --only R-0002 --max-parallel 1 --retry-failed
+# 4. Start the daemon (Phase 3 / parallel-5 with stacking + notifications)
+quikode daemon start --max-parallel 5 --retry-failed
 
-# 5. Monitor in another terminal
+# 5. Monitor (in another terminal)
 quikode tui                      # mission-control; press `g` for DAG viewer
 # or non-interactive
 quikode watch --active
-quikode tail R-0002
+quikode tail <task-id>
 ```
 
 For the rollout phasing (when to scale parallelism, enable stacking,
 turn on auto-merge), see `docs/runbook-tanren-watch-points.md` →
-"Tanren rollout phases". Start at Phase 1.
+"Tanren rollout phases". The tanren workspace is currently at Phase 3
+(stacking on, parallel-5).
 
-## Current state (as of 2026-05-03)
+## Current state (as of 2026-05-04)
 
-- v3 stacked-diffs + review loop + auto-merge all shipped + validated.
-- 626 pytest tests pass, ruff lint+format clean.
-- 3-run fixture E2E completed cleanly (4/4 each, no manual
-  intervention beyond review/merge).
-- Tanren R-0001 merged into main.
-- Tanren rollout phases defined; start at Phase 1 (single-task,
-  `--max-parallel 1`, stacking off).
+- All v3 base features (stacked diffs, review loop, auto-merge) shipped.
+- v3 driven-run hardening landed in 2026-05-04 session: fixup
+  decomposition (final-check / CI / review), priority pick,
+  subtask-boundary yield, branch-divergence handling, stalled-future
+  recovery, settled-task notifications (ntfy + slack), CI-failure-
+  after-AWAITING_MERGE handling, review_rounds_max cap, per-task abort,
+  idempotent _open_pr, ccusage cost sanity cap. See `docs/lessons-
+  learned.md` "v3 driven-run findings (2026-05-04)" for the full list.
+- 697 pytest tests pass, ruff lint+format clean.
+- Tanren workspace runs at `--max-parallel 5` + `stacking_strategy =
+  "within-milestone"` + `notify_settled_channel = "ntfy"`. R-0002 is
+  the canonical review-loop validation handle (PR #143).
+- Resource budget on the current host: 5-7 in-flight at most;
+  cpu_per_task = 2, mem_per_task_gb = 12.
 
 ## Critical knowledge
 
@@ -98,9 +106,16 @@ re-discover them. Full context in `CLAUDE.md`.
   sibling-conflict paths only fire under parallelism.
 - **Use the daemon, not bare `quikode run`** for any real tanren work
   — the supervisor restarts on crash with backoff.
-- **Don't push `--max-parallel` past 3 without checking
+- **Don't push `--max-parallel` past 7 without checking
   `quikode resources`** — tanren `cargo build` peaks at ~3GB per
-  container, so headroom matters.
+  container, so headroom matters. The current ceiling is ~5-7 on
+  a 78GB host; SQLite contention also rises non-linearly past 7.
+- **`cfg.notify_settled_channel = "ntfy"`** is configured for the
+  tanren workspace. Don't disable without checking with the user —
+  they rely on the phone push for review-ready signals.
+- **`cfg.review_rounds_max = 15`** caps codex find-everything-forever
+  cycles. A task hitting this BLOCKs with "manual merge/close
+  required" — that's the operator's signal to make a final call.
 
 ## Where to look
 
@@ -120,7 +135,7 @@ re-discover them. Full context in `CLAUDE.md`.
   = true` is explicitly set, and only at Phase 4+).
 - Don't break the running orchestrator — your code edits affect the
   *next* run, not the current one.
-- 626 tests + ruff strict — run them after any `quikode/` change.
+- 697 tests + ruff strict — run them after any `quikode/` change.
 - No in-function imports (PLC0415 enforced). Every `import` lives at
   module top.
 - Use Pydantic for agent-emitted shapes; TypedDict for SQLite rows.

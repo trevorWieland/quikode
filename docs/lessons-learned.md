@@ -237,3 +237,128 @@ Schedule is `[60, 300, 1800]` (cap), and resets to entry 0 only if the
 child ran ≥ `daemon_min_run_for_backoff_reset_s=300s` before crashing.
 Crashes within 5 min of spawn keep climbing the schedule. Test:
 `tests/test_daemon_supervisor.py`.
+
+## v3 driven-run findings (2026-05-04)
+
+Live observations from a ~10-hour driven run that started Phase 1 and
+walked through Phase 3 (max-parallel=5 + within-milestone stacking +
+ntfy notifications). Items below shipped during the same session as
+the bug surfaced; details + commit refs in `docs/future-work.md`.
+
+### Lefthook v2 dropped `--files` (singular `--file` + `--files-from-stdin`)
+
+The pre-commit gate's `lefthook run pre-commit --files <args>` was
+rejected by lefthook v2 ("flag provided but not defined: -files").
+Cost: every per-subtask commit failed for hours on R-0002 before we
+caught it. Fix: `--files-from-stdin` with the file list piped via stdin.
+See `worker.py:_pre_commit_gate`.
+
+The dev image initially didn't have lefthook at all — the only reason
+it worked once was because the doer hand-installed it inside the
+container. Adding `npm install -g lefthook` to `docker/Dockerfile`
+made it baked-in. Same for `python3` (apt-get install) for tanren's
+`scripts/roadmap_check.py`.
+
+### Daemon SIGTERM forwarding is not enough — need failsafe SIGKILL
+
+`quikode daemon stop` SIGTERMs the supervisor, which forwards SIGTERM
+to the inner orchestrator, then `child.wait()`s. If the inner ignores
+SIGTERM (e.g. blocked on a long subprocess.run), the supervisor hangs;
+`stop_daemon` SIGKILLs the supervisor after 30s, orphaning the inner.
+The orphaned inner keeps running, then `cleanup_all_quikode` from a
+fresh daemon kills its containers, sending it into a "container not
+found" 1-second-per-attempt runaway. Fix: failsafe SIGKILL via
+`threading.Timer` in the supervisor's signal handler. See
+`daemon.py:_schedule_failsafe_kill`.
+
+### `quikode abort` was workspace-wide, not per-task
+
+The legacy abort called `cleanup_all_quikode(cfg)` which killed every
+qk-* container in the workspace. Aborting one stuck task took down 4
+unrelated in-flight workers. Fix: per-task teardown using a
+`qk-<task-slug>-*` prefix match. See `cli.py:abort`.
+
+### Pool-slot leaks in review-response futures
+
+Multiple times during the session, a `responding_to_review` future
+was submitted but silently failed before any agent_call fired —
+typically because `_provision_container` raised inside the worker.
+The slot stayed reserved indefinitely, eventually starving real work.
+Diagnostic: heartbeat showed `responding_to_review_futures=2` while
+only one task was visibly in that state. Fix: stalled-future detector
+in `_check_stalls` watches for `>stall_warn_seconds` of zero
+agent_call activity on a `responding_to_review` task and force-cancels
++ resets to AWAITING_MERGE for re-dispatch.
+
+### Local attempt counter ≠ DB retries — progress-check cadence broke
+
+`_run_subtask_set`'s local `attempt = 0` counter resets on every
+worker resume, but `subtasks.retries` is cumulative. Progress-check
+cadence (fires at `attempt == cfg.subtask_progress_check_after`,
+then every N) used the local counter — so a long-stuck subtask that
+spanned 3 daemon restarts only ever fired the check at attempt=6
+each cycle, never at 9/12/15+. Symptom: R-0008 S-09 had retries=17
+and only 2 progress_check rows. Fix: seed `attempt = subtasks.retries`
+on resume.
+
+### Codex finds nits forever — review_rounds_max cap
+
+R-0002 hit fixup-review round 10 with codex still finding 1 new nit
+per pass ($30+ in cycles). Without a cap there's no termination
+condition besides operator intervention. Fix: `cfg.review_rounds_max`
+(default 15) BLOCKs the task with "manual merge/close required" when
+the count is exceeded.
+
+### CI failure after AWAITING_MERGE was unhandled
+
+GitHub CI can flip to FAILURE *after* the worker has handed off to
+AWAITING_MERGE — typical sequence: response cycle pushes a fixup
+commit, worker exits, GitHub re-runs CI, CI fails. The pre-v3 worker
+caught CI fail in `_poll_pr_loop`; v3 needs the daemon to dispatch a
+CI-fix cycle from `_poll_review_threads`. Without this, the task
+sits at AWAITING_MERGE forever. Fix: `_schedule_ci_fix_response` +
+`worker.run_ci_fix_response`.
+
+### Branch divergence wasn't detected at subtask boundaries
+
+If anything pushed to the child's own branch mid-task (operator
+hand-edit, parallel quikode workspace, GitHub web UI commit), the
+worker only found out at its final `git push` — non-fast-forward
+fail with one retry budget, then BLOCKED. Now: subtask-boundary
+detection via `git fetch + rev-list --left-right`. Pure FF →
+`reset --hard`. Force-push → BLOCK. Diverged → `git rebase
+origin/<branch>` with conflict-resolver fallback. See
+`worker.py:_handle_branch_divergence_if_needed`.
+
+### `gh pr create` fails on re-entry — `_open_pr` must be idempotent
+
+After a daemon restart in the post-PR-open phase, the worker re-enters
+`_open_pr` and `gh pr create` fails non-recoverably with "PR already
+exists for branch". Fix: check for existing pr_number/pr_url at the
+top of `_open_pr` and skip re-creation. The same row's PR is reused.
+
+### ccusage occasionally over-attributes (single-call cost > $50)
+
+ccusage's session-aggregate sometimes returns cumulative-since-install
+instead of a per-call delta when the snapshot baseline is missing or
+stale. Symptom: a single 86s subtask_doer reported $292.89 while real
+total spend was ~$15. Fix: `_MAX_PER_CALL_COST_USD = 50` clamp in
+`snapshot_delta` zeroes outliers with a warning log.
+
+### Codex review threads are never plain text — pre-formatted markdown
+
+The `last_comment_body` field on a codex thread is heavily formatted
+markdown (badges, sub tags, code blocks). Truncating it to 200 chars
+for the fixup-planner block sometimes cut mid-tag, producing malformed
+prompt context. Workaround: strip the leading badge prefix before
+truncating. (Not yet implemented; tracked.)
+
+### Settled-task notification: ntfy is the right primary channel
+
+iOS/Android push apps deliver reliably even when phone is locked. No
+auth, free, ~30s setup (pip install + topic-name registration in app).
+ntfy uses `Tags` header (e.g. `white_check_mark`) for emoji because
+urllib's HTTP headers are latin-1 encoded — raw ✅ in the Title raises
+UnicodeEncodeError. Slack webhook works as a redundant fallback for
+operators who'd rather see review-ready in their workspace. See
+`quikode/notify.py`.

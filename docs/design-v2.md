@@ -4,7 +4,7 @@
 > Current architecture lives in [`architecture.md`](architecture.md). Operational guidance is in
 > [`runbook-operations.md`](runbook-operations.md).
 
-All five phases landed 2026-05-02 (Phase 0, Resources, Phase A, Phase B, Phase C). The 76-test count cited below was the v2-completion baseline; the current suite is 581 tests (covers v3 work landed since).
+All five phases landed 2026-05-02 (Phase 0, Resources, Phase A, Phase B, Phase C). The 76-test count cited below was the v2-completion baseline; the current suite is 697 tests (covers v3 work + 2026-05-04 driven-run hardening).
 
 For the current shape of the system, see `architecture.md`. This doc is the design that drove v2.
 

@@ -2362,8 +2362,7 @@ class TaskWorker:
         # to replay our local commits on top of the upstream changes.
         # On conflict, fall back to the existing conflict-resolver agent.
         log.info(
-            "task %s: branch %s diverged (ahead=%d, behind=%d); attempting "
-            "auto-rebase onto origin/%s",
+            "task %s: branch %s diverged (ahead=%d, behind=%d); attempting auto-rebase onto origin/%s",
             self.node.id,
             branch,
             ahead,
@@ -2427,9 +2426,7 @@ class TaskWorker:
         # Force-push the rebased branch so the remote reflects the merge.
         # `--force-with-lease` is the safe form: refuses if remote was
         # advanced again between our fetch and our push.
-        rc_p, push_out = self._git_in_workspace(
-            ["push", "--force-with-lease", self.cfg.pr_remote, branch]
-        )
+        rc_p, push_out = self._git_in_workspace(["push", "--force-with-lease", self.cfg.pr_remote, branch])
         if rc_p != 0:
             log.warning(
                 "task %s: force-with-lease push after rebase failed: %s",

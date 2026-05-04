@@ -333,12 +333,20 @@ def test_snapshot_delta_clamps_outlier_cost_to_zero():
     to a fresh-baseline call. Sanity cap is $50; delta values above that
     are treated as parser noise and zeroed."""
     before = ccusage.CCUsageStats(
-        tokens_input=0, tokens_output=0, tokens_cached_read=0,
-        tokens_cached_creation=0, cost_usd=0.0, raw_json="",
+        tokens_input=0,
+        tokens_output=0,
+        tokens_cached_read=0,
+        tokens_cached_creation=0,
+        cost_usd=0.0,
+        raw_json="",
     )
     after = ccusage.CCUsageStats(
-        tokens_input=1000, tokens_output=500, tokens_cached_read=0,
-        tokens_cached_creation=0, cost_usd=292.89, raw_json="",
+        tokens_input=1000,
+        tokens_output=500,
+        tokens_cached_read=0,
+        tokens_cached_creation=0,
+        cost_usd=292.89,
+        raw_json="",
     )
     delta = ccusage.snapshot_delta("opencode", before, after)
     assert delta is not None
@@ -353,8 +361,12 @@ def test_snapshot_delta_no_baseline_clamps_outlier():
     Without a baseline we attribute everything to this call, so an
     accumulated session-total can land here too."""
     after = ccusage.CCUsageStats(
-        tokens_input=1000, tokens_output=500, tokens_cached_read=0,
-        tokens_cached_creation=0, cost_usd=999.99, raw_json="",
+        tokens_input=1000,
+        tokens_output=500,
+        tokens_cached_read=0,
+        tokens_cached_creation=0,
+        cost_usd=999.99,
+        raw_json="",
     )
     delta = ccusage.snapshot_delta("opencode", None, after)
     assert delta is not None
@@ -364,12 +376,20 @@ def test_snapshot_delta_no_baseline_clamps_outlier():
 def test_snapshot_delta_passes_through_under_cap():
     """Normal-sized costs are not affected by the cap."""
     before = ccusage.CCUsageStats(
-        tokens_input=0, tokens_output=0, tokens_cached_read=0,
-        tokens_cached_creation=0, cost_usd=1.20, raw_json="",
+        tokens_input=0,
+        tokens_output=0,
+        tokens_cached_read=0,
+        tokens_cached_creation=0,
+        cost_usd=1.20,
+        raw_json="",
     )
     after = ccusage.CCUsageStats(
-        tokens_input=100, tokens_output=50, tokens_cached_read=0,
-        tokens_cached_creation=0, cost_usd=2.50, raw_json="",
+        tokens_input=100,
+        tokens_output=50,
+        tokens_cached_read=0,
+        tokens_cached_creation=0,
+        cost_usd=2.50,
+        raw_json="",
     )
     delta = ccusage.snapshot_delta("claude", before, after)
     assert delta is not None

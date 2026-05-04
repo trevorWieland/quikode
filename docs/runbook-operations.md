@@ -32,12 +32,17 @@ Edit `.quikode/config.toml` to tune knobs. Defaults are in
 
 | Knob | Default | When to change |
 |---|---|---|
-| `max_parallel` | 3 | Lower if host can't handle parallel `cargo build` |
+| `max_parallel` | 3 | Lower if host can't handle parallel `cargo build`. Tanren today: 5. |
 | `max_parallel_auto` | false | `true` to compute from host headroom on `run` |
-| `cpu_per_task` / `mem_per_task_gb` | 4 / 12 | Tune to your hardware |
+| `cpu_per_task` / `mem_per_task_gb` | 4 / 12 | Tune to your hardware. Tanren: 2 / 12. |
 | `auto_merge_when_clean` | false | `true` for trusted workspaces (fixture; never tanren without review) |
-| `stacking_strategy` | "off" | "within-milestone" or "aggressive" once parallel runs are stable |
+| `stacking_strategy` | "off" | "within-milestone" or "aggressive" once parallel runs are stable. Tanren: "within-milestone". |
 | `subtask_hard_max_attempts` | 30 | Lower in cost-sensitive runs |
+| `notify_settled_channel` | "none" | "ntfy", "slack", or "both" once you want phone/Slack pings on review-ready tasks |
+| `notify_ntfy_topic` | (unset) | A unguessable random suffix; required if channel includes ntfy |
+| `notify_settled_after_s` | 1800 | How long AWAITING_MERGE must be quiet before pinging |
+| `review_rounds_max` | 15 | How many fixup-review cycles before BLOCK with "manual merge/close required" |
+| `preempt_at_subtask_boundary` | false | `true` lets long-running workers yield slot to higher-priority queued candidates |
 
 ## Starting a tanren run
 
@@ -51,8 +56,14 @@ quikode plan
 quikode briefing       # cost so far, blocked tasks, recent merges
 
 # Kick off the daemon supervisor in foreground
-quikode daemon start --max-parallel 3 --retry-failed
+quikode daemon start --max-parallel 5 --retry-failed
 ```
+
+Use `--max-parallel 1` only for the very first task in a fresh
+workspace where you want serialized observation. Real productivity
+starts at parallel-3 (sibling rebase + auto-rebase paths fire) and
+caps around parallel-7 on the current host (78GB RAM; SQLite
+contention non-linear past ~7).
 
 `--retry-failed` resets BLOCKED / FAILED / ABORTED tasks in scope to
 PENDING on startup, useful for "auto-retry overnight" loops.
@@ -160,6 +171,36 @@ See `orchestrator.py:_attempt_auto_merge` for the exact gating.
 
 `quikode tail <id>` tails a task log; `quikode logs <id>` prints its path.
 
+## Settled-task notifications
+
+When `cfg.notify_settled_channel` is set, the daemon's review-watcher
+pings you when a task has been in AWAITING_MERGE quietly for at least
+`cfg.notify_settled_after_s` (default 1800s). The notification fires
+once per task; the per-task `last_notified_settled_ts` column suppresses
+duplicates.
+
+Setup for ntfy.sh:
+
+```toml
+# .quikode/config.toml
+notify_settled_channel = "ntfy"
+notify_ntfy_topic = "quikode-<workspace>-<random-suffix>"   # subscribe in the ntfy app
+notify_settled_after_s = 1800                              # 30 min
+```
+
+Then:
+
+```bash
+# Verify reachability before depending on it for review-ready signals
+quikode notify-test
+```
+
+The `notify_ntfy_topic` is a public unguessable namespace — anyone
+who knows it can publish/subscribe. Treat it like a one-off shared
+secret. ntfy emoji are sent via the `Tags` header (e.g.
+`white_check_mark`), not the `Title`, since urllib HTTP headers are
+latin-1 encoded.
+
 ## Reviewing PRs
 
 The human's job in the loop:
@@ -209,6 +250,8 @@ orphan tasks via `Store.recover_orphan_tasks()`.
 | `quikode mark-merged <id ...>` | Manually mark already-complete tasks as MERGED so dependents unblock |
 | `quikode retry <id>` | Reset BLOCKED/FAILED/ABORTED → PENDING (cleans worktree). Worker re-plans from scratch. |
 | `quikode resume <id>` | Re-pend with `resume_from_existing_subtasks=1` — worker reuses the stored Plan + per-subtask state, picks up at the first non-DONE subtask. |
+| `quikode abort <id> [--reason ...]` | Per-task abort: kills only `qk-<task-slug>-*` containers, marks task ABORTED. Other in-flight workers untouched. |
+| `quikode notify-test` | Send a test ntfy/Slack push using the workspace's `notify_settled_*` config. Verify delivery before relying on phone pings. |
 
 `reset` vs `retry` vs `resume`:
 - `reset` — workspace-wide nuke

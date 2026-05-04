@@ -70,15 +70,15 @@ Notable command groups:
 DAG-aware scheduler running up to `max_parallel` workers in a
 `ThreadPoolExecutor`. Each tick:
 
-1. **Pick next ready task** (`_pick_next`) — topological order; respects stacking depth/breadth caps; emits `parent_pr_branch` for stacked children.
+1. **Pick next ready task** — `scheduler.collect_pick_candidates` + `scheduler.score_candidate`. Score = `stacked_boost(50) + unblock_boost(5×deps) − id_penalty`. Replaces the older topo-only picker; same DAG constraints (stacking depth/breadth caps, dependency satisfaction) but priorities high-fan-out / stacked candidates over leaf roots when slots free up.
 2. **Submit worker future** (`_run_one`).
-3. **Poll review threads** (`_poll_review_threads`) — every `cfg.review_poll_interval_s`, fetch `gh pr view --json statusCheckRollup,...` + `github_graphql.get_review_threads(repo, pr)` for every AWAITING_MERGE PR. Diff against `review_threads` table. New unresolved threads → `_schedule_review_response` → spawns RESPONDING_TO_REVIEW worker on the existing worktree/branch/PR.
+3. **Poll review threads** (`_poll_review_threads`) — every `cfg.review_poll_interval_s`, fetch `gh pr view --json statusCheckRollup,...` + `github_graphql.get_review_threads(repo, pr)` for every AWAITING_MERGE PR. Diff against `review_threads` table. New unresolved threads → `_schedule_review_response` → spawns RESPONDING_TO_REVIEW worker. CI flipped to FAILURE post-AWAITING_MERGE → `_schedule_ci_fix_response` → `worker.run_ci_fix_response`. Settled-task ping → `_maybe_notify_settled` (per-task, once, after `cfg.notify_settled_after_s` quiet).
 4. **Auto-merge** (`_attempt_auto_merge`) — opt-in via `cfg.auto_merge_when_clean`. Gates on PR OPEN+MERGEABLE+checks SUCCESS+threads resolved+age. Merges via `gh pr merge --squash --delete-branch`; sets `tasks.auto_merged=1`.
 5. **Schedule rebases for merged parents** (`_schedule_rebases_for_merged_parent`) — for each child of a just-merged parent, decide between:
    - Non-active child + child PR is CONFLICTING / base branch deleted → submit `_run_rebase_to_main_one` future.
    - Active child → set `tasks.needs_parent_rebase=1`. Worker checkpoints handle rebase inline.
 6. **Sample container stats** (`_sample_container_stats`) — `docker stats` snapshot every `cfg.container_stats_sample_seconds`, persisted to `container_stats`.
-7. **Stall-warn** (`_check_stalls`) — DOING tasks with quiet worktree mtime past `cfg.stall_warn_seconds`.
+7. **Stall-warn + stalled-future recovery** (`_check_stalls`) — DOING tasks with quiet worktree mtime past `cfg.stall_warn_seconds` log a warning. `responding_to_review` futures with zero agent_call activity for >`cfg.stall_warn_seconds` are force-cancelled and reset to AWAITING_MERGE for re-dispatch (closes pool-slot leak class).
 8. **Heartbeat** (`_write_heartbeat`) — JSON to `.quikode/orchestrator.heartbeat` so the supervisor + daemon-status see liveness.
 
 ### Daemon supervisor (`quikode/daemon.py`)
@@ -104,11 +104,14 @@ One per task. Drives the FSM through one full lifecycle:
   - doer → checker → triage cycle (with progress-check agent at intervals)
   - on PASS: `git commit` (running pre-commit hooks per slice) + `git push`
   - parent-merge checkpoint: read `tasks.needs_parent_rebase`, run inline rebase if set
-- `_final_check_loop()` — whole-spec checker after all subtasks pass
+  - branch-divergence checkpoint: `_handle_branch_divergence_if_needed` detects FF / force-push / diverged states each subtask boundary and acts accordingly
+  - opt-in slot yield: when `cfg.preempt_at_subtask_boundary=true` and a higher-priority candidate is queued, `_maybe_yield_at_boundary` surrenders the slot
+- `_final_check_loop()` — whole-spec checker after all subtasks pass; on fail, `_invoke_fixup_planner` decomposes the failure into 1-5 `kind='fixup-final'` mini-subtasks driven through the same per-slice loop. Bounded by `cfg.fixup_max_rounds` (default 3); falls back to legacy whole-spec doer if planner fails.
 - `_commit_push()` — final commit/push (no-op if all subtasks already pushed)
-- `_open_pr()` — `gh pr create` (early draft PR opens after S-01)
+- `_open_pr()` — idempotent `gh pr create` (skipped if `pr_number`/`pr_url` already set; early draft PR opens after S-01)
 - `_poll_pr_loop()` — gates on CI / mergeable / review state
-- `run_review_response()` — entered when daemon detects new review threads; reuses worktree/branch/PR
+- `run_review_response()` — entered when daemon detects new review threads. Uses fixup-planner decomposition (`kind='fixup-review'`) instead of monolithic doer call; bounded by `cfg.review_rounds_max` (default 15) before BLOCKing with "manual merge/close required". Resolve-thread is a deterministic GraphQL `resolveReviewThread` mutation, not an agent call.
+- `run_ci_fix_response()` — entered when daemon detects CI failure post-AWAITING_MERGE. Same fixup-decomposition pattern (`kind='fixup-ci'`), pushes to existing branch, returns to AWAITING_MERGE.
 - `run_rebase_to_main()` — entered for stacked children when parent merges; uses `git rebase --onto <parent_sha>`, recreates PR if base branch was deleted
 
 Worker checkpoints for `tasks.needs_parent_rebase`: 5 sites read the
@@ -184,7 +187,8 @@ DOING_SUBTASK[i] ↔ CHECKING_SUBTASK[i] ↔ TRIAGING_SUBTASK[i]
        │ (on subtask PASS) → per-subtask COMMITTING/PUSHING (idempotent)
        │ (all subtasks done)
        ▼
-FINAL_CHECKING ↔ TRIAGING ↔ DOING (whole-spec fixup)
+FINAL_CHECKING ↔ TRIAGING ↔ FIXUP_PLANNING ↔ DOING_SUBTASK[fixup-final] (decomposed slices)
+       │            (per-slice plan + commit; legacy whole-spec _do is fallback)
        │ (verdict PASS, ci pass)
        ▼
 COMMITTING → PUSHING → PR_OPENING → POLLING_CI → AWAITING_MERGE
@@ -218,9 +222,10 @@ success.
 Special transitions:
 - `DOING → AWAITING_MERGE` (no-diff short-circuit) when the doer made no changes.
 - `CHECKING → AWAITING_MERGE` directly when `checks_status == "none"` (fixture has no CI).
+- `AWAITING_MERGE → RESPONDING_TO_REVIEW` for a CI failure post-merge-handoff (via `_schedule_ci_fix_response`); same fixup-decomposition pipeline as review-thread response.
 - Any state → `FAILED` (uncaught exception)
-- Any state → `ABORTED` (`quikode abort`)
-- Any state → `BLOCKED` (retry budget exhausted)
+- Any state → `ABORTED` (`quikode abort` per-task)
+- Any state → `BLOCKED` (retry budget exhausted, or `cfg.review_rounds_max` exceeded with "manual merge/close required")
 
 Terminal: MERGED, AWAITING_MERGE, BLOCKED, FAILED, ABORTED. The
 `TERMINAL` set in `state.py` includes AWAITING_MERGE because no further
@@ -302,6 +307,9 @@ Key knob groups:
 - Intent (Phase B): `intent_check_on_dep_merge`, `intent_max_reviews_per_task`, `intent_max_replans`
 - Stacking (Phase C): `stacking_strategy`, `stacking_max_depth`, `stacking_max_breadth_per_root`, `stacking_auto_rebase_on_parent_merge`
 - Daemon (v3 Phase C): `daemon_heartbeat_staleness_s`, `daemon_min_run_for_backoff_reset_s`, `daemon_backoff_schedule_s`
+- Fixup decomposition (2026-05-04): `fixup_max_rounds`, `review_rounds_max`, `review_response_extra_slots`
+- Notifications (2026-05-04): `notify_settled_channel` ("none"/"ntfy"/"slack"/"both"), `notify_settled_after_s`, `notify_ntfy_url`, `notify_ntfy_topic`, `notify_slack_webhook_url`
+- Slot scheduling (2026-05-04): `preempt_at_subtask_boundary`, `preempt_yield_threshold`
 - Agent role assignments: `planner`, `doer`, `checker`, `triage`, `conflict_resolver`, `intent_reviewer`, `progress`
 
 ## Prompts

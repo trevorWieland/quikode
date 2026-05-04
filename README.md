@@ -60,7 +60,7 @@ quikode init --repo ../tanren --dag ../tanren/docs/roadmap/dag.json
 quikode doctor
 quikode build-image --flavor tanren    # rust+node+pg+agent CLIs (or --flavor python)
 quikode plan                           # preview ready tasks; nothing is launched
-quikode daemon start --max-parallel 3  # supervised orchestrator (foreground)
+quikode daemon start --max-parallel 5  # supervised orchestrator (foreground)
 quikode briefing                       # one-shot wake-up snapshot
 quikode tui                            # live mission-control TUI; press `g` for DAG viewer
 quikode show <id>                      # full state + artifacts for a task
@@ -93,7 +93,8 @@ quikode daemon stop                    # SIGTERM, clean wind-down
 | `resume <id>` | Re-pend a task with `resume_from_existing_subtasks=1` (reuses existing plan + done subtasks) |
 | `unblock <id>` | Print intervention info for a BLOCKED task (no state change) |
 | `mark-merged <id ...>` | Manually mark already-complete tasks as MERGED |
-| `abort <id>` | Mark task ABORTED + tear down container |
+| `abort <id> [--reason ...]` | Per-task abort: marks ABORTED + tears down only `qk-<task-slug>-*` containers |
+| `notify-test` | Send a test ntfy/Slack push using the workspace's `notify_settled_*` config |
 | `demo <id>` | Materialize a task's PR branch in `<repo-parent>/<repo>-demo` for hands-on testing |
 | `reset [--close-prs]` | Tear down everything + drop state |
 | `prune [--sccache-max-gb N]` | Trim sccache + remove worktrees of terminal tasks |
@@ -106,7 +107,7 @@ quikode daemon stop                    # SIGTERM, clean wind-down
 
 ```bash
 source .venv/bin/activate
-python -m pytest tests/ -q       # 581 tests, <2s
+python -m pytest tests/ -q       # 697 tests, <45s
 ruff check quikode/ tests/       # strict; see pyproject [tool.ruff.lint]
 ruff format quikode/ tests/      # consistent formatting
 ty check quikode/                # alpha typechecker, advisory
