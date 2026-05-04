@@ -2199,6 +2199,50 @@ def show(
             if rationale:
                 console.print(f"      [dim]{rationale}[/]")
 
+    # v3: review_threads summary — categorize by addressed source so
+    # operators can distinguish "we pushed a fix" from "upstream tool
+    # auto-resolved on its next scan" from "still unresolved".
+    rt_rows = list(
+        store.conn.execute(
+            "SELECT thread_id, is_resolved, addressed_in_commit_sha, last_comment_author, "
+            "last_comment_is_bot, last_comment_ts, first_seen_ts "
+            "FROM review_threads WHERE task_id = ? ORDER BY first_seen_ts",
+            (task_id,),
+        )
+    )
+    if rt_rows:
+        by_commit: list[dict] = []
+        upstream_resolved: list[dict] = []
+        unresolved: list[dict] = []
+        for r in rt_rows:
+            d = dict(r)
+            if not d["is_resolved"]:
+                unresolved.append(d)
+            elif d.get("addressed_in_commit_sha"):
+                by_commit.append(d)
+            else:
+                upstream_resolved.append(d)
+        console.print("\n[bold]── review threads ──[/]")
+        console.print(
+            f"  total={len(rt_rows)}  "
+            f"[green]addressed={len(by_commit)}[/]  "
+            f"[cyan]auto-resolved-upstream={len(upstream_resolved)}[/]  "
+            f"[red]unresolved={len(unresolved)}[/]"
+        )
+        if unresolved:
+            console.print("[red]  unresolved:[/]")
+            for d in unresolved[:8]:
+                ts = time.strftime("%H:%M:%S", time.localtime(d["last_comment_ts"] or 0))
+                bot = " (bot)" if d.get("last_comment_is_bot") else ""
+                console.print(
+                    f"    {d['thread_id']:30}  by {d.get('last_comment_author', '?')}{bot}  ts={ts}"
+                )
+        if upstream_resolved:
+            console.print(
+                f"[dim]  {len(upstream_resolved)} thread(s) resolved by upstream tool "
+                "(no quikode commit attributed — typically CodeQL re-scan after fix lands).[/]"
+            )
+
     # Artifacts (latest of each kind)
     artifacts = store.conn.execute(
         "SELECT kind, content, ts FROM artifacts WHERE task_id = ? ORDER BY ts DESC",

@@ -139,6 +139,61 @@ def test_show_renders_per_subtask_cost(tmp_path, monkeypatch):
     assert "S-02" in out
 
 
+def test_show_categorizes_review_threads_by_resolution_source(tmp_path, monkeypatch):
+    """`quikode show` distinguishes three review-thread states:
+    - addressed: is_resolved=1 + has commit_sha (we pushed a fix)
+    - auto-resolved-upstream: is_resolved=1 but commit_sha=NULL
+      (e.g. CodeQL re-scan cleared the alert without a quikode commit)
+    - unresolved: is_resolved=0 (still needs work)
+
+    Without categorization, operators couldn't tell why a thread shows
+    addressed_in_commit_sha=NULL — was it a quikode bug or upstream
+    auto-resolution? The new section makes this explicit."""
+    _bootstrap(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / ".quikode" / "quikode.db"
+    store = Store(db)
+    store.upsert_pending("R-001")
+    # Three threads, one of each kind.
+    store.upsert_review_thread(
+        "R-001",
+        thread_id="PRRT_addressed",
+        is_resolved=1,
+        last_comment_ts=1000.0,
+        last_comment_author="codex-bot",
+        last_comment_is_bot=1,
+    )
+    store.mark_thread_addressed("R-001", "PRRT_addressed", "abc1234567")
+    store.upsert_review_thread(
+        "R-001",
+        thread_id="PRRT_upstream",
+        is_resolved=1,
+        last_comment_ts=2000.0,
+        last_comment_author="github-advanced-security",
+        last_comment_is_bot=0,
+    )
+    # No mark_thread_addressed → upstream auto-resolved.
+    store.upsert_review_thread(
+        "R-001",
+        thread_id="PRRT_unresolved",
+        is_resolved=0,
+        last_comment_ts=3000.0,
+        last_comment_author="alice",
+        last_comment_is_bot=0,
+    )
+    store.conn.close()
+
+    result = CliRunner().invoke(app, ["show", "R-001"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "review threads" in out
+    assert "addressed=1" in out
+    assert "auto-resolved-upstream=1" in out
+    assert "unresolved=1" in out
+    # Unresolved details listed.
+    assert "PRRT_unresolved" in out
+
+
 def test_show_truncates_long_rationale(tmp_path, monkeypatch):
     _bootstrap(tmp_path)
     monkeypatch.chdir(tmp_path)
