@@ -592,7 +592,16 @@ def abort(
         None, "--reason", "-r", help="Reason for the abort, recorded in state_log."
     ),
 ):
-    """Mark a task ABORTED and tear down its container."""
+    """Mark a task ABORTED and tear down ONLY its container.
+
+    The previous "heavy-handed but reliable" path called
+    `docker_env.cleanup_all_quikode(cfg)` which killed every qk-* container
+    in the workspace — observed live on 2026-05-04 to crash 4 unrelated
+    in-flight task containers when aborting one stuck task. This version
+    targets only the aborted task's container by deriving the docker
+    handle from the per-task naming convention. Idempotent: if no
+    container exists for the task, the teardown is a no-op.
+    """
     cfg = load_config()
     store = _open_store(cfg)
     row = store.get(task_id)
@@ -601,7 +610,14 @@ def abort(
         raise typer.Exit(1)
     note = f"aborted by user: {reason}" if reason else "aborted by user"
     store.transition(task_id, State.ABORTED, note=note)
-    docker_env.cleanup_all_quikode(cfg)  # heavy-handed but reliable
+    # Per-task teardown: stop just this task's containers + network. Iterate
+    # all qk-* containers matching the task's name prefix (the workspace_id
+    # suffix isn't stored, so we match "qk-<task-id-slug>-...").
+    slug = docker_env.slugify(task_id)
+    prefix = f"qk-{slug}-"
+    for c in docker_env.list_quikode_containers(label=docker_env.workspace_label(cfg)):
+        if c["name"].startswith(prefix):
+            subprocess.run(["docker", "rm", "-f", c["name"]], capture_output=True, text=True)
     console.print(f"[yellow]aborted {task_id}[/]")
 
 

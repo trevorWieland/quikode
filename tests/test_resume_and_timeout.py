@@ -18,7 +18,7 @@ import json
 import sqlite3
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from typer.testing import CliRunner
 
@@ -357,11 +357,54 @@ def test_abort_reason_logged_in_state_log(tmp_path, monkeypatch):
     store.upsert_pending("R-001")
     store.conn.close()
 
-    # Patch docker cleanup so the test doesn't actually try to talk to docker.
-    with patch("quikode.cli.docker_env.cleanup_all_quikode"):
+    # Patch docker shells so the test doesn't actually talk to docker.
+    with (
+        patch("quikode.cli.docker_env.list_quikode_containers", return_value=[]),
+        patch("quikode.cli.subprocess.run"),
+    ):
         result = CliRunner().invoke(app, ["abort", "R-001", "--reason", "user changed scope"])
     assert result.exit_code == 0, result.output
     assert _last_state_log_note(db, "R-001") == "aborted by user: user changed scope"
+
+
+def test_abort_only_targets_per_task_containers(tmp_path, monkeypatch):
+    """Regression for the 2026-05-04 abort-blast-radius bug: aborting R-001
+    must NOT touch containers belonging to other tasks (R-002 etc.). The
+    previous implementation called `cleanup_all_quikode` which killed every
+    qk-* container in the workspace, breaking unrelated in-flight work."""
+    _bootstrap_workspace(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / ".quikode" / "quikode.db"
+    store = Store(db)
+    store.upsert_pending("R-001")
+    store.upsert_pending("R-002")
+    store.conn.close()
+
+    # Three containers across two tasks. Abort R-001 should only kill the
+    # two `qk-r-001-*` containers — `qk-r-002-foo-dev` must survive.
+    fake_containers = [
+        {"id": "1", "name": "qk-r-001-abc-dev", "status": "Up"},
+        {"id": "2", "name": "qk-r-001-abc-pg", "status": "Up"},
+        {"id": "3", "name": "qk-r-002-foo-dev", "status": "Up"},
+    ]
+    rm_calls: list[list[str]] = []
+
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        rm_calls.append(cmd)
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with (
+        patch("quikode.cli.docker_env.list_quikode_containers", return_value=fake_containers),
+        patch("quikode.cli.subprocess.run", side_effect=fake_subprocess_run),
+    ):
+        result = CliRunner().invoke(app, ["abort", "R-001"])
+
+    assert result.exit_code == 0, result.output
+    # Only R-001's containers were touched.
+    targeted = sorted(c[-1] for c in rm_calls if c[:3] == ["docker", "rm", "-f"])
+    assert targeted == ["qk-r-001-abc-dev", "qk-r-001-abc-pg"]
+    # R-002's container was NOT in any rm call.
+    assert all("qk-r-002" not in (c[-1] if c else "") for c in rm_calls)
 
 
 # ----- worktree.add_worktree idempotent on existing path -----
