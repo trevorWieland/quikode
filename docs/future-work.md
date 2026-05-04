@@ -133,7 +133,107 @@ the grep filter.
 
 ---
 
+## Stacked-diff vision: arbitrary DAGs without merging to main
+
+The long-term aim is a stacked-diff model robust enough that an entire
+DAG can advance through review-and-rebase entirely on top of the
+target branch, without anything needing to merge to main first. The
+operator returns to a queue of small, semantically-bounded chained
+PRs; ancestor-PR fixes percolate down the chain automatically.
+Phase 1 (readiness gate) shipped 2026-05-04. Phase 2 (multi-parent
+merge-base) and Phase 3 (instructional resolver) are open.
+
+### 🔴 Phase 2 — Multi-parent stacking (D depends on B + C)
+
+Today `tasks.parent_task_id` is scalar; `_resolve_stack_parent`
+returns one `(task_id, branch)`. A child with two unmet parents waits
+until at least one merges. Goal: D's branch starts from a synthetic
+merge-base built by `git merge B C` into a transient
+`quikode/d-base-<6hex>`. On parent change, recreate the merge-base
+and `git rebase --onto <new_merge_base> <old_merge_base> D`.
+
+Required changes:
+- Schema: replace scalar `parent_task_id`/`parent_branch` with JSON
+  arrays. Migration drops + recreates the columns.
+- `_resolve_stack_parent` becomes `_resolve_stack_parents` returning
+  a list; `parent_pr_branch` becomes plural too.
+- New worker step `_construct_merge_base` invoked from
+  `_provision_worktree`.
+- Stack-walk helpers (`_stack_root`, `_stack_depth`,
+  `_stack_size_under_root`) become DAG walks with cycle detection
+  (cycle detection already exists for the scalar case — generalize).
+- `_schedule_rebases_for_merged_parent` and the inline
+  needs-parent-rebase checkpoints in worker.py need to handle the
+  multi-parent case (rebase = recompute merge-base + rebase --onto).
+
+### 🔴 Phase 3 — Instructional conflict resolver
+
+**NOT** a "skip-checker on conflict-free rebase" fast path — that
+risks shipping a semantically broken foundation (the canonical
+"add-a-foo / add-bar-to-every-foo" failure mode where each commit
+applies cleanly but the chain is incoherent).
+
+Instead: when the conflict resolver produces a successful resolution,
+it persists a structured **merge instruction** alongside the resolved
+diff: which siblings are likely to need the same fix, the *reason*
+the conflict appeared (e.g. "field rename, propagate to all callers
+that touched the renamed call"), and the recipe (sed-pattern,
+import-rewrite, manual-checked snippet, etc).
+
+Subsequent resolver invocations on sibling rebases consume the prior
+instructions before re-investigating from scratch. This is
+fundamentally about **propagating intent**, not skipping checks:
+- The instruction is human-readable and surfaces in `quikode show`,
+  so reviewers see *what is being applied automatically* across the
+  chain, not just that the chain is conflict-free.
+- The follow-up agent applies the instructions and re-runs the
+  acceptance gate; semantic validation always fires.
+- Repo standards (lints, type checks, BDD tags, etc.) are part of the
+  acceptance gate, so any "intent drift" is still caught locally.
+
+Operator vision: "I go on vacation for a week, come back to a queue
+of small chained PRs to review. I leave a note on PR-A — that note
+auto-applies to B/C/D as the chain rebases on the resolved A. The
+system stays stable because every layer of the stack still passes
+its own intent + acceptance checks."
+
+Implementation sketch:
+- New table `merge_instructions` (resolver-emitted, JSON body).
+- `prompts/conflict-resolver.md` updated to emit instructions in
+  addition to the diff.
+- `_spawn_conflict_resolver` reads sibling instructions for the same
+  cascade (same root parent rebase) before invoking the agent — the
+  prompt frontloads "here is what the prior resolver in this cascade
+  found and chose to apply."
+- `quikode show` surfaces the instruction history under each
+  rebase event.
+- An **operator-supplied** instruction channel: `quikode annotate
+  R-001 "<note>"` writes to the same table with a special source so
+  the resolver consumes it on every cascading rebase.
+
+Phase 3 unblocks Phase 2 in practice — without instructional
+resolver, a single A-change creating sibling conflicts in B/C/D
+re-runs the resolver agent N times on each cascade, and each
+invocation is blind to its peers. That cost (and the inconsistency
+risk) is the load-bearing reason Phase 2 alone isn't sufficient.
+
+---
+
 ## Recently shipped (2026-05-04 evening additions)
+
+- **Stacking-readiness gate (Phase 1 of the stacked-diff vision)** —
+  `cfg.stacking_readiness ∈ {"speculative","settled"}` and
+  `cfg.stack_settle_quiet_s` (default 600s). In `settled` mode a
+  parent qualifies as a stack base only when it's been quietly in
+  AWAITING_MERGE — flapping through RESPONDING_TO_REVIEW resets the
+  timer. Closes the codex-fixup-storm rebase loop where every review
+  round re-rebased every child.
+- **Resume-boost in `score_candidate`** — orphan-recovered tasks
+  with subtasks already DONE or a PR open now outrank cold roots:
+  +25 max from subtask completion fraction, +15 if PR open. Caps at
+  +40 so a high-fan-out fresh root with 9+ dependents still wins.
+  Closes the "R-0015 was nearly done but a restart picked something
+  fresh instead" footgun.
 
 - **`quikode daemon start --detach` / `-d`** — fork + `os.setsid` +
   stdio redirect to daemon.log, so an interactive shell hangup

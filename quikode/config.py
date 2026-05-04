@@ -408,6 +408,32 @@ class Config(BaseModel):
         default=True,
         description="Auto-rebase a stacked child off the new base branch when its parent merges.",
     )
+    stacking_readiness: Literal["speculative", "settled"] = Field(
+        default="speculative",
+        description=(
+            "When a parent's branch becomes 'stack-ready' for children. "
+            "'speculative' (default): parent's branch exists on origin in any "
+            "PR-bearing state — children can fork the moment parent opens its "
+            "PR. Maximum throughput, but every parent fixup commit forces a "
+            "child rebase. 'settled': parent must be in AWAITING_MERGE quietly "
+            "for `stack_settle_quiet_s` (no recent CI-fix or review-response "
+            "churn). Lower throughput, dramatically less rebase churn — useful "
+            "when codex auto-reviews drive many fixup rounds (R-0002 hit 11+) "
+            "and each round would otherwise re-rebase every child."
+        ),
+    )
+    stack_settle_quiet_s: int = Field(
+        default=600,
+        ge=0,
+        le=3600,
+        description=(
+            "When stacking_readiness='settled': minimum quiet time in "
+            "AWAITING_MERGE before a parent qualifies as a stack base. "
+            "Resets whenever the daemon dispatches a CI-fix or review-response "
+            "(parent transitions out and back in). 0 collapses 'settled' to "
+            "'reached AWAITING_MERGE once', skipping the quiet check."
+        ),
+    )
     rebase_coalesce_window_s: int = Field(
         default=30,
         ge=0,
@@ -658,6 +684,8 @@ def load_config(root: Path | None = None) -> Config:
         stacking_auto_rebase_on_parent_merge=bool(
             stacking.get("auto_rebase_on_parent_merge", defaults.stacking_auto_rebase_on_parent_merge)
         ),
+        stacking_readiness=str(stacking.get("readiness", defaults.stacking_readiness)),  # type: ignore[arg-type]
+        stack_settle_quiet_s=int(stacking.get("settle_quiet_s", defaults.stack_settle_quiet_s)),
         rebase_coalesce_window_s=int(
             stacking.get("rebase_coalesce_window_s", defaults.rebase_coalesce_window_s)
         ),

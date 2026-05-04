@@ -237,22 +237,15 @@ class Orchestrator:
     def _collect_pick_candidates(self, scope: set[str], in_flight: set[str]) -> list[dict]:
         """Enumerate all tasks currently eligible for scheduling. No side
         effects. Each candidate carries the metadata `_apply_pick_side_effects`
-        and `_score_candidate` need so they can act without re-deriving."""
+        and `_score_candidate` need so they can act without re-deriving.
+
+        Stacking eligibility honors `cfg.stacking_readiness` via
+        `scheduler.is_parent_stack_ready`. Resume signals (has_open_pr,
+        subtask done/total) are pulled per candidate via
+        `scheduler._resume_signals` and consumed by `_score_candidate`.
+        """
         completed = self.store.completed_ids() & scope
         active = self.store.active_ids() & scope
-        # States where a dep is "stack-ready" — has a branch we can fork off.
-        # Mirror of scheduler.STACK_READY_STATES — includes the transient
-        # PROVISIONING / FIXUP_PLANNING states so a child doesn't briefly
-        # lose stacking eligibility during the parent's review-response
-        # cycle (the parent's remote branch is unchanged throughout).
-        STACK_READY = {
-            State.POLLING_CI.value,
-            State.AWAITING_MERGE.value,
-            State.PR_OPENING.value,
-            State.RESPONDING_TO_REVIEW.value,
-            State.PROVISIONING.value,
-            State.FIXUP_PLANNING.value,
-        }
         candidates: list[dict] = []
         for nid in sorted(scope):
             if nid in completed or nid in active or nid in in_flight:
@@ -265,13 +258,28 @@ class Orchestrator:
                 continue
             in_scope_deps = [d for d in n.depends_on if d in self.dag.nodes]
             unmet = [d for d in in_scope_deps if d not in completed]
+            has_open_pr, sub_done, sub_total = scheduler._resume_signals(row, self.store)
+            base_meta = {
+                "row": row,
+                "has_open_pr": has_open_pr,
+                "subtask_done": sub_done,
+                "subtask_total": sub_total,
+            }
             if not unmet:
-                candidates.append({"task_id": nid, "is_stacked": False, "unmet": [], "row": row})
+                candidates.append({"task_id": nid, "is_stacked": False, "unmet": [], **base_meta})
                 continue
             if self.cfg.stacking_strategy == "off":
                 continue
             unmet_states = {d: (self.store.get(d) or {}).get("state") for d in unmet}
-            if not all(s in STACK_READY for s in unmet_states.values()):
+            if not all(
+                scheduler.is_parent_stack_ready(
+                    cfg=self.cfg,
+                    parent_state=s,
+                    parent_id=d,
+                    store=self.store,
+                )
+                for d, s in unmet_states.items()
+            ):
                 continue
             if self.cfg.stacking_strategy == "within-milestone" and not all(
                 self.dag.nodes[d].milestone == n.milestone for d in unmet
@@ -296,7 +304,7 @@ class Orchestrator:
                     root,
                 )
                 continue
-            candidates.append({"task_id": nid, "is_stacked": True, "unmet": unmet, "row": row})
+            candidates.append({"task_id": nid, "is_stacked": True, "unmet": unmet, **base_meta})
         return candidates
 
     def _score_candidate(self, c: dict, scope: set[str]) -> int:
@@ -307,6 +315,9 @@ class Orchestrator:
             is_stacked=c["is_stacked"],
             dag=self.dag,
             scope=scope,
+            has_open_pr=c.get("has_open_pr", False),
+            subtask_done=c.get("subtask_done", 0),
+            subtask_total=c.get("subtask_total", 0),
         )
 
     def _apply_pick_side_effects(self, c: dict) -> None:

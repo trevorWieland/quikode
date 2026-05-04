@@ -123,6 +123,8 @@ These all blocked progress at some point and have been fixed; don't re-discover 
 24. Codex-style reviewers can find new nits indefinitely (R-0002 hit round 10 with $30+ in cycles). `cfg.review_rounds_max=15` BLOCKs the task with a "manual merge/close required" note when the cap is hit.
 25. **Foreground daemon dies on shell SIGHUP** with no supervisor exit log — a closed terminal silently kills `quikode daemon start` and leaves containers orphaned (still doing work nobody reads). Use `quikode daemon start --detach` (added 2026-05-04 evening): forks, calls `os.setsid()`, redirects stdio at the daemon log so the supervisor outlives the launching shell. See `daemon.py:detach_into_background`.
 26. **Supervisor only restarts on crash, not hang** — pre-watchdog, a hung inner orchestrator (lock contention, blocked subprocess.wait) left `child.wait()` blocking forever while heartbeat went cold. The watchdog (`daemon.py:_wait_with_watchdog`) reads heartbeat every 5s and SIGTERMs after two consecutive stale reads beyond `cfg.daemon_heartbeat_stale_kill_s` (default 600s). The crash path then handles backoff + restart. Set `daemon_heartbeat_stale_kill_s = 0` to disable.
+27. **Speculative stacking churns children on every parent fixup round** — pre-readiness-gate, a child stacked the moment its parent opened a PR; codex auto-reviews on R-0002 hit round 11+, each round forcing a re-rebase on every child. `cfg.stacking_readiness="settled"` (with `cfg.stack_settle_quiet_s`) gates stacking on parent being quietly in AWAITING_MERGE for the quiet window. Default stays `"speculative"` for back-compat. See `scheduler.is_parent_stack_ready`.
+28. **Picker ignored in-progress state across restarts** — score_candidate was pure (stacked +50, dependents ×5, id tiebreak) so an orphan-recovered task at 9/10 subtasks done scored identically to a fresh PENDING root. Resume-boost adds +25 max from subtask completion fraction + 15 if PR open, capped at +40 (still loses to a 9+ dependent fresh root). See `scheduler._resume_signals` and `scheduler.score_candidate`.
 
 ## Active work / context
 
@@ -134,7 +136,7 @@ These all blocked progress at some point and have been fixed; don't re-discover 
 
 ## Conventions when editing this codebase
 
-- Run `python -m pytest tests/ -q` after any change touching `quikode/`. **701 tests**; runs in <50s.
+- Run `python -m pytest tests/ -q` after any change touching `quikode/`. **709 tests**; runs in <50s.
 - Run `ruff check quikode/ tests/` and `ruff format --check quikode/ tests/` before committing. Strict ruleset enabled — see `pyproject.toml [tool.ruff.lint]`.
 - `ty check quikode/` is configured but ty is alpha; treat advisory.
 - Don't break the running orchestrator. If quikode is mid-run when you edit, the in-memory module is already loaded — your edits affect the *next* run.

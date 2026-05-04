@@ -405,9 +405,7 @@ def _wait_with_watchdog(
                     ts_age,
                     threshold,
                 )
-                log_fp.write(
-                    "--- [supervisor] heartbeat watchdog firing — SIGTERM child ---\n".encode()
-                )
+                log_fp.write("--- [supervisor] heartbeat watchdog firing — SIGTERM child ---\n".encode())
                 log_fp.flush()
                 # Treat as crash: forward SIGTERM, fall back to SIGKILL after
                 # the standard timeout, and return the rc so the caller's

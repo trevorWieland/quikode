@@ -11,6 +11,7 @@ orchestrator instance — they communicate through `store` + `dag` only.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from .state import State
@@ -30,6 +31,10 @@ log = logging.getLogger("quikode.scheduler")
 # child briefly loses stacking eligibility during the parent's review-response
 # provision window — the picker would skip it for one tick and re-evaluate
 # next loop. Cosmetic but worth fixing for cleaner picker behavior.
+#
+# This is the "speculative" set — used by `cfg.stacking_readiness="speculative"`
+# (default). The "settled" set is just {AWAITING_MERGE} plus a quiet-time
+# predicate, evaluated by `is_parent_stack_ready`.
 STACK_READY_STATES = frozenset(
     {
         State.POLLING_CI.value,
@@ -42,12 +47,61 @@ STACK_READY_STATES = frozenset(
 )
 
 
+def is_parent_stack_ready(
+    *,
+    cfg: Config,
+    parent_state: str | None,
+    parent_id: str,
+    store: Store,
+    now: float | None = None,
+) -> bool:
+    """Predicate: is this parent eligible to act as a stack base for children?
+
+    Honors `cfg.stacking_readiness`:
+
+    - `"speculative"` (default): any state in `STACK_READY_STATES`. A parent
+      that just opened its PR is fair game; children fork immediately.
+    - `"settled"`: parent must be in AWAITING_MERGE quietly for at least
+      `cfg.stack_settle_quiet_s` (per the most recent transition INTO
+      AWAITING_MERGE, read from state_log). A flap through RESPONDING_TO_REVIEW
+      resets the quiet timer.
+
+    `parent_state` is the cached state we already read for the candidate's
+    deps — passed in to avoid an extra Store.get per evaluation.
+    """
+    if parent_state is None:
+        return False
+    mode = getattr(cfg, "stacking_readiness", "speculative")
+    if mode == "speculative":
+        return parent_state in STACK_READY_STATES
+    if parent_state != State.AWAITING_MERGE.value:
+        return False
+    quiet_s = int(getattr(cfg, "stack_settle_quiet_s", 0))
+    if quiet_s <= 0:
+        return True
+    last_ts = store.last_entered_state_ts(parent_id, State.AWAITING_MERGE)
+    if last_ts is None:
+        return False
+    if now is None:
+        now = time.time()
+    return (now - last_ts) >= quiet_s
+
+
+# Resume-boost weights. Keep these visible at module top so the score
+# calibration is auditable from one place.
+_RESUME_PR_OPEN_BOOST = 15
+_RESUME_SUBTASK_FRACTION_MAX = 25  # fully-done-but-pending caps here
+
+
 def score_candidate(
     *,
     task_id: str,
     is_stacked: bool,
     dag: DAG,
     scope: set[str],
+    has_open_pr: bool = False,
+    subtask_done: int = 0,
+    subtask_total: int = 0,
 ) -> int:
     """Priority score for a pickable task. Higher wins.
 
@@ -55,6 +109,11 @@ def score_candidate(
     - `stacked_boost`: +50 for stacked children (Phase 3+ chain throughput).
     - `unblock_boost`: +5 per direct dependent in scope. High-fan-out tasks
       unblock more downstream parallelism.
+    - `resume_boost`: +15 if the task already has an open PR (orphan
+      recovery / explicit resume put it back in PENDING but we shouldn't
+      re-pick a fresh root over it). Plus up to +25 scaled by completed
+      subtask fraction. Keeps progressed tasks ahead of cold roots without
+      dominating high-fan-out roots (max +40).
     - `id_penalty`: -(R-XXXX // 10), so R-0001 ≈ 0, R-0220 ≈ -22. Tiebreak
       toward lower IDs (rough milestone order) without dominating fan-out.
 
@@ -67,12 +126,31 @@ def score_candidate(
         1 for other_id, other in dag.nodes.items() if other_id in scope and task_id in other.depends_on
     )
     unblock_boost = dependents * 5
+    pr_boost = _RESUME_PR_OPEN_BOOST if has_open_pr else 0
+    if subtask_total > 0:
+        fraction = max(0.0, min(1.0, subtask_done / subtask_total))
+        progress_boost = round(_RESUME_SUBTASK_FRACTION_MAX * fraction)
+    else:
+        progress_boost = 0
     try:
         id_num = int(task_id.split("-")[1])
     except (IndexError, ValueError):
         id_num = 9999
     id_penalty = id_num // 10
-    return stacked_boost + unblock_boost - id_penalty
+    return stacked_boost + unblock_boost + pr_boost + progress_boost - id_penalty
+
+
+def _resume_signals(row: dict | None, store: Store) -> tuple[bool, int, int]:
+    """Pull (has_open_pr, subtask_done, subtask_total) for a candidate row.
+
+    Cheap: one indexed SUM over the subtasks table. Returns zeros when the
+    task hasn't been touched yet (no row, no subtasks).
+    """
+    if not row:
+        return (False, 0, 0)
+    has_open_pr = bool(row.get("pr_number"))
+    done, total = store.subtask_progress(str(row["id"]))
+    return (has_open_pr, done, total)
 
 
 def collect_pick_candidates(
@@ -86,6 +164,7 @@ def collect_pick_candidates(
     stack_root_fn,
     stack_size_under_root_fn,
     would_form_cycle_fn,
+    now: float | None = None,
 ) -> list[dict]:
     """Enumerate eligible task candidates without side effects.
 
@@ -108,13 +187,33 @@ def collect_pick_candidates(
             continue
         in_scope_deps = [d for d in n.depends_on if d in dag.nodes]
         unmet = [d for d in in_scope_deps if d not in completed]
+        has_open_pr, sub_done, sub_total = _resume_signals(row, store)
         if not unmet:
-            candidates.append({"task_id": nid, "is_stacked": False, "unmet": [], "row": row})
+            candidates.append(
+                {
+                    "task_id": nid,
+                    "is_stacked": False,
+                    "unmet": [],
+                    "row": row,
+                    "has_open_pr": has_open_pr,
+                    "subtask_done": sub_done,
+                    "subtask_total": sub_total,
+                }
+            )
             continue
         if cfg.stacking_strategy == "off":
             continue
         unmet_states = {d: (store.get(d) or {}).get("state") for d in unmet}
-        if not all(s in STACK_READY_STATES for s in unmet_states.values()):
+        if not all(
+            is_parent_stack_ready(
+                cfg=cfg,
+                parent_state=s,
+                parent_id=d,
+                store=store,
+                now=now,
+            )
+            for d, s in unmet_states.items()
+        ):
             continue
         if cfg.stacking_strategy == "within-milestone" and not all(
             dag.nodes[d].milestone == n.milestone for d in unmet
@@ -139,7 +238,17 @@ def collect_pick_candidates(
                 root,
             )
             continue
-        candidates.append({"task_id": nid, "is_stacked": True, "unmet": unmet, "row": row})
+        candidates.append(
+            {
+                "task_id": nid,
+                "is_stacked": True,
+                "unmet": unmet,
+                "row": row,
+                "has_open_pr": has_open_pr,
+                "subtask_done": sub_done,
+                "subtask_total": sub_total,
+            }
+        )
     return candidates
 
 
@@ -193,7 +302,18 @@ def best_queued_priority(
             unmet = [d for d in in_scope_deps if d not in completed]
             if unmet:
                 continue
-            candidates.append({"task_id": nid, "is_stacked": False, "unmet": [], "row": row})
+            has_open_pr, sub_done, sub_total = _resume_signals(row, store)
+            candidates.append(
+                {
+                    "task_id": nid,
+                    "is_stacked": False,
+                    "unmet": [],
+                    "row": row,
+                    "has_open_pr": has_open_pr,
+                    "subtask_done": sub_done,
+                    "subtask_total": sub_total,
+                }
+            )
     else:
         candidates = collect_pick_candidates(
             cfg=cfg,
@@ -215,6 +335,9 @@ def best_queued_priority(
                 is_stacked=c["is_stacked"],
                 dag=dag,
                 scope=scope,
+                has_open_pr=c.get("has_open_pr", False),
+                subtask_done=c.get("subtask_done", 0),
+                subtask_total=c.get("subtask_total", 0),
             ),
             c["task_id"],
         )

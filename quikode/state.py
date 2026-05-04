@@ -675,6 +675,43 @@ class Store:
                 ).fetchall()
             ]
 
+    def last_entered_state_ts(self, task_id: str, state: State) -> float | None:
+        """Most recent ts at which `task_id` transitioned INTO `state`, or None.
+
+        Reads `state_log`. Used by the stacking-readiness gate to compute "how
+        long has this parent been quietly in AWAITING_MERGE?" — a parent that
+        flapped through RESPONDING_TO_REVIEW and back gets a fresh ts and
+        falls back below the quiet threshold until it stabilizes.
+        """
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT MAX(ts) FROM state_log WHERE task_id = ? AND to_state = ?",
+                (task_id, state.value),
+            ).fetchone()
+        if r is None:
+            return None
+        ts = r[0]
+        return float(ts) if ts is not None else None
+
+    def subtask_progress(self, task_id: str) -> tuple[int, int]:
+        """Return (done, total) subtask counts for `task_id`.
+
+        Used by the resume-boost in `score_candidate`: a task with most
+        subtasks already DONE that returned to PENDING (orphan recovery,
+        explicit resume) should outrank a fresh PENDING root with no work.
+        """
+        with self._tx_lock:
+            row = self.conn.execute(
+                "SELECT "
+                "  SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) AS done, "
+                "  COUNT(*) AS total "
+                "FROM subtasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        if row is None:
+            return (0, 0)
+        return (int(row["done"] or 0), int(row["total"] or 0))
+
     def completed_ids(self) -> set[str]:
         with self._tx_lock:
             return {
