@@ -116,6 +116,20 @@ def _open_pr_status() -> PRStatus:
     )
 
 
+def _ci_failed_pr_status() -> PRStatus:
+    return PRStatus(
+        number=42,
+        url="https://github.com/owner/repo/pull/42",
+        state="OPEN",
+        mergeable="MERGEABLE",
+        checks_status="failure",
+        failed_checks=[
+            {"name": "just ci", "conclusion": "FAILURE"},
+            {"name": "web checks", "conclusion": "FAILURE"},
+        ],
+    )
+
+
 # ----- _classify_threads -----
 
 
@@ -327,6 +341,84 @@ def test_poll_pr_closed_transitions_to_aborted(tmp_path):
         o._poll_review_threads(pool, futures, rrf)
 
     assert o.store.get("R-001")["state"] == State.ABORTED.value
+    pool.submit.assert_not_called()
+    o.store.conn.close()
+
+
+def test_poll_dispatches_ci_fix_on_post_merge_failure(tmp_path):
+    """Live regression on R-0002: GitHub CI flipped to FAILURE while the
+    task was AWAITING_MERGE (response push triggered CI re-run, CI failed).
+    The daemon's review-watcher must detect this + dispatch a ci-fix
+    cycle. Without this, the task sits at AWAITING_MERGE indefinitely."""
+    o = _orch(tmp_path, max_parallel=3)
+    o.cfg.review_response_extra_slots = 1
+    _seed_awaiting_merge(o)
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    rrf: set[str] = set()
+
+    with (
+        patch("quikode.orchestrator.github.poll_pr", return_value=_ci_failed_pr_status()),
+        patch("quikode.orchestrator.github_graphql.get_review_threads", return_value=[]),
+    ):
+        o._poll_review_threads(pool, futures, rrf)
+
+    pool.submit.assert_called_once()
+    # Submitted via the ci-fix path, not the review-response path.
+    args = pool.submit.call_args
+    assert args[0][0] == o._run_ci_fix_response_one
+    # Task transitioned RESPONDING_TO_REVIEW with a CI-fix note.
+    row = o.store.get("R-001")
+    assert row["state"] == State.RESPONDING_TO_REVIEW.value
+    assert "R-001" in rrf
+    o.store.conn.close()
+
+
+def test_poll_does_not_dispatch_ci_fix_when_pool_full(tmp_path):
+    """CI-fix uses the same pool budget as review responses
+    (max_parallel + review_response_extra_slots). At cap, defer."""
+    o = _orch(tmp_path, max_parallel=1)
+    o.cfg.review_response_extra_slots = 1
+    _seed_awaiting_merge(o)
+    pool = _make_pool()
+    futures: dict[str, Future] = {"OTHER-1": Future(), "OTHER-2": Future()}
+    rrf: set[str] = set()
+
+    with (
+        patch("quikode.orchestrator.github.poll_pr", return_value=_ci_failed_pr_status()),
+        patch("quikode.orchestrator.github_graphql.get_review_threads", return_value=[]),
+    ):
+        o._poll_review_threads(pool, futures, rrf)
+
+    pool.submit.assert_not_called()
+    assert o.store.get("R-001")["state"] == State.AWAITING_MERGE.value
+    o.store.conn.close()
+
+
+def test_poll_does_not_dispatch_ci_fix_when_no_failed_checks(tmp_path):
+    """checks_status='failure' but failed_checks=[] is a stale signal —
+    don't dispatch. Only fire when we have concrete check rows to feed
+    the fixup planner."""
+    o = _orch(tmp_path, max_parallel=3)
+    _seed_awaiting_merge(o)
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    rrf: set[str] = set()
+
+    weird_status = PRStatus(
+        number=42,
+        url="https://github.com/owner/repo/pull/42",
+        state="OPEN",
+        mergeable="MERGEABLE",
+        checks_status="failure",
+        failed_checks=[],
+    )
+    with (
+        patch("quikode.orchestrator.github.poll_pr", return_value=weird_status),
+        patch("quikode.orchestrator.github_graphql.get_review_threads", return_value=[]),
+    ):
+        o._poll_review_threads(pool, futures, rrf)
+
     pool.submit.assert_not_called()
     o.store.conn.close()
 

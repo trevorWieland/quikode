@@ -723,6 +723,32 @@ class Orchestrator:
                 )
                 continue
 
+            # v3 fix (live regression on R-0002): GitHub CI can transition
+            # to FAILURE *after* the worker has handed off to AWAITING_MERGE
+            # — typical sequence is response cycle pushes a fixup commit,
+            # worker exits to AWAITING_MERGE, GitHub re-runs CI, CI fails
+            # post-response. Pre-v3 the worker's _poll_pr_loop caught this
+            # inline; v3 needs the daemon to dispatch a CI-fix cycle.
+            #
+            # We use the same fixup-decomposition path as for review
+            # threads (kind="fixup-ci"). That gives us atomic per-slice
+            # commits + reusing the existing planner/doer/checker loop.
+            ci_failed = pr_status.checks_status == "failure" and pr_status.failed_checks
+            if (
+                ci_failed
+                and task_id not in futures
+                and len(futures) < self.cfg.max_parallel + self.cfg.review_response_extra_slots
+            ):
+                log.info(
+                    "task %s: PR #%s CI failing (%d failed check(s)) — scheduling CI-fix cycle",
+                    task_id,
+                    pr_number,
+                    len(pr_status.failed_checks),
+                )
+                self.store.set_field(task_id, last_review_poll_ts=now)
+                self._schedule_ci_fix_response(task_id, pr_status, pool, futures, review_response_futures)
+                continue
+
             # 2. Fetch + classify review threads.
             try:
                 threads = github_graphql.get_review_threads(repo, int(pr_number))
@@ -1003,6 +1029,44 @@ class Orchestrator:
         node = self.dag.nodes[task_id]
         worker = TaskWorker(self.cfg, self.dag, self.store, node)
         return worker.run_review_response(threads)
+
+    def _schedule_ci_fix_response(
+        self,
+        task_id: str,
+        pr_status: github.PRStatus,
+        pool: ThreadPoolExecutor,
+        futures: dict[str, Future],
+        review_response_futures: set[str],
+    ) -> None:
+        """Dispatch a CI-fix cycle when GitHub CI fails *after* the worker
+        has handed off to AWAITING_MERGE. Re-uses the review-response
+        worker entry mode (which fixup-decomposes into per-slice subtasks)
+        with a CI-failure trigger context."""
+        self.store.transition(
+            task_id,
+            State.RESPONDING_TO_REVIEW,
+            note=f"daemon scheduled CI-fix for {len(pr_status.failed_checks)} failed check(s)",
+        )
+        log.info(
+            "scheduling CI-fix for task %s (%d failed checks)",
+            task_id,
+            len(pr_status.failed_checks),
+        )
+        fut = pool.submit(self._run_ci_fix_response_one, task_id, pr_status)
+        futures[task_id] = fut
+        review_response_futures.add(task_id)
+
+    def _run_ci_fix_response_one(self, task_id: str, pr_status: github.PRStatus):
+        """Worker entry for daemon-detected CI failure on AWAITING_MERGE.
+
+        Fetches the failed-check logs, builds a synthetic ReviewThread-shaped
+        payload describing the CI failure, and routes through the same
+        `run_review_response` path. The worker's fixup planner sees the
+        failure context and emits CI-fix subtasks.
+        """
+        node = self.dag.nodes[task_id]
+        worker = TaskWorker(self.cfg, self.dag, self.store, node)
+        return worker.run_ci_fix_response(pr_status)
 
     # ----- v3 Phase C: stacked-diff auto-rebase on parent merge -----
 

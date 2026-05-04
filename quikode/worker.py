@@ -260,6 +260,90 @@ class TaskWorker:
                 docker_env.teardown(self._h)
                 self.handle = None
 
+    def run_ci_fix_response(self, pr_status: github.PRStatus) -> WorkerOutcome:
+        """Worker entry mode for daemon-detected post-merge CI failures.
+
+        When GitHub's CI flips to FAILURE while the task is in
+        AWAITING_MERGE (typically because a review-response push landed
+        and re-triggered CI which then failed), the daemon dispatches
+        this worker. We re-use the fixup-decomposition path with
+        kind='fixup-ci' and the failure log as the trigger context.
+
+        Critical for unattended operation: without this path, a CI
+        failure post-AWAITING-MERGE leaves the task stuck indefinitely
+        until an operator notices.
+        """
+        try:
+            self._provision(provision_worktree=False)
+            self.store.transition(
+                self.node.id,
+                State.RESPONDING_TO_REVIEW,
+                note=f"addressing CI failure ({len(pr_status.failed_checks)} failed check(s))",
+            )
+            row = self._row()
+            self.plan_text = str(row.get("plan_text") or "")
+
+            # Fetch the failed-check log excerpts for the fixup planner.
+            try:
+                ci_log = github.fetch_failed_check_logs(self.cfg.repo_path, int(pr_status.number))
+            except Exception as e:
+                log.warning("fetch_failed_check_logs raised: %s — using minimal context", e)
+                ci_log = "\n".join(f"failed: {c.get('name', '<unknown>')}" for c in pr_status.failed_checks)
+            ci_excerpt = _last_lines(ci_log, 80)
+
+            # ci_triage_retries is the cumulative count for this task,
+            # used as the round_no so successive CI failures get distinct
+            # subtask ID prefixes (F-1-1-..., F-2-1-..., etc).
+            round_no = int(row.get("ci_triage_retries") or 0) + 1
+            self.store.increment(self.node.id, "ci_triage_retries")
+            outcome = self._run_fixup_round(
+                kind="fixup-ci",
+                round_no=round_no,
+                trigger="ci",
+                ci_excerpt=ci_excerpt,
+            )
+            if outcome and outcome.final_state == State.BLOCKED:
+                log.warning(
+                    "ci-fix fixup round blocked: %s — returning to AWAITING_MERGE",
+                    outcome.note,
+                )
+                self.store.transition(
+                    self.node.id,
+                    State.AWAITING_MERGE,
+                    note=f"ci-fix fixup blocked: {outcome.note[:200]}",
+                )
+                return WorkerOutcome(
+                    State.AWAITING_MERGE,
+                    f"ci-fix fixup blocked: {outcome.note[:200]}",
+                )
+
+            # All fixup subtasks settled (per-subtask commits already
+            # pushed). Return to AWAITING_MERGE; GitHub will re-run CI
+            # against the new commits and the daemon's next poll picks
+            # up either CI-pass or another failure.
+            self.store.transition(
+                self.node.id,
+                State.AWAITING_MERGE,
+                note=f"ci-fix round {round_no} pushed {len(pr_status.failed_checks)} fix slice(s)",
+            )
+            return WorkerOutcome(
+                State.AWAITING_MERGE,
+                f"ci-fix round {round_no} complete",
+            )
+        except Exception as e:
+            log.exception("ci-fix for task %s crashed", self.node.id)
+            self.store.transition(
+                self.node.id,
+                State.AWAITING_MERGE,
+                note=f"ci-fix crashed: {e}",
+                last_error=str(e)[:1000],
+            )
+            return WorkerOutcome(State.AWAITING_MERGE, f"ci-fix crashed: {e}")
+        finally:
+            if self.handle is not None:
+                docker_env.teardown(self._h)
+                self.handle = None
+
     def run_rebase_to_main(self) -> WorkerOutcome:
         """v3 Phase C alternate worker entry mode: parent merged → rebase
         this child's branch onto main, retarget its PR, and restore the
