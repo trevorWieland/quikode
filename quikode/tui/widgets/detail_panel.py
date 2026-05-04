@@ -175,11 +175,18 @@ class DetailPanel(Container):
             # moved the cursor. The DataTable's `move_cursor` does NOT
             # auto-scroll when the widget isn't focused — and the subtasks
             # table is rarely focused, since the operator's cursor lives
-            # in the tasks panel above. Live regression confirmed via
-            # diagnostic logging: row_count=19 in DataTable, but viewport
-            # stayed pinned at rows 0-15 (F-6-1 at bottom) until manually
-            # scrolled. Switching to `scroll_end` / `scroll_to` for an
-            # explicit viewport anchor that works regardless of focus.
+            # in the tasks panel above.
+            #
+            # CRITICAL: Textual computes layout asynchronously after a
+            # message handler returns. Calling `scroll_to` / `scroll_end`
+            # synchronously inside `render_snapshot` uses the OLD
+            # `virtual_size` (from before the add_row loop), so the
+            # viewport scrolls to the wrong place — observed live as
+            # F-6-1 stuck at the bottom even though row_count=19.
+            #
+            # Fix: schedule the cursor + scroll ops via `call_after_refresh`
+            # so Textual's layout pass runs first. By the time the deferred
+            # callback fires, `virtual_size` reflects all 19 rows.
             if snap.subtasks:
                 if self._user_moved_subtask_cursor:
                     target = min(prev_cursor_row, len(snap.subtasks) - 1)
@@ -190,21 +197,19 @@ class DetailPanel(Container):
                     # recently-appended fixup subtask.
                     target = len(snap.subtasks) - 1
                 target = max(target, 0)
+                self._scroll_target = target
+                self._scroll_to_end = target >= len(snap.subtasks) - 2
                 try:
-                    st.move_cursor(row=target, column=0, animate=False)
+                    self.app.call_after_refresh(self._apply_subtask_scroll)
                 except Exception:
-                    pass
-                # Force the viewport to show the target row. `scroll_end`
-                # is reliable; `scroll_to(y=target)` works for in-bounds
-                # rows but `scroll_end` is preferred when the target is
-                # the last row (fixup subtasks always append to the end).
-                try:
-                    if target >= len(snap.subtasks) - 2:
-                        st.scroll_end(animate=False)
-                    else:
-                        st.scroll_to(y=target, animate=False)
-                except Exception:
-                    pass
+                    # Synchronous fallback (e.g. headless tests with no
+                    # active app event loop). Still useful for the active-
+                    # subtask cursor highlight even if the scroll lands
+                    # at a stale virtual_size.
+                    try:
+                        st.move_cursor(row=target, column=0, animate=False)
+                    except Exception:
+                        pass
             # Belt-and-suspenders: explicitly mark the table dirty so
             # Textual's next render pass sees the updated row set.
             try:
@@ -231,6 +236,34 @@ class DetailPanel(Container):
         cur = tabs.active or order[0]
         idx = order.index(cur) if cur in order else 0
         tabs.active = order[(idx + direction) % len(order)]
+
+    def _apply_subtask_scroll(self) -> None:
+        """Deferred move_cursor + scroll, run after Textual's layout pass.
+
+        Called via `app.call_after_refresh` from `render_snapshot` so
+        `virtual_size` reflects the just-added rows before we ask the
+        DataTable to scroll. Synchronous scroll attempts in
+        `render_snapshot` saw stale `virtual_size` and anchored the
+        viewport at an obsolete row count.
+        """
+        target = getattr(self, "_scroll_target", None)
+        if target is None:
+            return
+        try:
+            st = self.query_one("#subtasks-table", DataTable)
+        except Exception:
+            return
+        try:
+            st.move_cursor(row=target, column=0, animate=False)
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_scroll_to_end", False):
+                st.scroll_end(animate=False)
+            else:
+                st.scroll_to(y=target, animate=False)
+        except Exception:
+            pass
 
 
 def _subtask_state_cell(state: str) -> str:
