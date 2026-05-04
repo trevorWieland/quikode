@@ -128,22 +128,21 @@ class TaskWorker:
 
         Submitted to the worker pool by the daemon when its review-watcher
         pass detects unresolved review threads on an AWAITING_MERGE task.
-        Skips planning + the subtask loop + new-worktree provisioning; only
-        spins up a fresh container against the existing worktree, runs a
-        triage→do→check cycle scoped to the threads, commits + pushes,
+        Skips planning + the spec subtask loop + new-worktree provisioning;
+        spins up a fresh container against the existing worktree, lets the
+        fixup planner decompose the threads into per-thread mini-subtasks,
+        drives them through the per-subtask doer/checker/commit gate (each
+        thread's fix lands as its own commit + push on the PR branch),
         resolves the threads, and returns the task to AWAITING_MERGE.
 
         Lifecycle (humans drive cadence — no per-task retry budget):
           1. PROVISIONING → reuse worktree, fresh container
-          2. RESPONDING_TO_REVIEW → triage agent (phase=review)
-          3. DOING → whole-spec doer with triage notes
-          4. CHECKING → whole-spec checker (advisory; failure does NOT
-             block the cycle, since each round is human-driven and the
-             reviewer will see the result on the next poll)
-          5. pre-commit gate → on FAIL, one re-do attempt then proceed
-          6. commit + push (whole-spec, git add -A)
-          7. resolve each thread via GraphQL
-          8. transition back to AWAITING_MERGE
+          2. RESPONDING_TO_REVIEW → fixup planner (kind=fixup-review)
+          3. FIXUP_PLANNING → per-thread subtask plan emitted
+          4. DOING_SUBTASK / CHECKING_SUBTASK loop, one slice per thread
+             (each slice commits + pushes via per-subtask gate)
+          5. resolve threads via GraphQL
+          6. transition back to AWAITING_MERGE
         """
         if not threads_to_address:
             log.warning("run_review_response called with empty thread list; nothing to do")
@@ -158,90 +157,61 @@ class TaskWorker:
                 note=f"addressing {len(threads_to_address)} review thread(s)",
             )
 
-            # Re-hydrate plan_text from the row so triage/doer prompts have
-            # spec context. Resume plan if available — otherwise fall back to ""
-            # which the prompts handle.
+            # Re-hydrate plan_text from the row so the fixup-planner prompt
+            # has spec context. Resume plan if available — otherwise fall
+            # back to "" which the prompts handle.
             row = self._row()
             self.plan_text = str(row.get("plan_text") or "")
 
-            # Build review_comments payload from the threads. The existing
-            # prompts/triage.md `{% if review_comments %}` block iterates
-            # `author/path/line/body` fields on each item.
-            review_comments = [
-                {
-                    "author": t.last_comment_author,
-                    "path": t.path or "",
-                    "line": t.line or 0,
-                    "body": t.last_comment_body,
-                }
-                for t in threads_to_address
-            ]
+            # Render the threads as a block the fixup planner can consume.
+            # Each line = author + path:line + truncated body, so the planner
+            # can scope each emitted subtask to one thread's file/line.
+            thread_lines = []
+            for i, t in enumerate(threads_to_address, 1):
+                path_line = f"{t.path or '(no path)'}:{t.line or '?'}"
+                body = (t.last_comment_body or "").strip().replace("\n", " ")
+                if len(body) > 400:
+                    body = body[:400] + "…"
+                thread_lines.append(
+                    f"{i}. [{path_line}] (by {t.last_comment_author}, "
+                    f"bot={'yes' if t.last_comment_is_bot else 'no'}): {body}"
+                )
+            review_threads_block = "\n".join(thread_lines)
 
-            # 2. triage
-            triage_text = self._triage(
-                phase="review",
-                retry_count=int(row.get("review_round") or 0) + 1,
-                retry_budget=0,  # no budget — humans drive cadence
-                review_comments=review_comments,
+            # 2-4. v3 fixup decomposition: plan + run per-thread mini-subtasks.
+            # Each lands as its own commit on the PR branch via the per-subtask
+            # commit gate, replacing the legacy whole-spec _do(attempt=300)
+            # monolith that historically ran 30-60 min on a small set of
+            # threads with shaky convergence.
+            round_no = int(row.get("review_round") or 0) + 1
+            outcome = self._run_fixup_round(
+                kind="fixup-review",
+                round_no=round_no,
+                trigger="review",
+                review_threads_block=review_threads_block,
             )
-            self.last_triage_notes = triage_text
-
-            # 3. doer + 4. checker — first attempt
-            self._do(attempt=300)
-            verdict, ci_result, _, checker_text, _transient = self._check()
-
-            # 5. pre-commit gate (whole-spec; no specific files_to_touch list,
-            # so we run with `none` semantics — git's own hook fires on commit
-            # below). For v3 batch6 we deliberately don't run the per-subtask
-            # pre_commit_gate for review responses: it's scoped to a subtask
-            # row's files_to_touch, which doesn't apply here. Instead we let
-            # the commit's own hooks gate. If the commit fails, we re-do once.
-            commit_result = self._commit_and_push_response()
-            if not commit_result.success:
+            if outcome and outcome.final_state == State.BLOCKED:
+                # Don't surface BLOCKED to the orchestrator — review response
+                # is human-driven; let the operator see the partial progress
+                # and re-trigger via a fresh thread or a manual retry.
                 log.warning(
-                    "review response commit failed (will retry once): %s",
-                    commit_result.output[:300],
+                    "review response fixup round blocked: %s — returning to AWAITING_MERGE",
+                    outcome.note,
                 )
-                # Synthesize a triage note and re-do once.
-                self.last_triage_notes = (
-                    triage_text
-                    + "\n\nCOMMIT FAILED ON FIRST ATTEMPT — retry with hook fix:\n"
-                    + commit_result.output[:2000]
-                )
-                self._do(attempt=301)
-                # Don't re-check — humans will see the result on next poll.
-                commit_result = self._commit_and_push_response()
-                if not commit_result.success:
-                    log.error(
-                        "review response commit failed twice; transitioning back to AWAITING_MERGE: %s",
-                        commit_result.output[:300],
-                    )
-                    self.store.transition(
-                        self.node.id,
-                        State.AWAITING_MERGE,
-                        note=f"review response commit failed: {commit_result.output[:200]}",
-                    )
-                    return WorkerOutcome(
-                        State.AWAITING_MERGE,
-                        f"review response failed to commit: {commit_result.output[:200]}",
-                    )
-
-            # Note checker outcome — informational only; don't block the cycle.
-            if verdict is not Verdict.PASS or ci_result != "pass":
-                log.info(
-                    "review response checker FAILed (verdict=%s ci=%s); proceeding anyway, "
-                    "human will re-review",
-                    verdict,
-                    ci_result,
-                )
-                self.store.add_artifact(
+                self.store.transition(
                     self.node.id,
-                    "review_response_checker_warning",
-                    checker_text or "(no checker output)",
+                    State.AWAITING_MERGE,
+                    note=f"review response fixup blocked: {outcome.note[:200]}",
+                )
+                return WorkerOutcome(
+                    State.AWAITING_MERGE,
+                    f"review response fixup blocked: {outcome.note[:200]}",
                 )
 
-            # 7. resolve threads (best-effort)
-            commit_sha = commit_result.commit_sha or ""
+            # 5. resolve threads (best-effort). Use the latest commit sha on
+            # the branch as the addressed-in marker — the per-subtask commit
+            # gate has already pushed each thread's slice.
+            commit_sha = self._latest_commit_sha_on_branch()
             for t in threads_to_address:
                 try:
                     ok = github_graphql.resolve_thread(t.thread_id)
@@ -250,11 +220,6 @@ class TaskWorker:
                     ok = False
                 if not ok:
                     log.warning("resolve_thread %s returned False; continuing", t.thread_id)
-                # Mark addressed regardless of GitHub's resolve verdict —
-                # we did push a fix, even if the resolve mutation failed.
-                # Upsert first so the row exists when this method runs in
-                # isolation (e.g. tests, or a daemon that hasn't observed
-                # the thread before the worker schedules itself).
                 if commit_sha:
                     self.store.upsert_review_thread(
                         self.node.id,
@@ -638,6 +603,28 @@ class TaskWorker:
             note=f"rebase-to-main: PR #{pr_number} state unreachable",
             last_error=f"could not read state for PR #{pr_number}; refusing to recreate",
         )
+
+    def _latest_commit_sha_on_branch(self) -> str:
+        """Return the current HEAD sha in /workspace, or "" on error.
+
+        Used by `run_review_response` to mark threads addressed against the
+        most-recent commit landed on the PR branch — which after fixup
+        decomposition is the last per-subtask commit pushed by
+        `_handle_subtask_pass`.
+        """
+        try:
+            rc, out, _err = exec_in(
+                self._h,
+                ["bash", "-lc", "cd /workspace && git rev-parse HEAD"],
+                log_path=self.log_path,
+                timeout=30,
+            )
+        except Exception as e:
+            log.warning("latest_commit_sha lookup failed: %s", e)
+            return ""
+        if rc != 0:
+            return ""
+        return (out or "").strip()
 
     def _commit_and_push_response(self) -> worktree.CommitResult:
         """Commit + push the in-flight worktree edits for a review response."""
