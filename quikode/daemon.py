@@ -298,11 +298,156 @@ def _write_pid_file(cfg: Config) -> Path:
     return p
 
 
+def detach_into_background(log_path: Path) -> int:
+    """Fork into a session-leader child writing to `log_path`. Parent returns child PID.
+
+    The child:
+      - calls `os.setsid()` so it survives SIGHUP from the controlling terminal,
+      - re-opens stdin from /dev/null,
+      - redirects stdout/stderr to `log_path` (append mode).
+
+    The parent returns the child's PID. The child returns 0 — the caller
+    distinguishes the two by checking the return value, like `os.fork()`.
+
+    Why not double-fork? `os.setsid` already detaches from the controlling
+    terminal; the second fork only matters if you're worried about reacquiring
+    one via opening a tty device, which we never do.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    child_pid = os.fork()
+    if child_pid > 0:
+        # Parent — return child's pid so the caller can announce it.
+        return child_pid
+
+    # Child path. New session, detach from controlling terminal.
+    os.setsid()
+
+    # Redirect stdio. /dev/null for stdin; append to log_path for the rest.
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+
+    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+    os.close(log_fd)
+
+    return 0
+
+
 def _cleanup_pid_file(p: Path) -> None:
     try:
         p.unlink()
     except OSError:
         pass
+
+
+# Watchdog: how often to read the heartbeat while the child runs. Cheap
+# (one stat + one tiny json parse) so a 5s cadence is fine.
+_WATCHDOG_POLL_S = 5.0
+
+
+def _wait_with_watchdog(
+    cfg: Config,
+    child: subprocess.Popen,
+    state: _SupervisorState,
+    log_fp,
+    sleep_fn,
+) -> int:
+    """Wait for `child` to exit, but SIGTERM it if the heartbeat goes stale.
+
+    Returns the child's final return code. Two consecutive stale reads (over
+    `cfg.daemon_heartbeat_stale_kill_s`) are required before we kill — single
+    missed windows shouldn't trip on bursty heartbeat writers.
+
+    A `daemon_heartbeat_stale_kill_s <= 0` setting disables the watchdog and
+    falls back to the previous wait-forever behavior.
+
+    Implementation note: we use `child.wait(timeout=...)` rather than a poll +
+    sleep loop. wait() with a timeout actually reaps the child when it exits,
+    so on real subprocess.Popen the next iteration sees the rc immediately;
+    a poll/sleep loop would race the same outcome but spin a thread.
+    """
+    threshold = int(cfg.daemon_heartbeat_stale_kill_s)
+    if threshold <= 0:
+        return int(child.wait())
+
+    consecutive_stale = 0
+    while not state.shutdown:
+        try:
+            return int(child.wait(timeout=_WATCHDOG_POLL_S))
+        except subprocess.TimeoutExpired:
+            pass
+
+        hb = read_heartbeat(cfg)
+        now = time.time()
+        if hb is None:
+            # No heartbeat yet → orchestrator hasn't bootstrapped its writer.
+            # Tolerate this until the child has been alive longer than the
+            # staleness threshold; after that, treat absence as stale too.
+            ts_age = now - _process_start_time(child.pid)
+        else:
+            try:
+                ts_age = max(0.0, now - float(hb.get("ts", 0.0)))
+            except (TypeError, ValueError):
+                ts_age = float("inf")
+
+        if ts_age > threshold:
+            consecutive_stale += 1
+            log_fp.write(
+                f"--- [supervisor] heartbeat stale {ts_age:.0f}s > {threshold}s "
+                f"(consecutive={consecutive_stale}) ---\n".encode()
+            )
+            log_fp.flush()
+            if consecutive_stale >= 2:
+                log.warning(
+                    "supervisor: heartbeat stale %.0fs > %ds — killing inner orchestrator",
+                    ts_age,
+                    threshold,
+                )
+                log_fp.write(
+                    "--- [supervisor] heartbeat watchdog firing — SIGTERM child ---\n".encode()
+                )
+                log_fp.flush()
+                # Treat as crash: forward SIGTERM, fall back to SIGKILL after
+                # the standard timeout, and return the rc so the caller's
+                # backoff path runs (state.shutdown stays False).
+                return _terminate_child(child)
+        else:
+            consecutive_stale = 0
+
+        sleep_fn(0)  # pacing hook; the wait() above is the real timer
+
+    # Shutdown was requested while we were polling — let the caller's signal
+    # handler path drive cleanup. Just wait for the child to exit.
+    return int(child.wait())
+
+
+def _process_start_time(pid: int) -> float:
+    """Best-effort wall-clock start time for `pid` (epoch seconds).
+
+    Used to bound the "no heartbeat yet" tolerance: if the inner orchestrator
+    has been alive longer than the staleness threshold and still hasn't
+    written a heartbeat, we treat it as stale.
+    """
+    try:
+        # /proc/<pid>/stat field 22 is starttime in clock ticks since boot.
+        # Skip the comm field (parenthesized, may contain spaces) by anchoring
+        # on the final ')'. starttime is field 22 → index 19 in the post-')' split.
+        with open(f"/proc/{pid}/stat", "rb") as fp:
+            raw = fp.read().decode("utf-8", "replace")
+        rest = raw[raw.rfind(")") + 1 :].split()
+        starttime_ticks = int(rest[19])
+        clk_tck = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        with open("/proc/stat", "rb") as fp:
+            for line in fp:
+                if line.startswith(b"btime "):
+                    btime = int(line.split()[1])
+                    return float(btime) + starttime_ticks / clk_tck
+    except (OSError, ValueError, IndexError, KeyError):
+        pass
+    # Fallback: pretend the process started "now" so we don't false-positive.
+    return time.time()
 
 
 def supervise(cfg: Config, run_args: list[str], *, sleep_fn=time.sleep) -> int:
@@ -350,12 +495,15 @@ def supervise(cfg: Config, run_args: list[str], *, sleep_fn=time.sleep) -> int:
             state.current_child = child
             log.info("supervisor spawned child pid=%d", child.pid)
 
-            # Block until the child exits. We don't need a wakeup loop — when
-            # the supervisor receives SIGTERM, the handler forwards SIGTERM to
-            # the child, which triggers the child's own graceful shutdown and
-            # eventually returns from .wait().
+            # Watch the child with a heartbeat-stale watchdog. A crashed child
+            # exits and child.poll() flips; a *hung* child stays alive forever
+            # while the heartbeat goes cold — without intervention the
+            # supervisor would never restart it. Poll the heartbeat every
+            # ~5s and SIGTERM after two consecutive stale reads (the inner
+            # orchestrator writes its heartbeat on a timer, so a single
+            # missed window doesn't justify a kill).
             try:
-                rc = child.wait()
+                rc = _wait_with_watchdog(cfg, child, state, log_fp, sleep_fn)
             except KeyboardInterrupt:
                 # If KeyboardInterrupt sneaks past the signal handler (race
                 # during install), force the same shutdown path.

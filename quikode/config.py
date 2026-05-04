@@ -447,6 +447,17 @@ class Config(BaseModel):
             "crash-restarts. The last value is the cap (kept on subsequent crashes)."
         ),
     )
+    daemon_heartbeat_stale_kill_s: int = Field(
+        default=600,
+        ge=60,
+        le=3600,
+        description=(
+            "If the orchestrator's heartbeat is older than this for two consecutive "
+            "polls (worker hung, not crashed), the supervisor SIGTERMs it so the "
+            "normal crash-restart path can recover. Set well above the longest "
+            "expected legitimate stall (subtask doer timeouts, big rebases). 0 disables."
+        ),
+    )
 
     # ----- runtime dirs -----
     state_dir: Path = Field(
@@ -657,6 +668,9 @@ def load_config(root: Path | None = None) -> Config:
             daemon.get("min_run_for_backoff_reset_s", defaults.daemon_min_run_for_backoff_reset_s)
         ),
         daemon_backoff_schedule_s=list(daemon.get("backoff_schedule_s", defaults.daemon_backoff_schedule_s)),
+        daemon_heartbeat_stale_kill_s=int(
+            daemon.get("heartbeat_stale_kill_s", defaults.daemon_heartbeat_stale_kill_s)
+        ),
         state_dir=_path(raw.get("state_dir"), root / ".quikode"),
         worktree_root=_path(raw.get("worktree_root"), root / ".quikode" / "worktrees"),
         log_dir=_path(raw.get("log_dir"), root / ".quikode" / "logs"),

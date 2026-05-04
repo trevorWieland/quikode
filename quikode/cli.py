@@ -356,6 +356,9 @@ def _daemon_default(
     max_parallel: int = typer.Option(None, "--max-parallel"),
     log_level: str = typer.Option("INFO", "--log-level"),
     retry_failed: bool = typer.Option(False, "--retry-failed"),
+    detach: bool = typer.Option(
+        False, "--detach", "-d", help="Fork into background; survives SIGHUP from this shell"
+    ),
 ):
     """Default action with no subcommand: start the supervisor in the foreground."""
     if ctx.invoked_subcommand is not None:
@@ -366,6 +369,7 @@ def _daemon_default(
         max_parallel=max_parallel,
         log_level=log_level,
         retry_failed=retry_failed,
+        detach=detach,
     )
 
 
@@ -376,6 +380,9 @@ def daemon_start(
     max_parallel: int = typer.Option(None, "--max-parallel"),
     log_level: str = typer.Option("INFO", "--log-level"),
     retry_failed: bool = typer.Option(False, "--retry-failed"),
+    detach: bool = typer.Option(
+        False, "--detach", "-d", help="Fork into background; survives SIGHUP from this shell"
+    ),
 ):
     """Start the daemon (foreground supervisor that restarts `quikode run` on crash)."""
     _daemon_start_impl(
@@ -384,6 +391,7 @@ def daemon_start(
         max_parallel=max_parallel,
         log_level=log_level,
         retry_failed=retry_failed,
+        detach=detach,
     )
 
 
@@ -394,6 +402,7 @@ def _daemon_start_impl(
     max_parallel: int | None,
     log_level: str,
     retry_failed: bool,
+    detach: bool = False,
 ) -> None:
 
     _setup_logging(log_level)
@@ -421,7 +430,23 @@ def _daemon_start_impl(
     if retry_failed:
         run_args.append("--retry-failed")
 
-    console.print(f"[green]daemon started[/], pid={os.getpid()}, log={daemon_mod.daemon_log_file(cfg)}")
+    log_path = daemon_mod.daemon_log_file(cfg)
+    if detach:
+        # Fork-and-setsid so the supervisor outlives the terminal that started
+        # it. The parent prints the child's pid + log path then exits 0; the
+        # child re-points stdio at the daemon log and falls through into the
+        # normal supervisor loop.
+        child_pid = daemon_mod.detach_into_background(log_path)
+        if child_pid > 0:
+            console.print(f"[green]daemon detached[/], pid={child_pid}, log={log_path}")
+            raise typer.Exit(0)
+        # Child path: stdio is now the log file. Re-init logging so handlers
+        # bind to the new stderr fd. The console's prior carriage state is
+        # discarded — anything we print from here lives in the log.
+        _setup_logging(log_level)
+    else:
+        console.print(f"[green]daemon started[/], pid={os.getpid()}, log={log_path}")
+
     rc = daemon_mod.supervise(cfg, run_args)
     raise typer.Exit(rc)
 

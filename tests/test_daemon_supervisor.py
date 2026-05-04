@@ -80,7 +80,11 @@ class _FakeChild:
         self.signals_received: list[int] = []
         self._terminated = False
 
-    def wait(self) -> int:
+    def wait(self, timeout: float | None = None) -> int:
+        # `timeout` is accepted for parity with subprocess.Popen.wait — the
+        # supervisor's heartbeat watchdog uses it to wake periodically and
+        # check freshness. The fake just resolves immediately either way.
+        del timeout
         if not self._exit_codes:
             raise RuntimeError("no more exit codes scripted")
         rc = self._exit_codes.pop(0)
@@ -231,8 +235,8 @@ def test_supervisor_sigterm_forwards_and_exits(tmp_path, monkeypatch):
     # Use the real supervise but flip shutdown after the first wait
     real_wait = child.wait
 
-    def _wait_then_shutdown():
-        return real_wait()
+    def _wait_then_shutdown(timeout=None):
+        return real_wait(timeout=timeout)
 
     child.wait = _wait_then_shutdown
 
@@ -464,3 +468,152 @@ def test_spawn_child_uses_workspace_dir_not_repo(tmp_path, monkeypatch):
 
     assert captured["cwd"] == str(workspace)
     assert captured["cwd"] != str(repo)
+
+
+# ----- detach_into_background -----
+
+
+def test_detach_into_background_parent_returns_child_pid(tmp_path, monkeypatch):
+    """Parent path: fork() returns the child's pid; helper returns it unchanged
+    without entering the session-leader / stdio-redirect branch.
+    """
+    log_path = tmp_path / "logs" / "daemon.log"
+
+    monkeypatch.setattr(daemon_mod.os, "fork", lambda: 99999)
+
+    setsid_calls = []
+    monkeypatch.setattr(daemon_mod.os, "setsid", lambda: setsid_calls.append(True))
+
+    pid = daemon_mod.detach_into_background(log_path)
+
+    assert pid == 99999
+    # Parent must not detach from its session — that's the child's job.
+    assert setsid_calls == []
+    # log_path's parent is created eagerly so the child's open() can't race.
+    assert log_path.parent.exists()
+
+
+def test_detach_into_background_child_setsid_and_redirects(tmp_path, monkeypatch):
+    """Child path: fork() returns 0. setsid() runs, stdin/stdout/stderr are
+    redirected to /dev/null + the log path via dup2.
+    """
+    log_path = tmp_path / "logs" / "daemon.log"
+
+    monkeypatch.setattr(daemon_mod.os, "fork", lambda: 0)
+
+    setsid_calls = []
+    monkeypatch.setattr(daemon_mod.os, "setsid", lambda: setsid_calls.append(True))
+
+    dup2_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(daemon_mod.os, "dup2", lambda src, dst: dup2_calls.append((src, dst)))
+
+    closed: list[int] = []
+    monkeypatch.setattr(daemon_mod.os, "close", closed.append)
+
+    opened: list[tuple[str, int]] = []
+    real_open = daemon_mod.os.open
+
+    def fake_open(path, flags, mode=0o644):
+        # Return a synthetic fd that won't collide with real ones; we don't
+        # actually want to write to the log file from a unit test.
+        opened.append((str(path), flags))
+        # Use the real open for /dev/null (cheap, real fd) but a synthetic
+        # value for the log so dup2's monkeypatch is exercised symmetrically.
+        if str(path) == os.devnull:
+            return real_open(path, flags)
+        return 4242
+
+    monkeypatch.setattr(daemon_mod.os, "open", fake_open)
+
+    pid = daemon_mod.detach_into_background(log_path)
+
+    assert pid == 0
+    assert setsid_calls == [True]
+    # Child redirects stdin (0) and both stdout (1) and stderr (2) to log_fd.
+    dst_fds = [dst for _, dst in dup2_calls]
+    assert dst_fds == [0, 1, 2]
+    # The log was opened (path was correct).
+    log_opens = [p for p, _ in opened if p == str(log_path)]
+    assert log_opens == [str(log_path)]
+    # Synthetic log fd was closed after dup2.
+    assert 4242 in closed
+
+
+# ----- heartbeat watchdog -----
+
+
+class _HangingFakeChild(_FakeChild):
+    """A fake child whose .wait(timeout) always times out (process hung).
+
+    On SIGTERM it simulates a killed process by setting rc=-SIGTERM, which
+    the supervisor treats as a crash (rc != 0 → backoff + restart).
+    """
+
+    def __init__(self):
+        super().__init__(exit_codes=[])
+
+    def wait(self, timeout: float | None = None):
+        if self.returncode is not None:
+            return self.returncode
+        raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0.0)
+
+    def send_signal(self, sig: int) -> None:
+        self.signals_received.append(sig)
+        if sig == signal.SIGTERM:
+            # Killed-by-signal convention: rc = -signum
+            self.returncode = -sig
+
+
+def test_watchdog_kills_child_when_heartbeat_stale(tmp_path, monkeypatch):
+    """Two consecutive stale heartbeat reads → supervisor SIGTERMs the child."""
+    cfg = _make_cfg(tmp_path)
+    cfg = cfg.model_copy(update={"daemon_heartbeat_stale_kill_s": 60})
+
+    hung = _HangingFakeChild()
+    # Second spawn exits cleanly so the supervisor returns 0 after the kill.
+    clean = _FakeChild(exit_codes=[0])
+
+    spawned: list[object] = []
+
+    def _fake_spawn(_cfg, _args, _log_fp):
+        nxt = hung if not spawned else clean
+        spawned.append(nxt)
+        return nxt
+
+    monkeypatch.setattr(daemon_mod, "_spawn_child", _fake_spawn)
+    monkeypatch.setattr(daemon_mod, "_install_signal_handlers", lambda s: None)
+    # Make the watchdog see a stale heartbeat by faking a process start in the
+    # distant past; no on-disk heartbeat file exists, so the fallback path
+    # computes ts_age = now - process_start.
+    monkeypatch.setattr(daemon_mod, "_process_start_time", lambda pid: time.time() - 9999)
+
+    rc = daemon_mod.supervise(cfg, [], sleep_fn=_no_sleep)
+    assert rc == 0
+    assert signal.SIGTERM in hung.signals_received
+    # Second clean run was scheduled after the kill (treated as crash → restart).
+    assert len(spawned) == 2
+
+
+def test_watchdog_disabled_when_threshold_zero(tmp_path, monkeypatch):
+    """daemon_heartbeat_stale_kill_s=0 falls back to the original wait-forever path."""
+    cfg = _make_cfg(tmp_path)
+    cfg = cfg.model_copy(update={"daemon_heartbeat_stale_kill_s": 0})
+
+    child = _FakeChild(exit_codes=[0])
+    monkeypatch.setattr(daemon_mod, "_spawn_child", lambda *_: child)
+    monkeypatch.setattr(daemon_mod, "_install_signal_handlers", lambda s: None)
+
+    waits = {"calls": 0}
+    real_wait = child.wait
+
+    def _tracking_wait(timeout=None):
+        waits["calls"] += 1
+        # If the watchdog were enabled we'd see timeout != None.
+        assert timeout is None, f"watchdog should be disabled but wait got timeout={timeout}"
+        return real_wait(timeout)
+
+    child.wait = _tracking_wait
+
+    rc = daemon_mod.supervise(cfg, [], sleep_fn=_no_sleep)
+    assert rc == 0
+    assert waits["calls"] >= 1
