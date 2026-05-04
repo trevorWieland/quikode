@@ -21,7 +21,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from . import docker_env, github, github_graphql, manual_probe, prompts, scheduler, sound, worktree
+from . import (
+    docker_env,
+    github,
+    github_graphql,
+    manual_probe,
+    prompts,
+    retry_classify,
+    scheduler,
+    sound,
+    worktree,
+)
 from .agents import build_agent
 from .agents.progress import (
     ProgressAttempt,
@@ -1109,6 +1119,24 @@ class TaskWorker:
                         )
                         break
                     self.store.increment_subtask_transient_retries(self.node.id, subtask.id)
+                    # v3.5 retry classification: a transient checker failure
+                    # is the most common infra-flake retry shape; record it
+                    # so the operator can distinguish "container vanished 8x"
+                    # from "doer produced bad code 8x".
+                    cat, sig = retry_classify.classify_retry(
+                        rc=None,
+                        stderr=checker_text or "",
+                        stdout="",
+                        hint="checker",
+                    )
+                    self.store.append_retry_reason(
+                        self.node.id,
+                        subtask.id,
+                        attempt=attempt,
+                        category=cat,
+                        signature=sig,
+                        transient=True,
+                    )
                     attempt -= 1  # don't burn the real-attempt budget
                     time.sleep(15)
                     continue
@@ -1139,6 +1167,25 @@ class TaskWorker:
                     self.node.id, subtask.id, triage_notes=triage_notes, state=SubtaskState.TRIAGING.value
                 )
                 self.store.increment_subtask_retries(self.node.id, subtask.id)
+                # v3.5 retry classification: real verdict-FAIL retry. Pass the
+                # checker_text as stderr so pattern matching can pluck out
+                # rate-limit / OOM / network signatures if any. The hint
+                # ensures the catch-all bucket is `doer_output_invalid` rather
+                # than `other` when no pattern matches.
+                cat, sig = retry_classify.classify_retry(
+                    rc=None,
+                    stderr=checker_text or "",
+                    stdout="",
+                    hint="checker",
+                )
+                self.store.append_retry_reason(
+                    self.node.id,
+                    subtask.id,
+                    attempt=attempt,
+                    category=cat,
+                    signature=sig,
+                    transient=False,
+                )
 
                 # v3 Phase A: decide whether to run a progress check.
                 # Cadence: first at attempt == subtask_progress_check_after,
@@ -2977,6 +3024,21 @@ class TaskWorker:
                     self.node.id, subtask.id, triage_notes=triage_notes, state=SubtaskState.TRIAGING.value
                 )
                 self.store.increment_subtask_retries(self.node.id, subtask.id)
+                # v3.5 retry classification (post-replan resume path)
+                cat, sig = retry_classify.classify_retry(
+                    rc=None,
+                    stderr=checker_text or "",
+                    stdout="",
+                    hint="checker",
+                )
+                self.store.append_retry_reason(
+                    self.node.id,
+                    subtask.id,
+                    attempt=attempt,
+                    category=cat,
+                    signature=sig,
+                    transient=False,
+                )
             if not settled:
                 self._mark_subtask_blocked(subtask, "post-replan hard ceiling exhausted")
                 self._mark_remaining_pending_as_skipped(after=subtask.id)

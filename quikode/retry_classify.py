@@ -1,0 +1,190 @@
+"""Retry-cause classification.
+
+When a subtask retries, we want to know *why* — was it a real checker
+failure (the doer produced bad code), an infra wobble (container vanished,
+codex CLI timeout), a rate-limit, a pre-commit lint catch, or a network
+flake on `git push`?
+
+Without this signal an operator looking at "R-0019 F-1-1-install-actionlint
+retried 17 times" can't tell whether the system is making progress against
+a hard problem or burning cycles against a transient infra issue. Both
+shapes have the same *count*; only the *cause* distinguishes them.
+
+The classifier is heuristic — patterns over (rc, stderr, stdout) — and
+deliberately conservative: an unknown failure shape lands in `other` rather
+than guessing a category. Better to under-classify than mislead the
+operator.
+
+Categories — keep this list stable; the audit table stores raw strings:
+
+  doer_output_invalid     — doer ran, output didn't satisfy checker
+                             (the most common "real" retry)
+  checker_fail            — checker emitted a structured FAIL verdict
+                             (semantically the same as doer_output_invalid;
+                             distinct because it's the explicit "checker
+                             ran, voted FAIL" path)
+  checker_timeout         — codex/cli timed out before emitting a verdict
+  container_oom           — docker exit 137 / OOMKilled
+  container_vanished      — `docker exec` against a stopped container
+  agent_cli_rate_limit    — rate-limit signature in agent stderr
+  pre_commit_hook_fail    — lefthook returned non-zero
+  network_timeout         — git push / gh CLI hit network error
+  other                   — unclassified
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Final, Literal
+
+RetryCategory = Literal[
+    "doer_output_invalid",
+    "checker_fail",
+    "checker_timeout",
+    "container_oom",
+    "container_vanished",
+    "agent_cli_rate_limit",
+    "pre_commit_hook_fail",
+    "network_timeout",
+    "other",
+]
+
+# All-caps tuple for `quikode show` rendering + the audit-summary helper.
+ALL_CATEGORIES: Final[tuple[RetryCategory, ...]] = (
+    "doer_output_invalid",
+    "checker_fail",
+    "checker_timeout",
+    "container_oom",
+    "container_vanished",
+    "agent_cli_rate_limit",
+    "pre_commit_hook_fail",
+    "network_timeout",
+    "other",
+)
+
+
+# Pattern dictionary. Order matters — earliest match wins. Keep the most
+# specific patterns above the generic ones.
+#
+# Each entry: (compiled regex, category, signature_extractor)
+# `signature_extractor` reads a match object and returns a one-line
+# fingerprint that's useful in `quikode show` ("rate-limit: 429 too many
+# requests on /v1/messages"). Falls back to a generic "<category>: rc=N" if
+# nothing pattern-specific is captured.
+_PATTERNS: list[tuple[re.Pattern[str], RetryCategory, str | None]] = [
+    # Anthropic / Claude rate limit
+    (
+        re.compile(r"\b429\b.*\b(rate.?limit|too.?many.?requests)\b", re.IGNORECASE),
+        "agent_cli_rate_limit",
+        None,
+    ),
+    (
+        re.compile(r"\brate.?limit(?:ed|ing)?\b.*\b(retry.?after|reset.?at)\b", re.IGNORECASE),
+        "agent_cli_rate_limit",
+        None,
+    ),
+    (re.compile(r"\b(quota|usage limit) exceeded\b", re.IGNORECASE), "agent_cli_rate_limit", None),
+    # Container OOM kill (docker)
+    (re.compile(r"OOMKilled|out of memory|exit code 137|exit status 137"), "container_oom", None),
+    # Container vanished (docker exec on dead container)
+    (
+        re.compile(
+            r"(no such container|container .* is not running|Error: No such container)", re.IGNORECASE
+        ),
+        "container_vanished",
+        None,
+    ),
+    # Network errors on git/gh
+    (
+        re.compile(
+            r"(could not resolve host|connection (timed out|refused)|temporary failure in name resolution|network is unreachable|tls handshake timeout)",
+            re.IGNORECASE,
+        ),
+        "network_timeout",
+        None,
+    ),
+    # Lefthook / pre-commit hook
+    (
+        re.compile(r"(lefthook .*FAIL|pre-commit hook .*failed|hook .*returned non-zero)", re.IGNORECASE),
+        "pre_commit_hook_fail",
+        None,
+    ),
+    # Codex/agent timeout
+    (
+        re.compile(r"(timed out after \d+ ?s|timeout.*exceeded|context deadline exceeded)", re.IGNORECASE),
+        "checker_timeout",
+        None,
+    ),
+]
+
+# A small list of "don't match these as the catch-all": when we DO see a
+# checker verdict in the output, it's either FAIL or PASS — both go to
+# `checker_fail` / `doer_output_invalid` rather than `other`.
+_CHECKER_VERDICT_RE = re.compile(r'"verdict"\s*:\s*"(?P<v>FAIL|PASS)"', re.IGNORECASE)
+
+
+def classify_retry(
+    *,
+    rc: int | None,
+    stderr: str = "",
+    stdout: str = "",
+    hint: str | None = None,
+) -> tuple[RetryCategory, str]:
+    """Classify a single retry. Returns (category, short_signature).
+
+    `hint` is an optional caller-supplied tag — e.g. "checker" / "doer" /
+    "pre_commit" — used to disambiguate when patterns aren't decisive.
+    """
+    blob = "\n".join(s for s in (stderr or "", stdout or "") if s)
+    sig_default = f"rc={rc if rc is not None else '?'}"
+
+    # rc=137 is universally OOM — short-circuit before pattern scan.
+    if rc == 137:
+        return ("container_oom", "rc=137 (OOMKilled)")
+
+    for pat, category, _sig_ex in _PATTERNS:
+        m = pat.search(blob)
+        if m:
+            # Trim the matched substring to a readable signature.
+            snippet = blob[max(0, m.start() - 15) : m.end() + 30].replace("\n", " ").strip()
+            return (category, snippet[:120] or sig_default)
+
+    # Hint-driven fallbacks.
+    if hint == "pre_commit":
+        return ("pre_commit_hook_fail", sig_default)
+    if hint == "checker":
+        # If the checker emitted a structured verdict, it's a real fail.
+        m = _CHECKER_VERDICT_RE.search(blob)
+        if m and m.group("v").upper() == "FAIL":
+            return ("checker_fail", "verdict=FAIL")
+        # Doer ran, output didn't pass — the typical "real" retry shape.
+        return ("doer_output_invalid", sig_default)
+    if hint == "network":
+        return ("network_timeout", sig_default)
+
+    # Last-resort buckets.
+    if rc is None:
+        return ("other", "rc=None")
+    return ("other", sig_default)
+
+
+# ----- summary helpers used by `quikode show` -----
+
+
+def histogram(reasons: list[dict]) -> dict[RetryCategory, int]:
+    """Count category occurrences across a list of `retry_reasons` rows."""
+    counts: dict[RetryCategory, int] = {}
+    for r in reasons:
+        cat = r.get("category", "other")
+        if cat in ALL_CATEGORIES:
+            counts[cat] = counts.get(cat, 0) + 1  # type: ignore[index]
+        else:
+            counts["other"] = counts.get("other", 0) + 1
+    return counts
+
+
+def format_histogram(counts: dict[RetryCategory, int]) -> str:
+    """Render a category histogram as `category=N category=N` for quikode show."""
+    if not counts:
+        return ""
+    return " ".join(f"{cat}={n}" for cat, n in sorted(counts.items(), key=lambda kv: -kv[1]))

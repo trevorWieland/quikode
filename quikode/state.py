@@ -414,6 +414,11 @@ CREATE TABLE IF NOT EXISTS subtasks (
     flatline_count INTEGER DEFAULT 0,
     last_failure_root_cause_hash TEXT,
     pre_commit_failures INTEGER DEFAULT 0,
+    -- v3.5 retry-cause classification: JSON array of
+    -- {attempt:int, ts:float, category:str, signature:str, transient:bool}.
+    -- Each retry (real OR transient) appends an entry so `quikode show`
+    -- can render a "why did this retry?" histogram per subtask.
+    retry_reasons TEXT,
     created_at REAL,
     updated_at REAL,
     UNIQUE(task_id, subtask_id)
@@ -556,6 +561,9 @@ class Store:
                 # from fixup slices added on final-check / CI failure. Default
                 # 'spec' preserves behavior for older rows.
                 ("kind", "TEXT NOT NULL DEFAULT 'spec'"),
+                # v3.5 retry-cause classification: JSON array, see schema
+                # docstring above.
+                ("retry_reasons", "TEXT"),
             ],
             "agent_calls": [
                 # v2 Phase 0: scope agent_calls to a specific subtask
@@ -1051,6 +1059,71 @@ class Store:
                 (task_id, subtask_id),
             ).fetchone()
             return int(r["retries"]) if r else 0
+
+    def append_retry_reason(
+        self,
+        task_id: str,
+        subtask_id: str,
+        *,
+        attempt: int,
+        category: str,
+        signature: str,
+        transient: bool = False,
+    ) -> None:
+        """Record one retry's cause + fingerprint on the subtask row.
+
+        `retry_reasons` is a JSON array of objects:
+          [{"attempt": 3, "ts": 1777938xxx.xx,
+            "category": "checker_fail", "signature": "verdict=FAIL",
+            "transient": false}, ...]
+
+        Bounded at the latest 50 entries — pathological retry storms
+        (R-0019 F-1-1 saw 25+ in one stretch) shouldn't blow the column up
+        unboundedly. The histogram in `quikode show` only needs counts; the
+        signatures are kept for the most-recent entries to surface examples.
+        """
+        with self.tx() as c:
+            r = c.execute(
+                "SELECT retry_reasons FROM subtasks WHERE task_id = ? AND subtask_id = ?",
+                (task_id, subtask_id),
+            ).fetchone()
+            try:
+                existing = json.loads(r["retry_reasons"]) if r and r["retry_reasons"] else []
+            except (json.JSONDecodeError, TypeError):
+                existing = []
+            if not isinstance(existing, list):
+                existing = []
+            existing.append(
+                {
+                    "attempt": int(attempt),
+                    "ts": time.time(),
+                    "category": str(category),
+                    "signature": str(signature)[:200],
+                    "transient": bool(transient),
+                }
+            )
+            # Keep tail; counts are preserved by retry_reason_histogram.
+            if len(existing) > 50:
+                existing = existing[-50:]
+            c.execute(
+                "UPDATE subtasks SET retry_reasons = ?, updated_at = ? WHERE task_id = ? AND subtask_id = ?",
+                (json.dumps(existing), time.time(), task_id, subtask_id),
+            )
+
+    def retry_reasons(self, task_id: str, subtask_id: str) -> list[dict]:
+        """Read back the retry_reasons JSON array. Empty list when missing/malformed."""
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT retry_reasons FROM subtasks WHERE task_id = ? AND subtask_id = ?",
+                (task_id, subtask_id),
+            ).fetchone()
+        if r is None or r["retry_reasons"] is None:
+            return []
+        try:
+            data = json.loads(r["retry_reasons"])
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return list(data) if isinstance(data, list) else []
 
     def increment_subtask_pre_commit_failures(self, task_id: str, subtask_id: str) -> int:
         """Bump the pre-commit-failure counter for a subtask. Distinct from

@@ -20,7 +20,7 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from . import daemon as daemon_mod
-from . import docker_env, sound, worktree  # noqa: F401
+from . import docker_env, retry_classify, sound, worktree  # noqa: F401
 from . import notify as notify_mod
 from .config import DEFAULT_CONFIG_TOML, Config, find_config_root, load_config
 from .dag import DAG
@@ -2188,6 +2188,21 @@ def show(
             console.print(
                 f"  {ic} [cyan]{r['subtask_id']}[/]  {r['state']}{retries}  {r.get('title') or ''}{stats_str}"
             )
+            # v3.5 retry-cause histogram. Pulled from the JSON column we
+            # append to on each retry — answers "why" not just "how often."
+            reasons = store.retry_reasons(task_id, r["subtask_id"])
+            if reasons:
+                hist = retry_classify.histogram(reasons)
+                if hist:
+                    hist_str = retry_classify.format_histogram(hist)
+                    console.print(f"      [dim]retry causes: {hist_str}[/]")
+                # Surface the most-recent signature so the operator can see
+                # an example without fishing through state_log.
+                last = reasons[-1]
+                console.print(
+                    f"      [dim]most-recent: {last.get('category', '?')} — "
+                    f"{(last.get('signature') or '')[:120]}[/]"
+                )
 
     # v3: progress-check verdicts (latest per subtask). Surfaces what the
     # progress-check agent has been saying so operators can see FLATLINED
