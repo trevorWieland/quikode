@@ -1,0 +1,73 @@
+# Slim dev image for Python projects (e.g. fastapi).
+# Smaller and faster to build than Dockerfile (which has the rust toolchain).
+#
+# Build:
+#   docker build -t quikode-python-dev:latest -f docker/Dockerfile.python .
+
+FROM debian:trixie-slim
+
+ARG NODE_MAJOR=24
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PATH=/home/dev/.local/bin:/home/dev/.nvm/versions/node/current/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git build-essential pkg-config \
+        bash bash-completion sudo gnupg jq \
+        passwd procps \
+        sqlite3 ripgrep fd-find \
+        python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# gh CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | tee /usr/share/keyrings/githubcli-archive-keyring.gpg > /dev/null \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN /usr/sbin/useradd -m -s /bin/bash -u 1000 dev \
+    && echo "dev ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+USER dev
+WORKDIR /home/dev
+
+# uv (the python package manager)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# just (single binary)
+RUN curl -fsSL https://just.systems/install.sh | bash -s -- --to /home/dev/.local/bin
+
+# node + agent CLIs (claude-code, codex, opencode)
+ENV NVM_DIR=/home/dev/.nvm
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash \
+    && . "$NVM_DIR/nvm.sh" \
+    && nvm install ${NODE_MAJOR} \
+    && nvm alias default ${NODE_MAJOR} \
+    && ln -sfn "$NVM_DIR/versions/node/$(nvm version default)" "$NVM_DIR/versions/node/current" \
+    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && npm install -g ccusage @ccusage/codex @ccusage/opencode \
+    && curl -fsSL https://opencode.ai/install | bash
+
+# Make agent CLIs available in BOTH login and non-login shells, regardless of USER.
+# The login shell (bash -lc) sources /etc/profile.d/*.sh; we install our PATH there.
+USER root
+RUN cat > /etc/profile.d/quikode.sh <<'EOF'
+export NVM_DIR=/home/dev/.nvm
+export PATH=/home/dev/.local/bin:/home/dev/.opencode/bin:$NVM_DIR/versions/node/current/bin:$PATH
+EOF
+RUN chmod 0644 /etc/profile.d/quikode.sh
+USER dev
+RUN echo '. /etc/profile.d/quikode.sh' >> /home/dev/.bashrc
+
+# Copy entrypoint as root, then drop back to dev
+USER root
+COPY entrypoint.sh /usr/local/bin/quikode-entrypoint
+RUN chmod 0755 /usr/local/bin/quikode-entrypoint
+USER dev
+
+ENTRYPOINT ["/usr/local/bin/quikode-entrypoint"]
+CMD ["sleep", "infinity"]

@@ -1,0 +1,110 @@
+/* quikode TUI styles — dark theme, state-color palette per design-tui.md §4. */
+
+Screen {
+    background: $background;
+    color: $foreground;
+    layout: vertical;
+}
+
+#header-bar {
+    height: 4;
+    padding: 0 1;
+    background: $boost;
+    color: $text;
+    border-bottom: solid $primary-darken-2;
+}
+
+/* Layout (top-to-bottom):
+   row 1: tasks panel (full width) — primary nav surface
+   row 2: detail panel (full width) — drilldown for the selected task
+   row 3: activity + resources (split) — peripheral context
+   The intent: glance at the task you care about, drop into its detail right
+   below, and let the global log + resource gauges live at the periphery. */
+#main-grid {
+    layout: grid;
+    grid-size: 2 3;
+    grid-columns: 3fr 2fr;
+    grid-rows: auto 1fr auto;
+    height: 1fr;
+    min-height: 20;
+}
+
+#tasks-panel {
+    column-span: 2;
+    row-span: 1;
+    border: solid $primary-darken-2;
+    padding: 0 1;
+}
+
+#detail-panel {
+    column-span: 2;
+    row-span: 1;
+    border: solid $primary-darken-2;
+    padding: 0 1;
+}
+
+/* Phase status line at top of detail panel — surfaces what the agent is
+   doing right now, especially during whole-spec phases when the subtasks
+   tab is frozen. */
+#detail-phase {
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0;
+    color: $text;
+}
+
+/* The subtasks table can have 10+ rows on R-* nodes — let textual draw
+   the vertical scrollbar so they're all reachable. Without an explicit
+   max-height the parent container clipped overflow without showing a
+   scroll indicator. */
+#subtasks-table {
+    height: 1fr;
+    overflow-y: auto;
+}
+
+#calls-log {
+    height: 1fr;
+    overflow-y: auto;
+}
+
+#activity-panel {
+    border: solid $primary-darken-2;
+    padding: 0 1;
+}
+
+#resources-panel {
+    border: solid $primary-darken-2;
+    padding: 0 1;
+}
+
+#command-bar {
+    /* Input (3 rows incl. textual's tall border) + hint (1 row) + border-top (1 row) = 5 */
+    dock: bottom;
+    height: 5;
+    border-top: solid $primary-darken-2;
+    background: $surface;
+}
+
+/* Pin to textual's default Input height (3 rows: tall border + 1-row content).
+   Inside a constrained Container, the auto-layout can collapse Input to 1 row
+   and the typed text becomes invisible — that was the bug. */
+#command-input {
+    height: 3;
+    margin: 0 1;
+}
+
+#command-hint {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+}
+
+/* state-color hints — applied by tasks_table.py via row class */
+.state-doing      { color: $accent; }
+.state-blocked    { color: $error; }
+.state-awaiting   { color: $success; }
+.state-merged     { color: $success-darken-1; }
+.state-pending    { color: $text-muted; }
+.state-rebasing   { color: $warning; }
+.state-failed     { color: $error; }
+.state-responding { color: $accent; }

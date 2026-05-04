@@ -1,0 +1,108 @@
+"""Tasks panel — primary navigation surface."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from textual.widgets import DataTable
+
+
+@dataclass(frozen=True)
+class TaskRowSnapshot:
+    """One row's data, normalized for the table."""
+
+    task_id: str
+    title: str  # human title from the DAG (truncated for display)
+    milestone: str  # milestone id like "M-0001"
+    state: str
+    in_state_for: str  # time since the last state transition
+    runtime: str  # wall-clock since the most recent attempt began
+    retries: str
+    branch_or_pr: str
+
+
+_STATE_STYLE = {
+    "doing_subtask": "state-doing",
+    "checking_subtask": "state-doing",
+    "triaging_subtask": "state-rebasing",
+    "doing": "state-doing",
+    "checking": "state-doing",
+    "triaging": "state-rebasing",
+    "rebasing": "state-rebasing",
+    "conflict_resolving": "state-failed",
+    "intent_reviewing": "state-rebasing",
+    "replanning": "state-doing",
+    "blocked": "state-blocked",
+    "failed": "state-failed",
+    "aborted": "state-failed",
+    "awaiting_merge": "state-awaiting",
+    "merged": "state-merged",
+    "pending": "state-pending",
+    # v3 review-loop / parent-merge transitions. responding_to_review
+    # mirrors active-doing color (cyan); rebasing_to_main reuses the
+    # rebasing palette (yellow) so a glance signals "git surgery in
+    # flight".
+    "responding_to_review": "state-responding",
+    "rebasing_to_main": "state-rebasing",
+}
+
+
+class TasksTable(DataTable):
+    """DataTable populated from per-tick TaskRowSnapshot list.
+
+    Selection is row-based; the App listens to RowHighlighted to update the
+    detail panel.
+    """
+
+    DEFAULT_CSS = ""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_fp: tuple = ()
+
+    def on_mount(self) -> None:
+        self.cursor_type = "row"
+        self.zebra_stripes = True
+        self.add_columns(
+            "ID", "Milestone · Title", "State", "in-state", "Runtime", "Retries", "Branch / PR / Note"
+        )
+
+    def render_rows(self, rows: list[TaskRowSnapshot]) -> None:
+        # Fingerprint the snapshot — only re-render when something actually
+        # changed. Otherwise the 1s tick visually flashes the table.
+        fp = tuple((r.task_id, r.state, r.in_state_for, r.runtime, r.retries, r.branch_or_pr) for r in rows)
+        if fp == self._last_fp:
+            return
+        self._last_fp = fp
+        # Snapshot diff would be smoother but full re-render is fine for v1.
+        prev_cursor = self.cursor_coordinate
+        self.clear()
+        for r in rows:
+            style = _STATE_STYLE.get(r.state, "")
+            state_cell = f"[@click='show_state(\"{r.state}\")']{r.state}[/]" if style else r.state
+            mtitle = f"{r.milestone} · {r.title[:50]}" if r.milestone else r.title[:60]
+            self.add_row(
+                r.task_id,
+                mtitle,
+                state_cell,
+                r.in_state_for,
+                r.runtime,
+                r.retries,
+                r.branch_or_pr,
+                key=r.task_id,
+            )
+        # Try to restore cursor.
+        if rows:
+            try:
+                self.move_cursor(row=min(prev_cursor.row, len(rows) - 1), column=0)
+            except Exception:
+                pass
+
+    def selected_task_id(self) -> str | None:
+        if self.row_count == 0:
+            return None
+        try:
+            row_key = self.coordinate_to_cell_key(self.cursor_coordinate).row_key
+            return str(row_key.value) if row_key.value is not None else None
+        except Exception:
+            return None

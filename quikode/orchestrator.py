@@ -1,0 +1,1118 @@
+"""DAG-aware scheduler. Runs up to N task workers in parallel using threads."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import subprocess
+import threading
+import time
+from collections.abc import Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+from . import docker_env, github, github_graphql, scheduler
+from .config import Config
+from .dag import DAG
+from .github_graphql import ReviewThread
+from .state import State, Store
+from .worker import TaskWorker
+
+log = logging.getLogger("quikode.orchestrator")
+
+_SKIP_MTIME_DIRS = {
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".uv-cache",
+    ".venv",
+    "dist",
+    "build",
+}
+
+
+def _worktree_mtime(path: Path) -> float | None:
+    if not path.exists():
+        return None
+    latest = 0.0
+    try:
+        for root, dirs, files in os.walk(path):
+            dirs[:] = [d for d in dirs if d not in _SKIP_MTIME_DIRS]
+            for f in files:
+                try:
+                    mt = (Path(root) / f).stat().st_mtime
+                    latest = max(latest, mt)
+                except OSError:
+                    continue
+    except OSError:
+        return None
+    return latest if latest > 0 else None
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        cfg: Config,
+        dag: DAG,
+        store: Store,
+        *,
+        task_filter: set[str] | None = None,
+        awaiting_blocks_dependents: bool = True,
+    ):
+        self.cfg = cfg
+        self.dag = dag
+        self.store = store
+        self.task_filter = task_filter  # if set, only schedule these IDs (and their deps)
+        self.awaiting_blocks_dependents = awaiting_blocks_dependents
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        # Seed the store with PENDING entries for everything in scope
+        scope = self.task_filter or set(self.dag.nodes)
+        for nid in scope:
+            self.store.upsert_pending(nid)
+
+        # Warned-once tracker: avoid spamming the same stall warning every 5s
+        warned: dict[str, float] = {}
+        last_stats_sample = 0.0
+        # Track previously-known MERGED set so we can detect external merges
+        # (user merged a PR while the task was AWAITING_MERGE). When the merged
+        # set grows, the new entries trigger intent reviews on in-flight tasks.
+        previously_merged = self.store.completed_ids() & scope
+
+        with ThreadPoolExecutor(max_workers=self.cfg.max_parallel, thread_name_prefix="qk-task") as pool:
+            futures: dict[str, Future] = {}
+            # Track which futures are review-response futures vs full-run futures.
+            # Reaping treats them identically; this set just lets the heartbeat
+            # surface a count for visibility.
+            review_response_futures: set[str] = set()
+            while not self._stop.is_set():
+                self._check_stalls(warned)
+                now = time.time()
+                if now - last_stats_sample >= self.cfg.container_stats_sample_seconds:
+                    self._sample_container_stats()
+                    last_stats_sample = now
+                # v3 Phase B: review-watcher pass — poll AWAITING_MERGE tasks
+                # for new review threads + detect MERGED/CLOSED. Submits a
+                # `run_review_response` future for any task with unresolved
+                # threads to address.
+                self._poll_review_threads(pool, futures, review_response_futures)
+                # Write heartbeat early in the tick so it fires even on the
+                # all-AWAITING_MERGE branch below (which `continue`s). Without
+                # this, the watcher runs but staleness detection thinks the
+                # daemon is dead.
+                self._write_heartbeat(len(futures), len(review_response_futures))
+                # Detect external merges (e.g. user merged an AWAITING_MERGE PR)
+                # and trigger intent reviews on in-flight tasks. Phase B's
+                # worker-side `_run_intent_review` is the heavy part; we just
+                # raise the flag here.
+                current_merged = self.store.completed_ids() & scope
+                newly_merged = current_merged - previously_merged
+                if newly_merged and self.cfg.intent_check_on_dep_merge:
+                    in_flight = [
+                        r["id"]
+                        for r in self.store.in_state(
+                            State.DOING,
+                            State.CHECKING,
+                            State.TRIAGING,
+                            State.DOING_SUBTASK,
+                            State.CHECKING_SUBTASK,
+                            State.TRIAGING_SUBTASK,
+                            State.FINAL_CHECKING,
+                            State.PR_OPENING,
+                            State.POLLING_CI,
+                        )
+                        if r["id"] not in newly_merged
+                    ]
+                    if in_flight:
+                        for merged_id in newly_merged:
+                            self.store.mark_needs_intent_review(in_flight, triggered_by=merged_id)
+                        log.info(
+                            "external merge(s) detected (%s) → flagged %d in-flight task(s) for intent review",
+                            ", ".join(sorted(newly_merged)),
+                            len(in_flight),
+                        )
+                previously_merged = current_merged
+                # Schedule new work if we have capacity
+                while len(futures) < self.cfg.max_parallel:
+                    nxt = self._pick_next(scope, in_flight=set(futures.keys()))
+                    if nxt is None:
+                        break
+                    log.info("scheduling task %s", nxt)
+                    fut = pool.submit(self._run_one, nxt)
+                    futures[nxt] = fut
+
+                if not futures:
+                    if self._all_done(scope):
+                        log.info("all tasks reached terminal state")
+                        return
+                    time.sleep(5)
+                    continue
+
+                # Reap finished
+                done_ids = [tid for tid, f in futures.items() if f.done()]
+                for tid in done_ids:
+                    try:
+                        outcome = futures[tid].result()
+                        log.info("task %s → %s (%s)", tid, outcome.final_state, outcome.note)
+                        # v2 Phase B: a MERGE may shift the world for in-flight
+                        # tasks. Mark them so the worker triggers an intent review
+                        # at its next safe checkpoint.
+                        if outcome.final_state == State.MERGED and self.cfg.intent_check_on_dep_merge:
+                            in_flight = [
+                                r["id"]
+                                for r in self.store.in_state(
+                                    *[
+                                        State.DOING,
+                                        State.CHECKING,
+                                        State.TRIAGING,
+                                        State.DOING_SUBTASK,
+                                        State.CHECKING_SUBTASK,
+                                        State.TRIAGING_SUBTASK,
+                                        State.FINAL_CHECKING,
+                                        State.PR_OPENING,
+                                        State.POLLING_CI,
+                                    ]
+                                )
+                                if r["id"] != tid
+                            ]
+                            if in_flight:
+                                self.store.mark_needs_intent_review(in_flight, triggered_by=tid)
+                                log.info(
+                                    "flagged %d in-flight task(s) for intent review after %s merged",
+                                    len(in_flight),
+                                    tid,
+                                )
+                    except Exception as e:
+                        log.exception("task %s raised: %s", tid, e)
+                    del futures[tid]
+                    review_response_futures.discard(tid)
+
+                if not done_ids:
+                    time.sleep(2)
+
+    def _pick_next(self, scope: set[str], in_flight: set[str]) -> str | None:
+        """Return the next ready task id, or None.
+
+        Eligibility rules:
+        - With `stacking_strategy=off` (default), a task is only ready when
+          all its deps are MERGED.
+        - With `"within-milestone"` or `"aggressive"`, a dep can be in a
+          stack-ready state (has a remote branch we can fork off); the child
+          branches off the dep's branch instead of main.
+
+        Selection: among all eligible candidates, pick the highest-priority
+        one via `_score_candidate`. Priority axes (see scorer for weights):
+        type (stacked > fresh-root for chain throughput), unblock_boost
+        (favors tasks with more downstream dependents in scope), id_tiebreak
+        (lower R-XXXX = higher, preserves milestone order). This replaces
+        the v3.0 "first eligible by sorted ID" rule, which under-utilized
+        the orchestrator under sustained Phase 3+ parallelism by ignoring
+        the chain-unlock value of each candidate.
+
+        Side-effect on the chosen task: stamp/clear `parent_pr_branch` so
+        the worker's `_provision_worktree` branches off the right ref.
+        Side-effects only fire on the picked candidate, not on every
+        eligible one.
+        """
+        candidates = self._collect_pick_candidates(scope, in_flight)
+        if not candidates:
+            return None
+        # Sort: highest score first, lower task_id breaks score ties (so a
+        # tied R-001 wins over R-005, preserving milestone-order intuition).
+        candidates.sort(key=lambda c: (-self._score_candidate(c, scope), c["task_id"]))
+        best = candidates[0]
+        self._apply_pick_side_effects(best)
+        return str(best["task_id"])
+
+    def _collect_pick_candidates(self, scope: set[str], in_flight: set[str]) -> list[dict]:
+        """Enumerate all tasks currently eligible for scheduling. No side
+        effects. Each candidate carries the metadata `_apply_pick_side_effects`
+        and `_score_candidate` need so they can act without re-deriving."""
+        completed = self.store.completed_ids() & scope
+        active = self.store.active_ids() & scope
+        # States where a dep is "stack-ready" — has a branch we can fork off.
+        STACK_READY = {
+            State.POLLING_CI.value,
+            State.AWAITING_MERGE.value,
+            State.PR_OPENING.value,
+            State.RESPONDING_TO_REVIEW.value,
+        }
+        candidates: list[dict] = []
+        for nid in sorted(scope):
+            if nid in completed or nid in active or nid in in_flight:
+                continue
+            n = self.dag.nodes.get(nid)
+            if n is None:
+                continue
+            row = self.store.get(nid)
+            if row and row["state"] not in (State.PENDING.value,):
+                continue
+            in_scope_deps = [d for d in n.depends_on if d in self.dag.nodes]
+            unmet = [d for d in in_scope_deps if d not in completed]
+            if not unmet:
+                candidates.append({"task_id": nid, "is_stacked": False, "unmet": [], "row": row})
+                continue
+            if self.cfg.stacking_strategy == "off":
+                continue
+            unmet_states = {d: (self.store.get(d) or {}).get("state") for d in unmet}
+            if not all(s in STACK_READY for s in unmet_states.values()):
+                continue
+            if self.cfg.stacking_strategy == "within-milestone" and not all(
+                self.dag.nodes[d].milestone == n.milestone for d in unmet
+            ):
+                continue
+            depth = self._stack_depth(unmet[0])
+            if depth >= self.cfg.stacking_max_depth:
+                continue
+            if self._would_form_cycle(nid, unmet[0]):
+                log.warning(
+                    "refusing to stack %s on %s — would form parent_task_id cycle",
+                    nid,
+                    unmet[0],
+                )
+                continue
+            root = self._stack_root(unmet[0])
+            if self._stack_size_under_root(root) >= self.cfg.stacking_max_breadth_per_root:
+                log.warning(
+                    "task %s would exceed stacking_max_breadth_per_root (%d) under root %s",
+                    nid,
+                    self.cfg.stacking_max_breadth_per_root,
+                    root,
+                )
+                continue
+            candidates.append({"task_id": nid, "is_stacked": True, "unmet": unmet, "row": row})
+        return candidates
+
+    def _score_candidate(self, c: dict, scope: set[str]) -> int:
+        """Delegate to the shared scorer in `scheduler.py` so workers see
+        the same priority signal at yield time."""
+        return scheduler.score_candidate(
+            task_id=c["task_id"],
+            is_stacked=c["is_stacked"],
+            dag=self.dag,
+            scope=scope,
+        )
+
+    def _apply_pick_side_effects(self, c: dict) -> None:
+        """Run any stamping/clearing required for the picked candidate. For
+        stacked children, stamp `parent_pr_branch` from the deepest unmet
+        dep's branch. For fresh roots, clear any stale parent_pr_branch
+        from a prior stacking that no longer applies."""
+        nid = c["task_id"]
+        row = c.get("row")
+        if not c["is_stacked"]:
+            if row and (row.get("parent_pr_branch") or row.get("parent_branch")):
+                self.store.clear_parent_branch(nid)
+            return
+        # Stamp the child's stacking metadata. Deterministic deepest-id wins
+        # rule (same as `_resolve_stack_parent`).
+        unmet_with_branch: list[tuple[str, str]] = []
+        for d in sorted(c["unmet"]):
+            pr = self.store.get(d)
+            if pr and pr.get("branch"):
+                unmet_with_branch.append((d, str(pr["branch"])))
+        if unmet_with_branch:
+            _, parent_branch = unmet_with_branch[-1]
+            self.store.set_field(
+                nid,
+                parent_pr_branch=parent_branch,
+                parent_branch=parent_branch,
+            )
+
+    def _stack_depth(self, task_id: str) -> int:
+        """Compute how deep the stacking chain is starting from `task_id`.
+        Each parent_task_id link adds 1.
+
+        Defensive: a `parent_task_id` cycle (a → b → a) would otherwise
+        loop forever. The `seen` set short-circuits and we return the
+        partial depth; callers treating this as "deep enough to refuse"
+        is the safe default — a row in a cycle is a planning bug worth
+        flagging anyway.
+        """
+        depth = 0
+        cur = task_id
+        seen: set[str] = set()
+        while cur and cur not in seen and depth < 100:
+            seen.add(cur)
+            row = self.store.get(cur)
+            if not row:
+                break
+            cur = row.get("parent_task_id")
+            depth += 1
+        if cur and cur in seen:
+            log.warning(
+                "stacking cycle detected starting at %s (cycle on %s); refusing further stacking",
+                task_id,
+                cur,
+            )
+            # Force the depth above any reasonable max so the caller's
+            # `depth >= cfg.stacking_max_depth` check rejects this branch.
+            return max(depth, self.cfg.stacking_max_depth + 1)
+        return depth
+
+    def _would_form_cycle(self, child_id: str, prospective_parent_id: str) -> bool:
+        """Walking parent_task_id from `prospective_parent_id` upward, would
+        we re-encounter `child_id`? If so, stacking forms a cycle and must
+        be refused. Cycle-safe."""
+        if child_id == prospective_parent_id:
+            return True
+        cur = prospective_parent_id
+        seen: set[str] = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            if cur == child_id:
+                return True
+            row = self.store.get(cur)
+            if not row:
+                return False
+            parent = row.get("parent_task_id")
+            if not parent:
+                return False
+            cur = parent
+        return False
+
+    def _stack_root(self, task_id: str) -> str:
+        """Walk parent_task_id links to the topmost ancestor (the
+        non-stacked root). Returns `task_id` itself when not stacked.
+        Cycle-safe: bails on the first repeat."""
+        cur = task_id
+        seen: set[str] = set()
+        while cur and cur not in seen:
+            seen.add(cur)
+            row = self.store.get(cur)
+            if not row:
+                break
+            parent = row.get("parent_task_id")
+            if not parent:
+                return cur
+            cur = parent
+        return cur or task_id
+
+    def _stack_size_under_root(self, root_task_id: str) -> int:
+        """How many tasks (across the whole tree) are stacked off this
+        root, including the root itself? Used for the breadth-cap check."""
+        # Defensive linear scan — workspaces usually have <300 tasks total.
+        count = 0
+        for r in self.store.all_tasks():
+            if self._stack_root(str(r["id"])) == root_task_id:
+                count += 1
+        return count
+
+    def _sample_container_stats(self) -> None:
+        """Periodic snapshot of cpu/mem usage for every active task's dev container.
+        Records to `container_stats` table — used by `quikode resources` and
+        `quikode briefing` to show live + max-RSS."""
+        for row in self.store.in_state(
+            *[
+                State.PROVISIONING,
+                State.PLANNING,
+                State.DOING,
+                State.CHECKING,
+                State.TRIAGING,
+                State.DOING_SUBTASK,
+                State.CHECKING_SUBTASK,
+                State.TRIAGING_SUBTASK,
+                State.FINAL_CHECKING,
+                State.COMMITTING,
+                State.PUSHING,
+                State.PR_OPENING,
+            ]
+        ):
+            cid = row.get("container_id")
+            if not cid:
+                continue
+            # We don't have the handle on the orchestrator side, but the
+            # container name follows a stable pattern: qk-<slug>-<hex>-dev.
+            # We can infer it by matching the running containers.
+            for c in docker_env.list_quikode_containers():
+                if c["name"].endswith("-dev") and c["id"].startswith(cid[:12]):
+                    stats = docker_env.sample_container_stats(c["name"])
+                    if stats:
+                        self.store.record_container_stats(
+                            row["id"],
+                            c["name"],
+                            stats.get("cpu_pct"),
+                            stats.get("mem_bytes"),
+                            stats.get("mem_pct"),
+                        )
+                    break
+
+    def _check_stalls(self, warned: dict[str, float]) -> None:
+        """Warn once per stall-window when a DOING task's worktree has been quiet.
+
+        Only DOING is expected to produce file edits — planner/checker/triage
+        phases are read-only. We only warn during DOING.
+        """
+        threshold = self.cfg.stall_warn_seconds
+        if threshold <= 0:
+            return
+        now = time.time()
+        for row in self.store.in_state(State.DOING):
+            wt = row.get("worktree_path")
+            if not wt:
+                continue
+            mt = _worktree_mtime(Path(wt))
+            if mt is None:
+                continue
+            quiet = now - mt
+            if quiet < threshold:
+                warned.pop(row["id"], None)
+                continue
+            last_warned = warned.get(row["id"], 0)
+            if now - last_warned < threshold:
+                continue  # already warned in this window
+            log.warning(
+                "task %s appears stalled: doer worktree quiet for %d min (no file edits since %s)",
+                row["id"],
+                int(quiet // 60),
+                time.strftime("%H:%M:%S", time.localtime(mt)),
+            )
+            warned[row["id"]] = now
+
+    def _all_done(self, scope: set[str]) -> bool:
+        """All tasks reached a TRULY terminal state (no orchestrator work left).
+
+        With v3, AWAITING_MERGE is NOT terminal: the orchestrator's review
+        watcher polls those PRs for new threads + human merge. We keep the
+        loop alive on AWAITING_MERGE, RESPONDING_TO_REVIEW, REBASING_TO_MAIN,
+        CONFLICT_RESOLVING, INTENT_REVIEWING, and the subtask-loop states.
+
+        The four genuine terminal states — MERGED, BLOCKED, FAILED,
+        ABORTED — are the only ones that count toward "done."
+        """
+        terminal = {
+            State.MERGED.value,
+            State.BLOCKED.value,
+            State.FAILED.value,
+            State.ABORTED.value,
+        }
+        for nid in scope:
+            row = self.store.get(nid)
+            if not row:
+                return False
+            if row["state"] not in terminal:
+                return False
+        return True
+
+    def _run_one(self, task_id: str):
+        node = self.dag.nodes[task_id]
+        worker = TaskWorker(self.cfg, self.dag, self.store, node)
+        return worker.run()
+
+    # ----- v3 Phase B: review-watcher pass -----
+
+    def _poll_review_threads(
+        self,
+        pool: ThreadPoolExecutor,
+        futures: dict[str, Future],
+        review_response_futures: set[str],
+    ) -> None:
+        """One review-watcher tick.
+
+        For every AWAITING_MERGE task whose last poll was older than
+        `cfg.review_poll_interval_s`:
+
+        1. Check the PR state via `gh pr view`. MERGED → transition to
+           MERGED. CLOSED → transition to ABORTED. Skip review-thread
+           polling for either terminal state.
+        2. Fetch live review threads via GraphQL. Diff against the stored
+           `review_threads` table to determine which threads need
+           addressing.
+        3. Bump `last_review_poll_ts` so the throttle window is honored.
+        4. If any threads need addressing AND the worker pool has slack,
+           submit a `run_review_response` future. The task transitions to
+           RESPONDING_TO_REVIEW synchronously before submit so the TUI /
+           pick-next loop see the new state immediately.
+        """
+        now = time.time()
+        cutoff = now - self.cfg.review_poll_interval_s
+        candidates = self.store.tasks_needing_review_poll(cutoff=cutoff)
+        for task_row in candidates:
+            task_id = task_row["id"]
+            # Skip tasks that already have an in-flight future (e.g. a
+            # review response already running, or somehow re-entered the
+            # active set).
+            if task_id in futures:
+                continue
+            pr_number = task_row.get("pr_number")
+            if not pr_number:
+                # No PR opened yet (e.g. AWAITING_MERGE from a no-diff path).
+                # Mark polled and move on; nothing to do.
+                self.store.set_field(task_id, last_review_poll_ts=now)
+                continue
+            repo = self._repo_identifier(task_row)
+            if not repo:
+                log.warning(
+                    "task %s: cannot derive repo identifier from pr_url; skipping review poll", task_id
+                )
+                self.store.set_field(task_id, last_review_poll_ts=now)
+                continue
+
+            # 1. Check PR state — caught-up MERGE/CLOSE detection.
+            pr_status = github.poll_pr(self.cfg.repo_path, int(pr_number))
+            if pr_status.state == "MERGED":
+                # Capture the parent's branch BEFORE transitioning — we need
+                # it to find children stacked on this branch. The transition
+                # itself doesn't clear `branch`, but the branch field is the
+                # only stable handle from this row to children's
+                # parent_pr_branch; reading it from the row is cleaner than
+                # re-querying after the state change.
+                parent_branch = str(task_row.get("branch") or "")
+                self.store.transition(task_id, State.MERGED, note="merged on github")
+                self.store.set_field(task_id, last_review_poll_ts=now)
+                # v3 Phase C: auto-rebase children stacked on this branch.
+                if parent_branch:
+                    self._schedule_rebases_for_merged_parent(
+                        parent_branch, pool, futures, review_response_futures
+                    )
+                continue
+            if pr_status.state == "CLOSED":
+                # GitHub auto-closes a child PR when its base branch is
+                # deleted (which happens immediately on the parent's
+                # `--delete-branch` merge). If THIS task has a stacked
+                # parent that just merged (parent_pr_branch set, parent
+                # task in MERGED state, AND base branch on the PR no
+                # longer exists), the close is a side-effect of github
+                # cleanup, not a deliberate user close. Schedule a rebase
+                # + fresh PR instead of aborting.
+                parent_branch_field = task_row.get("parent_pr_branch") or task_row.get("parent_branch")
+                pr_base_ref = pr_status.base_ref_name or ""
+                if (
+                    parent_branch_field
+                    and pr_base_ref
+                    and pr_base_ref != self.cfg.base_branch
+                    and not self._remote_branch_exists(pr_base_ref)
+                ):
+                    log.info(
+                        "task %s: PR #%s auto-closed — base %s deleted by parent merge; "
+                        "scheduling rebase-to-main + re-PR",
+                        task_id,
+                        pr_number,
+                        pr_base_ref,
+                    )
+                    self.store.set_field(task_id, last_review_poll_ts=now)
+                    self._schedule_rebase_to_main(
+                        task_id,
+                        pool,
+                        futures,
+                        review_response_futures,
+                        trigger_reason="parent_merge_auto_close",
+                    )
+                    continue
+                # Real close (user-initiated). Capture this task's own
+                # branch BEFORE transitioning so we can clear stale
+                # parent_pr_branch on any stacked children.
+                parent_branch = str(task_row.get("branch") or "")
+                self.store.transition(task_id, State.ABORTED, note="closed without merge")
+                self.store.set_field(task_id, last_review_poll_ts=now)
+                # v3 stacked-diffs fix: parent ABORT means the stack base
+                # no longer exists. Clear children's stale parent metadata
+                # so their next provision/PR-open path goes against main.
+                if parent_branch:
+                    stranded = self.store.children_with_parent_branch(parent_branch)
+                    for c in stranded:
+                        self.store.clear_parent_branch(str(c["id"]))
+                    if stranded:
+                        log.info(
+                            "parent %s closed without merge → cleared parent_pr_branch on %d child(ren)",
+                            task_id,
+                            len(stranded),
+                        )
+                continue
+
+            # v3 enhancement: when a sibling task merges and creates a
+            # mergeability conflict on this PR, GitHub flips mergeable to
+            # CONFLICTING. The pre-v3 worker handled this inside _poll_pr_loop,
+            # but with v3 the worker has exited; the daemon must trigger a
+            # rebase + conflict-resolve cycle.
+            if pr_status.mergeable == "CONFLICTING" and task_id not in futures:
+                log.info("task %s: PR #%s is CONFLICTING — scheduling rebase to main", task_id, pr_number)
+                self.store.set_field(task_id, last_review_poll_ts=now)
+                self._schedule_rebase_to_main(
+                    task_id,
+                    pool,
+                    futures,
+                    review_response_futures,
+                    trigger_reason="sibling_conflict",
+                )
+                continue
+
+            # 2. Fetch + classify review threads.
+            try:
+                threads = github_graphql.get_review_threads(repo, int(pr_number))
+            except Exception as e:
+                log.warning("get_review_threads(%s, %s) raised: %s", repo, pr_number, e)
+                threads = []
+            to_address = self._classify_threads(task_id, threads)
+
+            # 3. Update poll timestamp regardless — throttle is on poll cadence,
+            # not on whether work was found.
+            self.store.set_field(task_id, last_review_poll_ts=now)
+
+            # 4. Schedule response if work found AND slack available.
+            # Reviews are gated on `max_parallel + review_response_extra_slots`
+            # rather than just `max_parallel` so response cycles can dispatch
+            # even when the regular-worker pool is saturated. Without this,
+            # AWAITING_MERGE PRs accumulate unresolved threads under sustained
+            # parallelism and the daemon never frees a slot to address them.
+            review_cap = self.cfg.max_parallel + self.cfg.review_response_extra_slots
+            if to_address and len(futures) < review_cap:
+                self._schedule_review_response(task_id, to_address, pool, futures, review_response_futures)
+                continue
+            if to_address:
+                log.info(
+                    "task %s has %d unresolved review threads but pool is full (%d/%d); will retry next tick",
+                    task_id,
+                    len(to_address),
+                    len(futures),
+                    review_cap,
+                )
+                continue
+
+            # 5. v3 polish: auto-merge a clean AWAITING_MERGE task when
+            # opt-in. Skips when threads are unresolved (we want the
+            # response cycle to finish first).
+            if self.cfg.auto_merge_when_clean and task_row.get("state") == State.AWAITING_MERGE.value:
+                self._attempt_auto_merge(task_row, pr_status, threads)
+
+    def _attempt_auto_merge(
+        self,
+        task_row: Mapping[str, Any],
+        pr_status: github.PRStatus,
+        threads: list[ReviewThread],
+    ) -> None:
+        """Squash-merge `task_row`'s PR if it's safe to do so unattended.
+
+        Preconditions (all must hold):
+          - cfg.auto_merge_when_clean is True (caller checked, defensive recheck)
+          - PR state == OPEN
+          - PR mergeable == MERGEABLE
+          - All checks SUCCESS (or none)
+          - No unresolved review threads (regardless of bot status)
+          - The task has been in AWAITING_MERGE for at least
+            cfg.auto_merge_min_age_s
+
+        On success: sets `auto_merged=1` and lets the next poll tick
+        catch the actual MERGED transition through the existing path.
+        Failures are logged but never raised — a transient `gh pr merge`
+        error gets retried on the next watcher tick.
+        """
+        if not self.cfg.auto_merge_when_clean:
+            return
+        if pr_status.state != "OPEN":
+            return
+        if pr_status.mergeable != "MERGEABLE":
+            return
+        if pr_status.checks_status not in ("success", "none"):
+            return
+        # Every visible thread must be resolved — even bot threads, even
+        # ones we wouldn't normally respond to. Auto-merging while a
+        # human comment chain is open is a footgun.
+        if any(not t.is_resolved for t in threads):
+            return
+        # Time-in-state check.
+        last_change = self._last_state_change_ts(str(task_row["id"]))
+        if last_change is not None and (time.time() - last_change) < self.cfg.auto_merge_min_age_s:
+            return
+
+        task_id = str(task_row["id"])
+        pr_number = int(task_row.get("pr_number") or 0)
+        if not pr_number:
+            return
+        log.info(
+            "task %s: auto-merge preconditions met → gh pr merge --squash --delete-branch #%d",
+            task_id,
+            pr_number,
+        )
+        try:
+            r = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "merge",
+                    str(pr_number),
+                    "--squash",
+                    "--delete-branch",
+                ],
+                cwd=self.cfg.repo_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning("auto-merge for task %s raised %s; will retry on next tick", task_id, e)
+            return
+        if r.returncode != 0:
+            log.warning(
+                "auto-merge for task %s PR #%d failed (rc=%d): %s",
+                task_id,
+                pr_number,
+                r.returncode,
+                (r.stderr or r.stdout)[:300],
+            )
+            return
+        self.store.set_field(task_id, auto_merged=1)
+        log.info("task %s: PR #%d auto-merged successfully", task_id, pr_number)
+
+    def _last_state_change_ts(self, task_id: str) -> float | None:
+        """Most-recent `state_log` ts for a task, or None when missing."""
+        r = self.store.conn.execute(
+            "SELECT MAX(ts) AS ts FROM state_log WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if r is None:
+            return None
+        v = r["ts"]
+        return float(v) if v is not None else None
+
+    def _classify_threads(self, task_id: str, threads: list[ReviewThread]) -> list[ReviewThread]:
+        """Decide which threads warrant a response cycle and upsert all of
+        them into the `review_threads` table.
+
+        Address rules (all must be satisfied):
+          - thread.is_resolved is False
+          - last_comment_is_bot is False, OR cfg.respond_to_bot_reviews is True
+          - thread is "new" relative to what we last addressed: either no
+            stored row exists, OR the stored row was never marked addressed,
+            OR the latest comment is newer than what we stored last time we
+            addressed the thread.
+        """
+        to_address: list[ReviewThread] = []
+        for t in threads:
+            stored = self.store.get_review_thread(task_id, t.thread_id)
+            # Upsert first so the table tracks current state regardless of action.
+            self.store.upsert_review_thread(
+                task_id,
+                thread_id=t.thread_id,
+                is_resolved=t.is_resolved,
+                last_comment_ts=t.last_comment_created_at,
+                last_comment_author=t.last_comment_author,
+                last_comment_is_bot=t.last_comment_is_bot,
+            )
+            if t.is_resolved:
+                continue
+            if t.last_comment_is_bot and not self.cfg.respond_to_bot_reviews:
+                continue
+            # Thread is new (no stored row) → address.
+            if stored is None:
+                to_address.append(t)
+                continue
+            addressed_sha = stored.get("addressed_in_commit_sha")
+            if not addressed_sha:
+                # Never addressed; the stored row is from a prior poll-only
+                # observation. Address it.
+                to_address.append(t)
+                continue
+            # Already addressed at some point. Address again iff the latest
+            # comment is newer than what we last saw at address time. We
+            # approximate by comparing the incoming `last_comment_created_at`
+            # to the previously-stored `last_comment_ts` — the upsert above
+            # already overwrote that field, so we fall back to stored value
+            # before the upsert. For a conservative approach: if the times
+            # differ, treat it as a new comment.
+            stored_ts = float(stored.get("last_comment_ts") or 0.0)
+            if t.last_comment_created_at > stored_ts:
+                to_address.append(t)
+        return to_address
+
+    def _schedule_review_response(
+        self,
+        task_id: str,
+        threads: list[ReviewThread],
+        pool: ThreadPoolExecutor,
+        futures: dict[str, Future],
+        review_response_futures: set[str],
+    ) -> None:
+        """Mark the task RESPONDING_TO_REVIEW and submit a worker future."""
+        self.store.transition(
+            task_id,
+            State.RESPONDING_TO_REVIEW,
+            note=f"daemon scheduled response to {len(threads)} thread(s)",
+        )
+        log.info("scheduling review response for task %s (%d threads)", task_id, len(threads))
+        fut = pool.submit(self._run_review_response_one, task_id, threads)
+        futures[task_id] = fut
+        review_response_futures.add(task_id)
+
+    def _run_review_response_one(self, task_id: str, threads: list[ReviewThread]):
+        node = self.dag.nodes[task_id]
+        worker = TaskWorker(self.cfg, self.dag, self.store, node)
+        return worker.run_review_response(threads)
+
+    # ----- v3 Phase C: stacked-diff auto-rebase on parent merge -----
+
+    def _schedule_rebases_for_merged_parent(
+        self,
+        parent_branch: str,
+        pool: ThreadPoolExecutor,
+        futures: dict[str, Future],
+        review_response_futures: set[str],
+    ) -> None:
+        """When a parent task transitions to MERGED, scan for children
+        whose `parent_pr_branch` matches and trigger an auto-rebase only
+        for children that actually need one. Children that are already
+        terminal (MERGED/ABORTED/etc) are excluded by
+        `children_of_parent_branch`.
+
+        Smart-skip: if a child's PR is still MERGEABLE against the base
+        branch AND its base ref still exists, no rebase is required —
+        github already maintained the rebased view. We just clear the
+        stale parent metadata so the child is treated as a top-level task
+        going forward. Rebase is only scheduled when the child is
+        CONFLICTING or its base ref has been deleted.
+        """
+        children = self.store.children_of_parent_branch(parent_branch)
+        if not children:
+            return
+        log.info(
+            "parent branch %s merged → evaluating %d child(ren) for rebase",
+            parent_branch,
+            len(children),
+        )
+        skipped = 0
+        for child in children:
+            child_id = str(child["id"])
+            pr_number = child.get("pr_number")
+            # Decide whether a rebase is actually needed. With no PR yet
+            # (e.g. mid-DOING_SUBTASK before pr_opening), we keep the
+            # current behavior — flag + schedule — because we don't have
+            # a mergeable signal to consult.
+            needs_rebase = True
+            if pr_number:
+                try:
+                    pr_status = github.poll_pr(self.cfg.repo_path, int(pr_number))
+                except (OSError, subprocess.SubprocessError) as e:
+                    log.warning(
+                        "poll_pr for child %s PR #%s failed (%s); falling back to scheduling rebase",
+                        child_id,
+                        pr_number,
+                        e,
+                    )
+                    pr_status = None
+                if pr_status is not None:
+                    base_intact = self._remote_branch_exists(parent_branch)
+                    if pr_status.mergeable == "MERGEABLE" and base_intact:
+                        # No work to do — child PR is still in good shape
+                        # against its base ref. Clear stale metadata so
+                        # later picks treat the child as top-level.
+                        self.store.clear_parent_branch(child_id)
+                        log.info(
+                            "child %s PR #%s mergeable + base intact; skipping rebase, cleared parent metadata",
+                            child_id,
+                            pr_number,
+                        )
+                        skipped += 1
+                        continue
+                    if pr_status.mergeable == "CONFLICTING":
+                        log.info(
+                            "child %s PR #%s CONFLICTING — scheduling rebase",
+                            child_id,
+                            pr_number,
+                        )
+                    elif not base_intact:
+                        log.info(
+                            "child %s base ref %s missing on remote — scheduling rebase",
+                            child_id,
+                            parent_branch,
+                        )
+            if not needs_rebase:
+                continue
+            # Always raise the mid-flight flag. The worker checks it at
+            # safe checkpoints and handles the rebase inline. For non-active
+            # children we additionally schedule a worker future as today.
+            self.store.mark_needs_parent_rebase(child_id)
+            if child_id in futures:
+                # An active worker is mid-flight on this child. Don't submit
+                # a duplicate future — the flag is enough; the worker will
+                # handle the rebase + PR retarget before continuing.
+                log.info(
+                    "child %s has active worker; flagged needs_parent_rebase for inline handling",
+                    child_id,
+                )
+                continue
+            self._schedule_rebase_to_main(child_id, pool, futures, review_response_futures)
+        if skipped:
+            log.info(
+                "parent branch %s: %d child(ren) skipped rebase (PR still mergeable)",
+                parent_branch,
+                skipped,
+            )
+
+    def _remote_branch_exists(self, branch: str) -> bool:
+        """Check if `branch` still exists on the configured remote.
+
+        Used by the smart-rebase path to decide whether a child whose PR
+        is currently MERGEABLE actually needs a rebase. If the remote
+        branch is gone (parent merged with --delete-branch), github will
+        have auto-closed the child PR and we DO need to recreate / rebase.
+        """
+        try:
+            r = subprocess.run(
+                ["git", "ls-remote", "--heads", self.cfg.pr_remote, branch],
+                cwd=self.cfg.repo_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning("ls-remote for %s failed: %s; assuming branch exists", branch, e)
+            return True
+        if r.returncode != 0:
+            return True  # be conservative — assume present on error
+        return bool(r.stdout.strip())
+
+    def _schedule_rebase_to_main(
+        self,
+        task_id: str,
+        pool: ThreadPoolExecutor,
+        futures: dict[str, Future],
+        review_response_futures: set[str],
+        *,
+        trigger_reason: str = "parent_merged",
+    ) -> None:
+        """Stash the child's pre-rebase state, transition to REBASING_TO_MAIN,
+        and submit a worker future. Mirror of `_schedule_review_response`.
+
+        `trigger_reason` is one of: parent_merged, sibling_conflict,
+        worker_checkpoint_flag, manual. It's surfaced in the state-log
+        note so debuggers don't have to guess WHY a given rebase fired.
+        """
+        row = self.store.get(task_id)
+        if row is None:
+            log.warning("_schedule_rebase_to_main: task %s missing from store", task_id)
+            return
+        # Coalescing: if a rebase was already triggered for this task within
+        # the configured window, skip. The first rebase will run shortly and
+        # the watcher's next tick will surface any genuinely-new conflict
+        # against fresh main; another trigger fires from there if needed.
+        # This avoids burning a container + agent call on the second of two
+        # back-to-back triggers (e.g. parent-merge then sibling-merge within
+        # ~30s) where the first rebase already covers both shifts.
+        window = self.cfg.rebase_coalesce_window_s
+        if window > 0:
+            last_ts = self.store.get_last_rebase_scheduled_ts(task_id)
+            if last_ts is not None and (time.time() - last_ts) < window:
+                log.info(
+                    "task %s: coalescing rebase trigger (%s) — last trigger %.1fs ago < %ds window",
+                    task_id,
+                    trigger_reason,
+                    time.time() - last_ts,
+                    window,
+                )
+                return
+        self.store.set_last_rebase_scheduled(task_id, time.time())
+        pre_state = str(row.get("state") or State.PENDING.value)
+        # Stash the pre-rebase active state so the rebase worker can restore
+        # it on success. AWAITING_MERGE flows back to AWAITING_MERGE; mid-loop
+        # active states return where they were (the worker re-enters from the
+        # FSM at the same point).
+        self.store.set_pre_rebase_state(task_id, pre_state)
+        reason_label = {
+            "parent_merged": "parent merged",
+            "sibling_conflict": "sibling conflict via mergeable=CONFLICTING",
+            "worker_checkpoint_flag": "worker checkpoint flag",
+            "manual": "manual",
+        }.get(trigger_reason, trigger_reason)
+        self.store.transition(
+            task_id,
+            State.REBASING_TO_MAIN,
+            note=f"rebasing onto main ({reason_label}; was {pre_state})",
+        )
+        log.info(
+            "scheduling rebase-to-main for task %s (pre-rebase state %s, reason %s)",
+            task_id,
+            pre_state,
+            trigger_reason,
+        )
+        fut = pool.submit(self._run_rebase_to_main_one, task_id)
+        futures[task_id] = fut
+        # Track in the same set as review-response futures so the heartbeat
+        # surfaces the count under "responding_to_review_futures". Ground truth
+        # lives in the store's REBASING_TO_MAIN state.
+        review_response_futures.add(task_id)
+
+    def _run_rebase_to_main_one(self, task_id: str):
+        node = self.dag.nodes[task_id]
+        worker = TaskWorker(self.cfg, self.dag, self.store, node)
+        return worker.run_rebase_to_main()
+
+    def _repo_identifier(self, task_row: Mapping[str, Any]) -> str:
+        """Derive `owner/name` for GraphQL calls.
+
+        Sources, in priority order:
+          1. `task_row['repo']` if a future migration ever stores it directly
+             (the plan doc references this; today's schema doesn't have it
+             so we keep this branch for forward-compat).
+          2. Parse from the row's `pr_url`
+             (`https://github.com/<owner>/<name>/pull/<n>`).
+          3. Fall back to `gh repo view --json nameWithOwner` against the
+             repo path on disk. Cached on the orchestrator for the lifetime
+             of the process.
+        """
+        explicit = task_row.get("repo")
+        if isinstance(explicit, str) and "/" in explicit:
+            return explicit
+        pr_url = task_row.get("pr_url") or ""
+        if isinstance(pr_url, str) and pr_url:
+            m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/pull/\d+", pr_url)
+            if m:
+                return f"{m.group(1)}/{m.group(2)}"
+        # Last resort: gh repo view (cached).
+        cached = getattr(self, "_repo_id_cache", None)
+        if cached:
+            return cached
+        try:
+            r = subprocess.run(
+                ["gh", "repo", "view", "--json", "nameWithOwner"],
+                cwd=self.cfg.repo_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning("gh repo view failed: %s", e)
+            return ""
+        if r.returncode != 0:
+            return ""
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            return ""
+        repo_id = str(data.get("nameWithOwner") or "")
+        if repo_id:
+            self._repo_id_cache = repo_id
+        return repo_id
+
+    def _write_heartbeat(self, in_flight: int, responding_to_review_futures: int) -> None:
+        """Write a small JSON liveness blob to `state_dir/orchestrator.heartbeat`.
+
+        Light touch — the supervisor loop in batch 8 will use this for
+        crash-restart, and the TUI may read it for liveness display. For now
+        this just records the file every tick.
+        """
+        try:
+            self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
+            awaiting_merge = len(self.store.in_state(State.AWAITING_MERGE))
+            responding = len(self.store.in_state(State.RESPONDING_TO_REVIEW))
+            payload = {
+                "ts": time.time(),
+                "in_flight": in_flight,
+                "awaiting_merge": awaiting_merge,
+                "responding_to_review": responding,
+                "responding_to_review_futures": responding_to_review_futures,
+            }
+            (self.cfg.state_dir / "orchestrator.heartbeat").write_text(json.dumps(payload))
+        except OSError as e:
+            log.debug("heartbeat write failed: %s", e)
