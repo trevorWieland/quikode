@@ -993,7 +993,18 @@ class TaskWorker:
                 return yield_outcome
             triage_notes: str | None = None
             settled = False
-            attempt = 0
+            # v3 fix #24: seed the local attempt counter from the cumulative
+            # `retries` column so progress-check cadence (fires at attempt ==
+            # cfg.subtask_progress_check_after, then every N) keeps firing
+            # across daemon restarts. Without this, a long-running stuck
+            # subtask could survive multiple restart cycles, each restarting
+            # `attempt = 0` and only ever firing the progress check at the
+            # FIRST cadence point — never at higher attempt numbers where
+            # flatline-block would have caught it earlier.
+            #
+            # `existing` is the SubtaskRow read above; on resume it carries
+            # the cumulative retries. Fresh subtasks (no row yet) start at 0.
+            attempt = int((existing or {}).get("retries") or 0)
             block_reason: str | None = None
             consecutive_transients = 0
             transient_max = self.cfg.subtask_transient_max_retries

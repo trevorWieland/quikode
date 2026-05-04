@@ -322,6 +322,60 @@ def test_progress_agent_nonzero_rc_returns_uncertain(tmp_path):
     assert "rc=2" in outcome.rationale
 
 
+# ----- progress check cadence seeded from retries (regression #24) -----
+
+
+def test_progress_check_cadence_seeds_attempt_from_retries_after_resume(tmp_path):
+    """Regression for #24: the local attempt counter must seed from the
+    DB row's `retries` so cadence (fires at 6, 9, 12, ...) keeps firing
+    across daemon restarts. Without this, a long-running stuck subtask
+    survives multiple restart cycles, each restarting `attempt=0` and
+    only ever firing the progress check at the first cadence point."""
+    plan = _build_plan(["S-01"])
+    worker = _build_worker(
+        tmp_path, plan, progress_after=6, progress_every=3, hard_max=20
+    )
+    # Persist a subtask row simulating a resume mid-stuck-subtask: retries=12.
+    worker.store.update_subtask("R-001", "S-01", retries=12)
+
+    progress_called_with: list[int] = []
+
+    def fake_progress(subtask, attempt):
+        progress_called_with.append(attempt)
+        return ProgressVerdict(verdict="progressing", rationale="x")
+
+    do_count = {"n": 0}
+
+    def fake_do(subtask, attempt, triage_notes):
+        do_count["n"] += 1
+        if do_count["n"] > 3:
+            raise RuntimeError("test-stop")
+
+    with (
+        patch.object(worker, "_do_subtask", side_effect=fake_do),
+        patch.object(worker, "_check_subtask", return_value=(Verdict.FAIL, "VERDICT: FAIL", False)),
+        patch.object(worker, "_triage_subtask", return_value="x"),
+        patch.object(worker, "_run_progress_check", side_effect=fake_progress),
+        patch.object(worker, "_handle_parent_rebase_if_needed", return_value=None),
+        patch.object(worker, "_handle_branch_divergence_if_needed", return_value=None),
+        patch("quikode.worker.time.sleep"),
+    ):
+        try:
+            worker._run_subtask_set([plan.subtasks[0]])
+        except RuntimeError as e:
+            assert "test-stop" in str(e)
+
+    # Cadence with after=6, every=3 fires at attempts 6, 9, 12, 15, 18.
+    # Without the fix, post-restart the local attempt would have been
+    # 1, 2, 3 → no progress check ever fires. With the fix, retries=12
+    # seeds attempt to 12, so the first iteration is attempt=13, second 14,
+    # third 15 — and 15 hits the cadence.
+    assert any(a >= 13 for a in progress_called_with), (
+        f"progress_check should have fired at attempt >= 13 (seeded from "
+        f"retries=12); got attempts={progress_called_with}"
+    )
+
+
 # ----- _should_run_progress_check cadence -----
 
 
