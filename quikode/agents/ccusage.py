@@ -39,6 +39,7 @@ an agent run because of a token-accounting hiccup.
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -48,6 +49,8 @@ from ..types import AgentResult
 
 if TYPE_CHECKING:
     from ..docker_env import TaskContainer
+
+log = logging.getLogger("quikode.ccusage")
 
 
 # --- Variant registry --------------------------------------------------------
@@ -183,6 +186,16 @@ def merge_into_result(result: object, stats: CCUsageStats) -> object:
     )
 
 
+# Sanity cap on per-call cost. ccusage's session-aggregate occasionally
+# misattributes (e.g. counts sessions from outside this call's window,
+# or returns a cumulative-since-install value when the snapshot's
+# `before` baseline was missing). Anything above this cap is almost
+# certainly a parser error; observed live: a single 86s subtask_doer
+# call was reported at $292.89. We zero out the cost in that case
+# rather than poison the briefing total + per-task rollup.
+_MAX_PER_CALL_COST_USD = 50.0
+
+
 def snapshot_delta(
     cli: str,
     before: CCUsageStats | None,
@@ -194,23 +207,42 @@ def snapshot_delta(
     None we return `after` unchanged (no baseline → attribute everything
     to this call, which is correct on a fresh-container first call).
 
-    Tokens clamp to >= 0. Cost clamps to >= 0.0. This catches the rare
-    case where ccusage's totals decrease across calls (it shouldn't, but
-    we defend against it instead of poisoning the agent_calls table with
-    negatives).
+    Tokens clamp to >= 0. Cost clamps to >= 0.0. Cost values that
+    exceed `_MAX_PER_CALL_COST_USD` are treated as parser errors and
+    set to 0 with a warning logged.
     """
     if after is None:
         return None
     if before is None:
-        return after
-    return CCUsageStats(
-        tokens_input=max(0, after.tokens_input - before.tokens_input),
-        tokens_output=max(0, after.tokens_output - before.tokens_output),
-        tokens_cached_read=max(0, after.tokens_cached_read - before.tokens_cached_read),
-        tokens_cached_creation=max(0, after.tokens_cached_creation - before.tokens_cached_creation),
-        cost_usd=max(0.0, after.cost_usd - before.cost_usd),
-        raw_json=after.raw_json,
-    )
+        candidate = after
+    else:
+        candidate = CCUsageStats(
+            tokens_input=max(0, after.tokens_input - before.tokens_input),
+            tokens_output=max(0, after.tokens_output - before.tokens_output),
+            tokens_cached_read=max(0, after.tokens_cached_read - before.tokens_cached_read),
+            tokens_cached_creation=max(0, after.tokens_cached_creation - before.tokens_cached_creation),
+            cost_usd=max(0.0, after.cost_usd - before.cost_usd),
+            raw_json=after.raw_json,
+        )
+    if candidate.cost_usd > _MAX_PER_CALL_COST_USD:
+        log.warning(
+            "ccusage snapshot_delta(%s): cost_usd=%.2f exceeds sanity cap (%.2f); "
+            "treating as parser error and zeroing. before=%s after=%s",
+            cli,
+            candidate.cost_usd,
+            _MAX_PER_CALL_COST_USD,
+            "<None>" if before is None else f"${before.cost_usd:.2f}",
+            f"${after.cost_usd:.2f}",
+        )
+        candidate = CCUsageStats(
+            tokens_input=candidate.tokens_input,
+            tokens_output=candidate.tokens_output,
+            tokens_cached_read=candidate.tokens_cached_read,
+            tokens_cached_creation=candidate.tokens_cached_creation,
+            cost_usd=0.0,
+            raw_json=candidate.raw_json,
+        )
+    return candidate
 
 
 # --- internals ---------------------------------------------------------------

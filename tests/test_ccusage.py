@@ -327,6 +327,55 @@ def test_snapshot_delta_no_after_returns_none():
     assert ccusage.snapshot_delta("claude", before, None) is None
 
 
+def test_snapshot_delta_clamps_outlier_cost_to_zero():
+    """Live regression on R-0008: a single 86s subtask_doer call reported
+    cost=$292.89 due to ccusage misattributing cumulative session totals
+    to a fresh-baseline call. Sanity cap is $50; delta values above that
+    are treated as parser noise and zeroed."""
+    before = ccusage.CCUsageStats(
+        tokens_input=0, tokens_output=0, tokens_cached_read=0,
+        tokens_cached_creation=0, cost_usd=0.0, raw_json="",
+    )
+    after = ccusage.CCUsageStats(
+        tokens_input=1000, tokens_output=500, tokens_cached_read=0,
+        tokens_cached_creation=0, cost_usd=292.89, raw_json="",
+    )
+    delta = ccusage.snapshot_delta("opencode", before, after)
+    assert delta is not None
+    # Cost zeroed; tokens preserved (they're rarely the bug).
+    assert delta.cost_usd == 0.0
+    assert delta.tokens_input == 1000
+    assert delta.tokens_output == 500
+
+
+def test_snapshot_delta_no_baseline_clamps_outlier():
+    """Same sanity cap applies on the no-baseline (None before) path.
+    Without a baseline we attribute everything to this call, so an
+    accumulated session-total can land here too."""
+    after = ccusage.CCUsageStats(
+        tokens_input=1000, tokens_output=500, tokens_cached_read=0,
+        tokens_cached_creation=0, cost_usd=999.99, raw_json="",
+    )
+    delta = ccusage.snapshot_delta("opencode", None, after)
+    assert delta is not None
+    assert delta.cost_usd == 0.0
+
+
+def test_snapshot_delta_passes_through_under_cap():
+    """Normal-sized costs are not affected by the cap."""
+    before = ccusage.CCUsageStats(
+        tokens_input=0, tokens_output=0, tokens_cached_read=0,
+        tokens_cached_creation=0, cost_usd=1.20, raw_json="",
+    )
+    after = ccusage.CCUsageStats(
+        tokens_input=100, tokens_output=50, tokens_cached_read=0,
+        tokens_cached_creation=0, cost_usd=2.50, raw_json="",
+    )
+    delta = ccusage.snapshot_delta("claude", before, after)
+    assert delta is not None
+    assert abs(delta.cost_usd - 1.30) < 1e-9
+
+
 def test_snapshot_delta_clamps_negatives_to_zero():
     """Defensive: if `after` somehow has lower totals (shouldn't happen)
     we must not record a negative delta."""
