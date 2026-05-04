@@ -172,20 +172,14 @@ class DetailPanel(Container):
                     ("; ".join(add_errors)[:500]) if add_errors else "",
                 )
             # Auto-follow the active subtask UNLESS the user has manually
-            # moved the cursor (in which case respect their position). When
-            # fixup decomposition appends new subtasks past the visible
-            # viewport (e.g. F-7-* on R-0002 fell below screen), the user
-            # would otherwise have no idea they exist.
-            #
-            # NOTE: do NOT call `scroll_to(y=...)` after `add_row()` in a
-            # tight loop — Textual's DataTable processes row additions
-            # asynchronously, and the explicit scroll fires before all
-            # rows are registered, leaving the viewport anchored at a
-            # stale row index (observed live: F-7-1/F-7-2 invisible on
-            # R-0002 even though all 18 rows were in the snapshot).
-            # `move_cursor` triggers a natural scroll-into-view via
-            # Textual's cursor-follow logic on the next render pass,
-            # which is sequenced correctly with the row additions.
+            # moved the cursor. The DataTable's `move_cursor` does NOT
+            # auto-scroll when the widget isn't focused — and the subtasks
+            # table is rarely focused, since the operator's cursor lives
+            # in the tasks panel above. Live regression confirmed via
+            # diagnostic logging: row_count=19 in DataTable, but viewport
+            # stayed pinned at rows 0-15 (F-6-1 at bottom) until manually
+            # scrolled. Switching to `scroll_end` / `scroll_to` for an
+            # explicit viewport anchor that works regardless of focus.
             if snap.subtasks:
                 if self._user_moved_subtask_cursor:
                     target = min(prev_cursor_row, len(snap.subtasks) - 1)
@@ -195,8 +189,20 @@ class DetailPanel(Container):
                     # Default to last row when no active — usually the most
                     # recently-appended fixup subtask.
                     target = len(snap.subtasks) - 1
+                target = max(target, 0)
                 try:
-                    st.move_cursor(row=max(target, 0), column=0, animate=False)
+                    st.move_cursor(row=target, column=0, animate=False)
+                except Exception:
+                    pass
+                # Force the viewport to show the target row. `scroll_end`
+                # is reliable; `scroll_to(y=target)` works for in-bounds
+                # rows but `scroll_end` is preferred when the target is
+                # the last row (fixup subtasks always append to the end).
+                try:
+                    if target >= len(snap.subtasks) - 2:
+                        st.scroll_end(animate=False)
+                    else:
+                        st.scroll_to(y=target, animate=False)
                 except Exception:
                     pass
             # Belt-and-suspenders: explicitly mark the table dirty so
