@@ -1847,6 +1847,7 @@ class TaskWorker:
         ci_excerpt: str | None = None,
         review_threads_block: str | None = None,
         triage_root_cause: str | None = None,
+        expected_finding_ids: list[str] | None = None,
     ) -> WorkerOutcome | None:
         """Plan a fixup round, append the slices to the subtasks table, and
         run them through the same per-subtask machinery as spec subtasks.
@@ -1875,6 +1876,63 @@ class TaskWorker:
             review_threads_block=review_threads_block,
             triage_root_cause=triage_root_cause,
         )
+        # Completeness check: for audit-driven fixup rounds, every
+        # `expected_finding_ids` entry must appear in the planner's
+        # `findings_addressed` AND in at least one subtask's
+        # `addresses_findings`. If any are missing, re-prompt the planner
+        # once with an explicit gap list. If still missing after the
+        # retry, BLOCK — better to surface to the operator than to ship
+        # a fixup that drops findings.
+        if (
+            fixup_plan is not None
+            and fixup_plan.subtasks
+            and expected_finding_ids
+            and kind == "fixup-pre-pr-audit"
+        ):
+            missing = self._missing_finding_coverage(fixup_plan, expected_finding_ids)
+            if missing:
+                log.warning(
+                    "fixup planner missed %d finding(s) for %s round %d; re-prompting: %s",
+                    len(missing),
+                    kind,
+                    round_no,
+                    ", ".join(sorted(missing)[:8]),
+                )
+                gap_addendum = (
+                    "## ⚠️ Coverage gap from your previous attempt\n\n"
+                    "Your previous plan missed the following finding ids — "
+                    "include each one in `findings_addressed` and assign "
+                    "each to a subtask's `addresses_findings`:\n\n"
+                    + "\n".join(f"- `{fid}`" for fid in sorted(missing))
+                    + "\n\n"
+                    "Re-emit the COMPLETE plan (do not emit only the deltas)."
+                )
+                augmented_root = (gap_addendum + "\n\n---\n\n" + (triage_root_cause or ""))[:16000]
+                fixup_plan = self._invoke_fixup_planner(
+                    kind=kind,
+                    round_no=round_no,
+                    trigger=trigger,
+                    checker_output=checker_output,
+                    ci_excerpt=ci_excerpt,
+                    review_threads_block=review_threads_block,
+                    triage_root_cause=augmented_root,
+                )
+                if fixup_plan is not None and fixup_plan.subtasks:
+                    still_missing = self._missing_finding_coverage(fixup_plan, expected_finding_ids)
+                    if still_missing:
+                        note = (
+                            f"fixup planner still missed {len(still_missing)} finding(s) "
+                            f"after re-prompt for {kind} round {round_no}: "
+                            f"{', '.join(sorted(still_missing)[:8])}; BLOCKing"
+                        )
+                        log.warning(note)
+                        self.store.transition(
+                            self.node.id,
+                            State.BLOCKED,
+                            note=note,
+                            last_error=note[:1000],
+                        )
+                        return WorkerOutcome(State.BLOCKED, note)
         if fixup_plan is None or not fixup_plan.subtasks:
             note = (
                 f"fixup planner returned empty/invalid plan for {kind} round "
@@ -1914,6 +1972,21 @@ class TaskWorker:
             ", ".join(s.id for s in fixup_plan.subtasks),
         )
         return self._run_subtask_set(list(fixup_plan.subtasks))
+
+    @staticmethod
+    def _missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -> set[str]:
+        """Compute the set of expected finding ids the plan does NOT cover.
+
+        Coverage = id appears in `plan.findings_addressed` AND in at
+        least one subtask's `addresses_findings` (extra notes field).
+        Since `Subtask` doesn't have a typed `addresses_findings` field
+        (extra="forbid" on the model), the planner's per-subtask mapping
+        rides only in the `findings_addressed` plan-level array. We
+        therefore validate completeness against that single source.
+        """
+        expected = set(expected_finding_ids)
+        covered = set(plan.findings_addressed)
+        return expected - covered
 
     def _invoke_fixup_planner(
         self,
@@ -2243,16 +2316,35 @@ class TaskWorker:
                 ),
             )
             findings_block = pre_pr_audit.merge_failed_stage_reports(cycle_result.failed_stages)
+            expected_finding_ids = pre_pr_audit.collect_finding_ids(cycle_result.failed_stages)
             self.store.add_artifact(
                 self.node.id,
                 f"pre_pr_audit:cycle_{cycle}",
                 findings_block,
             )
+            # Completeness-augmented findings block: prepend an explicit
+            # "every id below MUST appear in your `findings_addressed`"
+            # instruction so the planner cannot drop findings to fit a
+            # smaller subtask count.
+            if expected_finding_ids:
+                augmented = (
+                    "## Required finding coverage\n\n"
+                    "Every id below MUST appear in your output's "
+                    "`findings_addressed` array AND be referenced by at "
+                    "least one subtask's `addresses_findings` field. "
+                    "Dropping ids is forbidden.\n\n"
+                    + "\n".join(f"- `{fid}`" for fid in expected_finding_ids)
+                    + "\n\n---\n\n"
+                    + findings_block
+                )
+            else:
+                augmented = findings_block
             outcome = self._run_fixup_round(
                 kind="fixup-pre-pr-audit",
                 round_no=cycle,
                 trigger="pre_pr_audit",
-                triage_root_cause=findings_block[:8000],
+                triage_root_cause=augmented[:16000],
+                expected_finding_ids=expected_finding_ids,
             )
             if outcome and outcome.final_state == State.BLOCKED:
                 # Fixup ceiling exhausted on the audit round — surface as

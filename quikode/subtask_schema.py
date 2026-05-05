@@ -229,19 +229,31 @@ class FixupPlan(BaseModel):
 
     Distinct from `Plan` because fixup is an *addition* to an existing plan,
     not a replacement: the original `final_acceptance` still governs the
-    gate, and the original spec subtasks have already landed. The fixup
-    planner emits a small set (1-5) of independently verifiable slices
-    scoped to the surfaced failure.
+    gate, and the original spec subtasks have already landed.
+
+    For audit-driven fixup rounds (`kind="fixup-pre-pr-audit"`), the planner
+    must emit `findings_addressed` listing every finding id from the audit
+    bundle and per-subtask `addresses_findings` arrays mapping each slice
+    to the specific finding ids it covers. Used by the orchestrator's
+    completeness check to ensure no finding gets dropped.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     summary: str = Field(default="")
     subtasks: tuple[Subtask, ...] = Field(min_length=1)
+    findings_addressed: tuple[str, ...] = Field(default=())
 
     @field_validator("subtasks", mode="before")
     @classmethod
     def _coerce_tuple(cls, v: Any) -> Any:
+        if isinstance(v, list):
+            return tuple(v)
+        return v
+
+    @field_validator("findings_addressed", mode="before")
+    @classmethod
+    def _coerce_findings_tuple(cls, v: Any) -> Any:
         if isinstance(v, list):
             return tuple(v)
         return v

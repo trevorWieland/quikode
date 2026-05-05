@@ -142,6 +142,79 @@ def test_merge_failed_stage_reports_empty():
     assert pre_pr_audit.merge_failed_stage_reports([]) == ""
 
 
+# ----- collect_finding_ids (completeness check support) -----
+
+
+def test_collect_finding_ids_namespaces_per_stage():
+    rubric = pre_pr_audit.StageOutcome(
+        name="rubric",
+        passed=False,
+        summary="",
+        findings=[
+            {
+                "id": "category-security",
+                "gaps_to_reach_ten": [
+                    {"id": "validate-org-name"},
+                    {"id": "redact-pii-in-logs"},
+                ],
+            },
+        ],
+    )
+    standards = pre_pr_audit.StageOutcome(
+        name="standards",
+        passed=False,
+        summary="",
+        findings=[{"id": "rename-account-orgs", "severity": "high"}],
+    )
+    behavior = pre_pr_audit.StageOutcome(
+        name="behavior",
+        passed=False,
+        summary="",
+        findings=[
+            {
+                "behavior_id": "B-1",
+                "completeness_gaps": [{"id": "falsification-on-dup"}],
+            }
+        ],
+    )
+    ids = pre_pr_audit.collect_finding_ids([rubric, standards, behavior])
+    assert "rubric:validate-org-name" in ids
+    assert "rubric:redact-pii-in-logs" in ids
+    assert "rubric:category-security" in ids
+    assert "standards:rename-account-orgs" in ids
+    assert "behavior:falsification-on-dup" in ids
+    assert "behavior:B-1" in ids
+
+
+def test_collect_finding_ids_synthesizes_when_no_id():
+    stage = pre_pr_audit.StageOutcome(
+        name="local_ci",
+        passed=False,
+        summary="",
+        findings=[
+            {"kind": "compile_error", "file": "src/foo.rs", "message": "boom"},
+            {"kind": "compile_error", "file": None},
+        ],
+    )
+    ids = pre_pr_audit.collect_finding_ids([stage])
+    # Both findings get a stable id even without an explicit `id` field.
+    assert all(fid.startswith("local_ci:") for fid in ids)
+    assert len(ids) == 2
+
+
+def test_collect_finding_ids_dedupes_across_stages():
+    s = pre_pr_audit.StageOutcome(
+        name="rubric",
+        passed=False,
+        summary="",
+        findings=[
+            {"id": "x", "gaps_to_reach_ten": [{"id": "x"}]},
+        ],
+    )
+    ids = pre_pr_audit.collect_finding_ids([s])
+    assert ids.count("rubric:x") == 1
+
+
 # ----- collect_standards_text -----
 
 

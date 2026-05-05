@@ -508,6 +508,54 @@ def merge_failed_stage_reports(failed: list[StageOutcome]) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+def collect_finding_ids(failed: list[StageOutcome]) -> list[str]:
+    """Extract every finding `id` (namespaced by stage) across the failed
+    stages. Used by the orchestrator's completeness check to verify the
+    fixup planner mapped every finding to a subtask.
+
+    The audit prompts emit a stable kebab-case `id` field per finding /
+    gap; we namespace with the stage name (rubric / standards / behavior)
+    to avoid collisions across stages and to keep the planner's
+    `findings_addressed` list traceable.
+
+    Findings without an `id` (e.g. local_ci's structured CI failures
+    which have file/line but no semantic id, or rubric `gaps_to_reach_ten`
+    on the older prompt format) get a synthetic id derived from stage +
+    file/line so they still appear in the coverage check.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for stage in failed:
+        for idx, f in enumerate(stage.findings or []):
+            raw_id = (
+                f.get("id") or f.get("behavior_id") or f.get("category") or f.get("file") or f.get("kind")
+            )
+            fid = f"{stage.name}:{raw_id}" if raw_id else f"{stage.name}:auto-{idx}"
+            # Walk each rubric category's gaps_to_reach_ten if present
+            # (the v3.7 rubric prompt emits these inline).
+            gaps = f.get("gaps_to_reach_ten") or []
+            if isinstance(gaps, list):
+                for gap in gaps:
+                    if isinstance(gap, dict) and gap.get("id"):
+                        gap_fid = f"{stage.name}:{gap['id']}"
+                        if gap_fid not in seen:
+                            seen.add(gap_fid)
+                            ids.append(gap_fid)
+            # Walk behavior `completeness_gaps` similarly.
+            cgaps = f.get("completeness_gaps") or []
+            if isinstance(cgaps, list):
+                for cgap in cgaps:
+                    if isinstance(cgap, dict) and cgap.get("id"):
+                        cgap_fid = f"{stage.name}:{cgap['id']}"
+                        if cgap_fid not in seen:
+                            seen.add(cgap_fid)
+                            ids.append(cgap_fid)
+            if fid not in seen:
+                seen.add(fid)
+                ids.append(fid)
+    return ids
+
+
 def _tail(text: str, n_lines: int) -> str:
     if not text:
         return ""

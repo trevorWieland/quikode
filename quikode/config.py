@@ -499,14 +499,18 @@ class Config(BaseModel):
         ),
     )
     pre_pr_audit_max_cycles: int = Field(
-        default=3,
+        default=10,
         ge=1,
-        le=10,
+        le=20,
         description=(
             "How many full pipeline cycles (CI + 3 audits → triage → fixup → "
-            "subtask loop → re-run pipeline) before BLOCKing. Each cycle is "
-            "expensive; 3 is enough that genuine fixes converge while real "
-            "stuck-points get surfaced for human review."
+            "subtask loop → re-run pipeline) before BLOCKing. The earlier "
+            "default of 3 was too tight: when initial audit findings exceeded "
+            "what one fixup-planner round could decompose, genuine fixes were "
+            "still in flight when the cap fired. 10 gives the convergence "
+            "loop room to address all findings (rubric ≥7 every category, "
+            "zero medium+ standards findings, every behavior verified) "
+            "rather than just enough to pass."
         ),
     )
     pre_pr_audit_timeout_s: int = Field(
