@@ -1,4 +1,14 @@
-/* quikode TUI styles — dark theme, state-color palette per design-tui.md §4. */
+/* quikode TUI styles — dark theme, state-color palette per design-tui.md §4.
+
+   Layout philosophy: proportional everywhere. The only fixed-height pieces
+   are the physical chrome (header, command bar) and the Textual Input
+   widget (which collapses when allowed to size auto inside a Container).
+   Every visual region uses `1fr` / `2fr` / `3fr` weights so the layout
+   adapts to any terminal size without truncation or wasted whitespace.
+
+   No more 12-row caps on activity/resources. No more 2fr/12 ratio that
+   wedged tasks+detail into a sliver on small terminals while wasting
+   space on big ones. Trust Textual's CSS engine to redistribute. */
 
 Screen {
     background: $background;
@@ -14,37 +24,53 @@ Screen {
     border-bottom: solid $primary-darken-2;
 }
 
-/* Layout (top-to-bottom):
-   row 1: tasks panel (full width) — primary nav surface
-   row 2: detail panel (full width) — drilldown for the selected task
-   row 3: activity + resources (split) — peripheral context
-   The intent: glance at the task you care about, drop into its detail right
-   below, and let the global log + resource gauges live at the periphery.
-   Row sizing: detail-panel needs the most vertical space (subtasks lists
-   on R-* tasks routinely run 15-19 rows), so it gets 2fr. The tasks panel
-   shows ~5-10 in-flight tasks at any time and self-sizes; activity lives
-   at the bottom with a clamped height so it never crowds detail out. */
-#main-grid {
-    layout: grid;
-    grid-size: 2 3;
-    grid-columns: 3fr 2fr;
-    grid-rows: auto 2fr 12;
+/* Main split: 3fr left column (tasks + detail) | 2fr right column (activity + resources).
+   Widths are proportional — narrow terminals get a 60/40 split, wide terminals
+   keep the same ratio so neither side overruns. */
+#main-split {
+    layout: horizontal;
     height: 1fr;
-    min-height: 20;
 }
 
+#main-left {
+    width: 3fr;
+    layout: vertical;
+}
+
+#main-right {
+    width: 2fr;
+    layout: vertical;
+}
+
+/* Inside the left column: tasks (1fr) | detail (2fr). Detail gets 2x because
+   subtasks lists routinely run 10-19 rows. The ratio adapts: on a 30-row
+   terminal, tasks gets ~10 rows / detail ~20; on an 80-row terminal,
+   tasks gets ~27 rows / detail ~53. Both proportional, neither truncated. */
 #tasks-panel {
-    column-span: 2;
-    row-span: 1;
+    height: 1fr;
     border: solid $primary-darken-2;
     padding: 0 1;
 }
 
 #detail-panel {
-    column-span: 2;
-    row-span: 1;
+    height: 2fr;
     border: solid $primary-darken-2;
     padding: 0 1;
+}
+
+/* Inside the right column: activity (1fr) | resources (1fr). Equal split. */
+#activity-panel {
+    height: 1fr;
+    border: solid $primary-darken-2;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+#resources-panel {
+    height: 1fr;
+    border: solid $primary-darken-2;
+    padding: 0 1;
+    overflow-y: auto;
 }
 
 /* Phase status line at top of detail panel — surfaces what the agent is
@@ -57,10 +83,8 @@ Screen {
     color: $text;
 }
 
-/* The subtasks table can have 10+ rows on R-* nodes — let textual draw
-   the vertical scrollbar so they're all reachable. Without an explicit
-   max-height the parent container clipped overflow without showing a
-   scroll indicator. */
+/* Detail-panel inner tables. `1fr` lets them claim whatever vertical space
+   the detail panel itself was given by its own `2fr` weight. */
 #subtasks-table {
     height: 1fr;
     overflow-y: auto;
@@ -71,22 +95,9 @@ Screen {
     overflow-y: auto;
 }
 
-#activity-panel {
-    border: solid $primary-darken-2;
-    padding: 0 1;
-    height: 12;
-    overflow-y: auto;
-}
-
-#resources-panel {
-    border: solid $primary-darken-2;
-    padding: 0 1;
-    height: 12;
-    overflow-y: auto;
-}
-
 #command-bar {
-    /* Input (3 rows incl. textual's tall border) + hint (1 row) + border-top (1 row) = 5 */
+    /* Input (3 rows incl. textual's tall border) + hint (1 row) + border-top (1 row) = 5.
+       Docked to the bottom of the screen so it never competes with the main split for space. */
     dock: bottom;
     height: 5;
     border-top: solid $primary-darken-2;
@@ -95,7 +106,8 @@ Screen {
 
 /* Pin to textual's default Input height (3 rows: tall border + 1-row content).
    Inside a constrained Container, the auto-layout can collapse Input to 1 row
-   and the typed text becomes invisible — that was the bug. */
+   and the typed text becomes invisible — confirmed Textual quirk, not a hack
+   we can purge. */
 #command-input {
     height: 3;
     margin: 0 1;

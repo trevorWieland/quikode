@@ -16,7 +16,7 @@ from typing import ClassVar
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
-from textual.containers import Container
+from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable
 
 from quikode.config import load_config
@@ -71,13 +71,18 @@ class QuikodeTUI(App):
 
     def compose(self) -> ComposeResult:
         yield WorkspaceHeader(id="header-bar")
-        # Order matters — textual fills the grid in compose order. Match the
-        # row order in the CSS: tasks, detail, then activity + resources.
-        with Container(id="main-grid"):
-            yield TasksTable(id="tasks-panel")
-            yield DetailPanel(id="detail-panel")
-            yield ActivityFeed(id="activity-panel")
-            yield ResourcesPanel(id="resources-panel")
+        # Proportional split — left column (3fr) gets tasks + detail, right column
+        # (2fr) gets activity + resources. Each child uses `1fr` / `2fr` weights
+        # in CSS so the layout adapts to any terminal size. No fixed heights;
+        # no composition-order coupling to a grid template (the previous layout
+        # required compose() order to match `grid-rows: auto 2fr 12` exactly).
+        with Horizontal(id="main-split"):
+            with Vertical(id="main-left"):
+                yield TasksTable(id="tasks-panel")
+                yield DetailPanel(id="detail-panel")
+            with Vertical(id="main-right"):
+                yield ActivityFeed(id="activity-panel")
+                yield ResourcesPanel(id="resources-panel")
         yield CommandBar(SLASH_CATALOG, on_submit=self._dispatch_slash, id="command-bar")
 
     def on_mount(self) -> None:

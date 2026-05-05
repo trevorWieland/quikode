@@ -105,7 +105,11 @@ class DetailPanel(Container):
             with TabPane("Subtasks", id="subtasks-tab"):
                 yield DataTable(id="subtasks-table", zebra_stripes=True, cursor_type="row")
             with TabPane("Agent calls", id="calls-tab"):
-                yield RichLog(id="calls-log", markup=True, wrap=False, max_lines=200)
+                # Soft buffer cap (RichLog drops oldest when exceeded). Display
+                # is bounded by the panel's proportional height; this controls
+                # scroll-back depth. 1000 covers a multi-hour task with 40+
+                # agent calls per phase without losing early history.
+                yield RichLog(id="calls-log", markup=True, wrap=False, max_lines=1000)
 
     def on_mount(self) -> None:
         # Set up the subtasks DataTable columns once.

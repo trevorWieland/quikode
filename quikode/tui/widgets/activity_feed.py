@@ -27,7 +27,11 @@ class ActivityFeed(RichLog):
     def on_mount(self) -> None:
         self.wrap = False
         self.markup = True
-        self.max_lines = 200
+        # Soft buffer cap (RichLog drops oldest when exceeded). Display is bounded
+        # by the panel's proportional height; this just controls how far the
+        # operator can scroll back. 1000 covers a multi-hour session without
+        # losing early activity, while staying inexpensive to render.
+        self.max_lines = 1000
 
     def render_entries(self, entries: list[ActivityEntry]) -> None:
         # Caller passes entries newest-first (matches the SQL ORDER BY ts DESC).
