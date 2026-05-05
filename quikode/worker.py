@@ -2059,27 +2059,50 @@ class TaskWorker:
             triage_root_cause=triage_root_cause,
         )
         self._write_log_header(f"FIXUP PLANNER {kind} round {round_no}", prompt)
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=600)
-        self.store.record_agent_call(
-            self.node.id,
-            phase=f"fixup_planner:{kind}",
-            cli=self.cfg.planner.cli,
-            model=self.cfg.planner.model,
-            rc=result.rc,
-            duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
-            tokens_input=result.tokens_input,
-            tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
-            cost_usd=result.cost_usd,
-        )
-        self.store.add_artifact(
-            self.node.id,
-            f"fixup_planner_output:{kind}:{round_no}",
-            result.stdout,
-        )
-        if result.rc != 0:
+
+        # rc=124 maps to either a real timeout or `agents.base._is_transient_container_failure`
+        # (codex CLI flake, container hiccup). Retry once or twice before giving up so
+        # infra noise doesn't burn fixup_max_rounds on a transient.
+        retries_left = self.cfg.fixup_planner_retries_on_transient
+        attempt_no = 0
+        while True:
+            attempt_no += 1
+            result = agent.run(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.fixup_planner_timeout_s,
+            )
+            self.store.record_agent_call(
+                self.node.id,
+                phase=f"fixup_planner:{kind}",
+                cli=self.cfg.planner.cli,
+                model=self.cfg.planner.model,
+                rc=result.rc,
+                duration_s=result.duration_s or 0,
+                tokens_used=result.tokens_used,
+                tokens_input=result.tokens_input,
+                tokens_output=result.tokens_output,
+                tokens_cached_read=result.tokens_cached_read,
+                tokens_cached_creation=result.tokens_cached_creation,
+                cost_usd=result.cost_usd,
+            )
+            self.store.add_artifact(
+                self.node.id,
+                f"fixup_planner_output:{kind}:{round_no}:attempt{attempt_no}",
+                result.stdout,
+            )
+            if result.rc == 0:
+                break
+            if result.rc == 124 and retries_left > 0:
+                retries_left -= 1
+                log.warning(
+                    "fixup planner rc=124 (timeout/transient) for %s round %d, retrying (%d left)",
+                    kind,
+                    round_no,
+                    retries_left,
+                )
+                continue
             log.warning("fixup planner exited rc=%d (kind=%s round=%d)", result.rc, kind, round_no)
             return None
         try:

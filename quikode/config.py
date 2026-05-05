@@ -218,6 +218,36 @@ class Config(BaseModel):
             "a cascade, third round is the safety net before declaring the task BLOCKED."
         ),
     )
+    fixup_planner_timeout_s: int = Field(
+        default=1200,
+        ge=120,
+        le=3600,
+        description=(
+            "Hard timeout for a single fixup planner agent invocation. The audit "
+            "decomposition path (`fixup-pre-pr-audit`) feeds the planner a bundle "
+            "that can include 20-30 findings each requiring a per-subtask mapping; "
+            "the planner has to read every finding, decide a partition into 1-5 "
+            "subtasks (or more), AND emit a complete `findings_addressed` array — "
+            "with the v3.7 thorough audit prompts the resulting JSON can be 4-8KB "
+            "of structured output, which codex routinely takes 8-12 minutes to "
+            "produce. The previous 600s ceiling fired with empty stdout (rc=124) "
+            "and the worker BLOCKed the task; 20 minutes gives genuine convergence "
+            "room without being so wide that a real hang goes unnoticed."
+        ),
+    )
+    fixup_planner_retries_on_transient: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description=(
+            "When the fixup planner returns rc=124 (timeout or transient container "
+            "failure per `agents.base._is_transient_container_failure`), retry the "
+            "agent invocation up to N times before giving up. Each retry is a fresh "
+            "agent.run with the same prompt; this absorbs codex CLI flakes and "
+            "occasional bursty backpressure without burning the fixup_max_rounds "
+            "budget on infrastructure noise. Set 0 to disable."
+        ),
+    )
     preempt_at_subtask_boundary: bool = Field(
         default=False,
         description=(
