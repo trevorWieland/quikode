@@ -849,19 +849,14 @@ def unblock(
         console.print("\n[bold]Forensics:[/]")
         cats = forensics.get("retry_categories_total") or {}
         if cats:
-            cats_str = " ".join(
-                f"{c}={n}" for c, n in sorted(cats.items(), key=lambda kv: -kv[1])
-            )
+            cats_str = " ".join(f"{c}={n}" for c, n in sorted(cats.items(), key=lambda kv: -kv[1]))
             console.print(f"  retry categories: [dim]{cats_str}[/]")
         for ps in forensics.get("per_subtask") or []:
             r = ps.get("retries") or 0
             tr = ps.get("transient_retries") or 0
             fl = ps.get("flatline_count") or 0
             if r or tr or fl:
-                console.print(
-                    f"  [cyan]{ps.get('subtask_id')}[/]: retries={r} transient={tr} "
-                    f"flatline={fl}"
-                )
+                console.print(f"  [cyan]{ps.get('subtask_id')}[/]: retries={r} transient={tr} flatline={fl}")
         last_co = (forensics.get("last_checker_outputs") or [])[:1]
         if last_co:
             excerpt = (last_co[0].get("excerpt") or "")[:300]

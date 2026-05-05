@@ -2379,13 +2379,16 @@ class TaskWorker:
         from the top.
         """
         for cycle in range(1, self.cfg.pre_pr_audit_max_cycles + 1):
+            log.info(
+                "task %s: pre-pr pipeline cycle %d/%d", self.node.id, cycle, self.cfg.pre_pr_audit_max_cycles
+            )
+            # Seed the audit summary so the TUI shows queued / in-flight /
+            # done states for each stage as the cycle progresses.
+            self.store.begin_pre_pr_audit_cycle(self.node.id, cycle)
             self.store.transition(
                 self.node.id,
                 State.LOCAL_CI_CHECKING,
-                note=f"pre-pr cycle {cycle}: local-ci",
-            )
-            log.info(
-                "task %s: pre-pr pipeline cycle %d/%d", self.node.id, cycle, self.cfg.pre_pr_audit_max_cycles
+                note=f"pre-pr cycle {cycle}: local-ci ({self.cfg.local_ci_command})",
             )
 
             # Build the diff excerpt against the base branch — every audit
@@ -2400,20 +2403,43 @@ class TaskWorker:
                 handle=self._h,
                 log_path=self.log_path,
             )
+            self.store.update_pre_pr_audit_stage(
+                self.node.id,
+                cycle=cycle,
+                stage_name="local_ci",
+                passed=local_ci.passed,
+                summary=local_ci.summary,
+            )
 
-            # Stages 1-3: audit agents.
+            # Stages 1-3: audit agents — each transitions PRE_PR_AUDITING
+            # with a stage-specific note so the TUI can show "rubric
+            # audit" rather than the opaque "auditing" umbrella state.
+            standards_text = pre_pr_audit.collect_standards_text(self.cfg)
+
             self.store.transition(
                 self.node.id,
                 State.PRE_PR_AUDITING,
-                note=f"pre-pr cycle {cycle}: audits (rubric/standards/behavior)",
+                note=f"pre-pr cycle {cycle}: rubric audit (codex)",
             )
-            standards_text = pre_pr_audit.collect_standards_text(self.cfg)
             rubric = pre_pr_audit.run_rubric_audit(
                 cfg=self.cfg,
                 handle=self._h,
                 diff_excerpt=diff_excerpt,
                 plan_text=plan_text,
                 log_path=self.log_path,
+            )
+            self.store.update_pre_pr_audit_stage(
+                self.node.id,
+                cycle=cycle,
+                stage_name="rubric",
+                passed=rubric.passed,
+                summary=rubric.summary,
+            )
+
+            self.store.transition(
+                self.node.id,
+                State.PRE_PR_AUDITING,
+                note=f"pre-pr cycle {cycle}: standards audit (claude-opus)",
             )
             standards = pre_pr_audit.run_standards_audit(
                 cfg=self.cfg,
@@ -2422,6 +2448,19 @@ class TaskWorker:
                 standards_text=standards_text,
                 log_path=self.log_path,
             )
+            self.store.update_pre_pr_audit_stage(
+                self.node.id,
+                cycle=cycle,
+                stage_name="standards",
+                passed=standards.passed,
+                summary=standards.summary,
+            )
+
+            self.store.transition(
+                self.node.id,
+                State.PRE_PR_AUDITING,
+                note=f"pre-pr cycle {cycle}: behavior audit (codex)",
+            )
             behavior = pre_pr_audit.run_behavior_audit(
                 cfg=self.cfg,
                 handle=self._h,
@@ -2429,6 +2468,13 @@ class TaskWorker:
                 diff_excerpt=diff_excerpt,
                 plan_text=plan_text,
                 log_path=self.log_path,
+            )
+            self.store.update_pre_pr_audit_stage(
+                self.node.id,
+                cycle=cycle,
+                stage_name="behavior",
+                passed=behavior.passed,
+                summary=behavior.summary,
             )
 
             cycle_result = pre_pr_audit.PipelineCycleResult(

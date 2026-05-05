@@ -63,6 +63,14 @@ class DetailSnapshot:
     # for older states / pre-v3 tasks.
     review_round: int | None = None
     review_threads_count: int | None = None
+    # v3.6 pre-PR audit gauntlet (4 stages: local_ci, rubric, standards,
+    # behavior). Populated from `tasks.pre_pr_audit_summary` JSON. The
+    # detail panel renders one row per stage with a pass/fail/queued
+    # indicator so the operator can see at a glance what passed and what
+    # failed in the most recent cycle. None on tasks that have never
+    # entered the pipeline.
+    pre_pr_audit_cycle: int | None = None
+    pre_pr_audit_stages: list[dict] = field(default_factory=list)
 
 
 class DetailPanel(Container):
@@ -114,14 +122,31 @@ class DetailPanel(Container):
             self._user_moved_subtask_cursor = False
             self._last_task_id = snap.task_id
 
-        # ---- Phase status line ----
+        # ---- Phase status line + (when present) audit-gauntlet block ----
         # in_state_for re-stringifies every tick (incrementing seconds), so
         # the fingerprint includes it and the line refreshes once per second.
         # The cost is one Static.update() — way cheaper than the DataTable
         # rebuild that the fingerprints below skip.
-        phase_fp = (snap.task_state, snap.last_state_note, snap.in_state_for, snap.last_worktree_edit)
+        gauntlet_fp = (
+            snap.pre_pr_audit_cycle,
+            tuple(
+                (s.get("name"), s.get("passed"), (s.get("summary") or "")[:80])
+                for s in snap.pre_pr_audit_stages
+            ),
+        )
+        phase_fp = (
+            snap.task_state,
+            snap.last_state_note,
+            snap.in_state_for,
+            snap.last_worktree_edit,
+            gauntlet_fp,
+        )
         if phase_fp != self._phase_fp:
-            self.query_one("#detail-phase", Static).update(_phase_line(snap))
+            phase_text = _phase_line(snap)
+            gauntlet_text = _gauntlet_block(snap)
+            if gauntlet_text:
+                phase_text = f"{phase_text}\n\n{gauntlet_text}"
+            self.query_one("#detail-phase", Static).update(phase_text)
             self._phase_fp = phase_fp
 
         # ---- Subtasks tab ----
@@ -317,7 +342,14 @@ def _phase_line(snap: DetailSnapshot) -> str:
     parts = [f"[b]{snap.task_id}[/]"]
     if snap.title:
         parts.append(f"[dim]{snap.title[:60]}[/]")
-    parts.append(f"[{color}]{state}[/]")
+    # State display: short label with bracketed long description so the
+    # operator never has to remember what "checking" vs "checking_subtask"
+    # vs "final_checking" vs "local_ci_checking" actually means.
+    long_desc = _state_long_description(state)
+    if long_desc:
+        parts.append(f"[{color}]{state}[/] [dim]({long_desc})[/]")
+    else:
+        parts.append(f"[{color}]{state}[/]")
     # State-specific extras: review-loop context (round / threads) takes
     # priority over the generic state_log note when addressing_feedback,
     # since "round 3 · 2 threads" is more useful at-a-glance than a
@@ -325,16 +357,9 @@ def _phase_line(snap: DetailSnapshot) -> str:
     if state == "addressing_feedback":
         if snap.review_round is not None and snap.review_threads_count is not None:
             parts.append(f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads")
-        else:
-            parts.append("[dim]fixup planner + per-subtask doer[/]")
-    elif state == "triaging_feedback":
-        parts.append("[dim]Python triage (CI parse / thread classify)[/]")
-    elif state == "pending_ci":
-        parts.append("[dim]PR open · CI running[/]")
-    elif state == "awaiting_review":
-        parts.append("[dim]CI green · awaiting review[/]")
-    elif state == "merge_ready":
-        parts.append("[dim]ready to merge[/]")
+    elif state in {"local_ci_checking", "pre_pr_auditing", "pre_pr_triaging"} and note:
+        # Pipeline notes carry per-stage context ("rubric audit (codex)"); show.
+        parts.append(f"[dim]{note[:80]}[/]")
     elif note:
         parts.append(f"[dim]{note[:80]}[/]")
     if in_state:
@@ -350,6 +375,88 @@ def _phase_line(snap: DetailSnapshot) -> str:
     elif state in _WHOLE_SPEC_STATES:
         line += "\n[dim italic](whole-spec phase — subtask states below are frozen until this returns)[/]"
     return line
+
+
+_STATE_LONG_DESCRIPTION = {
+    "checking": "whole-spec checker (v0.1 legacy)",
+    "checking_subtask": "per-subtask checker",
+    "triaging_subtask": "per-subtask triage",
+    "final_checking": "final whole-spec checker",
+    "local_ci_checking": "local CI gate (just ci)",
+    "pre_pr_auditing": "pre-PR audit gauntlet",
+    "pre_pr_triaging": "merging audit findings → fixup planner",
+    "triaging_feedback": "Python triage of review threads",
+    "addressing_feedback": "fixup planner + per-subtask doer",
+    "conflict_resolving": "spawned conflict-resolver agent",
+    "intent_reviewing": "checking spec-compatibility after dep merge",
+    "rebasing": "rebasing onto current main",
+    "rebasing_to_main": "rebasing onto main (parent merged)",
+    "fixup_planning": "planning fixup subtasks",
+    "pending_ci": "PR open · CI running",
+    "awaiting_review": "CI green · awaiting review",
+    "merge_ready": "ready to merge",
+    "doing_subtask": "running per-subtask doer",
+    "doing": "running whole-spec doer (v0.1 legacy)",
+    "triaging": "whole-spec triage (v0.1 legacy)",
+    "replanning": "replanning after intent review",
+}
+
+
+def _state_long_description(state: str) -> str | None:
+    """Long-form description for an ambiguous state name. None when no
+    description is needed (already self-explanatory: pending, merged, etc.)."""
+    return _STATE_LONG_DESCRIPTION.get(state)
+
+
+# Stage display order + human labels. The same four stages always render —
+# ones that haven't run yet in the current cycle show as "queued" so the
+# operator sees the full pipeline shape rather than just "what's done so far."
+_GAUNTLET_STAGES = [
+    ("local_ci", "local CI gate (just ci)"),
+    ("rubric", "rubric audit (codex, 6 categories)"),
+    ("standards", "standards audit (claude-opus + repo profile)"),
+    ("behavior", "behavior audit (codex verifies expected_evidence)"),
+]
+
+
+def _gauntlet_block(snap: DetailSnapshot) -> str | None:
+    """Render the 4-stage pre-PR audit gauntlet as a pass/fail/queued block.
+
+    Shape per stage:
+      ✓ local_ci    — passed (CI green; rc=0)
+      ✗ rubric      — security=5 < 7 (rationale: missing input validation)
+      … standards   — running...
+      · behavior    — queued
+
+    Returns None when the task has never entered the pipeline (no summary
+    on the row). The cycle number is shown so multi-cycle runs are
+    distinguishable: cycle 1 fails → fixup → cycle 2 passes."""
+    if not snap.pre_pr_audit_stages or snap.pre_pr_audit_cycle is None:
+        return None
+    by_name = {s.get("name"): s for s in snap.pre_pr_audit_stages}
+    lines = [f"[bold]Pre-PR audit gauntlet[/] — cycle {snap.pre_pr_audit_cycle}"]
+    for name, label in _GAUNTLET_STAGES:
+        s = by_name.get(name)
+        if not s:
+            # Stage not in the summary at all (older row layout) — skip rather
+            # than render a misleading "queued."
+            continue
+        passed = s.get("passed")
+        summary = (s.get("summary") or "")[:80]
+        if passed is True:
+            icon = "[green]✓[/]"
+            status = "[green]passed[/]"
+        elif passed is False:
+            icon = "[red]✗[/]"
+            status = "[red]failed[/]"
+        elif summary == "queued":
+            icon = "[dim]·[/]"
+            status = "[dim]queued[/]"
+        else:
+            icon = "[yellow]…[/]"
+            status = "[yellow]running[/]"
+        lines.append(f"  {icon} [cyan]{label}[/] — {status} {f'[dim]({summary})[/]' if summary else ''}")
+    return "\n".join(lines)
 
 
 def _phase_color(state: str) -> str:

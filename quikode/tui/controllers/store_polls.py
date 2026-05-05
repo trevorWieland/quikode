@@ -28,10 +28,15 @@ from ..widgets.tasks_table import TaskRowSnapshot
 
 # State -> short label that fits the table column without truncation.
 _SHORT_STATE = {
-    "doing_subtask": "doing_sub",
-    "checking_subtask": "checking_sub",
-    "triaging_subtask": "triaging_sub",
+    # v3.6 disambiguation: each "checking" variant gets a distinct label so
+    # operators can tell at a glance which gate the task is currently in.
+    # The base column has finite width — short forms below; the detail
+    # panel + briefing render the long forms.
+    "doing_subtask": "subtask_do",
+    "checking_subtask": "subtask_check",
+    "triaging_subtask": "subtask_triage",
     "final_checking": "final_check",
+    "checking": "spec_check",  # v0.1 monolithic flow whole-spec checker
     "conflict_resolving": "conflict_res",
     "intent_reviewing": "intent_rev",
     "triaging_feedback": "triaging_fb",
@@ -39,6 +44,35 @@ _SHORT_STATE = {
     "pending_ci": "pending_ci",
     "awaiting_review": "awaiting_rev",
     "merge_ready": "merge_ready",
+    "local_ci_checking": "local_ci",
+    "pre_pr_auditing": "pre_pr_audit",
+    "pre_pr_triaging": "pre_pr_triage",
+}
+
+# Long-form descriptions used by the detail-panel phase line + briefing.
+# The state column in tables is too narrow for these.
+_LONG_STATE_DESCRIPTION = {
+    "checking": "whole-spec checker (v0.1 legacy)",
+    "checking_subtask": "per-subtask checker",
+    "triaging_subtask": "per-subtask triage (root-causing FAIL)",
+    "final_checking": "final whole-spec checker",
+    "local_ci_checking": "local CI gate (just ci)",
+    "pre_pr_auditing": "pre-PR audit gauntlet",
+    "pre_pr_triaging": "merging audit findings → fixup planner",
+    "triaging_feedback": "Python triage of review threads",
+    "addressing_feedback": "fixup planner + per-subtask doer",
+    "conflict_resolving": "spawned conflict-resolver agent",
+    "intent_reviewing": "checking spec-compatibility after dep merge",
+    "rebasing": "rebasing onto current main",
+    "rebasing_to_main": "rebasing onto main (parent merged)",
+    "fixup_planning": "planning fixup subtasks",
+    "pending_ci": "PR open · CI running",
+    "awaiting_review": "CI green · awaiting human/bot review",
+    "merge_ready": "ready to merge",
+    "doing_subtask": "running per-subtask doer",
+    "doing": "running whole-spec doer (v0.1 legacy)",
+    "triaging": "whole-spec triage (v0.1 legacy)",
+    "replanning": "replanning after intent review",
 }
 
 _NON_TERMINAL_AGGREGATES = {
@@ -163,6 +197,7 @@ class StorePoller:
             "do_check_retries, ci_triage_retries, review_triage_retries, "
             "needs_intent_review, parent_task_id, last_error, "
             "review_round, intervention_request, "
+            "pre_pr_audit_summary, "
             "updated_at, created_at "
             "FROM tasks ORDER BY "
             "  CASE state "
@@ -418,6 +453,25 @@ class StorePoller:
         except (KeyError, IndexError, json.JSONDecodeError, TypeError):
             review_threads_count = None
 
+        # v3.6 pre-PR audit gauntlet: parse the most recent cycle summary so
+        # the detail panel can render one row per stage with pass/fail/queued.
+        pre_pr_audit_cycle: int | None = None
+        pre_pr_audit_stages: list[dict] = []
+        try:
+            blob = match["pre_pr_audit_summary"]
+        except (KeyError, IndexError):
+            blob = None
+        if blob:
+            try:
+                parsed = json.loads(blob)
+                if isinstance(parsed, dict):
+                    pre_pr_audit_cycle = int(parsed["cycle"]) if parsed.get("cycle") is not None else None
+                    stages = parsed.get("stages") or []
+                    if isinstance(stages, list):
+                        pre_pr_audit_stages = [s for s in stages if isinstance(s, dict)]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
         return DetailSnapshot(
             task_id=selected_task_id,
             title=title,
@@ -430,6 +484,8 @@ class StorePoller:
             last_worktree_edit=last_worktree_edit,
             review_round=review_round,
             review_threads_count=review_threads_count,
+            pre_pr_audit_cycle=pre_pr_audit_cycle,
+            pre_pr_audit_stages=pre_pr_audit_stages,
         )
 
 

@@ -569,6 +569,15 @@ class Store:
                 # peak rss, last subtask state timeline) so post-mortem
                 # diagnosis doesn't require log-grepping. JSON column.
                 ("block_forensics", "TEXT"),
+                # v3.6 pre-PR pipeline summary: JSON object recording the
+                # most recent cycle's per-stage outcomes. Updated
+                # incrementally as each stage finishes so the TUI can
+                # surface "rubric ✓ / standards … / behavior — / local_ci ✓"
+                # while a cycle is mid-run. Shape:
+                # {"cycle": int, "stages":
+                #     [{"name": "local_ci", "passed": bool, "summary": str}],
+                #  "ts": float}
+                ("pre_pr_audit_summary", "TEXT"),
                 # v2.2 resume: skip the planner agent on the next provision
                 # and reconstruct Plan from the existing subtasks rows. Set by
                 # `quikode resume <id>`; cleared by the worker on consume.
@@ -1213,6 +1222,89 @@ class Store:
                     time.time(),
                     task_id,
                 ),
+            )
+
+    def get_pre_pr_audit_summary(self, task_id: str) -> dict | None:
+        """Read the most recent pre-PR audit summary for a task.
+
+        Shape:
+          {"cycle": int, "stages": [{"name": str, "passed": bool|None,
+                                     "summary": str}], "ts": float}
+        `passed=None` means the stage hasn't run yet in the current
+        cycle (or is currently in flight). The TUI uses that to render
+        a "…" indicator distinct from pass/fail.
+        """
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT pre_pr_audit_summary FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        if r is None or not r["pre_pr_audit_summary"]:
+            return None
+        try:
+            data = json.loads(r["pre_pr_audit_summary"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def begin_pre_pr_audit_cycle(self, task_id: str, cycle: int) -> None:
+        """Reset the audit summary at the top of a new cycle so stale stage
+        results from prior cycles don't bleed into the TUI display. The
+        four stages are pre-seeded with `passed=None` (in-flight) so the
+        operator sees a "queued" indicator before each stage actually runs.
+        """
+        seeded = {
+            "cycle": cycle,
+            "ts": time.time(),
+            "stages": [
+                {"name": "local_ci", "passed": None, "summary": "queued"},
+                {"name": "rubric", "passed": None, "summary": "queued"},
+                {"name": "standards", "passed": None, "summary": "queued"},
+                {"name": "behavior", "passed": None, "summary": "queued"},
+            ],
+        }
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET pre_pr_audit_summary = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(seeded), time.time(), task_id),
+            )
+
+    def update_pre_pr_audit_stage(
+        self,
+        task_id: str,
+        *,
+        cycle: int,
+        stage_name: str,
+        passed: bool,
+        summary: str,
+    ) -> None:
+        """Update one stage's outcome on the current cycle. Idempotent:
+        re-calling with the same stage name overwrites. If the cycle on
+        disk doesn't match the caller's cycle, no-op (defensive against
+        a worker that re-entered the pipeline before clearing)."""
+        existing = self.get_pre_pr_audit_summary(task_id)
+        if existing is None or existing.get("cycle") != cycle:
+            # Caller forgot to call begin_pre_pr_audit_cycle — seed lazily.
+            self.begin_pre_pr_audit_cycle(task_id, cycle)
+            existing = self.get_pre_pr_audit_summary(task_id)
+            if existing is None:
+                return
+        stages = list(existing.get("stages") or [])
+        replaced = False
+        for s in stages:
+            if s.get("name") == stage_name:
+                s["passed"] = bool(passed)
+                s["summary"] = str(summary)[:300]
+                replaced = True
+                break
+        if not replaced:
+            stages.append({"name": stage_name, "passed": bool(passed), "summary": str(summary)[:300]})
+        existing["stages"] = stages
+        existing["ts"] = time.time()
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET pre_pr_audit_summary = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(existing), time.time(), task_id),
             )
 
     def get_block_forensics(self, task_id: str) -> dict | None:
