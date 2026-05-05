@@ -39,13 +39,9 @@ def _seed(store: Store, task_id: str, state: State, **fields) -> None:
     "from_state",
     [
         State.PLANNING,
-        State.DOING,
-        State.CHECKING,
-        State.TRIAGING,
         State.DOING_SUBTASK,
         State.CHECKING_SUBTASK,
         State.TRIAGING_SUBTASK,
-        State.FINAL_CHECKING,
         State.COMMITTING,
         State.PUSHING,
         State.REPLANNING,
@@ -201,13 +197,13 @@ def test_recovery_clears_retry_counters(tmp_path):
 
 def test_recovery_returns_log_entries(tmp_path):
     s = _store(tmp_path)
-    _seed(s, "T-1", State.DOING)
+    _seed(s, "T-1", State.DOING_SUBTASK)
     _seed(s, "T-2", State.PR_OPENING, pr_number=42)
     _seed(s, "T-3", State.PENDING)  # untouched
     _seed(s, "T-4", State.MERGED)  # untouched
     out = s.recover_orphan_tasks()
     by_id = {t[0]: t for t in out}
-    assert by_id["T-1"] == ("T-1", State.DOING.value, State.PENDING.value)
+    assert by_id["T-1"] == ("T-1", State.DOING_SUBTASK.value, State.PENDING.value)
     assert by_id["T-2"] == ("T-2", State.PR_OPENING.value, State.PENDING_CI.value)
     assert "T-3" not in by_id
     assert "T-4" not in by_id

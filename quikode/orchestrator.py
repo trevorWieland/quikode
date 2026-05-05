@@ -121,13 +121,9 @@ class Orchestrator:
                     in_flight = [
                         r["id"]
                         for r in self.store.in_state(
-                            State.DOING,
-                            State.CHECKING,
-                            State.TRIAGING,
                             State.DOING_SUBTASK,
                             State.CHECKING_SUBTASK,
                             State.TRIAGING_SUBTASK,
-                            State.FINAL_CHECKING,
                             State.PR_OPENING,
                             State.POLLING_CI,
                         )
@@ -172,13 +168,9 @@ class Orchestrator:
                                 r["id"]
                                 for r in self.store.in_state(
                                     *[
-                                        State.DOING,
-                                        State.CHECKING,
-                                        State.TRIAGING,
                                         State.DOING_SUBTASK,
                                         State.CHECKING_SUBTASK,
                                         State.TRIAGING_SUBTASK,
-                                        State.FINAL_CHECKING,
                                         State.PR_OPENING,
                                         State.POLLING_CI,
                                     ]
@@ -493,13 +485,9 @@ class Orchestrator:
             *[
                 State.PROVISIONING,
                 State.PLANNING,
-                State.DOING,
-                State.CHECKING,
-                State.TRIAGING,
                 State.DOING_SUBTASK,
                 State.CHECKING_SUBTASK,
                 State.TRIAGING_SUBTASK,
-                State.FINAL_CHECKING,
                 State.COMMITTING,
                 State.PUSHING,
                 State.PR_OPENING,
@@ -550,7 +538,7 @@ class Orchestrator:
         if threshold <= 0:
             return
         now = time.time()
-        for row in self.store.in_state(State.DOING):
+        for row in self.store.in_state(State.DOING_SUBTASK):
             wt = row.get("worktree_path")
             if not wt:
                 continue

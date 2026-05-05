@@ -155,39 +155,30 @@ class State(StrEnum):
     PENDING = "pending"
     PROVISIONING = "provisioning"  # worktree + container coming up
     PLANNING = "planning"
-    # v0.1 monolithic flow
-    DOING = "doing"
-    CHECKING = "checking"
-    TRIAGING = "triaging"
-    # v2 Phase 0: subtask flow
+    # Per-subtask flow (the only flow — the monolithic whole-spec doer/checker
+    # was removed in the legacy purge).
     DOING_SUBTASK = "doing_subtask"
     CHECKING_SUBTASK = "checking_subtask"
     TRIAGING_SUBTASK = "triaging_subtask"
-    FINAL_CHECKING = "final_checking"  # whole-spec checker after all subtasks
-    # post-implementation
+    # Post-implementation
     COMMITTING = "committing"
     PUSHING = "pushing"
     PR_OPENING = "pr_opening"
     POLLING_CI = "polling_ci"
-    # v2 Phase A: parallel-safe merge handling
+    # Parallel-safe merge handling
     REBASING = "rebasing"  # rebasing onto current main; clean→back to polling
     CONFLICT_RESOLVING = "conflict_resolving"  # spawned resolver agent on a conflicted rebase
-    # v2 Phase B: intent-gap detection
+    # Intent-gap detection
     INTENT_REVIEWING = "intent_reviewing"  # checking if main has shifted under us in a way that breaks intent
     REPLANNING = "replanning"  # producing a new plan in light of intent conflict
-    # v3 fixup decomposition: invoking the fixup planner on a final-check
-    # or CI failure to break the fixup into per-subtask slices instead of a
-    # monolithic doer attempt. Brief transitional state (entered from
-    # triaging / polling_ci, exited to doing_subtask once subtasks are
-    # appended). Distinct from REPLANNING because the original spec plan
-    # is preserved — fixup slices are *additive*, not replacements.
+    # Fixup decomposition: invoking the fixup planner on a CI / audit-gauntlet
+    # / review failure to break the fixup into per-subtask slices.
     FIXUP_PLANNING = "fixup_planning"
-    # ----- v3.6 pre-PR pipeline (4-stage gate before _open_pr) -----
-    # Final-check passing + per-subtask commits landed is no longer enough
-    # to open a PR — we run the full local-CI suite and three audit agents
-    # first. Any failure routes back through the fixup-planner with a
-    # different `kind` so the subtask loop addresses the findings before
-    # we re-run the gate.
+    # ----- pre-PR pipeline (4-stage gate before _open_pr) -----
+    # Per-subtask commits landed is no longer enough to open a PR — we run
+    # the full local-CI suite and three audit agents first. Any failure
+    # routes back through the fixup-planner with a different `kind` so the
+    # subtask loop addresses the findings before we re-run the gate.
     LOCAL_CI_CHECKING = "local_ci_checking"  # `just ci` (or cfg-configurable) inside the dev container
     PRE_PR_AUDITING = "pre_pr_auditing"  # rubric + standards + behavior audits
     PRE_PR_TRIAGING = "pre_pr_triaging"  # merging audit findings → triage → fixup plan
@@ -241,13 +232,9 @@ TERMINAL = {
 ACTIVE = {
     State.PROVISIONING,
     State.PLANNING,
-    State.DOING,
-    State.CHECKING,
-    State.TRIAGING,
     State.DOING_SUBTASK,
     State.CHECKING_SUBTASK,
     State.TRIAGING_SUBTASK,
-    State.FINAL_CHECKING,
     State.COMMITTING,
     State.PUSHING,
     State.PR_OPENING,
@@ -266,9 +253,8 @@ ACTIVE = {
 }
 
 # Convenience set: any state where the PR is open and waiting on something
-# outside the worker (CI run, human/bot review, settle window). Replaces most
-# legacy `state == AWAITING_MERGE` checks. PENDING_CI is the most common —
-# the worker just opened the PR and CI is running.
+# outside the worker (CI run, human/bot review, settle window). PENDING_CI
+# is the most common — the worker just opened the PR and CI is running.
 POST_PR_STATES = {State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_READY}
 
 
@@ -1959,13 +1945,9 @@ class Store:
         active_states = {
             State.PROVISIONING,
             State.PLANNING,
-            State.DOING,
-            State.CHECKING,
-            State.TRIAGING,
             State.DOING_SUBTASK,
             State.CHECKING_SUBTASK,
             State.TRIAGING_SUBTASK,
-            State.FINAL_CHECKING,
             State.COMMITTING,
             State.PUSHING,
             State.PR_OPENING,
@@ -1977,6 +1959,9 @@ class Store:
             State.FIXUP_PLANNING,
             State.TRIAGING_FEEDBACK,
             State.ADDRESSING_FEEDBACK,
+            State.LOCAL_CI_CHECKING,
+            State.PRE_PR_AUDITING,
+            State.PRE_PR_TRIAGING,
             State.REBASING_TO_MAIN,
         }
         # Subset that stays in active phases mid-implementation; any of these
@@ -1984,13 +1969,9 @@ class Store:
         # picks up where it left off (subtask granularity).
         resume_to_pending = {
             State.PLANNING,
-            State.DOING,
-            State.CHECKING,
-            State.TRIAGING,
             State.DOING_SUBTASK,
             State.CHECKING_SUBTASK,
             State.TRIAGING_SUBTASK,
-            State.FINAL_CHECKING,
             State.COMMITTING,
             State.PUSHING,
             State.REPLANNING,
@@ -2003,6 +1984,9 @@ class Store:
         pr_aware = {
             State.PR_OPENING,
             State.POLLING_CI,
+            State.LOCAL_CI_CHECKING,
+            State.PRE_PR_AUDITING,
+            State.PRE_PR_TRIAGING,
             State.TRIAGING_FEEDBACK,
             State.ADDRESSING_FEEDBACK,
             State.REBASING,

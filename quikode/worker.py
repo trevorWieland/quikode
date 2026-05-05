@@ -133,19 +133,15 @@ class TaskWorker:
             outcome = self._subtask_loop()
             if outcome:
                 return outcome
-            outcome = self._final_check_loop()
-            if outcome:
-                return outcome
             outcome = self._commit_push()
             if outcome:
                 return outcome
-            # v3.6: 4-stage gate (local-CI + 3 audits) BEFORE opening the PR.
+            # 4-stage gate (local-CI + 3 audits) BEFORE opening the PR.
             # Catches issues early so reviewers see fewer nits and the fixup
             # cycle happens in-process instead of through review threads.
-            if self.cfg.pre_pr_pipeline_enabled:
-                outcome = self._run_pre_pr_pipeline()
-                if outcome:
-                    return outcome
+            outcome = self._run_pre_pr_pipeline()
+            if outcome:
+                return outcome
             outcome = self._open_pr()
             if outcome:
                 return outcome
@@ -1480,43 +1476,6 @@ class TaskWorker:
             )
         return attempts
 
-    def _do(self, attempt: int) -> None:
-        """Legacy whole-spec doer — used only for final-check fixup in v2.
-        Inside the subtask loop, use _do_subtask instead.
-
-        v3 Phase A note: this doer asks the agent to write code only —
-        the agent prompt (`prompts/doer.md`) explicitly tells it not to
-        commit or push, and the orchestrator handles staging/committing
-        in `_commit_push`. There is **no `git commit --amend` path** in
-        this codebase, so per-subtask commits made by the v3 commit gate
-        cannot be silently rewritten by a downstream final-check fixup.
-        Verified by `tests/test_no_amend_in_doer.py`."""
-        self.store.transition(self.node.id, State.DOING, note=f"whole-spec fixup attempt {attempt}")
-        agent = build_agent(self.cfg.doer)
-        prompt = prompts.doer_prompt(
-            self.cfg, self.node, self.plan_text, triage_notes=self.last_triage_notes or None
-        )
-        self._write_log_header(f"DOER FIXUP (attempt {attempt})", prompt)
-        # 4 hours: tanren-style multi-interface tasks with opencode glm-5.1
-        # routinely take 1-2h for the doer phase alone.
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=14400)
-        self.store.record_agent_call(
-            self.node.id,
-            phase="doer",
-            cli=self.cfg.doer.cli,
-            model=self.cfg.doer.model,
-            rc=result.rc,
-            duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
-            tokens_input=result.tokens_input,
-            tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
-            cost_usd=result.cost_usd,
-        )
-        self.last_doer_summary = result.stdout[-2000:]
-        self.store.add_artifact(self.node.id, "doer_output", result.stdout)
-
     # ----- subtask-level doer / checker / triage -----
 
     def _do_subtask(self, subtask: Subtask, attempt: int, triage_notes: str | None) -> None:
@@ -1898,76 +1857,7 @@ class TaskWorker:
 
     # ----- final whole-spec check -----
 
-    def _final_check_loop(self) -> WorkerOutcome | None:
-        """After all subtasks complete (or are skipped/blocked), run the
-        whole-spec checker against final_acceptance + just ci. On failure,
-        invoke the fixup planner to decompose the fixup into 1-5 mini-
-        subtasks and drive them through the per-subtask doer/checker loop;
-        re-check after each round. Caps at `cfg.fixup_max_rounds` rounds.
-
-        Why decomposition: the v0 path called a monolithic whole-spec doer
-        with triage notes, which on tanren-scale tasks took 1-2h, lost
-        session context, and converged unreliably. Decomposed slices commit
-        atomically, give priority/yield natural pause points, and let
-        triage scope to one slice at a time.
-
-        Transient checker failures (container crash, agent CLI auth issues,
-        rc=124 timeouts) DON'T burn budget — they're free retries with a
-        backoff. Only real `Verdict.FAIL` outcomes count toward fixup
-        rounds. Capped at `transient_max` consecutive transients to prevent
-        infinite loops on a permanently-broken setup.
-        """
-        # v3 stacked-diffs fix: parent may have merged while we were in the
-        # subtask loop. Handle before kicking off the whole-spec checker.
-        rebase_outcome = self._handle_parent_rebase_if_needed()
-        if rebase_outcome:
-            return rebase_outcome
-        transient_max = self.cfg.subtask_transient_max_retries
-        consecutive_transients = 0
-        fixup_round = 0
-        max_rounds = self.cfg.fixup_max_rounds
-        while True:
-            self.store.transition(
-                self.node.id,
-                State.FINAL_CHECKING,
-                note=(f"final check after fixup round {fixup_round}" if fixup_round else "final check"),
-            )
-            verdict, ci_result, ci_excerpt, checker_out, transient = self._check()
-            if transient:
-                consecutive_transients += 1
-                if consecutive_transients > transient_max:
-                    self.store.transition(
-                        self.node.id,
-                        State.BLOCKED,
-                        note=f"final-check transient cap exceeded ({transient_max})",
-                    )
-                    return WorkerOutcome(State.BLOCKED, "transient checker failures")
-                time.sleep(15)
-                continue
-            consecutive_transients = 0
-            if verdict is Verdict.PASS and ci_result == "pass":
-                return None
-            fixup_round += 1
-            if fixup_round > max_rounds:
-                self.store.transition(
-                    self.node.id,
-                    State.BLOCKED,
-                    note=f"exhausted fixup rounds ({max_rounds}) on final check",
-                )
-                return WorkerOutcome(State.BLOCKED, "exhausted fixup rounds")
-            self.store.increment(self.node.id, "do_check_retries")
-            outcome = self._run_fixup_round(
-                kind="fixup-final",
-                round_no=fixup_round,
-                trigger="final-check",
-                checker_output=checker_out,
-                ci_excerpt=ci_excerpt,
-            )
-            if outcome and outcome.final_state == State.BLOCKED:
-                return outcome
-            # Loop continues — re-check after fixup subtasks settle.
-
-    # ----- v3 fixup decomposition -----
+    # ----- fixup decomposition (used by audit-gauntlet failures + CI-fix dispatch) -----
 
     def _run_fixup_round(
         self,
@@ -2008,20 +1898,18 @@ class TaskWorker:
             triage_root_cause=triage_root_cause,
         )
         if fixup_plan is None or not fixup_plan.subtasks:
-            log.warning(
-                "fixup planner returned empty/invalid plan for %s round %d (%s) — "
-                "falling back to monolithic doer",
-                kind,
-                round_no,
-                trigger,
+            note = (
+                f"fixup planner returned empty/invalid plan for {kind} round "
+                f"{round_no} ({trigger}); BLOCKing for operator review"
             )
-            # Legacy path keeps tasks unblocked when the planner output is
-            # malformed. The attempt-number convention (200+round for
-            # final-check, 300+round for ci) is retained so log readers
-            # familiar with the old encoding still see something coherent.
-            legacy_attempt = (200 if kind == "fixup-final" else 300) + round_no
-            self._do(attempt=legacy_attempt)
-            return None
+            log.warning(note)
+            self.store.transition(
+                self.node.id,
+                State.BLOCKED,
+                note=note,
+                last_error=note[:1000],
+            )
+            return WorkerOutcome(State.BLOCKED, note)
 
         # Persist the new fixup subtasks (additive — does NOT delete spec rows).
         self.store.append_subtasks(
@@ -2135,84 +2023,6 @@ class TaskWorker:
             )
             return None
 
-    def _check(self) -> tuple[Verdict, str, str | None, str, bool]:
-        """Run just ci then the checker agent. Returns (verdict, ci_result, ci_failure_excerpt, checker_text, transient).
-
-        `transient=True` means the checker run itself failed in a way that
-        looks like infrastructure (rc=124 timeout, container crash, etc) —
-        the caller should retry without burning budget.
-        """
-        self.store.transition(self.node.id, State.CHECKING)
-
-        # 1. Objective: just ci
-        rc, out, err = exec_in(
-            self._h,
-            ["bash", "-lc", "cd /workspace && just ci 2>&1"],
-            log_path=self.log_path,
-            timeout=1800,
-        )
-        ci_log = out + err
-        self.store.add_artifact(self.node.id, "ci_log", ci_log)
-        ci_result = "pass" if rc == 0 else "fail"
-        ci_excerpt = _last_lines(ci_log, 80) if rc != 0 else None
-
-        # 2a. Manual probes (defensive: never crash the worker on parse
-        # errors). Probes run BEFORE the checker agent so their output
-        # can be appended to the prompt as objective evidence.
-        manual_probe_block = self._run_manual_probes()
-
-        # 2b. Subjective: checker agent
-        agent = build_agent(self.cfg.checker)
-        prompt = prompts.checker_prompt(
-            self.cfg,
-            self.node,
-            self.plan_text,
-            ci_result=ci_result,
-            ci_failure_excerpt=ci_excerpt,
-            manual_probe_results=manual_probe_block or None,
-        )
-        self._write_log_header("CHECKER", prompt)
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
-        self.store.record_agent_call(
-            self.node.id,
-            phase="checker",
-            cli=self.cfg.checker.cli,
-            model=self.cfg.checker.model,
-            rc=result.rc,
-            duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
-            tokens_input=result.tokens_input,
-            tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
-            cost_usd=result.cost_usd,
-        )
-        checker_text = result.stdout
-        self.store.add_artifact(self.node.id, "checker_output", checker_text)
-
-        # Detect transient checker failure: the AgentResult flag (set by
-        # _exec on rc=124/137/daemon errors) is the authoritative signal.
-        # As a backstop, also flag a degenerate fast-fail (the checker
-        # returned rc!=0 in <5s with no parseable verdict in the output) —
-        # this catches container/auth issues that don't trip the rc-based
-        # detector but still produce no meaningful checker run. Without
-        # this, three "attempts" can finish in 2 seconds and burn the
-        # whole final-check budget on infrastructure noise.
-        transient = bool(result.transient)
-        if (
-            not transient
-            and result.rc != 0
-            and (result.duration_s or 0) < 5
-            and "VERDICT:" not in checker_text
-        ):
-            transient = True
-
-        verdict = _parse_verdict(checker_text)
-        # If CI failed, force overall fail regardless of agent verdict
-        if ci_result == "fail":
-            verdict = Verdict.FAIL
-        return verdict, ci_result, ci_excerpt, checker_text, transient
-
     def _run_manual_probes(self) -> str:
         """Scan the node's `expected_evidence` for `kind="manual"` items,
         run them through `ManualProbeRunner`, and return a pre-rendered
@@ -2246,48 +2056,6 @@ class TaskWorker:
             log.warning("manual probes: runner raised %s; degrading", e)
             return ""
         return manual_probe.render_probe_block(results)
-
-    def _triage(
-        self,
-        *,
-        phase: str,
-        retry_count: int,
-        retry_budget: int,
-        checker_output: str | None = None,
-        ci_log_excerpt: str | None = None,
-        review_comments: list[dict] | None = None,
-    ) -> str:
-        agent = build_agent(self.cfg.triage)
-        prompt = prompts.triage_prompt(
-            self.cfg,
-            self.node,
-            self.plan_text,
-            phase=phase,
-            retry_count=retry_count,
-            retry_budget=retry_budget,
-            checker_output=checker_output,
-            ci_log_excerpt=ci_log_excerpt,
-            review_comments=review_comments,
-            recent_doer_summary=self.last_doer_summary,
-        )
-        self._write_log_header(f"TRIAGE ({phase})", prompt)
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
-        self.store.record_agent_call(
-            self.node.id,
-            phase=f"triage_{phase}",
-            cli=self.cfg.triage.cli,
-            model=self.cfg.triage.model,
-            rc=result.rc,
-            duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
-            tokens_input=result.tokens_input,
-            tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
-            cost_usd=result.cost_usd,
-        )
-        self.store.add_artifact(self.node.id, "triage_output", result.stdout)
-        return result.stdout
 
     # ----- phase: commit + push -----
 
@@ -2324,40 +2092,29 @@ class TaskWorker:
                     sound.ding()
                     return WorkerOutcome(State.PENDING_CI, "no diff")
             else:
-                # Actual hook/commit failure → triage path
-                return self._post_commit_triage_loop("commit", out)
+                # commit failed for a real reason (hook gate, repo state) and
+                # the per-subtask flow already commits each slice — so a
+                # whole-spec commit failure here means something the audit
+                # gauntlet would flag anyway. Block with the failure output;
+                # operator inspects the worktree.
+                self.store.transition(
+                    self.node.id,
+                    State.BLOCKED,
+                    note=f"commit failed (post-subtasks): {out[:200]}",
+                    last_error=out[:1000],
+                )
+                return WorkerOutcome(State.BLOCKED, "commit failed post-subtasks")
 
         self.store.transition(self.node.id, State.PUSHING)
         rc, out = github.push(self._h, branch, remote=self.cfg.pr_remote, log_path=self.log_path)
         if rc != 0:
-            return self._post_commit_triage_loop("push", out)
-        return None
-
-    def _post_commit_triage_loop(self, sub_phase: str, log_excerpt: str) -> WorkerOutcome:
-        # Single-attempt triage cycle for commit/push failures: triage → re-do → re-check → re-commit
-        self.store.transition(self.node.id, State.TRIAGING, note=f"{sub_phase} failed")
-        notes = self._triage(
-            phase=sub_phase,
-            retry_count=1,
-            retry_budget=1,
-            ci_log_excerpt=_last_lines(log_excerpt, 80),
-        )
-        self.last_triage_notes = notes
-        # one more do/check pass
-        self._do(attempt=99)
-        verdict, ci_result, _ci_excerpt, _checker_text, _transient = self._check()
-        if verdict != "PASS" or ci_result != "pass":
-            self.store.transition(self.node.id, State.BLOCKED, note=f"{sub_phase} triage cycle failed")
-            return WorkerOutcome(State.BLOCKED, f"{sub_phase} failure could not be auto-resolved")
-        # retry commit/push
-        msg = f"{self.node.id}: {self.node.title}\n\nPlanned and implemented by quikode."
-        github.commit_all(self._h, msg, log_path=self.log_path)
-        rc, out = github.push(
-            self._h, str(self._row()["branch"]), remote=self.cfg.pr_remote, log_path=self.log_path
-        )
-        if rc != 0:
-            self.store.transition(self.node.id, State.BLOCKED, note=f"push still failing: {out[:200]}")
-            return WorkerOutcome(State.BLOCKED, "push retry failed")
+            self.store.transition(
+                self.node.id,
+                State.BLOCKED,
+                note=f"push failed: {out[:200]}",
+                last_error=out[:1000],
+            )
+            return WorkerOutcome(State.BLOCKED, "push failed")
         return None
 
     # ----- v3.6 phase: pre-PR pipeline (local-CI + 3 audits) -----
@@ -3307,80 +3064,17 @@ class TaskWorker:
             len(new_plan.subtasks),
             len(prior_done),
         )
-        # Resume the subtask loop. _subtask_loop iterates topo-order and skips
-        # subtasks already in DONE state implicitly (we re-do anything not DONE).
-        outcome = self._subtask_loop_resume()
+        # Resume the subtask loop — it skips DONE subtasks implicitly and
+        # drives any remaining ones through the same per-subtask flow as
+        # the initial run, including progress-check + retry classification.
+        outcome = self._subtask_loop()
         if outcome:
             return outcome
-        # Resumed fine — fall back into the polling loop
+        # Resumed fine — fall back into the polling loop.
         self.store.transition(self.node.id, State.POLLING_CI, note="post-replan; back to polling")
         return None
 
-    def _subtask_loop_resume(self) -> WorkerOutcome | None:
-        """Like _subtask_loop but only runs subtasks not already DONE.
-        Used after a replan when some subtasks carried over.
-
-        Same critical contract as _subtask_loop: a blocked subtask is a
-        task-level failure. Return BLOCKED immediately rather than letting
-        the rest of the loop build on broken foundation.
-
-        Uses the same v3 hard-ceiling gating as _subtask_loop. Progress
-        checks are not invoked on the resume path — this is invoked only
-        after a replan, where a fresh start is intended.
-        """
-        assert self.plan is not None
-        hard_max = self.cfg.subtask_hard_max_attempts
-        for subtask in self.plan.topo_order():
-            current = self.store.get_subtask(self.node.id, subtask.id)
-            if current and current["state"] == SubtaskState.DONE.value:
-                continue
-            triage_notes: str | None = None
-            settled = False
-            for attempt in range(1, hard_max + 1):
-                self._do_subtask(subtask, attempt, triage_notes)
-                outcome = self._check_subtask(subtask)
-                verdict = outcome.verdict
-                checker_text = outcome.checker_text
-                if verdict == "PASS":
-                    self._mark_subtask_done(subtask)
-                    settled = True
-                    break
-                self.store.transition(
-                    self.node.id,
-                    State.TRIAGING_SUBTASK,
-                    note=f"{subtask.id} attempt {attempt} failed (post-replan)",
-                )
-                triage_notes = self._triage_subtask(subtask, attempt, hard_max, checker_text)
-                self.store.update_subtask(
-                    self.node.id, subtask.id, triage_notes=triage_notes, state=SubtaskState.TRIAGING.value
-                )
-                self.store.increment_subtask_retries(self.node.id, subtask.id)
-                # v3.5 retry classification (post-replan resume path) — pass
-                # the structured rc/stderr/stdout from the checker outcome
-                # so signatures are real, not `rc=?` placeholders.
-                cat, sig = retry_classify.classify_retry(
-                    rc=outcome.rc,
-                    stderr=outcome.stderr,
-                    stdout=outcome.checker_text,
-                    hint="checker",
-                )
-                self.store.append_retry_reason(
-                    self.node.id,
-                    subtask.id,
-                    attempt=attempt,
-                    category=cat,
-                    signature=sig,
-                    transient=False,
-                )
-            if not settled:
-                self._mark_subtask_blocked(subtask, "post-replan hard ceiling exhausted")
-                self._mark_remaining_pending_as_skipped(after=subtask.id)
-                reason = f"post-replan: subtask {subtask.id} blocked after {hard_max} attempts"
-                self.store.transition(self.node.id, State.BLOCKED, note=reason, last_error=reason[:1000])
-                return WorkerOutcome(State.BLOCKED, reason)
-        return None
-
-    # ----- v2 Phase A: rebase + conflict resolution -----
+    # ----- rebase + conflict resolution -----
 
     def _rebase_or_resolve(self) -> WorkerOutcome | None:
         """Rebase the current task's branch onto fresh main. On clean rebase,
@@ -3486,14 +3180,24 @@ class TaskWorker:
             return WorkerOutcome(State.BLOCKED, "conflict iteration cap")
         # ↳ for-loop completed without break OR via break = we're past it.
 
-        # Verify by re-running the final checker
-        verdict, ci_result, _ci_excerpt, _, _transient = self._check()
-        if verdict != "PASS" or ci_result != "pass":
-            # Resolver edits broke ci — block (don't recurse into final triage)
+        # Verify by re-running `just ci` inside the dev container. Don't
+        # re-invoke an agent verifier — the audit gauntlet downstream will
+        # do the rubric/standards/behavior pass; here we just need an
+        # objective "did the resolver break the build" signal.
+        rc, out, err = exec_in(
+            self._h,
+            ["bash", "-lc", "cd /workspace && just ci 2>&1"],
+            log_path=self.log_path,
+            timeout=1800,
+        )
+        if rc != 0:
+            ci_log = (out or "") + "\n" + (err or "")
+            self.store.add_artifact(self.node.id, "post_rebase_ci_log", ci_log)
             self.store.transition(
                 self.node.id,
                 State.BLOCKED,
-                note="post-rebase checker FAILed; conflict resolution broke spec",
+                note="post-rebase `just ci` FAILed; conflict resolution broke build",
+                last_error=_last_lines(ci_log, 30)[:1000],
             )
             return WorkerOutcome(State.BLOCKED, "rebase verify failed")
 

@@ -20,10 +20,10 @@ def test_idempotent_upsert(tmp_path: Path):
     s = Store(tmp_path / "q.db")
     s.upsert_pending("R-1")
     # Second upsert shouldn't create a duplicate row or reset state
-    s.transition("R-1", State.DOING)
+    s.transition("R-1", State.DOING_SUBTASK)
     s.upsert_pending("R-1")
     row = s.get("R-1")
-    assert row["state"] == State.DOING.value
+    assert row["state"] == State.DOING_SUBTASK.value
 
 
 def test_transition_records_log(tmp_path: Path):
@@ -41,7 +41,7 @@ def test_completed_and_active_ids(tmp_path: Path):
     for nid in ("A", "B", "C", "D", "E"):
         s.upsert_pending(nid)
     s.transition("A", State.MERGED)
-    s.transition("B", State.DOING)
+    s.transition("B", State.DOING_SUBTASK)
     s.transition("C", State.PENDING_CI)
     s.transition("D", State.BLOCKED)
     # E left PENDING

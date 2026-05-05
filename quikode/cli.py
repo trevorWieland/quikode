@@ -1159,9 +1159,6 @@ def dag_stats(
     active_states = {
         State.PROVISIONING.value,
         State.PLANNING.value,
-        State.DOING.value,
-        State.CHECKING.value,
-        State.TRIAGING.value,
         State.COMMITTING.value,
         State.PUSHING.value,
         State.PR_OPENING.value,
@@ -1314,7 +1311,7 @@ def _build_status_table(store: Store, *, show_terminal: bool = True) -> Table:
         wt_age = (now - wt_mt) if wt_mt else None
         # red flag: in active state but worktree quiet for >5 min
         wt_color = "white"
-        if wt_age is not None and st in (State.DOING.value, State.CHECKING.value, State.TRIAGING.value):
+        if wt_age is not None and st == State.DOING_SUBTASK.value:
             if wt_age > 300:
                 wt_color = "red"
             elif wt_age > 120:
@@ -1328,9 +1325,6 @@ def _build_status_table(store: Store, *, show_terminal: bool = True) -> Table:
         # state-elapsed colour: stale yellow at 10min, red at 30min for active states
         in_state_color = "white"
         if in_state and st in (
-            State.DOING.value,
-            State.CHECKING.value,
-            State.TRIAGING.value,
             State.PLANNING.value,
         ):
             if in_state > 1800:
@@ -1438,13 +1432,9 @@ def resources(
         active_states = (
             State.PROVISIONING,
             State.PLANNING,
-            State.DOING,
-            State.CHECKING,
-            State.TRIAGING,
             State.DOING_SUBTASK,
             State.CHECKING_SUBTASK,
             State.TRIAGING_SUBTASK,
-            State.FINAL_CHECKING,
             State.COMMITTING,
             State.PUSHING,
             State.PR_OPENING,
@@ -1498,13 +1488,9 @@ def resources(
         *[
             State.PROVISIONING,
             State.PLANNING,
-            State.DOING,
-            State.CHECKING,
-            State.TRIAGING,
             State.DOING_SUBTASK,
             State.CHECKING_SUBTASK,
             State.TRIAGING_SUBTASK,
-            State.FINAL_CHECKING,
             State.COMMITTING,
             State.PUSHING,
             State.PR_OPENING,
@@ -2345,13 +2331,9 @@ def briefing(
         active_states = (
             State.PROVISIONING,
             State.PLANNING,
-            State.DOING,
-            State.CHECKING,
-            State.TRIAGING,
             State.DOING_SUBTASK,
             State.CHECKING_SUBTASK,
             State.TRIAGING_SUBTASK,
-            State.FINAL_CHECKING,
             State.COMMITTING,
             State.PUSHING,
             State.PR_OPENING,
@@ -2451,13 +2433,9 @@ def briefing(
     active_states = (
         State.PROVISIONING,
         State.PLANNING,
-        State.DOING,
-        State.CHECKING,
-        State.TRIAGING,
         State.DOING_SUBTASK,
         State.CHECKING_SUBTASK,
         State.TRIAGING_SUBTASK,
-        State.FINAL_CHECKING,
         State.COMMITTING,
         State.PUSHING,
         State.PR_OPENING,
@@ -2614,7 +2592,7 @@ def briefing(
     # 8. Warnings
     warnings: list[str] = []
     for r in actives:
-        if r["state"] == State.DOING.value:
+        if r["state"] == State.DOING_SUBTASK.value:
             wt_mt = _worktree_mtime(Path(r["worktree_path"])) if r.get("worktree_path") else None
             if wt_mt and (now - wt_mt) > cfg.stall_warn_seconds:
                 warnings.append(f"{r['id']} doer worktree quiet for {int((now - wt_mt) // 60)} min")

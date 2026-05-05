@@ -45,13 +45,9 @@ class HeadlineStats:
 _IN_FLIGHT = {
     State.PROVISIONING.value,
     State.PLANNING.value,
-    State.DOING.value,
-    State.CHECKING.value,
-    State.TRIAGING.value,
     State.DOING_SUBTASK.value,
     State.CHECKING_SUBTASK.value,
     State.TRIAGING_SUBTASK.value,
-    State.FINAL_CHECKING.value,
     State.COMMITTING.value,
     State.PUSHING.value,
     State.PR_OPENING.value,
