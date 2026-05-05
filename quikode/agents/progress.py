@@ -17,9 +17,9 @@ parse error, transient container glitch) collapses to `uncertain`, never
 propagates as an exception. Worse than a missing signal is a crashed
 worker.
 
-Defaults to claude-sonnet-4-6 (configurable via `cfg.progress.cli/model`).
-Sonnet's reasoning is cleaner on the "is this trajectory making real
-progress vs flatlined" judgment than the older haiku default.
+Defaults to codex gpt-5.4-mini (configurable via `cfg.progress.cli/model`).
+A lightweight verdict role — the input is short (last few attempts'
+checker root-causes + triage notes) and the decision is shallow.
 """
 
 from __future__ import annotations

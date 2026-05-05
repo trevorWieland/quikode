@@ -181,10 +181,10 @@ allows ~5-7 in-flight tasks; CPU is the binding constraint.
 
 | Phase | CLI | Default model |
 |---|---|---|
-| Planner | claude | claude-opus-4-7 |
+| Planner | codex | gpt-5.5 |
 | Doer | opencode | zai-coding-plan/glm-5.1 |
 | Checker | codex | gpt-5.3-codex |
-| Triage | claude | claude-opus-4-7 |
-| Conflict resolver | claude | claude-opus-4-7 |
-| Intent reviewer | claude | claude-sonnet-4-6 |
-| Progress | claude | claude-sonnet-4-6 |
+| Triage | codex | gpt-5.5 |
+| Conflict resolver | codex | gpt-5.5 |
+| Intent reviewer | codex | gpt-5.4-mini |
+| Progress | codex | gpt-5.4-mini |

@@ -39,7 +39,7 @@ def test_set_model_replaces_existing_agent_section(tmp_path):
     assert cfg.doer.cli.value == "claude"
     assert cfg.doer.model == "claude-opus-4-7"
     # Other agents preserved
-    assert cfg.planner.cli.value == "claude"
+    assert cfg.planner.cli.value == "codex"
     assert cfg.checker.cli.value == "codex"
 
 
@@ -91,7 +91,7 @@ async def test_dispatch_set_model_rejects_unknown_phase(tmp_path):
         await pilot.pause()
         cfg = load_config(tmp_path)
         # planner stays at default
-        assert cfg.planner.cli.value == "claude"
+        assert cfg.planner.cli.value == "codex"
 
 
 @pytest.mark.asyncio
@@ -104,7 +104,7 @@ async def test_dispatch_set_model_rejects_unknown_cli(tmp_path):
         app._dispatch_slash("/set-model planner aider:bogus")
         await pilot.pause()
         cfg = load_config(tmp_path)
-        assert cfg.planner.cli.value == "claude"  # unchanged
+        assert cfg.planner.cli.value == "codex"  # unchanged
 
 
 @pytest.mark.asyncio

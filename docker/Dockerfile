@@ -61,6 +61,16 @@ RUN cargo binstall --no-confirm --locked \
         cargo-mutants cargo-edit cargo-hack \
         taplo-cli lychee rumdl sccache
 
+# ---- actionlint ---------------------------------------------------------------
+# Standards-audit findings repeatedly cite actionlint as expected. Pre-installing
+# the binary so the doer doesn't have to install it (which it can't from inside
+# an unprivileged dev container — no sudo on this user, no apt-get without it).
+# Using the official one-shot installer; lands the binary in /usr/local/bin via
+# the dev user's sudo line above.
+RUN curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash \
+    && sudo mv actionlint /usr/local/bin/actionlint \
+    && sudo chmod +x /usr/local/bin/actionlint
+
 # ---- node + pnpm via nvm ------------------------------------------------------
 ENV NVM_DIR=/home/dev/.nvm
 RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash \

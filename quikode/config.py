@@ -578,8 +578,13 @@ class Config(BaseModel):
     )
 
     # ----- agent role assignments -----
+    # Heavy reasoning roles run on codex gpt-5.5; lightweight verdict roles
+    # run on codex gpt-5.4-mini. Claude was retired from default config due
+    # to subscription token-expiry issues — every claude call risked a 401
+    # mid-run, which surfaced as cascading "fixup planner returned empty"
+    # BLOCKs across the workspace.
     planner: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-opus-4-7"),
+        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.5"),
         description="Planner agent — emits structured plan JSON.",
     )
     doer: AgentRole = Field(
@@ -591,25 +596,26 @@ class Config(BaseModel):
         description="Checker agent — runs the playbook + acceptance.",
     )
     triage: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-opus-4-7"),
+        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.5"),
         description="Triage agent — root-causes failures.",
     )
     conflict_resolver: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-opus-4-7"),
-        description="Phase A — resolves rebase conflicts.",
+        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.5"),
+        description="Resolves rebase conflicts via the agent's full reasoning budget.",
     )
     intent_reviewer: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-sonnet-4-6"),
+        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.4-mini"),
         description=(
-            "Phase B — checks intent drift after dep merges. Sonnet for cleaner "
-            "reasoning on the 'are these two specs still compatible' judgment."
+            "Checks intent drift after dep merges. Lightweight verdict role "
+            "— gpt-5.4-mini handles the 'are these two specs still compatible' "
+            "judgment quickly and cheaply."
         ),
     )
     progress: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CLAUDE, model="claude-sonnet-4-6"),
+        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.4-mini"),
         description=(
-            "v3 Phase A — progress-check agent that decides whether a struggling "
-            "subtask is making progress, has flatlined, or it's too early to tell."
+            "Progress-check agent that decides whether a struggling subtask is "
+            "making progress, has flatlined, or it's too early to tell."
         ),
     )
 
@@ -811,8 +817,8 @@ pr_remote = "origin"
 triage_budget_per_phase = 3
 
 [agents.planner]
-cli = "claude"
-model = "claude-opus-4-7"
+cli = "codex"
+model = "gpt-5.5"
 
 [agents.doer]
 cli = "opencode"
@@ -823,6 +829,6 @@ cli = "codex"
 model = "gpt-5.3-codex"
 
 [agents.triage]
-cli = "claude"
-model = "claude-opus-4-7"
+cli = "codex"
+model = "gpt-5.5"
 """
