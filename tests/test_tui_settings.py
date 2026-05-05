@@ -71,14 +71,6 @@ def test_persist_overrides_routes_stacking_to_section(tmp_path):
     assert parsed["stacking"]["strategy"] == "within-milestone"
 
 
-def test_persist_overrides_routes_intent_to_section(tmp_path):
-    p = tmp_path / "config.toml"
-    p.write_text("# header\n")
-    _persist_overrides(p, {"intent_check_on_dep_merge": False})
-    parsed = tomllib.loads(p.read_text())
-    assert parsed["intent"]["check_on_dep_merge"] is False
-
-
 def test_persist_overrides_replaces_existing_sectioned_key(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text('# header\nrepo_path = "/x"\n\n[stacking]\nstrategy = "off"\nmax_depth = 4\n')

@@ -7,7 +7,6 @@ For v1 we expose:
 - max_parallel
 - triage_budget_per_phase
 - stacking_strategy (enum dropdown)
-- intent_check_on_dep_merge (toggle)
 - conflict_auto_resolve (toggle)
 
 For everything else, /config opens the TOML in $EDITOR.
@@ -35,7 +34,6 @@ _MODAL_FIELDS: list[tuple[str, str]] = [
     ("triage_budget_per_phase", "int"),
     ("stall_warn_seconds", "int"),
     ("stacking_strategy", "enum"),
-    ("intent_check_on_dep_merge", "bool"),
     ("conflict_auto_resolve", "bool"),
     ("max_parallel_auto", "bool"),
 ]
@@ -214,7 +212,6 @@ _TOML_SCHEMA: dict[str, tuple[str | None, str]] = {
     "stall_warn_seconds": (None, "stall_warn_seconds"),
     "max_parallel_auto": ("resources", "max_parallel_auto"),
     "conflict_auto_resolve": ("conflicts", "auto_resolve"),
-    "intent_check_on_dep_merge": ("intent", "check_on_dep_merge"),
     "stacking_strategy": ("stacking", "strategy"),
 }
 

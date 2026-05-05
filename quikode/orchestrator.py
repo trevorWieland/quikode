@@ -117,7 +117,7 @@ class Orchestrator:
                 # raise the flag here.
                 current_merged = self.store.completed_ids() & scope
                 newly_merged = current_merged - previously_merged
-                if newly_merged and self.cfg.intent_check_on_dep_merge:
+                if newly_merged:
                     in_flight = [
                         r["id"]
                         for r in self.store.in_state(
@@ -163,7 +163,7 @@ class Orchestrator:
                         # v2 Phase B: a MERGE may shift the world for in-flight
                         # tasks. Mark them so the worker triggers an intent review
                         # at its next safe checkpoint.
-                        if outcome.final_state == State.MERGED and self.cfg.intent_check_on_dep_merge:
+                        if outcome.final_state == State.MERGED:
                             in_flight = [
                                 r["id"]
                                 for r in self.store.in_state(

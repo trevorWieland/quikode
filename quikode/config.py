@@ -362,11 +362,7 @@ class Config(BaseModel):
         description="Max conflict-resolver retries before marking BLOCKED for human resolution.",
     )
 
-    # ----- v2 Phase B: intent -----
-    intent_check_on_dep_merge: bool = Field(
-        default=True,
-        description="Run intent-reviewer when a dependency merges while we have in-flight work.",
-    )
+    # ----- intent gap detection -----
     intent_max_reviews_per_task: int = Field(
         default=5,
         ge=0,
@@ -446,15 +442,7 @@ class Config(BaseModel):
         ),
     )
 
-    # ----- v3.6 pre-PR pipeline: local CI gate + 3-stage audit -----
-    pre_pr_pipeline_enabled: bool = Field(
-        default=True,
-        description=(
-            "Run the local-CI + rubric + standards + behavior gate before "
-            "opening a PR. When False, falls back to the legacy "
-            "final-check → commit → push → open-pr path."
-        ),
-    )
+    # ----- pre-PR pipeline: local CI gate + 3-stage audit -----
     local_ci_command: str = Field(
         default="just ci",
         description=(
@@ -755,7 +743,6 @@ def load_config(root: Path | None = None) -> Config:
         conflict_max_resolve_attempts=int(
             conflicts.get("max_resolve_attempts", defaults.conflict_max_resolve_attempts)
         ),
-        intent_check_on_dep_merge=bool(intent.get("check_on_dep_merge", defaults.intent_check_on_dep_merge)),
         intent_max_reviews_per_task=int(
             intent.get("max_reviews_per_task", defaults.intent_max_reviews_per_task)
         ),
@@ -773,7 +760,6 @@ def load_config(root: Path | None = None) -> Config:
         rebase_coalesce_window_s=int(
             stacking.get("rebase_coalesce_window_s", defaults.rebase_coalesce_window_s)
         ),
-        pre_pr_pipeline_enabled=bool(raw.get("pre_pr_pipeline_enabled", defaults.pre_pr_pipeline_enabled)),
         local_ci_command=str(raw.get("local_ci_command", defaults.local_ci_command)),
         local_ci_timeout_s=int(raw.get("local_ci_timeout_s", defaults.local_ci_timeout_s)),
         pre_pr_rubric_categories=list(raw.get("pre_pr_rubric_categories", defaults.pre_pr_rubric_categories)),

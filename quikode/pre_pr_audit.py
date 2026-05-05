@@ -98,8 +98,14 @@ def run_local_ci_gate(
     if not cmd_str:
         return StageOutcome(
             name="local_ci",
-            passed=True,
-            summary="local_ci_command empty — gate skipped",
+            passed=False,
+            summary="cfg.local_ci_command is empty — pipeline cannot validate",
+            findings=[
+                {
+                    "kind": "config_error",
+                    "message": "Set cfg.local_ci_command (e.g. 'just ci') to enable the gate.",
+                }
+            ],
         )
     try:
         rc, stdout, stderr = exec_in(
@@ -288,8 +294,20 @@ def run_standards_audit(
     if not standards_text.strip():
         return StageOutcome(
             name="standards",
-            passed=True,
-            summary="no standards profile docs found — gate skipped",
+            passed=False,
+            summary=(
+                "cfg.pre_pr_standards_profile_globs matched no readable docs — "
+                "configure standards docs to enable the gate"
+            ),
+            findings=[
+                {
+                    "kind": "config_error",
+                    "message": (
+                        "No standards profile docs found. Add docs at one of "
+                        f"{list(cfg.pre_pr_standards_profile_globs)}."
+                    ),
+                }
+            ],
         )
     try:
         prompt = prompts_mod.render(
