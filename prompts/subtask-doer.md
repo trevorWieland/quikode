@@ -77,14 +77,26 @@ And File Convention" if you're unsure about a rule.
 - `DATABASE_URL` is set.
 - Other subtasks of this same spec have NOT been started yet unless listed in `depends_on`. Don't assume their files exist.
 
-## Quality gate for this subtask
+## Quality gate for this subtask — how your work will be judged
 
-Before stopping, **verify your acceptance criteria are met**. For most subtasks this means:
-- The files you edited compile (run a focused `cargo check -p <crate>` or equivalent — full `just ci` is too slow per subtask).
-- Lint/format pass for the files you touched.
-- Any tests you added pass.
+The orchestrator runs a **two-layer gate** the moment you finish:
 
-Do NOT run the full `just ci` for every subtask — that's too slow. The orchestrator runs the full gate at the end. Per-subtask, just verify your slice.
+{% if subtask_check_command %}**Layer 1 — objective check** (mechanical, no LLM):
+```
+{{ subtask_check_command }}
+```
+This MUST exit 0 or your subtask attempt is recorded as a failure and you'll be re-prompted with the failure output as triage feedback. Run this command yourself before stopping. If it fails, fix what it flags before declaring done — every retry burns wall-clock time, agent cost, and risks the progress-check flatline-block. The objective gate catches:
+- Compile errors (`cargo check --workspace`)
+- Lint warnings as errors (`cargo clippy -D warnings`)
+- Format violations (`cargo fmt --check`, taplo, markdown)
+- Workflow lint, deps boundary, line-budget, BDD tag well-formedness, dependency-locked, etc.
+
+If the gate fails on something OUTSIDE your declared `files_to_touch` (e.g. a pre-existing line-budget violation in a file your subtask doesn't directly modify but indirectly grew via imports/re-exports), surface that in your summary — the planner may need to add a refactoring slice. Don't ignore the failure or claim the gate is wrong.
+
+**Layer 2 — LLM acceptance check**: the per-subtask checker reads your diff and verifies each acceptance criterion above. Layer 2 only runs after Layer 1 passes.
+{% else %}**Acceptance check**: run a focused `cargo check -p <crate>` or equivalent (full `just ci` is too slow per subtask).{% endif %}
+
+Before stopping, **verify your acceptance criteria are met** AND the objective gate passes. Acceptance criteria are LLM-verified; the objective gate is mechanical and unforgiving — run it yourself, fix what it flags.
 
 {% if triage_notes %}
 

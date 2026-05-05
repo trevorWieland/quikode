@@ -99,7 +99,14 @@ def triage_prompt(
 
 
 def subtask_doer_prompt(cfg: Config, node: Node, subtask, triage_notes: str | None = None) -> str:
-    return render(cfg, "subtask-doer.md", node=node, subtask=subtask, triage_notes=triage_notes)
+    return render(
+        cfg,
+        "subtask-doer.md",
+        node=node,
+        subtask=subtask,
+        triage_notes=triage_notes,
+        subtask_check_command=cfg.subtask_check_command,
+    )
 
 
 def subtask_checker_prompt(cfg: Config, node: Node, subtask) -> str:
