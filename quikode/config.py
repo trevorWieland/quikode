@@ -491,6 +491,32 @@ class Config(BaseModel):
             "~25min on a clean cache; 30min default leaves headroom."
         ),
     )
+    subtask_check_command: str = Field(
+        default="just check",
+        description=(
+            "Fast objective gate run AT THE START of the per-subtask checker, "
+            "BEFORE the LLM verdict. Default 'just check' is tanren's "
+            "lightweight bundle: deps-locked / format / workflow lint / docs "
+            "lint / line-budget — runs in seconds with a hot cache. Catches "
+            "compile + lint regressions at the subtask boundary instead of "
+            "letting them accumulate until the local-CI gate fires post-DAG, "
+            "which is what made R-0021 burn 10 subtasks before the audit "
+            "stage caught a missing `check_host_access` method. Set to "
+            "empty string to disable; if your repo doesn't have a 'just' "
+            "harness, override (e.g. 'cargo check --workspace && pnpm lint')."
+        ),
+    )
+    subtask_check_timeout_s: int = Field(
+        default=300,
+        ge=10,
+        le=1800,
+        description=(
+            "Timeout for the per-subtask check command. Defaults to 5min — "
+            "the gate is meant to be fast (no full test runs); a hang past "
+            "5min suggests the command is doing too much and should be "
+            "narrowed."
+        ),
+    )
     pre_pr_rubric_categories: list[str] = Field(
         default_factory=lambda: [
             "security",
@@ -802,6 +828,8 @@ def load_config(root: Path | None = None) -> Config:
         ),
         local_ci_command=str(raw.get("local_ci_command", defaults.local_ci_command)),
         local_ci_timeout_s=int(raw.get("local_ci_timeout_s", defaults.local_ci_timeout_s)),
+        subtask_check_command=str(raw.get("subtask_check_command", defaults.subtask_check_command)),
+        subtask_check_timeout_s=int(raw.get("subtask_check_timeout_s", defaults.subtask_check_timeout_s)),
         pre_pr_rubric_categories=list(raw.get("pre_pr_rubric_categories", defaults.pre_pr_rubric_categories)),
         pre_pr_rubric_min_score=int(raw.get("pre_pr_rubric_min_score", defaults.pre_pr_rubric_min_score)),
         pre_pr_standards_profile_globs=list(

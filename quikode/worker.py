@@ -1500,9 +1500,24 @@ class TaskWorker:
         bailed before the container was usable. Without this, three
         "attempts" can finish in seconds and burn the hard ceiling on
         infrastructure noise.
+
+        v3.7 layered gate: BEFORE the LLM checker, run an objective
+        `cfg.subtask_check_command` (default `just check` — deps-locked,
+        format, workflow lint, docs lint, line-budget). If that gate
+        fails, synthesize a checker FAIL immediately with the command
+        output as triage feedback — no LLM call needed for what's a
+        mechanical failure. Catches workspace-wide compile / lint /
+        line-budget regressions at the subtask boundary instead of
+        letting them accumulate until local-CI / pre-PR audit fires.
         """
         self.store.transition(self.node.id, State.CHECKING_SUBTASK, note=subtask.id)
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.CHECKING.value)
+
+        # Layer 1: objective check command (fast, mechanical).
+        objective_outcome = self._run_subtask_check_command(subtask)
+        if objective_outcome is not None:
+            return objective_outcome
+
         agent = build_agent(self.cfg.checker)
         prompt = prompts.subtask_checker_prompt(self.cfg, self.node, subtask)
         self._write_log_header(f"SUBTASK CHECKER {subtask.id}", prompt)
@@ -1539,6 +1554,80 @@ class TaskWorker:
             transient=transient,
             rc=int(result.rc) if result.rc is not None else None,
             stderr=getattr(result, "stderr", "") or "",
+        )
+
+    def _run_subtask_check_command(self, subtask: Subtask) -> _CheckerOutcome | None:
+        """Layer-1 objective gate. Returns:
+        - `None` when the gate passes OR is disabled (caller proceeds to
+          the LLM checker as before).
+        - A FAIL `_CheckerOutcome` with the command output as
+          `checker_text` when the gate fails — the existing FAIL handler
+          synthesizes triage notes and the doer retries with mechanical
+          feedback like compile errors / line-budget violations / lint
+          messages, which it can act on without LLM interpretation.
+
+        Transient (rc=124 / container-vanished / fast-fail < 5s) gets
+        the same free-retry treatment as the LLM checker's transient
+        path so an infra hiccup doesn't burn the retry budget.
+        """
+        cmd_str = (self.cfg.subtask_check_command or "").strip()
+        if not cmd_str:
+            return None
+        log.info(
+            "subtask %s/%s: running objective check `%s`",
+            self.node.id,
+            subtask.id,
+            cmd_str,
+        )
+        try:
+            rc, stdout, stderr = exec_in(
+                self._h,
+                ["bash", "-lc", f"cd /workspace && {cmd_str}"],
+                log_path=self.log_path,
+                timeout=self.cfg.subtask_check_timeout_s,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.warning(
+                "subtask %s/%s: objective check raised %s; treating as transient",
+                self.node.id,
+                subtask.id,
+                e,
+            )
+            return _CheckerOutcome(
+                verdict=Verdict.FAIL,
+                checker_text=f"subtask check command raised: {e}",
+                transient=True,
+                rc=124,
+                stderr=str(e),
+            )
+        if rc == 0:
+            return None  # passed → proceed to LLM checker
+        # Real failure — synthesize a structured FAIL the LLM-FAIL path can consume.
+        blob = (stdout or "") + ("\n" + stderr if stderr else "")
+        head = blob[:6000]
+        synthesized = (
+            f"VERDICT: FAIL\n"
+            f"ROOT_CAUSE: objective subtask check `{cmd_str}` failed (rc={rc})\n"
+            f"DETAILS:\n{head}"
+        )
+        self.store.add_artifact(
+            self.node.id,
+            f"subtask_objective_check:{subtask.id}",
+            blob[:20000],
+        )
+        log.info(
+            "subtask %s/%s: objective check FAILED (rc=%d, %d bytes of output)",
+            self.node.id,
+            subtask.id,
+            rc,
+            len(blob),
+        )
+        return _CheckerOutcome(
+            verdict=Verdict.FAIL,
+            checker_text=synthesized,
+            transient=False,
+            rc=rc,
+            stderr=stderr or "",
         )
 
     def _triage_subtask(self, subtask: Subtask, attempt: int, budget: int, checker_output: str) -> str:
