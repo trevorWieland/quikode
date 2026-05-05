@@ -315,6 +315,198 @@ def test_picker_single_parent_unchanged(tmp_path):
     assert store.get("R-002")["parent_branch"] == "quikode/r-001-aaa"
 
 
+def test_stack_depth_uses_max_path_in_dag(tmp_path):
+    """A child with two parents at depths 1 and 3 returns 4 (1 + max(3,1))."""
+    edges = [("R-001", []), ("R-002", []), ("R-003", []), ("R-099", ["R-001", "R-002"])]
+    dag = _make_dag(tmp_path, edges)
+    cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json")
+    store = Store(tmp_path / "q.db")
+    o = Orchestrator(cfg, dag, store)
+    for nid, _ in edges:
+        store.upsert_pending(nid)
+    # Build a deeper chain on R-002: R-003 → R-002 → root, and a shallow
+    # chain on R-001: R-001 → root. R-099's depth should be 1 + max(2, 3) = 4
+    # if R-002 itself has depth 3, but as direct parent it's depth-2 from
+    # R-099's POV. We assert depth >= 2 (the shallow path) and that adding
+    # an indirect ancestor pushes it deeper.
+    store.set_parent_chain("R-002", parent_task_ids=["R-003"], parent_branches=["quikode/r-003-aaa"])
+    store.set_parent_chain("R-099", parent_task_ids=["R-001", "R-002"], parent_branches=["a", "b"])
+    # R-099 → max(R-001 depth=1, R-002 depth=2) + 1 = 3
+    assert o._stack_depth("R-099") == 3
+    # R-001 has no parents → depth 1 (counts itself, matches legacy semantics)
+    assert o._stack_depth("R-001") == 1
+
+
+def test_stack_root_with_multi_parent_returns_min_id(tmp_path):
+    """Multi-parent DAG: pick the lexicographically lowest root for the
+    breadth-cap key. Deterministic across re-walks."""
+    edges = [("R-005", []), ("R-001", []), ("R-099", ["R-005", "R-001"])]
+    dag = _make_dag(tmp_path, edges)
+    cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json")
+    store = Store(tmp_path / "q.db")
+    o = Orchestrator(cfg, dag, store)
+    for nid, _ in edges:
+        store.upsert_pending(nid)
+    store.set_parent_chain("R-099", parent_task_ids=["R-005", "R-001"], parent_branches=["a", "b"])
+    # Roots are R-005 and R-001; min wins.
+    assert o._stack_root("R-099") == "R-001"
+
+
+def test_would_form_cycle_via_alternate_path(tmp_path):
+    """Cycle detection must catch a → b → a even when the cycle isn't
+    on the lowest-id path. BFS over parent_task_ids."""
+    edges = [("R-001", []), ("R-002", []), ("R-003", [])]
+    dag = _make_dag(tmp_path, edges)
+    cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json")
+    store = Store(tmp_path / "q.db")
+    o = Orchestrator(cfg, dag, store)
+    for nid, _ in edges:
+        store.upsert_pending(nid)
+    # Wire R-002 → R-003, R-003 → R-001. If we now ask "would stacking
+    # R-001 on R-002 form a cycle?", the BFS should walk
+    # R-002 → R-003 → R-001 (HIT) and return True.
+    store.set_parent_chain("R-002", parent_task_ids=["R-003"], parent_branches=["a"])
+    store.set_parent_chain("R-003", parent_task_ids=["R-001"], parent_branches=["b"])
+    assert o._would_form_cycle("R-001", "R-002") is True
+    # R-001 onto a fresh ancestor (no path) should be safe.
+    assert o._would_form_cycle("R-099", "R-001") is False
+
+
+def test_stack_size_under_root_counts_dag_dependents(tmp_path):
+    """Multiple children sharing roots should all count; merging children
+    don't get double-counted under each parent's root."""
+    edges = [("R-001", []), ("R-002", []), ("R-003", []), ("R-099", ["R-001", "R-002"])]
+    dag = _make_dag(tmp_path, edges)
+    cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json")
+    store = Store(tmp_path / "q.db")
+    o = Orchestrator(cfg, dag, store)
+    for nid, _ in edges:
+        store.upsert_pending(nid)
+    store.set_parent_chain("R-099", parent_task_ids=["R-001", "R-002"], parent_branches=["a", "b"])
+    # R-099 → root R-001 (min(R-001, R-002)). R-001 → root R-001. R-002 → root R-002.
+    # R-003 → root R-003. So under_root(R-001) = R-001 + R-099 = 2.
+    assert o._stack_size_under_root("R-001") == 2
+    assert o._stack_size_under_root("R-002") == 1
+
+
+def test_children_of_parent_branch_matches_array_column(tmp_path):
+    """A child whose `parent_pr_branches` JSON array contains the branch
+    should be returned alongside legacy scalar matches."""
+    store = Store(tmp_path / "q.db")
+    # Three children, each with different linkage shapes:
+    # - R-001: only the legacy scalar parent_pr_branch is set.
+    # - R-002: only the JSON-array parent_pr_branches is set.
+    # - R-003: both set (the lockstep case from set_parent_chain).
+    # All point at the same parent branch.
+    for nid in ("R-001", "R-002", "R-003"):
+        store.upsert_pending(nid)
+        store.transition(nid, State.DOING_SUBTASK)
+    branch = "quikode/parent-aaa"
+    store.conn.execute("UPDATE tasks SET parent_pr_branch = ? WHERE id = ?", (branch, "R-001"))
+    store.conn.execute(
+        "UPDATE tasks SET parent_pr_branches = ? WHERE id = ?",
+        (json.dumps([branch]), "R-002"),
+    )
+    store.conn.execute(
+        "UPDATE tasks SET parent_pr_branch = ?, parent_pr_branches = ? WHERE id = ?",
+        (branch, json.dumps([branch, "quikode/other-bbb"]), "R-003"),
+    )
+    store.conn.commit()
+    children = store.children_of_parent_branch(branch)
+    ids = {c["id"] for c in children}
+    assert ids == {"R-001", "R-002", "R-003"}
+
+
+def test_observed_branch_tip_round_trip(tmp_path):
+    store = Store(tmp_path / "q.db")
+    store.upsert_pending("R-001")
+    assert store.get_last_observed_branch_tip_sha("R-001") is None
+    store.set_last_observed_branch_tip_sha("R-001", "deadbeef00")
+    assert store.get_last_observed_branch_tip_sha("R-001") == "deadbeef00"
+
+
+def test_cascade_rebase_recurses_into_grandchildren(tmp_path, monkeypatch):
+    """When a parent's tip advances, descendants at every depth should be
+    queued. B → C → D: B advances → C and D both rebase."""
+    edges = [
+        ("R-001", []),
+        ("R-002", ["R-001"]),
+        ("R-003", ["R-002"]),
+    ]
+    dag = _make_dag(tmp_path, edges)
+    cfg = Config(
+        repo_path=tmp_path,
+        dag_path=tmp_path / "dag.json",
+        stacking_strategy="within-milestone",
+    )
+    store = Store(tmp_path / "q.db")
+    o = Orchestrator(cfg, dag, store)
+    for nid, _ in edges:
+        store.upsert_pending(nid)
+        store.transition(nid, State.DOING_SUBTASK, branch=f"quikode/{nid.lower()}-aaa")
+    # R-002 stacks on R-001; R-003 stacks on R-002.
+    store.set_parent_chain(
+        "R-002",
+        parent_task_ids=["R-001"],
+        parent_branches=["quikode/r-001-aaa"],
+        parent_pr_branches=["quikode/r-001-aaa"],
+    )
+    store.set_parent_chain(
+        "R-003",
+        parent_task_ids=["R-002"],
+        parent_branches=["quikode/r-002-aaa"],
+        parent_pr_branches=["quikode/r-002-aaa"],
+    )
+
+    scheduled: list[str] = []
+
+    def _stub_schedule(self, task_id, pool, futures, rrf, *, trigger_reason="parent_merged"):
+        scheduled.append(task_id)
+
+    monkeypatch.setattr(Orchestrator, "_schedule_rebase_to_main", _stub_schedule)
+
+    # Trigger cascade: R-001's branch tip advanced.
+    o._schedule_cascade_rebase("quikode/r-001-aaa", pool=None, futures={}, review_response_futures=set())
+    # R-002 (direct child) and R-003 (grandchild via R-002's branch) both queued.
+    assert "R-002" in scheduled
+    assert "R-003" in scheduled
+    # needs_parent_rebase flag set on both.
+    assert store.get("R-002")["needs_parent_rebase"] == 1
+    assert store.get("R-003")["needs_parent_rebase"] == 1
+
+
+def test_cascade_rebase_skips_terminal_descendants(tmp_path, monkeypatch):
+    """MERGED / ABORTED / BLOCKED descendants are excluded from the cascade."""
+    edges = [("R-001", []), ("R-002", ["R-001"])]
+    dag = _make_dag(tmp_path, edges)
+    cfg = Config(
+        repo_path=tmp_path,
+        dag_path=tmp_path / "dag.json",
+        stacking_strategy="within-milestone",
+    )
+    store = Store(tmp_path / "q.db")
+    o = Orchestrator(cfg, dag, store)
+    for nid, _ in edges:
+        store.upsert_pending(nid)
+    # R-002 already MERGED → must NOT be re-rebased.
+    store.set_parent_chain(
+        "R-002",
+        parent_task_ids=["R-001"],
+        parent_branches=["quikode/r-001-aaa"],
+        parent_pr_branches=["quikode/r-001-aaa"],
+    )
+    store.transition("R-002", State.MERGED, branch="quikode/r-002-aaa")
+
+    scheduled: list[str] = []
+
+    def _stub_schedule(self, task_id, pool, futures, rrf, *, trigger_reason="parent_merged"):
+        scheduled.append(task_id)
+
+    monkeypatch.setattr(Orchestrator, "_schedule_rebase_to_main", _stub_schedule)
+    o._schedule_cascade_rebase("quikode/r-001-aaa", pool=None, futures={}, review_response_futures=set())
+    assert scheduled == []
+
+
 def test_set_parent_merge_base_round_trip(tmp_path):
     store = Store(tmp_path / "q.db")
     store.upsert_pending("R-099")

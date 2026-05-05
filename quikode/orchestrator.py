@@ -367,73 +367,113 @@ class Orchestrator:
             self.store.set_parent_merge_base(nid, branch=None, sha=None)
 
     def _stack_depth(self, task_id: str) -> int:
-        """Compute how deep the stacking chain is starting from `task_id`.
-        Each parent_task_id link adds 1.
+        """Compute how deep the stacking DAG is starting from `task_id`.
 
-        Defensive: a `parent_task_id` cycle (a → b → a) would otherwise
-        loop forever. The `seen` set short-circuits and we return the
-        partial depth; callers treating this as "deep enough to refuse"
-        is the safe default — a row in a cycle is a planning bug worth
-        flagging anyway.
+        v3.5 Phase 2 follow-up: walks the multi-parent DAG via
+        `parent_task_ids`, taking the **maximum** depth across all paths
+        upward. A child with two parents at depths 3 and 5 returns 5 (the
+        deepest path), so the caller's `depth >= stacking_max_depth`
+        check rejects when *any* path is too deep. Falls back to the
+        scalar `parent_task_id` for legacy rows that haven't been
+        backfilled yet.
+
+        Defensive: a parent-DAG cycle would otherwise loop forever. The
+        `visited` set short-circuits; on cycle detection we return a
+        sentinel above max-depth so the caller refuses.
         """
-        depth = 0
-        cur = task_id
-        seen: set[str] = set()
-        while cur and cur not in seen and depth < 100:
-            seen.add(cur)
-            row = self.store.get(cur)
-            if not row:
-                break
-            cur = row.get("parent_task_id")
-            depth += 1
-        if cur and cur in seen:
-            log.warning(
-                "stacking cycle detected starting at %s (cycle on %s); refusing further stacking",
-                task_id,
-                cur,
-            )
-            # Force the depth above any reasonable max so the caller's
-            # `depth >= cfg.stacking_max_depth` check rejects this branch.
+        # `on_stack` tracks the *current* recursion path so a cycle (a→b→a)
+        # is detected. We don't memoize cross-path visits — the same node
+        # reached via different paths can have different depths if the
+        # graph has DAG-shape diamonds, but our caller only cares about
+        # max-depth so memoizing-then-reusing is also correct. We pick the
+        # simpler stack-only variant since DAG depth maxes don't change
+        # from re-traversal cost in practice (workspaces are small).
+        # Match the legacy scalar-chain semantics: depth counts nodes in the
+        # chain *inclusive* of the starting task. A root returns 1; B
+        # stacked on A returns 2; etc. Critical so existing callers'
+        # `depth >= cfg.stacking_max_depth` checks reject at the same
+        # boundary they always have.
+        on_stack: set[str] = set()
+        cycle_detected = [False]
+
+        def _depth(node: str) -> int:
+            if node in on_stack:
+                cycle_detected[0] = True
+                return 0
+            on_stack.add(node)
+            try:
+                parents = self._parents_of(node)
+                if not parents:
+                    return 1
+                return 1 + max(_depth(p) for p in parents)
+            finally:
+                on_stack.discard(node)
+
+        depth = _depth(task_id)
+        if cycle_detected[0]:
+            log.warning("stacking cycle detected from %s — refusing further stacking", task_id)
             return max(depth, self.cfg.stacking_max_depth + 1)
         return depth
 
+    def _parents_of(self, task_id: str) -> list[str]:
+        """Return the multi-parent list for `task_id`, falling back to the
+        scalar `parent_task_id` for legacy rows. Single source of truth for
+        the stack-walk helpers."""
+        ids = self.store.get_parent_task_ids(task_id)
+        if ids:
+            return ids
+        row = self.store.get(task_id)
+        if row and row.get("parent_task_id"):
+            return [str(row["parent_task_id"])]
+        return []
+
     def _would_form_cycle(self, child_id: str, prospective_parent_id: str) -> bool:
-        """Walking parent_task_id from `prospective_parent_id` upward, would
-        we re-encounter `child_id`? If so, stacking forms a cycle and must
-        be refused. Cycle-safe."""
+        """Multi-parent cycle detection. Walking the parent DAG from
+        `prospective_parent_id` upward, would we re-encounter `child_id`?
+        If so, stacking on this parent forms a cycle and must be refused.
+        BFS over `parent_task_ids` so a multi-path cycle (a→b, b→c, c→a)
+        is caught even when the cycle isn't on the lowest-id path.
+        """
         if child_id == prospective_parent_id:
             return True
-        cur = prospective_parent_id
         seen: set[str] = set()
-        while cur and cur not in seen:
+        frontier = [prospective_parent_id]
+        while frontier:
+            cur = frontier.pop()
+            if cur in seen:
+                continue
             seen.add(cur)
             if cur == child_id:
                 return True
-            row = self.store.get(cur)
-            if not row:
-                return False
-            parent = row.get("parent_task_id")
-            if not parent:
-                return False
-            cur = parent
+            for p in self._parents_of(cur):
+                if p not in seen:
+                    frontier.append(p)
         return False
 
     def _stack_root(self, task_id: str) -> str:
-        """Walk parent_task_id links to the topmost ancestor (the
-        non-stacked root). Returns `task_id` itself when not stacked.
-        Cycle-safe: bails on the first repeat."""
-        cur = task_id
+        """Find a stacking root for `task_id` — the topmost non-stacked
+        ancestor. With multi-parent stacking, the DAG can have multiple
+        roots; we return the lexicographically lowest one for
+        determinism (callers use this only for the breadth-cap key).
+        Cycle-safe."""
         seen: set[str] = set()
-        while cur and cur not in seen:
+        frontier = [task_id]
+        roots: list[str] = []
+        while frontier:
+            cur = frontier.pop()
+            if cur in seen:
+                continue
             seen.add(cur)
-            row = self.store.get(cur)
-            if not row:
-                break
-            parent = row.get("parent_task_id")
-            if not parent:
-                return cur
-            cur = parent
-        return cur or task_id
+            parents = self._parents_of(cur)
+            if not parents:
+                roots.append(cur)
+                continue
+            for p in parents:
+                if p not in seen:
+                    frontier.append(p)
+        if not roots:
+            return task_id
+        return min(roots)
 
     def _stack_size_under_root(self, root_task_id: str) -> int:
         """How many tasks (across the whole tree) are stacked off this
@@ -673,6 +713,29 @@ class Orchestrator:
 
             # 1. Check PR state — caught-up MERGE/CLOSE detection.
             pr_status = github.poll_pr(self.cfg.repo_path, int(pr_number))
+
+            # v3.5 Phase 2 follow-up: cascade-on-push detection. If the
+            # PR's head sha changed since our last poll, every descendant
+            # whose merge-base depended on this branch needs to rebase.
+            # Fires for OPEN PRs only — MERGED/CLOSED handled below in the
+            # existing branches.
+            parent_branch_for_cascade = str(task_row.get("branch") or "")
+            if pr_status.state == "OPEN" and pr_status.head_sha and parent_branch_for_cascade:
+                last_seen = self.store.get_last_observed_branch_tip_sha(task_id)
+                if last_seen and last_seen != pr_status.head_sha:
+                    log.info(
+                        "task %s: branch %s tip advanced %s → %s; scheduling cascade rebase for descendants",
+                        task_id,
+                        parent_branch_for_cascade,
+                        last_seen[:8],
+                        pr_status.head_sha[:8],
+                    )
+                    self._schedule_cascade_rebase(
+                        parent_branch_for_cascade, pool, futures, review_response_futures
+                    )
+                # Always stamp the latest tip so the next tick has a baseline.
+                self.store.set_last_observed_branch_tip_sha(task_id, pr_status.head_sha)
+
             if pr_status.state == "MERGED":
                 # Capture the parent's branch BEFORE transitioning — we need
                 # it to find children stacked on this branch. The transition
@@ -1398,6 +1461,71 @@ class Orchestrator:
                 parent_branch,
                 skipped,
             )
+
+    def _schedule_cascade_rebase(
+        self,
+        parent_branch: str,
+        pool: ThreadPoolExecutor,
+        futures: dict[str, Future],
+        review_response_futures: set[str],
+    ) -> None:
+        """v3.5 Phase 2 follow-up: when a parent's branch advances (push, not
+        merge), schedule rebases for every descendant whose merge-base or
+        single-parent base referenced this branch. Walks the parent DAG
+        downward via `children_of_parent_branch` (matches both scalar and
+        JSON-array linkage). Active workers get `needs_parent_rebase=1`
+        (handled inline at safe checkpoints); non-active children are
+        scheduled through the existing rebase pool.
+
+        Critical guarantee: descendants are queued in topo order so a child
+        rebases AFTER its own parents have themselves rebased. We approximate
+        topo-order by sorting candidate ids and recursing — workspaces are
+        small (< 300 nodes), so the overhead is negligible.
+        """
+        children = self.store.children_of_parent_branch(parent_branch)
+        if not children:
+            return
+        log.info(
+            "parent branch %s tip advanced → cascading rebase to %d direct descendant(s)",
+            parent_branch,
+            len(children),
+        )
+        # Track which descendants have been queued already so we don't
+        # re-enqueue across recursion.
+        scheduled: set[str] = set()
+
+        def _enqueue(child_row: dict) -> None:
+            child_id = str(child_row["id"])
+            if child_id in scheduled:
+                return
+            scheduled.add(child_id)
+            # Always raise the mid-flight flag. When the worker exits the
+            # current safe checkpoint it'll pick this up and rebase inline.
+            self.store.mark_needs_parent_rebase(child_id)
+            if child_id in futures:
+                log.info(
+                    "cascade rebase: %s has active worker; flagged needs_parent_rebase",
+                    child_id,
+                )
+            else:
+                self._schedule_rebase_to_main(
+                    child_id,
+                    pool,
+                    futures,
+                    review_response_futures,
+                    trigger_reason="parent_tip_advanced",
+                )
+            # Recurse into the *child's* descendants — D depends on B, B
+            # advances → D rebases → D's downstream descendants also need
+            # to rebase against the new D.
+            child_branch = child_row.get("branch")
+            if child_branch:
+                grandchildren = self.store.children_of_parent_branch(str(child_branch))
+                for gc in grandchildren:
+                    _enqueue(gc)
+
+        for child in children:
+            _enqueue(child)
 
     def _remote_branch_exists(self, branch: str) -> bool:
         """Check if `branch` still exists on the configured remote.

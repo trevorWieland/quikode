@@ -20,6 +20,7 @@ class PRStatus:
     checks_status: str  # success | failure | pending | none
     failed_checks: list[dict]
     base_ref_name: str = ""  # base branch the PR targets — empty if unknown
+    head_sha: str = ""  # head commit sha — used for cascade-on-push detection
 
 
 def _exec_gh(
@@ -92,7 +93,7 @@ def open_pr(
 def pr_view(
     repo: Path,
     pr_number: int,
-    fields: str = "state,mergeable,statusCheckRollup,url,baseRefName",
+    fields: str = "state,mergeable,statusCheckRollup,url,baseRefName,headRefOid",
 ) -> dict[str, Any]:
     """Run gh pr view on the host, against the host repo.
 
@@ -121,6 +122,10 @@ def poll_pr(repo: Path, pr_number: int) -> PRStatus:
 
     This is a thin status fetcher — it does NOT return review comments. For
     review-thread polling, use `github_graphql.get_review_threads`.
+
+    Also captures `head_sha` (the PR's current head commit) so the
+    cascade-on-push detector can notice when a parent's branch advances
+    without going through MERGE_READY.
     """
     data = pr_view(repo, pr_number)
     state = data.get("state", "UNKNOWN")
@@ -149,6 +154,7 @@ def poll_pr(repo: Path, pr_number: int) -> PRStatus:
         checks_status=checks,
         failed_checks=failed,
         base_ref_name=data.get("baseRefName", "") or "",
+        head_sha=str(data.get("headRefOid") or ""),
     )
 
 

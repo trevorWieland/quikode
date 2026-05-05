@@ -395,15 +395,69 @@ class TaskWorker:
             # 1. provision container against existing worktree
             self._provision(provision_worktree=False)
 
-            # 2. capture parent_sha BEFORE fetch — local ref persists even
-            # after the parent's remote branch is deleted by `--delete-branch`,
-            # but the local ref is what we hand to `--onto`.
+            # 2. capture the rebase --onto target BEFORE fetch.
+            #
+            # v3.5 Phase 2: for a multi-parent child whose existing commits
+            # sit on top of a synthetic merge-base, the recompute path is:
+            #   a. Use the *prior* merge-base sha as `--onto`'s "upstream"
+            #      reference (the boundary above which child commits live).
+            #      Capture it before any fetch since the local ref can be
+            #      reset by `construct_merge_base` below.
+            #   b. Recompute a fresh merge-base off the parents' new tips.
+            #      If parents' tips haven't changed, the new sha == prior
+            #      sha and the rebase is a no-op (useful idempotence).
+            #   c. Rebase --onto <new_merge_base> <prior_merge_base> branch.
+            # If recompute fails (conflict between parents), fall back to
+            # the single-parent path against the first listed parent.
+            #
+            # For a single-parent child, the local parent_branch ref is the
+            # legacy --onto target (the v3 path). The local ref persists
+            # even after `--delete-branch`, so we capture before the fetch.
+            prior_merge_base_sha = str(row.get("parent_merge_base_sha") or "")
             parent_branch_local = str(row.get("parent_branch") or "")
-            parent_sha = ""
-            if parent_branch_local:
+            parent_task_ids = self.store.get_parent_task_ids(self.node.id)
+            parent_branches = self.store.get_parent_branches(self.node.id)
+            onto_sha = ""
+            new_merge_base_sha = ""
+
+            if prior_merge_base_sha:
+                # Verify the prior merge-base sha is still in the worktree's
+                # git database. If it isn't (e.g. branch was deleted from
+                # the repo), fall back to the parent_branch path.
+                rc_ps, _ = self._git_in_workspace(["rev-parse", "--verify", prior_merge_base_sha])
+                if rc_ps == 0:
+                    onto_sha = prior_merge_base_sha
+
+            # v3.5 Phase 2 follow-up: when the row records multi-parent
+            # linkage, recompute the merge-base off current parent tips
+            # before rebasing. This is what makes "parent advances → all
+            # descendants rebase" actually work for multi-parent children.
+            if len(parent_task_ids) > 1 and len(parent_branches) >= len(parent_task_ids):
+                # Make sure the parents' refs are up to date.
+                for pb in parent_branches:
+                    self._git_in_workspace(["fetch", self.cfg.pr_remote, pb])
+                mb_name = stacking.compute_merge_base_branch_name(self.node.id, parent_branches)
+                mb_sha = stacking.construct_merge_base(
+                    repo_path=self.cfg.repo_path,
+                    parent_branches=parent_branches,
+                    branch_name=mb_name,
+                    base_branch=self.cfg.base_branch,
+                )
+                if mb_sha:
+                    new_merge_base_sha = mb_sha
+                    self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
+                else:
+                    log.warning(
+                        "task %s: multi-parent merge-base recompute failed; "
+                        "falling back to single-parent rebase against %s",
+                        self.node.id,
+                        parent_branches[0],
+                    )
+
+            if not onto_sha and parent_branch_local:
                 rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branch_local])
                 if rc_ps == 0:
-                    parent_sha = ps_out.strip().splitlines()[-1] if ps_out.strip() else ""
+                    onto_sha = ps_out.strip().splitlines()[-1] if ps_out.strip() else ""
 
             # 3. fetch origin main
             rc, fetch_out = self._git_in_workspace(["fetch", self.cfg.pr_remote, self.cfg.base_branch])
@@ -416,25 +470,32 @@ class TaskWorker:
                 )
                 return WorkerOutcome(pre_state, "rebase fetch failed")
 
-            # 4. rebase. With a known parent_sha, use --onto to drop the
-            # parent's commits (already in main as a squash) and replay
-            # only the child's exclusive work. Falls back to a plain rebase
-            # when the local parent ref can't be resolved.
-            if parent_sha:
+            # 4. rebase. Three paths:
+            #
+            #   (a) Multi-parent recompute succeeded → rebase --onto the
+            #       new merge-base sha, treating the prior merge-base as
+            #       the upstream boundary. Drops the old merge content,
+            #       replays only the child's commits onto the new base.
+            #   (b) Single-parent (or fallback) with a known --onto sha →
+            #       drop parent's commits (already squashed into main),
+            #       replay only child's exclusive work.
+            #   (c) No --onto known → plain rebase against origin/main.
+            rebase_target = (
+                new_merge_base_sha if new_merge_base_sha else f"{self.cfg.pr_remote}/{self.cfg.base_branch}"
+            )
+            if onto_sha:
                 rc, _rebase_out = self._git_in_workspace(
                     [
                         "-c",
                         "core.editor=true",
                         "rebase",
                         "--onto",
-                        f"{self.cfg.pr_remote}/{self.cfg.base_branch}",
-                        parent_sha,
+                        rebase_target,
+                        onto_sha,
                     ]
                 )
             else:
-                rc, _rebase_out = self._git_in_workspace(
-                    ["-c", "core.editor=true", "rebase", f"{self.cfg.pr_remote}/{self.cfg.base_branch}"]
-                )
+                rc, _rebase_out = self._git_in_workspace(["-c", "core.editor=true", "rebase", rebase_target])
             if rc != 0:
                 # 4. conflict — try the resolver. _spawn_conflict_resolver
                 # already handles staging, --continue, verify, and push;

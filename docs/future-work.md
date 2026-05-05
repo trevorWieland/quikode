@@ -143,40 +143,40 @@ PRs; ancestor-PR fixes percolate down the chain automatically.
 Phase 1 (readiness gate) shipped 2026-05-04. Phase 2 (multi-parent
 merge-base) and Phase 3 (instructional resolver) are open.
 
-### 🟡 Phase 2 follow-up — Cascade rebase on parent advance
+### ✅ Phase 2 fully landed (2026-05-04 evening)
 
-Phase 2 minimum-viable shipped 2026-05-04 evening: schema, store
-helpers, picker side-effects, `stacking.construct_merge_base`,
-worker provisioning hook, 14 tests. What remains:
+All four follow-ups from the original Phase 2 MVP are shipped:
 
-- **Cascade rebase scheduler.** When a parent in MERGE_READY accepts
-  a new commit (e.g. fixup pushed in the addressing-feedback path),
-  every descendant relying on its merge-base needs to recompute.
-  Today the scheduler reacts to *parent merge*; extend
-  `_schedule_rebases_for_merged_parent` (or a sibling
-  `_schedule_rebases_for_parent_advance`) to fire on push, not just
-  merge, and traverse the multi-parent DAG in topo order so D
-  rebases only after B/C have themselves finished.
-- **`run_rebase_to_main` multi-parent variant.** Today the worker
-  uses `git rebase --onto <parent_sha>` against a single parent;
-  for multi-parent, rebase against the *prior* merge-base sha so
-  the child's commits replay onto the new merge-base. The store
-  already records `parent_merge_base_sha` for this reason.
-- **Stack-walk helpers as DAG walks.** `_stack_depth`,
-  `_stack_root`, `_stack_size_under_root` currently follow the
-  scalar `parent_task_id` chain. Generalize to walk
-  `parent_task_ids` (union of all paths upward). Multi-parent
-  cycle detection already covered by the scalar version's `seen`
-  set — extend to the array case.
-- **End-to-end integration test** with real git: tmp repo with
-  three branches, run `construct_merge_base`, assert a clean
-  merge tree comes out, then introduce a conflict and assert
-  the helper aborts cleanly without leaving the repo dirty.
+- **Cascade rebase on parent advance** — `_schedule_cascade_rebase`
+  in the orchestrator + cascade-on-push detection in
+  `_poll_review_threads` (compares `pr_status.head_sha` against the
+  stored `last_observed_branch_tip_sha`). Recurses topologically
+  through grandchildren via repeated `children_of_parent_branch`
+  scans, marks `needs_parent_rebase=1` on every descendant, and
+  routes inactive ones through the existing `_schedule_rebase_to_main`
+  pool.
+- **`run_rebase_to_main` multi-parent variant** — when the row
+  carries `len(parent_task_ids) > 1`, the worker recomputes the
+  merge-base off current parent tips before rebase, then uses
+  `git rebase --onto <new_merge_base> <prior_merge_base>` to drop
+  the old merge content and replay only the child's commits onto
+  the new merge-base. Falls back to single-parent rebase if the
+  recompute fails.
+- **Stack-walk helpers as DAG walks** — `_stack_depth`,
+  `_stack_root`, `_stack_size_under_root`, `_would_form_cycle`
+  rewritten to traverse `parent_task_ids` as a multi-parent DAG.
+  `_stack_root` returns the lexicographically-lowest root for
+  determinism. `_would_form_cycle` uses BFS over parent_task_ids
+  so multi-path cycles (a→b, b→c, c→a) are caught.
+- **E2E integration test against real git** — `test_stacking_e2e_git.py`
+  builds tmp_path repos with two and three independent parents,
+  exercises octopus + sequential + conflict-abort paths against
+  real `git merge`, and verifies the working tree is left clean
+  after a conflict abort (no MERGE_HEAD lingering).
 
-The MVP that shipped today is correct on the schema + provisioning
-fork-point; the cascade-rebase logic is the load-bearing follow-up
-that lets a multi-parent chain advance through review without
-operator intervention.
+The full vision — multi-parent merge-base construction, cascade
+rebase on every parent push, deterministic DAG-walk semantics — is
+now implemented end-to-end.
 
 ### 🔴 Phase 3 — Instructional conflict resolver
 

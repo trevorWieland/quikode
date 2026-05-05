@@ -543,6 +543,11 @@ class Store:
                 ("parent_pr_branches", "TEXT"),  # JSON array (remote refs)
                 ("parent_merge_base_sha", "TEXT"),
                 ("parent_merge_base_branch", "TEXT"),
+                # v3.5 cascade-on-push: track the most recent remote tip
+                # observed for this task's branch. When the daemon's poll
+                # sees a different tip, every descendant whose merge-base
+                # depended on this branch is queued for rebase.
+                ("last_observed_branch_tip_sha", "TEXT"),
                 # v2.2 resume: skip the planner agent on the next provision
                 # and reconstruct Plan from the existing subtasks rows. Set by
                 # `quikode resume <id>`; cleared by the worker on consume.
@@ -1178,6 +1183,27 @@ class Store:
                 ),
             )
 
+    def get_last_observed_branch_tip_sha(self, task_id: str) -> str | None:
+        """Read the cascade-on-push tracker: the most recent remote-branch tip
+        sha we observed for this task. None when never seen / column absent."""
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT last_observed_branch_tip_sha FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        if r is None:
+            return None
+        v = r["last_observed_branch_tip_sha"]
+        return str(v) if v else None
+
+    def set_last_observed_branch_tip_sha(self, task_id: str, sha: str) -> None:
+        """Stamp the most-recent remote-branch tip sha for cascade detection."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET last_observed_branch_tip_sha = ?, updated_at = ? WHERE id = ?",
+                (sha, time.time(), task_id),
+            )
+
     def set_parent_merge_base(self, task_id: str, *, branch: str | None, sha: str | None) -> None:
         """Record the synthetic merge-base branch + sha used for multi-parent
         stacking. Either argument may be None to clear."""
@@ -1512,14 +1538,15 @@ class Store:
     # ----- v3 Phase C: stacked diffs / parent-merge rebase plumbing -----
 
     def children_of_parent_branch(self, parent_branch: str) -> list[TaskRow]:
-        """Return non-terminal child tasks whose parent_pr_branch matches.
+        """Return non-terminal child tasks whose parent linkage includes
+        `parent_branch`. Matches both the legacy scalar `parent_pr_branch`
+        column AND the v3.5 multi-parent `parent_pr_branches` JSON array.
 
         Used by the orchestrator to find every child that needs to rebase
-        when the parent's PR merges. Excludes terminal states (MERGED,
-        ABORTED, FAILED, BLOCKED) — there's nothing left to rebase for
-        those — and PENDING (no work has begun, so the next provision
-        will pick up the new base naturally if parent_pr_branch is
-        cleared).
+        when the parent's PR merges or pushes a new commit. Excludes
+        terminal states (MERGED, ABORTED, FAILED, BLOCKED) — there's
+        nothing left to rebase for those — and PENDING (no work has
+        begun, so the next provision will pick up the new base naturally).
         """
         terminal = (
             State.MERGED.value,
@@ -1531,8 +1558,13 @@ class Store:
         q = ",".join("?" * len(terminal))
         with self._tx_lock:
             rows = self.conn.execute(
-                f"SELECT * FROM tasks WHERE parent_pr_branch = ? AND state NOT IN ({q}) ORDER BY id",
-                (parent_branch, *terminal),
+                f"SELECT * FROM tasks WHERE state NOT IN ({q}) "
+                f"AND (parent_pr_branch = ? "
+                f"     OR (parent_pr_branches IS NOT NULL "
+                f"         AND EXISTS (SELECT 1 FROM json_each(parent_pr_branches) "
+                f"                     WHERE json_each.value = ?))) "
+                f"ORDER BY id",
+                (*terminal, parent_branch, parent_branch),
             ).fetchall()
         return [dict(r) for r in rows]  # type: ignore[misc]
 
@@ -1564,10 +1596,11 @@ class Store:
             )
 
     def children_with_parent_branch(self, parent_branch: str) -> list[TaskRow]:
-        """Return ALL non-terminal tasks whose parent_pr_branch matches —
-        regardless of whether `_schedule_rebases_for_merged_parent` will
-        also schedule a rebase future. Used to clear stale parent metadata
-        when a parent closes without merging."""
+        """Return ALL non-terminal tasks whose parent linkage includes
+        `parent_branch` — regardless of whether
+        `_schedule_rebases_for_merged_parent` will also schedule a rebase
+        future. Used to clear stale parent metadata when a parent closes
+        without merging. Matches both the scalar + JSON-array columns."""
         terminal = (
             State.MERGED.value,
             State.ABORTED.value,
@@ -1576,8 +1609,13 @@ class Store:
         q = ",".join("?" * len(terminal))
         with self._tx_lock:
             rows = self.conn.execute(
-                f"SELECT * FROM tasks WHERE parent_pr_branch = ? AND state NOT IN ({q}) ORDER BY id",
-                (parent_branch, *terminal),
+                f"SELECT * FROM tasks WHERE state NOT IN ({q}) "
+                f"AND (parent_pr_branch = ? "
+                f"     OR (parent_pr_branches IS NOT NULL "
+                f"         AND EXISTS (SELECT 1 FROM json_each(parent_pr_branches) "
+                f"                     WHERE json_each.value = ?))) "
+                f"ORDER BY id",
+                (*terminal, parent_branch, parent_branch),
             ).fetchall()
         return [dict(r) for r in rows]  # type: ignore[misc]
 
