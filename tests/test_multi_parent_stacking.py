@@ -39,10 +39,6 @@ def test_store_round_trip_multi_parent(tmp_path):
         "quikode/r-001-aaa",
         "quikode/r-002-bbb",
     ]
-    # Legacy scalar columns also stamped (first entry).
-    row = store.get("R-099")
-    assert row["parent_task_id"] == "R-001"
-    assert row["parent_branch"] == "quikode/r-001-aaa"
 
 
 def test_store_clear_multi_parent(tmp_path):
@@ -57,22 +53,6 @@ def test_store_clear_multi_parent(tmp_path):
     # Clear by passing empty list.
     store.set_parent_chain("R-099", parent_task_ids=[])
     assert store.get_parent_task_ids("R-099") == []
-
-
-def test_store_legacy_scalar_falls_through(tmp_path):
-    """An old DB with only scalar parent_task_id should still appear in the
-    JSON-array getter — backfill migration runs at Store init."""
-    store = Store(tmp_path / "q.db")
-    store.upsert_pending("R-099")
-    # Write only the scalar (legacy shape).
-    store.conn.execute(
-        "UPDATE tasks SET parent_task_id = ?, parent_branch = ? WHERE id = ?",
-        ("R-001", "quikode/r-001-aaa", "R-099"),
-    )
-    store.conn.commit()
-    # Re-open Store: backfill should populate parent_task_ids.
-    store2 = Store(tmp_path / "q.db")
-    assert store2.get_parent_task_ids("R-099") == ["R-001"]
 
 
 # ----- Merge-base branch naming -----
@@ -262,9 +242,6 @@ def test_picker_stamps_multi_parent_chain(tmp_path):
     assert store.get_parent_task_ids("R-099") == ["R-001", "R-002"]
     branches = store.get_parent_branches("R-099")
     assert "quikode/r-001-aaa" in branches and "quikode/r-002-bbb" in branches
-    # Legacy scalar = first entry, deterministic.
-    row = store.get("R-099")
-    assert row["parent_task_id"] == "R-001"
 
 
 def test_picker_clears_parent_chain_on_fresh_root(tmp_path):
@@ -294,8 +271,8 @@ def test_picker_clears_parent_chain_on_fresh_root(tmp_path):
 
 
 def test_picker_single_parent_unchanged(tmp_path):
-    """The single-parent case (legacy stacking) still stamps cleanly into
-    the new array columns + the legacy scalars in lockstep."""
+    """The single-parent case still stamps cleanly into the JSON-array
+    columns."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
     dag = _make_dag(tmp_path, edges)
     cfg = Config(
@@ -311,8 +288,7 @@ def test_picker_single_parent_unchanged(tmp_path):
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt == "R-002"
     assert store.get_parent_task_ids("R-002") == ["R-001"]
-    assert store.get("R-002")["parent_task_id"] == "R-001"
-    assert store.get("R-002")["parent_branch"] == "quikode/r-001-aaa"
+    assert store.get_parent_branches("R-002") == ["quikode/r-001-aaa"]
 
 
 def test_stack_depth_uses_max_path_in_dag(tmp_path):
@@ -390,28 +366,22 @@ def test_stack_size_under_root_counts_dag_dependents(tmp_path):
 
 
 def test_children_of_parent_branch_matches_array_column(tmp_path):
-    """A child whose `parent_pr_branches` JSON array contains the branch
-    should be returned alongside legacy scalar matches."""
+    """`children_of_parent_branch` returns every non-terminal task whose
+    `parent_pr_branches` JSON array contains the cited branch — including
+    children with multi-parent linkage where the cited branch is one
+    among several parents."""
     store = Store(tmp_path / "q.db")
-    # Three children, each with different linkage shapes:
-    # - R-001: only the legacy scalar parent_pr_branch is set.
-    # - R-002: only the JSON-array parent_pr_branches is set.
-    # - R-003: both set (the lockstep case from set_parent_chain).
-    # All point at the same parent branch.
     for nid in ("R-001", "R-002", "R-003"):
         store.upsert_pending(nid)
         store.transition(nid, State.DOING_SUBTASK)
     branch = "quikode/parent-aaa"
-    store.conn.execute("UPDATE tasks SET parent_pr_branch = ? WHERE id = ?", (branch, "R-001"))
-    store.conn.execute(
-        "UPDATE tasks SET parent_pr_branches = ? WHERE id = ?",
-        (json.dumps([branch]), "R-002"),
+    store.set_parent_chain("R-001", parent_task_ids=["P"], parent_pr_branches=[branch])
+    store.set_parent_chain("R-002", parent_task_ids=["P"], parent_pr_branches=[branch])
+    store.set_parent_chain(
+        "R-003",
+        parent_task_ids=["P", "OTHER"],
+        parent_pr_branches=[branch, "quikode/other-bbb"],
     )
-    store.conn.execute(
-        "UPDATE tasks SET parent_pr_branch = ?, parent_pr_branches = ? WHERE id = ?",
-        (branch, json.dumps([branch, "quikode/other-bbb"]), "R-003"),
-    )
-    store.conn.commit()
     children = store.children_of_parent_branch(branch)
     ids = {c["id"] for c in children}
     assert ids == {"R-001", "R-002", "R-003"}

@@ -416,8 +416,7 @@ class TaskWorker:
 
             # 2. capture the rebase --onto target BEFORE fetch.
             #
-            # v3.5 Phase 2: for a multi-parent child whose existing commits
-            # sit on top of a synthetic merge-base, the recompute path is:
+            # The recompute path is:
             #   a. Use the *prior* merge-base sha as `--onto`'s "upstream"
             #      reference (the boundary above which child commits live).
             #      Capture it before any fetch since the local ref can be
@@ -426,15 +425,13 @@ class TaskWorker:
             #      If parents' tips haven't changed, the new sha == prior
             #      sha and the rebase is a no-op (useful idempotence).
             #   c. Rebase --onto <new_merge_base> <prior_merge_base> branch.
-            # If recompute fails (conflict between parents), fall back to
-            # the single-parent path against the first listed parent.
+            # If recompute fails (conflict between parents), the worker
+            # BLOCKs — there's no clean rebase target without a merge-base.
             #
-            # For a single-parent child, the local parent_branch ref is the
-            # legacy --onto target (the v3 path). The local ref persists
-            # even after `--delete-branch`, so we capture before the fetch.
+            # For a single-parent child, the parent's branch IS the merge
+            # base; we read it from `parent_branches[0]` and rev-parse to
+            # get the upstream sha for the rebase.
             prior_merge_base_sha = str(row.get("parent_merge_base_sha") or "")
-            parent_branch_local = str(row.get("parent_branch") or "")
-            parent_task_ids = self.store.get_parent_task_ids(self.node.id)
             parent_branches = self.store.get_parent_branches(self.node.id)
             onto_sha = ""
             new_merge_base_sha = ""
@@ -442,41 +439,43 @@ class TaskWorker:
             if prior_merge_base_sha:
                 # Verify the prior merge-base sha is still in the worktree's
                 # git database. If it isn't (e.g. branch was deleted from
-                # the repo), fall back to the parent_branch path.
+                # the repo), fall through and recompute from parent_branches.
                 rc_ps, _ = self._git_in_workspace(["rev-parse", "--verify", prior_merge_base_sha])
                 if rc_ps == 0:
                     onto_sha = prior_merge_base_sha
 
-            # v3.5 Phase 2 follow-up: when the row records multi-parent
-            # linkage, recompute the merge-base off current parent tips
-            # before rebasing. This is what makes "parent advances → all
-            # descendants rebase" actually work for multi-parent children.
-            if len(parent_task_ids) > 1 and len(parent_branches) >= len(parent_task_ids):
+            if len(parent_branches) >= 1:
                 # Make sure the parents' refs are up to date.
                 for pb in parent_branches:
                     self._git_in_workspace(["fetch", self.cfg.pr_remote, pb])
-                mb_name = stacking.compute_merge_base_branch_name(self.node.id, parent_branches)
-                mb_sha = stacking.construct_merge_base(
-                    repo_path=self.cfg.repo_path,
-                    parent_branches=parent_branches,
-                    branch_name=mb_name,
-                    base_branch=self.cfg.base_branch,
-                )
-                if mb_sha:
-                    new_merge_base_sha = mb_sha
-                    self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
-                else:
-                    log.warning(
-                        "task %s: multi-parent merge-base recompute failed; "
-                        "falling back to single-parent rebase against %s",
-                        self.node.id,
-                        parent_branches[0],
+                if len(parent_branches) > 1:
+                    # Multi-parent: recompute the synthetic merge-base.
+                    mb_name = stacking.compute_merge_base_branch_name(self.node.id, parent_branches)
+                    mb_sha = stacking.construct_merge_base(
+                        repo_path=self.cfg.repo_path,
+                        parent_branches=parent_branches,
+                        branch_name=mb_name,
+                        base_branch=self.cfg.base_branch,
                     )
-
-            if not onto_sha and parent_branch_local:
-                rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branch_local])
-                if rc_ps == 0:
-                    onto_sha = ps_out.strip().splitlines()[-1] if ps_out.strip() else ""
+                    if mb_sha:
+                        new_merge_base_sha = mb_sha
+                        self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
+                    else:
+                        note = (
+                            f"multi-parent merge-base recompute failed for {parent_branches}; cannot rebase"
+                        )
+                        self.store.transition(
+                            self.node.id,
+                            State.BLOCKED,
+                            note=note,
+                            last_error=note[:1000],
+                        )
+                        return WorkerOutcome(State.BLOCKED, note)
+                elif not onto_sha:
+                    # Single-parent: parent_branches[0] IS the upstream.
+                    rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branches[0]])
+                    if rc_ps == 0:
+                        onto_sha = ps_out.strip().splitlines()[-1] if ps_out.strip() else ""
 
             # 3. fetch origin main
             rc, fetch_out = self._git_in_workspace(["fetch", self.cfg.pr_remote, self.cfg.base_branch])
@@ -865,19 +864,15 @@ class TaskWorker:
         wt_dir = docker_env.slugify(self.node.id) + (f"-{suffix}" if suffix else "")
         wt_path = (self.cfg.worktree_root / wt_dir).resolve()
 
-        # v3.5 Phase 2: multi-parent stacking. The orchestrator stamps the
-        # full parent chain into `parent_task_ids` / `parent_branches`. When
-        # >1 parent, build a synthetic merge-base branch (`quikode/<id>-base-<6hex>`)
-        # off `git merge` of the parent tips and fork the worktree from there.
-        # When ==1, fall through to the existing single-parent path. When 0,
-        # the deps-driven resolver kicks in (covers resume paths where the
-        # orchestrator hasn't re-stamped).
-        row = self.store.get(self.node.id) or {}
-        parent_task_ids = self.store.get_parent_task_ids(self.node.id)
+        # Multi-parent stacking. The orchestrator stamps the full parent
+        # chain into `parent_task_ids` / `parent_branches` JSON arrays.
+        # When > 1 parent, build a synthetic merge-base branch
+        # (`quikode/<id>-base-<6hex>`) off `git merge` of the parent tips
+        # and fork the worktree from there. When == 1 parent, branch off
+        # that parent's branch directly. When 0, branch off main.
         parent_branches = self.store.get_parent_branches(self.node.id)
-        parent_task_id: str | None = None
         parent_branch: str | None = None
-        if len(parent_task_ids) > 1 and len(parent_branches) >= len(parent_task_ids):
+        if len(parent_branches) > 1:
             # Build the merge-base branch off origin/main + every parent's tip.
             worktree.fetch_base(self.cfg.repo_path, self.cfg.pr_remote, self.cfg.base_branch)
             mb_name = stacking.compute_merge_base_branch_name(self.node.id, parent_branches)
@@ -887,37 +882,22 @@ class TaskWorker:
                 branch_name=mb_name,
                 base_branch=self.cfg.base_branch,
             )
-            if mb_sha:
-                self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
-                # Use merge-base branch as the fork point; persist parent_task_id
-                # = first listed parent for legacy callers that read scalar.
-                parent_task_id = parent_task_ids[0]
-                parent_branch = mb_name
-            else:
-                log.warning(
-                    "task %s: multi-parent merge-base construction failed (conflict); "
-                    "falling back to single-parent stacking on %s",
-                    self.node.id,
-                    parent_branches[0],
+            if not mb_sha:
+                note = (
+                    f"multi-parent merge-base construction failed for "
+                    f"{parent_branches}; cannot provision worktree"
                 )
-                parent_task_id = parent_task_ids[0]
-                parent_branch = parent_branches[0]
-        elif len(parent_task_ids) == 1 and len(parent_branches) >= 1:
-            parent_task_id = parent_task_ids[0]
+                self.store.transition(
+                    self.node.id,
+                    State.BLOCKED,
+                    note=note,
+                    last_error=note[:1000],
+                )
+                raise RuntimeError(note)
+            self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
+            parent_branch = mb_name
+        elif len(parent_branches) == 1:
             parent_branch = parent_branches[0]
-        else:
-            # v3 Phase C fallback: orchestrator hasn't stamped (resume paths,
-            # tests). Use the deps-driven resolver.
-            parent_pr_branch = row.get("parent_pr_branch")
-            if parent_pr_branch:
-                for dep in self.node.depends_on:
-                    dep_row = self.store.get(dep)
-                    if dep_row and dep_row.get("branch") == parent_pr_branch:
-                        parent_task_id = dep
-                        break
-                parent_branch = str(parent_pr_branch)
-            else:
-                parent_task_id, parent_branch = self._resolve_stack_parent()
         worktree.fetch_base(self.cfg.repo_path, self.cfg.pr_remote, self.cfg.base_branch)
         # Capture the main SHA at branch creation. Used by Phase A's
         # conflict resolver to compute "what landed since" and by Phase B's
@@ -950,8 +930,6 @@ class TaskWorker:
             worktree_path=str(wt_path),
             base_ref_sha=base_ref_sha,
             last_synced_main_sha=base_ref_sha,
-            parent_task_id=parent_task_id,
-            parent_branch=parent_branch,
         )
 
     def _existing_worktree_path(self) -> Path:
@@ -2615,23 +2593,27 @@ class TaskWorker:
     def _rebase_to_base_branch(self) -> bool:
         """Rebase the current branch onto cfg.base_branch and force-push.
 
-        When the row carries `parent_branch` and that local ref still
-        resolves, uses `git rebase --onto <base> <parent_sha>` so the
-        parent's commits (now squash-merged into base) are dropped from
-        the replay. Falls back to a plain rebase when no parent context
-        exists. Returns True on success; on conflict, invokes the
+        When the row carries a parent linkage and the parent's local ref
+        still resolves, uses `git rebase --onto <base> <parent_sha>` so
+        the parent's commits (now squash-merged into base) are dropped
+        from the replay. Falls back to a plain rebase when no parent
+        context exists. Returns True on success; on conflict, invokes the
         conflict resolver and returns whatever it produced. Best-effort —
         caller decides what to do on failure.
         """
         row = self._row()
         branch = str(row["branch"])
-        parent_branch_local = str(row.get("parent_branch") or "")
-        # 1. capture parent_sha before fetch (local ref, persists post-deletion)
+        parent_branches = self.store.get_parent_branches(self.node.id)
+        # 1. capture parent_sha before fetch (local ref, persists post-deletion).
+        # Single-parent: use the parent's branch tip. Multi-parent: use the
+        # stored merge-base sha (set by the picker / worker on provision).
         parent_sha = ""
-        if parent_branch_local:
-            rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branch_local])
+        if len(parent_branches) == 1:
+            rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branches[0]])
             if rc_ps == 0:
                 parent_sha = ps_out.strip().splitlines()[-1] if ps_out.strip() else ""
+        elif len(parent_branches) > 1:
+            parent_sha = str(row.get("parent_merge_base_sha") or "")
         # 2. fetch base
         self._git_in_workspace(["fetch", self.cfg.pr_remote, self.cfg.base_branch])
         # 3. rebase: use --onto when we have a parent sha to skip
@@ -2804,85 +2786,7 @@ class TaskWorker:
                 sound.ding()
                 return WorkerOutcome(State.PENDING_CI)
 
-    # ----- v2 Phase C: stacked diffs -----
-
-    def _resolve_stack_parent(self) -> tuple[str | None, str | None]:
-        """If stacking is enabled and any unmerged dep has an existing branch
-        we can fork off, return (dep_task_id, dep_branch). Else (None, None).
-
-        Mirrors the orchestrator's depth + cycle defenses so resume paths
-        (where this is the only resolver) honor the same caps.
-        """
-        if self.cfg.stacking_strategy == "off":
-            return None, None
-        STACK_READY = {
-            State.POLLING_CI.value,
-            State.PENDING_CI.value,
-            State.PR_OPENING.value,
-            State.ADDRESSING_FEEDBACK.value,
-        }
-        candidates: list[tuple[str, str]] = []
-        for dep in self.node.depends_on:
-            r = self.store.get(dep)
-            if not r or r["state"] not in STACK_READY or not r.get("branch"):
-                continue
-            if self.cfg.stacking_strategy == "within-milestone":
-                dep_node = self.dag.nodes.get(dep)
-                if not dep_node or dep_node.milestone != self.node.milestone:
-                    continue
-            # Worker-side cycle defense: refuse if stacking on this dep
-            # would form a parent_task_id cycle (i.e. dep transitively
-            # descends from this task).
-            if self._stacking_cycle(self.node.id, dep):
-                log.warning("worker: refusing to stack %s on %s (cycle)", self.node.id, dep)
-                continue
-            # Worker-side depth cap.
-            if self._stack_depth(dep) >= self.cfg.stacking_max_depth:
-                continue
-            candidates.append((dep, r["branch"]))
-        if not candidates:
-            return None, None
-        # Pick deterministically — deepest first (so chains stay tight)
-        candidates.sort(key=lambda x: x[0])
-        return candidates[-1]
-
-    def _stack_depth(self, task_id: str) -> int:
-        """Worker-side mirror of `Orchestrator._stack_depth` — same
-        cycle-safe walk."""
-        depth = 0
-        cur: str | None = task_id
-        seen: set[str] = set()
-        while cur and cur not in seen and depth < 100:
-            seen.add(cur)
-            row = self.store.get(cur)
-            if not row:
-                break
-            cur = row.get("parent_task_id")
-            depth += 1
-        if cur and cur in seen:
-            return self.cfg.stacking_max_depth + 1  # force reject
-        return depth
-
-    def _stacking_cycle(self, child_id: str, prospective_parent_id: str) -> bool:
-        """Worker-side mirror of `Orchestrator._would_form_cycle`."""
-        if child_id == prospective_parent_id:
-            return True
-        cur: str | None = prospective_parent_id
-        seen: set[str] = set()
-        while cur and cur not in seen:
-            seen.add(cur)
-            if cur == child_id:
-                return True
-            row = self.store.get(cur)
-            if not row:
-                return False
-            parent = row.get("parent_task_id")
-            if not parent:
-                return False
-            cur = parent
-        return False
-
-    # ----- v2 Phase B: intent gap detection -----
+    # ----- intent gap detection -----
 
     def _run_intent_review(self) -> WorkerOutcome | None:
         """A dependency merged. Check if main has shifted under us in a way

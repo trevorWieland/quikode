@@ -328,18 +328,15 @@ class Orchestrator:
         prior stacking that no longer applies.
         """
         nid = c["task_id"]
-        row = c.get("row")
         if not c["is_stacked"]:
-            if row and (row.get("parent_pr_branch") or row.get("parent_branch")):
+            # Clear any stale parent linkage from a prior stacking round.
+            if self.store.get_parent_task_ids(nid):
                 self.store.clear_parent_branch(nid)
-                # Defensive: also clear the array columns + merge-base bookkeeping.
-                self.store.set_parent_chain(nid, parent_task_ids=[])
                 self.store.set_parent_merge_base(nid, branch=None, sha=None)
             return
         # Collect the (id, branch) pairs for every unmet stack-ready parent.
-        # Sorted by id for determinism — `set_parent_chain` writes the *first*
-        # entry into the legacy scalar columns, so this also pins the
-        # "primary" parent in a stable way across re-picks.
+        # Sorted by id for determinism — set_parent_chain stamps the JSON
+        # arrays in this order so re-picks land at the same primary parent.
         unmet_with_branch: list[tuple[str, str]] = []
         for d in sorted(c["unmet"]):
             pr = self.store.get(d)
@@ -408,16 +405,9 @@ class Orchestrator:
         return depth
 
     def _parents_of(self, task_id: str) -> list[str]:
-        """Return the multi-parent list for `task_id`, falling back to the
-        scalar `parent_task_id` for legacy rows. Single source of truth for
-        the stack-walk helpers."""
-        ids = self.store.get_parent_task_ids(task_id)
-        if ids:
-            return ids
-        row = self.store.get(task_id)
-        if row and row.get("parent_task_id"):
-            return [str(row["parent_task_id"])]
-        return []
+        """Return the multi-parent list for `task_id` — single source of
+        truth for the stack-walk helpers."""
+        return self.store.get_parent_task_ids(task_id)
 
     def _would_form_cycle(self, child_id: str, prospective_parent_id: str) -> bool:
         """Multi-parent cycle detection. Walking the parent DAG from
@@ -749,10 +739,10 @@ class Orchestrator:
                 # longer exists), the close is a side-effect of github
                 # cleanup, not a deliberate user close. Schedule a rebase
                 # + fresh PR instead of aborting.
-                parent_branch_field = task_row.get("parent_pr_branch") or task_row.get("parent_branch")
+                stacked_parents = self.store.get_parent_branches(task_id)
                 pr_base_ref = pr_status.base_ref_name or ""
                 if (
-                    parent_branch_field
+                    stacked_parents
                     and pr_base_ref
                     and pr_base_ref != self.cfg.base_branch
                     and not self._remote_branch_exists(pr_base_ref)

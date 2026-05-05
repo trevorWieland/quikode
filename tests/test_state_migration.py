@@ -25,8 +25,11 @@ _V2_TASK_COLUMNS = {
     "last_intent_review_ts",
     "intent_review_count",
     "replan_count",
-    "parent_task_id",
-    "parent_branch",
+    # parent_* columns are JSON arrays only (scalar variants dropped in
+    # the legacy purge). The on-disk column names are the plural forms.
+    "parent_task_ids",
+    "parent_branches",
+    "parent_pr_branches",
 }
 _V2_AGENT_CALLS_COLUMNS = {"subtask_id"}
 
@@ -135,7 +138,7 @@ def test_migration_preserves_existing_rows(tmp_path):
     assert row["do_check_retries"] == 1
     # New columns default to None (TEXT/REAL) or 0 (INTEGER DEFAULT 0)
     assert row["needs_intent_review"] in (0, None)
-    assert row["parent_task_id"] is None
+    assert row["parent_task_ids"] is None
     s.conn.close()
 
 

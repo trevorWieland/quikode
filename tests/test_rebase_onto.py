@@ -52,11 +52,14 @@ def _worker(tmp_path) -> TaskWorker:
 def _setup_child_with_parent(w: TaskWorker, parent_branch: str | None) -> None:
     w.store.upsert_pending("T-CHILD")
     w.store.transition("T-CHILD", State.PR_OPENING)
-    w.store.set_field(
-        "T-CHILD",
-        branch="quikode/t-child-abc123",
-        parent_branch=parent_branch,
-    )
+    w.store.set_field("T-CHILD", branch="quikode/t-child-abc123")
+    if parent_branch:
+        w.store.set_parent_chain(
+            "T-CHILD",
+            parent_task_ids=["T-PARENT"],
+            parent_branches=[parent_branch],
+            parent_pr_branches=[parent_branch],
+        )
     # Stub container handle so worker._h works.
     w.handle = MagicMock(container_name="qk-stub")
 
@@ -171,7 +174,7 @@ def test_run_rebase_to_main_uses_onto_when_parent_resolves(tmp_path, monkeypatch
     )
     w.store.set_field(
         "T-CHILD",
-        parent_branch="quikode/parent-xyz",
+        parent_branches='["quikode/parent-xyz"]',
         pr_number=42,
     )
     w.store.set_pre_rebase_state("T-CHILD", State.PENDING_CI.value)
@@ -220,8 +223,8 @@ def test_run_rebase_to_main_uses_onto_when_parent_resolves(tmp_path, monkeypatch
 
     # Stacking metadata cleared on success
     row = w.store.get("T-CHILD")
-    assert row["parent_branch"] is None
-    assert row["parent_pr_branch"] is None
+    assert row["parent_branches"] is None
+    assert row["parent_pr_branches"] is None
 
 
 def test_run_rebase_to_main_falls_back_without_parent(tmp_path, monkeypatch):

@@ -143,7 +143,7 @@ def test_stack_depth_cap(tmp_path):
         o.store.upsert_pending(nid)
     o.store.transition("A", State.POLLING_CI)
     o.store.transition("B", State.POLLING_CI)
-    o.store.set_field("B", parent_task_id="A")
+    o.store.set_field("B", parent_task_ids='["A"]')
     # C wants to stack on B (which is stacked on A) → depth 2 would push past cap
     next_id = o._pick_next({"A", "B", "C", "D"}, set())
     # depth check via _stack_depth("B") = 2 already → C not picked
@@ -207,10 +207,15 @@ def _seed_chain_in_polling(o, ids):
         o.store.upsert_pending(nid)
     for parent in ids[:-1]:
         o.store.transition(parent, State.POLLING_CI, branch=f"quikode/{parent.lower()}-x")
-    # Wire parent_task_id chain for the in-flight tasks (skip the last
+    # Wire parent_task_ids chain for the in-flight tasks (skip the last
     # PENDING node — its parent gets stamped by _pick_next).
     for parent, child in pairwise(ids[:-1]):
-        o.store.set_field(child, parent_task_id=parent)
+        o.store.set_parent_chain(
+            child,
+            parent_task_ids=[parent],
+            parent_branches=[f"quikode/{parent.lower()}-x"],
+            parent_pr_branches=[f"quikode/{parent.lower()}-x"],
+        )
 
 
 def test_stack_depth_3_chain_allowed_at_default(tmp_path):
@@ -275,8 +280,8 @@ def test_cycle_in_parent_task_id_rejects_stack(tmp_path):
     o.store.transition("A", State.POLLING_CI, branch="quikode/a-x")
     o.store.transition("B", State.POLLING_CI, branch="quikode/b-x")
     # Inject cycle: A's parent is B; B's parent is A
-    o.store.set_field("A", parent_task_id="B")
-    o.store.set_field("B", parent_task_id="A")
+    o.store.set_field("A", parent_task_ids='["B"]')
+    o.store.set_field("B", parent_task_ids='["A"]')
     # depth of B walks B→A→B (cycle); should exceed cap → C blocked.
     assert o._pick_next({"A", "B", "C"}, set()) is None
 
@@ -302,6 +307,6 @@ def test_breadth_per_root_blocks_excess(tmp_path):
     for i in range(5):
         cid = f"C{i}"
         o.store.transition(cid, State.POLLING_CI, branch=f"quikode/{cid.lower()}-x")
-        o.store.set_field(cid, parent_task_id="ROOT")
+        o.store.set_field(cid, parent_task_ids='["ROOT"]')
     # 1 root + 5 children = 6 > 4 → LATE rejected.
     assert o._pick_next({n for n, _ in nodes}, set()) is None

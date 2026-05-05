@@ -93,8 +93,8 @@ def _seed(o: Orchestrator, *, child_state: State = State.PENDING_CI, pr_number: 
     )
     o.store.set_field(
         "CHILD",
-        parent_pr_branch="quikode/parent-aaa",
-        parent_branch="quikode/parent-aaa",
+        parent_pr_branches='["quikode/parent-aaa"]',
+        parent_branches='["quikode/parent-aaa"]',
     )
 
 

@@ -546,7 +546,7 @@ def status(
                     "ci_triage_retries": r.get("ci_triage_retries") or 0,
                     "review_triage_retries": r.get("review_triage_retries") or 0,
                     "last_error": r.get("last_error"),
-                    "parent_task_id": r.get("parent_task_id"),
+                    "parent_task_ids": store.get_parent_task_ids(r["id"]),
                 }
                 for r in rows
             ],
@@ -1324,9 +1324,7 @@ def _build_status_table(store: Store, *, show_terminal: bool = True) -> Table:
             branch_pr += f" → PR #{pr_n}"
         # state-elapsed colour: stale yellow at 10min, red at 30min for active states
         in_state_color = "white"
-        if in_state and st in (
-            State.PLANNING.value,
-        ):
+        if in_state and st in (State.PLANNING.value,):
             if in_state > 1800:
                 in_state_color = "red"
             elif in_state > 600:

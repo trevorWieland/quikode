@@ -191,7 +191,7 @@ class StorePoller:
         rows = c.execute(
             "SELECT id, state, branch, pr_number, pr_url, worktree_path, "
             "do_check_retries, ci_triage_retries, review_triage_retries, "
-            "needs_intent_review, parent_task_id, last_error, "
+            "needs_intent_review, parent_task_ids, last_error, "
             "review_round, intervention_request, "
             "pre_pr_audit_summary, "
             "updated_at, created_at "

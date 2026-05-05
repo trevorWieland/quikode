@@ -71,8 +71,8 @@ def test_pick_next_stamps_parent_pr_branch_when_parent_awaiting_merge(tmp_path):
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"
     row_b = o.store.get("B")
-    assert row_b["parent_pr_branch"] == "quikode/a-abc123"
-    assert row_b["parent_branch"] == "quikode/a-abc123"
+    assert json.loads(row_b["parent_pr_branches"]) == ["quikode/a-abc123"]
+    assert json.loads(row_b["parent_branches"]) == ["quikode/a-abc123"]
     o.store.conn.close()
 
 
@@ -84,15 +84,19 @@ def test_pick_next_clears_parent_branch_when_parent_merged(tmp_path):
     o.store.upsert_pending("A")
     o.store.upsert_pending("B")
     # Pre-stamp B with stale stacking metadata (e.g., from a prior tick
-    # where A was AWAITING_MERGE). The merge should clear it.
-    o.store.set_field("B", parent_pr_branch="quikode/a-old", parent_branch="quikode/a-old")
+    # where A was AWAITING_REVIEW). The merge should clear it.
+    o.store.set_parent_chain(
+        "B",
+        parent_task_ids=["A"],
+        parent_branches=["quikode/a-old"],
+        parent_pr_branches=["quikode/a-old"],
+    )
     o.store.transition("A", State.MERGED, branch="quikode/a-abc123")
 
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"
-    row_b = o.store.get("B")
-    assert row_b["parent_pr_branch"] is None
-    assert row_b["parent_branch"] is None
+    assert o.store.get_parent_task_ids("B") == []
+    assert o.store.get_parent_branches("B") == []
     o.store.conn.close()
 
 
@@ -123,7 +127,7 @@ def test_pick_next_addressing_feedback_is_stack_ready(tmp_path):
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"
     row_b = o.store.get("B")
-    assert row_b["parent_pr_branch"] == "quikode/a-resp"
+    assert json.loads(row_b["parent_pr_branches"]) == ["quikode/a-resp"]
     o.store.conn.close()
 
 
@@ -140,7 +144,7 @@ def test_pick_next_provisioning_is_stack_ready(tmp_path):
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"
     row_b = o.store.get("B")
-    assert row_b["parent_pr_branch"] == "quikode/a-prov"
+    assert json.loads(row_b["parent_pr_branches"]) == ["quikode/a-prov"]
     o.store.conn.close()
 
 
@@ -157,7 +161,7 @@ def test_pick_next_fixup_planning_is_stack_ready(tmp_path):
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"
     row_b = o.store.get("B")
-    assert row_b["parent_pr_branch"] == "quikode/a-fix"
+    assert json.loads(row_b["parent_pr_branches"]) == ["quikode/a-fix"]
     o.store.conn.close()
 
 
@@ -188,5 +192,5 @@ def test_pick_next_polling_ci_still_stack_ready(tmp_path):
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"
     row_b = o.store.get("B")
-    assert row_b["parent_pr_branch"] == "quikode/a-ci"
+    assert json.loads(row_b["parent_pr_branches"]) == ["quikode/a-ci"]
     o.store.conn.close()

@@ -83,15 +83,16 @@ def _worker(tmp_path: Path, *, child_id: str = "CHILD") -> TaskWorker:
 
 
 def test_provision_worktree_with_parent_pr_branch_calls_off_branch(tmp_path):
-    """Child has `parent_pr_branch` stamped → uses add_worktree_off_branch
+    """Child has parent linkage stamped → uses add_worktree_off_branch
     with the parent_branch as base + the configured remote for fetch."""
     w = _worker(tmp_path)
     # Parent is in flight on a known branch.
     w.store.set_field("PARENT", branch="quikode/parent-deadbe")
-    w.store.set_field(
+    w.store.set_parent_chain(
         "CHILD",
-        parent_pr_branch="quikode/parent-deadbe",
-        parent_branch="quikode/parent-deadbe",
+        parent_task_ids=["PARENT"],
+        parent_branches=["quikode/parent-deadbe"],
+        parent_pr_branches=["quikode/parent-deadbe"],
     )
 
     with (
@@ -107,17 +108,16 @@ def test_provision_worktree_with_parent_pr_branch_calls_off_branch(tmp_path):
 
         w._provision_worktree()
 
-    fb_mock.assert_called_once()
+    fb_mock.assert_called()  # called twice: once before construct_merge_base check, once before fork
     off_mock.assert_called_once()
     add_mock.assert_not_called()
     # Inspect args: (repo, wt_path, child_branch, parent_branch); remote kw.
     args, kwargs = off_mock.call_args
     assert args[3] == "quikode/parent-deadbe"
     assert kwargs.get("remote") == w.cfg.pr_remote
-
-    row = w.store.get("CHILD")
-    assert row["parent_branch"] == "quikode/parent-deadbe"
-    assert row["parent_task_id"] == "PARENT"
+    # Parent linkage preserved (the picker stamped it; provisioning doesn't clear).
+    assert w.store.get_parent_branches("CHILD") == ["quikode/parent-deadbe"]
+    assert w.store.get_parent_task_ids("CHILD") == ["PARENT"]
     w.store.conn.close()
 
 

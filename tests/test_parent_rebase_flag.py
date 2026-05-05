@@ -100,8 +100,8 @@ def _seed_stacked_child(o: Orchestrator, child_id: str, *, state: State, pr_numb
     o.store.transition(child_id, state, branch=f"quikode/{child_id.lower()}-bbb")
     o.store.set_field(
         child_id,
-        parent_pr_branch="quikode/parent-aaa",
-        parent_branch="quikode/parent-aaa",
+        parent_pr_branches='["quikode/parent-aaa"]',
+        parent_branches='["quikode/parent-aaa"]',
         pr_number=pr_number or None,
         pr_url=(f"https://github.com/owner/repo/pull/{pr_number}" if pr_number else None),
     )
@@ -192,8 +192,8 @@ def test_parent_closed_clears_children_parent_branch(tmp_path):
     assert o.store.get("PARENT")["state"] == State.ABORTED.value
     # CHILD-A's parent metadata cleared (active, non-terminal)
     row = o.store.get("CHILD-A")
-    assert row["parent_pr_branch"] is None
-    assert row["parent_branch"] is None
+    assert row["parent_pr_branches"] is None
+    assert row["parent_branches"] is None
     assert row["needs_parent_rebase"] == 0
     o.store.conn.close()
 
@@ -228,8 +228,8 @@ def test_parent_closed_clears_multiple_active_children(tmp_path):
     assert o.store.get("PARENT")["state"] == State.ABORTED.value
     for cid in ("CHILD-A", "CHILD-B"):
         row = o.store.get(cid)
-        assert row["parent_pr_branch"] is None, f"{cid} should have parent_pr_branch cleared"
-        assert row["parent_branch"] is None, f"{cid} should have parent_branch cleared"
+        assert row["parent_pr_branches"] is None, f"{cid} should have parent_pr_branch cleared"
+        assert row["parent_branches"] is None, f"{cid} should have parent_branch cleared"
     o.store.conn.close()
 
 
@@ -283,8 +283,8 @@ def test_handle_parent_rebase_runs_rebase_and_clears(tmp_path, monkeypatch):
     w.store.transition("T-CHILD", State.PR_OPENING, branch="quikode/t-child-abc")
     w.store.set_field(
         "T-CHILD",
-        parent_branch="quikode/parent-xyz",
-        parent_pr_branch="quikode/parent-xyz",
+        parent_branches='["quikode/parent-xyz"]',
+        parent_pr_branches='["quikode/parent-xyz"]',
         pr_number=42,
     )
     w.store.mark_needs_parent_rebase("T-CHILD")
@@ -327,8 +327,8 @@ def test_handle_parent_rebase_runs_rebase_and_clears(tmp_path, monkeypatch):
 
     # Stacking metadata cleared, flag cleared
     row = w.store.get("T-CHILD")
-    assert row["parent_branch"] is None
-    assert row["parent_pr_branch"] is None
+    assert row["parent_branches"] is None
+    assert row["parent_pr_branches"] is None
     assert row["needs_parent_rebase"] == 0
 
 
@@ -337,7 +337,7 @@ def test_handle_parent_rebase_fails_returns_blocked(tmp_path, monkeypatch):
     w = _worker(tmp_path)
     w.store.upsert_pending("T-CHILD")
     w.store.transition("T-CHILD", State.PR_OPENING, branch="quikode/t-child-abc")
-    w.store.set_field("T-CHILD", parent_branch="quikode/parent-xyz")
+    w.store.set_field("T-CHILD", parent_branches='["quikode/parent-xyz"]')
     w.store.mark_needs_parent_rebase("T-CHILD")
     w.handle = MagicMock(container_name="qk-stub")
 
@@ -399,15 +399,15 @@ def test_clear_parent_branch_also_clears_flag(tmp_path):
     store.upsert_pending("T-1")
     store.set_field(
         "T-1",
-        parent_branch="quikode/parent-xyz",
-        parent_pr_branch="quikode/parent-xyz",
+        parent_branches='["quikode/parent-xyz"]',
+        parent_pr_branches='["quikode/parent-xyz"]',
     )
     store.mark_needs_parent_rebase("T-1")
     assert store.get("T-1")["needs_parent_rebase"] == 1
 
     store.clear_parent_branch("T-1")
     row = store.get("T-1")
-    assert row["parent_branch"] is None
-    assert row["parent_pr_branch"] is None
+    assert row["parent_branches"] is None
+    assert row["parent_pr_branches"] is None
     assert row["needs_parent_rebase"] == 0
     store.conn.close()

@@ -94,8 +94,8 @@ def _seed(o: Orchestrator, pr_number: int = 0) -> None:
     )
     o.store.set_field(
         "CHILD",
-        parent_pr_branch="quikode/parent-aaa",
-        parent_branch="quikode/parent-aaa",
+        parent_pr_branches='["quikode/parent-aaa"]',
+        parent_branches='["quikode/parent-aaa"]',
     )
 
 
@@ -128,8 +128,8 @@ def test_mergeable_child_with_intact_base_skips_rebase(tmp_path):
     pool.submit.assert_not_called()
     row = o.store.get("CHILD")
     assert row["state"] == State.PENDING_CI.value  # untouched
-    assert row["parent_pr_branch"] is None  # cleared
-    assert row["parent_branch"] is None
+    assert row["parent_pr_branches"] is None  # cleared
+    assert row["parent_branches"] is None
     assert (row.get("needs_parent_rebase") or 0) == 0
     o.store.conn.close()
 
@@ -184,8 +184,8 @@ def test_no_pr_yet_falls_back_to_scheduling(tmp_path):
     o.store.transition("CHILD", State.DOING_SUBTASK, branch="quikode/child-bbb")
     o.store.set_field(
         "CHILD",
-        parent_pr_branch="quikode/parent-aaa",
-        parent_branch="quikode/parent-aaa",
+        parent_pr_branches='["quikode/parent-aaa"]',
+        parent_branches='["quikode/parent-aaa"]',
     )
     pool = _make_pool()
     futures: dict[str, Future] = {}

@@ -91,8 +91,8 @@ def _seed_stacked_child(o: Orchestrator, child_id: str, *, state: State, pr_numb
     o.store.transition(child_id, state, branch=f"quikode/{child_id.lower()}-bbb")
     o.store.set_field(
         child_id,
-        parent_pr_branch="quikode/parent-aaa",
-        parent_branch="quikode/parent-aaa",
+        parent_pr_branches='["quikode/parent-aaa"]',
+        parent_branches='["quikode/parent-aaa"]',
         pr_number=pr_number or None,
         pr_url=(f"https://github.com/owner/repo/pull/{pr_number}" if pr_number else None),
     )
@@ -118,8 +118,8 @@ def test_clear_parent_branch_idempotent(tmp_path):
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
     o.store.clear_parent_branch("CHILD-A")
     row = o.store.get("CHILD-A")
-    assert row["parent_pr_branch"] is None
-    assert row["parent_branch"] is None
+    assert row["parent_pr_branches"] is None
+    assert row["parent_branches"] is None
     # Calling again is a no-op.
     o.store.clear_parent_branch("CHILD-A")
     o.store.conn.close()

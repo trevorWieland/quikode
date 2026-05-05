@@ -28,7 +28,6 @@ from quikode.state import (
 _V3_TASK_COLUMNS = {
     "review_round",
     "intervention_request",
-    "parent_pr_branch",
     "draft_pr_number",
     "last_review_poll_ts",
 }
@@ -305,7 +304,7 @@ def test_migration_preserves_existing_rows(tmp_path):
     # New v3 columns default to 0 (INTEGER DEFAULT 0) or None (TEXT/REAL/INTEGER no default)
     assert row["review_round"] in (0, None)
     assert row["intervention_request"] is None
-    assert row["parent_pr_branch"] is None
+    assert row["parent_pr_branches"] is None
     assert row["draft_pr_number"] is None
     assert row["last_review_poll_ts"] is None
     s.conn.close()
