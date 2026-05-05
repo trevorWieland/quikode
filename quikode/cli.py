@@ -222,39 +222,39 @@ def run(
             console.print(f"[yellow]orphan recovery:[/] {tid}: {frm} → {to}")
         console.print(f"[yellow]recovered {len(recovered)} orphan task(s) from prior run[/]")
 
-    # Optional: reset BLOCKED/FAILED tasks in scope so they get re-attempted.
-    # Useful for "auto-retry overnight" loops.
+    # Re-attempt BLOCKED/FAILED tasks: transition back to PENDING with the
+    # resume marker set. Branch, worktree, and committed subtask state stay
+    # intact — the existing PROVISIONING resume detection in
+    # `_provision_worktree` (worktree-on-disk + branch + git-registered →
+    # reuse verbatim) is the single state-machine path that handles every
+    # form of "task already has work in progress". Re-planning from scratch
+    # was the bug R-0020 hit: 10 committed subtasks orphaned by a fresh
+    # planner run with different subtask names, surfacing as "subtasks all
+    # pending but audit gauntlet failing" in the TUI.
+    #
+    # Operators who genuinely want a clean reset use `quikode retry <id>`
+    # (the destructive path that explicitly tears down branch + worktree).
+    # This auto-loop path is the resume path — period.
     if retry_failed:
         reset_count = 0
         terminal_to_retry = (State.BLOCKED.value, State.FAILED.value, State.ABORTED.value)
         for r in store.all_tasks():
             if r["state"] in terminal_to_retry and (scope is None or r["id"] in scope):
-                wt = r.get("worktree_path")
-                if wt and Path(wt).exists():
-                    worktree.remove_worktree(cfg.repo_path, Path(wt), force=True)
-                if r.get("branch"):
-                    subprocess.run(
-                        ["git", "branch", "-D", r["branch"]],
-                        cwd=cfg.repo_path,
-                        capture_output=True,
-                        text=True,
-                    )
                 store.transition(
                     r["id"],
                     State.PENDING,
                     note="auto retry-failed",
                     ci_triage_retries=0,
                     last_error=None,
-                    branch=None,
-                    worktree_path=None,
                     container_id=None,
-                    pr_url=None,
-                    pr_number=None,
+                    resume_from_existing_subtasks=1,
                 )
                 reset_count += 1
         if reset_count:
-            worktree.prune(cfg.repo_path)
-            console.print(f"[yellow]auto-retry: reset {reset_count} blocked/failed task(s) to pending[/]")
+            console.print(
+                f"[yellow]auto-retry: resumed {reset_count} blocked/failed task(s) "
+                "(branch + worktree + subtasks preserved)[/]"
+            )
 
     # Print scope summary so the user knows exactly what's about to happen
     actual_scope = scope if scope is not None else set(dag.nodes)
