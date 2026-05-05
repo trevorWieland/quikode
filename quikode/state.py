@@ -48,9 +48,7 @@ class TaskRow(TypedDict):
     pr_number: NotRequired[int | None]
     plan_text: NotRequired[str | None]
     last_error: NotRequired[str | None]
-    do_check_retries: NotRequired[int | None]
     ci_triage_retries: NotRequired[int | None]
-    review_triage_retries: NotRequired[int | None]
     last_pr_event_ts: NotRequired[str | None]
     base_ref_sha: NotRequired[str | None]
     last_synced_main_sha: NotRequired[str | None]
@@ -279,9 +277,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     pr_number INTEGER,
     plan_text TEXT,
     last_error TEXT,
-    do_check_retries INTEGER DEFAULT 0,
     ci_triage_retries INTEGER DEFAULT 0,
-    review_triage_retries INTEGER DEFAULT 0,
     last_pr_event_ts TEXT,
     -- v2 Phase A: track main HEAD at branch time + last successful rebase, so
     -- we can compute "what landed since" for conflict-resolver context.
@@ -653,71 +649,44 @@ class Store:
                 with self._tx_lock:
                     self.conn.execute(ddl)
 
-        # Drop the retired scalar parent_* columns if they exist. The codebase
-        # is opinionated post-purge: only the JSON-array columns
-        # (parent_task_ids / parent_branches / parent_pr_branches) carry the
-        # parent linkage. Backfill from scalars before drop so rows that
-        # weren't migrated under the prior in-place backfill don't lose data.
+        # Drop retired columns from any existing tasks table. The codebase is
+        # 2 days old, post-legacy-purge: scalar parent_* columns and the
+        # legacy whole-spec retry counters (do_check_retries,
+        # review_triage_retries) are gone. SQLite ≥ 3.35 supports DROP
+        # COLUMN; Linux runtime has 3.45+.
         with self._tx_lock:
             existing_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(tasks)").fetchall()}
-            scalar_cols = ("parent_task_id", "parent_branch", "parent_pr_branch")
-            if any(c in existing_cols for c in scalar_cols):
-                # Backfill JSON arrays one last time on the way out.
-                if "parent_task_id" in existing_cols:
-                    self.conn.execute(
-                        "UPDATE tasks SET parent_task_ids = json_array(parent_task_id) "
-                        "WHERE parent_task_id IS NOT NULL AND parent_task_ids IS NULL"
-                    )
-                if "parent_branch" in existing_cols:
-                    self.conn.execute(
-                        "UPDATE tasks SET parent_branches = json_array(parent_branch) "
-                        "WHERE parent_branch IS NOT NULL AND parent_branches IS NULL"
-                    )
-                if "parent_pr_branch" in existing_cols:
-                    self.conn.execute(
-                        "UPDATE tasks SET parent_pr_branches = json_array(parent_pr_branch) "
-                        "WHERE parent_pr_branch IS NOT NULL AND parent_pr_branches IS NULL"
-                    )
-                # SQLite ≥ 3.35 supports DROP COLUMN. Linux runtime has 3.45+.
-                for col in scalar_cols:
-                    if col in existing_cols:
-                        self.conn.execute(f"ALTER TABLE tasks DROP COLUMN {col}")
-
-        # State-name migrations. Idempotent — UPDATE matches zero rows on
-        # already-migrated DBs.
-        #
-        # Pre-v3 (`awaiting_human`) and v3 (`awaiting_merge`, `responding_to_review`)
-        # values get rewritten to the v3.5 split:
-        #   awaiting_human       → pending_ci  (defensive default — long retired path)
-        #   awaiting_merge       → pending_ci  (v3.5 split; daemon's poll re-classifies)
-        #   responding_to_review → addressing_feedback  (semantic rename only)
-        legacy_state_map = [
-            ("awaiting_human", "pending_ci"),
-            ("awaiting_merge", "pending_ci"),
-            ("responding_to_review", "addressing_feedback"),
-        ]
-        with self._tx_lock:
-            for old, new in legacy_state_map:
+            retired_cols = (
+                # Replaced by parent_task_ids / parent_branches / parent_pr_branches
+                # JSON arrays (purge 2/4).
+                "parent_task_id",
+                "parent_branch",
+                "parent_pr_branch",
+                # v0.1 monolithic flow retry counters; the per-subtask flow
+                # uses subtasks.retries / retry_reasons instead (purge 3/4).
+                "do_check_retries",
+                "review_triage_retries",
+            )
+            # Backfill parent JSON arrays from scalars one last time before
+            # dropping, so rows written by older code don't lose linkage.
+            if "parent_task_id" in existing_cols:
                 self.conn.execute(
-                    "UPDATE tasks SET state = ? WHERE state = ?",
-                    (new, old),
+                    "UPDATE tasks SET parent_task_ids = json_array(parent_task_id) "
+                    "WHERE parent_task_id IS NOT NULL AND parent_task_ids IS NULL"
                 )
+            if "parent_branch" in existing_cols:
                 self.conn.execute(
-                    "UPDATE state_log SET to_state = ? WHERE to_state = ?",
-                    (new, old),
+                    "UPDATE tasks SET parent_branches = json_array(parent_branch) "
+                    "WHERE parent_branch IS NOT NULL AND parent_branches IS NULL"
                 )
+            if "parent_pr_branch" in existing_cols:
                 self.conn.execute(
-                    "UPDATE state_log SET from_state = ? WHERE from_state = ?",
-                    (new, old),
+                    "UPDATE tasks SET parent_pr_branches = json_array(parent_pr_branch) "
+                    "WHERE parent_pr_branch IS NOT NULL AND parent_pr_branches IS NULL"
                 )
-            # `pre_rebase_state` (column on tasks) carries the same string
-            # values; migrate it too so resumption after a rebase lands in a
-            # valid post-split state.
-            for old, new in legacy_state_map:
-                self.conn.execute(
-                    "UPDATE tasks SET pre_rebase_state = ? WHERE pre_rebase_state = ?",
-                    (new, old),
-                )
+            for col in retired_cols:
+                if col in existing_cols:
+                    self.conn.execute(f"ALTER TABLE tasks DROP COLUMN {col}")
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
@@ -1964,9 +1933,7 @@ class Store:
             State.REBASING_TO_MAIN,
         }
         retry_reset_fields = {
-            "do_check_retries": 0,
             "ci_triage_retries": 0,
-            "review_triage_retries": 0,
             "conflict_resolve_retries": 0,
             "needs_intent_review": 0,
             "needs_parent_rebase": 0,

@@ -190,7 +190,7 @@ class StorePoller:
         # in a "live work" view, the header's `merged: N/total` covers them.
         rows = c.execute(
             "SELECT id, state, branch, pr_number, pr_url, worktree_path, "
-            "do_check_retries, ci_triage_retries, review_triage_retries, "
+            "ci_triage_retries, "
             "needs_intent_review, parent_task_ids, last_error, "
             "review_round, intervention_request, "
             "pre_pr_audit_summary, "
@@ -243,11 +243,7 @@ class StorePoller:
             # → pending transition). Resets on `quikode retry`, so a fresh
             # restart shows a fresh runtime, not yesterday's accumulated hours.
             runtime = _humanize_seconds(now - attempt_start_per_task.get(r["id"], r["created_at"]))
-            retries = "{}/{}/{}".format(
-                r["do_check_retries"] or 0,
-                r["ci_triage_retries"] or 0,
-                r["review_triage_retries"] or 0,
-            )
+            retries = str(r["ci_triage_retries"] or 0)
             dag = self._load_dag_cached()
             node = dag.nodes.get(r["id"]) if dag else None
             task_rows.append(

@@ -135,7 +135,6 @@ def test_migration_preserves_existing_rows(tmp_path):
     assert row is not None
     assert row["state"] == State.MERGED.value
     assert row["branch"] == "old-branch"
-    assert row["do_check_retries"] == 1
     # New columns default to None (TEXT/REAL) or 0 (INTEGER DEFAULT 0)
     assert row["needs_intent_review"] in (0, None)
     assert row["parent_task_ids"] is None

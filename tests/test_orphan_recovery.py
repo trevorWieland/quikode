@@ -175,9 +175,7 @@ def test_recovery_clears_retry_counters(tmp_path):
     _seed(s, "T-1", State.DOING_SUBTASK)
     s.set_field(
         "T-1",
-        do_check_retries=5,
         ci_triage_retries=2,
-        review_triage_retries=1,
         conflict_resolve_retries=3,
         needs_intent_review=1,
         needs_parent_rebase=1,
@@ -185,9 +183,7 @@ def test_recovery_clears_retry_counters(tmp_path):
     )
     s.recover_orphan_tasks()
     row = s.get("T-1")
-    assert row["do_check_retries"] == 0
     assert row["ci_triage_retries"] == 0
-    assert row["review_triage_retries"] == 0
     assert row["conflict_resolve_retries"] == 0
     assert row["needs_intent_review"] == 0
     assert row["needs_parent_rebase"] == 0

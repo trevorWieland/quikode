@@ -243,9 +243,7 @@ def run(
                     r["id"],
                     State.PENDING,
                     note="auto retry-failed",
-                    do_check_retries=0,
                     ci_triage_retries=0,
-                    review_triage_retries=0,
                     last_error=None,
                     branch=None,
                     worktree_path=None,
@@ -542,9 +540,7 @@ def status(
                     "branch": r.get("branch"),
                     "pr_url": r.get("pr_url"),
                     "pr_number": r.get("pr_number"),
-                    "do_check_retries": r.get("do_check_retries") or 0,
                     "ci_triage_retries": r.get("ci_triage_retries") or 0,
-                    "review_triage_retries": r.get("review_triage_retries") or 0,
                     "last_error": r.get("last_error"),
                     "parent_task_ids": store.get_parent_task_ids(r["id"]),
                 }
@@ -571,7 +567,7 @@ def status(
     table.add_column("Retries (do/ci/rev)")
     table.add_column("Last")
     for r in rows:
-        retries = f"{r.get('do_check_retries') or 0}/{r.get('ci_triage_retries') or 0}/{r.get('review_triage_retries') or 0}"
+        retries = f"{r.get('ci_triage_retries') or 0}"
         pr = r.get("pr_url") or ""
         table.add_row(
             r["id"],
@@ -712,9 +708,7 @@ def retry(
         task_id,
         State.PENDING,
         note=note,
-        do_check_retries=0,
         ci_triage_retries=0,
-        review_triage_retries=0,
         last_error=None,
         branch=None,
         worktree_path=None,
@@ -775,9 +769,7 @@ def resume(
         task_id,
         State.PENDING,
         note=note,
-        do_check_retries=0,
         ci_triage_retries=0,
-        review_triage_retries=0,
         last_error=None,
         container_id=None,  # container is gone; let provision spin up a fresh one
         resume_from_existing_subtasks=1,
@@ -1316,7 +1308,7 @@ def _build_status_table(store: Store, *, show_terminal: bool = True) -> Table:
                 wt_color = "red"
             elif wt_age > 120:
                 wt_color = "yellow"
-        retries = f"{r.get('do_check_retries') or 0}/{r.get('ci_triage_retries') or 0}/{r.get('review_triage_retries') or 0}"
+        retries = f"{r.get('ci_triage_retries') or 0}"
         pr = r.get("pr_url") or ""
         pr_n = pr.rsplit("/", 1)[-1] if pr else ""
         branch_pr = r.get("branch") or ""
@@ -1823,9 +1815,7 @@ def explain(
         for k in (
             "branch",
             "pr_url",
-            "do_check_retries",
             "ci_triage_retries",
-            "review_triage_retries",
             "last_error",
             "container_id",
         ):
@@ -2098,12 +2088,7 @@ def show(
         console.print(f"  PR: {row['pr_url']}")
     if row.get("last_error"):
         console.print(f"  [red]last_error:[/] {row['last_error']}")
-    retries = (
-        f"do/check {row.get('do_check_retries') or 0}, "
-        f"ci-triage {row.get('ci_triage_retries') or 0}, "
-        f"review-triage {row.get('review_triage_retries') or 0}"
-    )
-    console.print(f"  retries: {retries}")
+    console.print(f"  ci-triage retries: {row.get('ci_triage_retries') or 0}")
 
     # State timeline
     log = list(

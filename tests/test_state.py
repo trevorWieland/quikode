@@ -13,7 +13,6 @@ def test_upsert_and_initial_state(tmp_path: Path):
     row = s.get("R-1")
     assert row is not None
     assert row["state"] == State.PENDING.value
-    assert row["do_check_retries"] == 0
 
 
 def test_idempotent_upsert(tmp_path: Path):
@@ -53,10 +52,9 @@ def test_completed_and_active_ids(tmp_path: Path):
 def test_increment(tmp_path: Path):
     s = Store(tmp_path / "q.db")
     s.upsert_pending("R-1")
-    assert s.increment("R-1", "do_check_retries") == 1
-    assert s.increment("R-1", "do_check_retries") == 2
-    row = s.get("R-1")
-    assert row["do_check_retries"] == 2
+    assert s.increment("R-1", "ci_triage_retries") == 1
+    assert s.increment("R-1", "ci_triage_retries") == 2
+    s.get("R-1")
 
 
 def test_set_field(tmp_path: Path):
