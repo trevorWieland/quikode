@@ -79,8 +79,25 @@ class Subtask(BaseModel):
             "to render fixup rounds distinctly."
         ),
     )
+    addresses_findings: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "For `kind='fixup-pre-pr-audit'` subtasks: the audit-finding ids "
+            "this slice resolves (rubric/standards/behavior namespaces). The "
+            "orchestrator's completeness check unions these across the plan's "
+            "subtasks and verifies every finding from the audit bundle is "
+            "covered. Empty for spec subtasks and other fixup kinds."
+        ),
+    )
 
-    @field_validator("acceptance", "depends_on", "files_to_touch", "interfaces", mode="before")
+    @field_validator(
+        "acceptance",
+        "depends_on",
+        "files_to_touch",
+        "interfaces",
+        "addresses_findings",
+        mode="before",
+    )
     @classmethod
     def _coerce_tuple(cls, v: Any) -> Any:
         # Accept lists (most common from JSON) and convert to tuple for hashability.

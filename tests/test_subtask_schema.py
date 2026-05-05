@@ -7,6 +7,7 @@ import pytest
 from quikode.subtask_schema import (
     PlanValidationError,
     extract_json,
+    parse_fixup_planner_output,
     parse_planner_output,
     validate_and_build_plan,
 )
@@ -211,3 +212,77 @@ That's the plan."""
     assert len(plan.subtasks) == 2
     assert plan.subtasks[0].id == "S-01-domain"
     assert plan.final_acceptance == ("just ci passes", "B-0043 BDD scenarios pass")
+
+
+# ----------------------------- FixupPlan -----------------------------
+
+
+def test_fixup_plan_accepts_per_subtask_addresses_findings():
+    """R-0020/R-0021 regression: the fixup-planner.md prompt instructs the
+    planner to emit a per-subtask `addresses_findings` array for
+    `kind="fixup-pre-pr-audit"` so the orchestrator can verify every audit
+    finding is mapped to a slice. The Subtask model previously had
+    `extra="forbid"` with no such field — every subtask carrying that key
+    was rejected, the tuple emptied, and the worker BLOCKed the task."""
+    text = """```json
+{
+  "summary": "decompose audit findings",
+  "findings_addressed": ["rubric:add-validation", "behavior:missing-witness"],
+  "subtasks": [
+    {
+      "id": "F-1-1-add-validation",
+      "title": "Add input validation",
+      "depends_on": [],
+      "files_to_touch": ["src/foo.rs"],
+      "boundary": "validation only",
+      "acceptance": ["cargo check passes"],
+      "kind": "fixup-pre-pr-audit",
+      "addresses_findings": ["rubric:add-validation"]
+    },
+    {
+      "id": "F-1-2-add-witness",
+      "title": "Add B-0030 BDD witness",
+      "depends_on": [],
+      "files_to_touch": ["tests/bdd/features/B-0030.feature"],
+      "boundary": "test fixture only",
+      "acceptance": ["scenario runs"],
+      "kind": "fixup-pre-pr-audit",
+      "addresses_findings": ["behavior:missing-witness"]
+    }
+  ]
+}
+```"""
+    plan = parse_fixup_planner_output(text)
+    assert len(plan.subtasks) == 2
+    assert plan.findings_addressed == (
+        "rubric:add-validation",
+        "behavior:missing-witness",
+    )
+    # Per-subtask traceability survives.
+    assert plan.subtasks[0].addresses_findings == ("rubric:add-validation",)
+    assert plan.subtasks[1].addresses_findings == ("behavior:missing-witness",)
+
+
+def test_fixup_plan_accepts_subtasks_without_addresses_findings():
+    """Spec subtasks + non-audit fixup kinds don't need the field. Default
+    is empty tuple; absence is fine."""
+    text = """```json
+{
+  "summary": "fixup CI",
+  "subtasks": [
+    {
+      "id": "F-1-1-fix-ci",
+      "title": "Fix CI",
+      "depends_on": [],
+      "files_to_touch": ["src/lib.rs"],
+      "boundary": "",
+      "acceptance": ["just ci passes"],
+      "kind": "fixup-ci"
+    }
+  ]
+}
+```"""
+    plan = parse_fixup_planner_output(text)
+    assert len(plan.subtasks) == 1
+    assert plan.subtasks[0].addresses_findings == ()
+    assert plan.findings_addressed == ()
