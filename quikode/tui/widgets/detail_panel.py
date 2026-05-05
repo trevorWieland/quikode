@@ -200,51 +200,18 @@ class DetailPanel(Container):
                     len(add_errors),
                     ("; ".join(add_errors)[:500]) if add_errors else "",
                 )
-            # Auto-follow the active subtask UNLESS the user has manually
-            # moved the cursor. The DataTable's `move_cursor` does NOT
-            # auto-scroll when the widget isn't focused — and the subtasks
-            # table is rarely focused, since the operator's cursor lives
-            # in the tasks panel above.
-            #
-            # CRITICAL: Textual computes layout asynchronously after a
-            # message handler returns. Calling `scroll_to` / `scroll_end`
-            # synchronously inside `render_snapshot` uses the OLD
-            # `virtual_size` (from before the add_row loop), so the
-            # viewport scrolls to the wrong place — observed live as
-            # F-6-1 stuck at the bottom even though row_count=19.
-            #
-            # Fix: schedule the cursor + scroll ops via `call_after_refresh`
-            # so Textual's layout pass runs first. By the time the deferred
-            # callback fires, `virtual_size` reflects all 19 rows.
+            # Auto-follow the active subtask UNLESS the user has moved the
+            # cursor manually. Cursor + scroll updates are deferred to the
+            # next layout pass via `call_after_refresh` because Textual
+            # computes `virtual_size` asynchronously after the message
+            # handler returns — synchronous scroll attempts inside
+            # `render_snapshot` see the pre-add_row size and anchor wrong.
+            # That's the framework's API for "do this after layout
+            # settles", not a hack we can purge.
             if snap.subtasks:
-                if self._user_moved_subtask_cursor:
-                    target = min(prev_cursor_row, len(snap.subtasks) - 1)
-                elif snap.active_subtask_idx >= 0:
-                    target = snap.active_subtask_idx
-                else:
-                    # Default to last row when no active — usually the most
-                    # recently-appended fixup subtask.
-                    target = len(snap.subtasks) - 1
-                target = max(target, 0)
-                self._scroll_target = target
-                self._scroll_to_end = target >= len(snap.subtasks) - 2
-                try:
-                    self.app.call_after_refresh(self._apply_subtask_scroll)
-                except Exception:
-                    # Synchronous fallback (e.g. headless tests with no
-                    # active app event loop). Still useful for the active-
-                    # subtask cursor highlight even if the scroll lands
-                    # at a stale virtual_size.
-                    try:
-                        st.move_cursor(row=target, column=0, animate=False)
-                    except Exception:
-                        pass
-            # Belt-and-suspenders: explicitly mark the table dirty so
-            # Textual's next render pass sees the updated row set.
-            try:
-                st.refresh(layout=True)
-            except Exception:
-                pass
+                target = self._compute_scroll_target(snap, prev_cursor_row)
+                total = len(snap.subtasks)
+                self.app.call_after_refresh(self._apply_subtask_scroll, target, total)
             self._subtasks_fp = sub_fp
 
         # ---- Agent calls tab ----
@@ -266,33 +233,29 @@ class DetailPanel(Container):
         idx = order.index(cur) if cur in order else 0
         tabs.active = order[(idx + direction) % len(order)]
 
-    def _apply_subtask_scroll(self) -> None:
-        """Deferred move_cursor + scroll, run after Textual's layout pass.
+    def _compute_scroll_target(self, snap: DetailSnapshot, prev_cursor_row: int) -> int:
+        """Pick the row the subtasks-table viewport should anchor on after a
+        re-render. User cursor wins; otherwise follow the active subtask;
+        otherwise jump to the last row (newly-appended fixup slices)."""
+        if self._user_moved_subtask_cursor:
+            return max(0, min(prev_cursor_row, len(snap.subtasks) - 1))
+        if snap.active_subtask_idx >= 0:
+            return snap.active_subtask_idx
+        return max(0, len(snap.subtasks) - 1)
 
-        Called via `app.call_after_refresh` from `render_snapshot` so
-        `virtual_size` reflects the just-added rows before we ask the
-        DataTable to scroll. Synchronous scroll attempts in
-        `render_snapshot` saw stale `virtual_size` and anchored the
-        viewport at an obsolete row count.
-        """
-        target = getattr(self, "_scroll_target", None)
-        if target is None:
+    def _apply_subtask_scroll(self, target: int, total: int) -> None:
+        """Move cursor + scroll to `target`, called via call_after_refresh
+        so Textual's layout pass has finished and `virtual_size` reflects
+        the current row count. `total` is captured at scheduling time so a
+        rapid second update doesn't race with this one."""
+        st = self.query_one("#subtasks-table", DataTable)
+        if total == 0 or target >= total:
             return
-        try:
-            st = self.query_one("#subtasks-table", DataTable)
-        except Exception:
-            return
-        try:
-            st.move_cursor(row=target, column=0, animate=False)
-        except Exception:
-            pass
-        try:
-            if getattr(self, "_scroll_to_end", False):
-                st.scroll_end(animate=False)
-            else:
-                st.scroll_to(y=target, animate=False)
-        except Exception:
-            pass
+        st.move_cursor(row=target, column=0, animate=False)
+        if target >= total - 2:
+            st.scroll_end(animate=False)
+        else:
+            st.scroll_to(y=target, animate=False)
 
 
 def _subtask_state_cell(state: str) -> str:
