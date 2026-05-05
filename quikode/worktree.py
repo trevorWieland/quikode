@@ -111,8 +111,53 @@ def commit_subtask(
             output="commit_subtask: subtask declared no files_to_touch; nothing to add",
         )
 
-    # 1. git add — only the planner-declared files.
-    quoted = " ".join(shlex.quote(p) for p in subtask.files_to_touch)
+    # 1. Filter files_to_touch to only paths that actually exist in the worktree.
+    # The planner declares files speculatively — for auto-generated outputs
+    # (e.g. Paraglide message bundles, openapi-typegen output) the actual on-disk
+    # name may differ from what the planner guessed (.ts vs .js, or generated
+    # at all). Without this filter, `git add -- <missing>` fails rc=1 with
+    # `pathspec did not match any files`, the worker synthesizes a checker FAIL,
+    # triage retries the doer, doer no-ops because the implementation is
+    # already committed, and the loop runs the full retry budget. Boundary
+    # discipline is preserved: we still only add files the planner declared,
+    # we just don't reject the whole commit because one declared file is a
+    # ghost.
+    declared = list(subtask.files_to_touch)
+    _rc_check, check_out, _ = exec_in(
+        handle,
+        [
+            "bash",
+            "-lc",
+            "cd /workspace && for f in "
+            + " ".join(shlex.quote(p) for p in declared)
+            + '; do [ -e "$f" ] && echo "$f"; done',
+        ],
+        log_path=log_path,
+        timeout=30,
+    )
+    existing = [line for line in (check_out or "").splitlines() if line.strip()]
+    missing = [p for p in declared if p not in existing]
+    if not existing:
+        return CommitResult(
+            success=False,
+            commit_sha=None,
+            transient=False,
+            output=(
+                "commit_subtask: none of the planner-declared files_to_touch exist "
+                f"on disk: {declared!r}. Doer likely wrote nothing OR planner declared "
+                "ghost paths. Treating as a real failure so triage can re-prompt."
+            ),
+        )
+    if missing and log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a") as f:
+            f.write(
+                f"[commit_subtask] {len(missing)} declared file(s) missing on disk "
+                f"(skipped from `git add`): {missing!r}\n"
+            )
+
+    # 2. git add — only the existing, planner-declared files.
+    quoted = " ".join(shlex.quote(p) for p in existing)
     rc, out, err = exec_in(
         handle,
         ["bash", "-lc", f"cd /workspace && git add -- {quoted}"],
@@ -127,7 +172,7 @@ def commit_subtask(
             output=f"git add failed (rc={rc}):\n{out}\n{err}",
         )
 
-    # 2. git commit -m <message>. If there's nothing staged it usually
+    # 3. git commit -m <message>. If there's nothing staged it usually
     # means the doer made no diff — but it can ALSO mean a prior attempt
     # already committed this subtask's work and the worker re-entered.
     # Detect the second case by checking whether HEAD has commits beyond
@@ -180,7 +225,7 @@ def commit_subtask(
             )
         # Fall through with ahead > 0 — capture HEAD + push (idempotent).
 
-    # 3. capture the new HEAD sha.
+    # 4. capture the new HEAD sha.
     rc, sha_out, _sha_err = exec_in(
         handle,
         ["bash", "-lc", "cd /workspace && git rev-parse HEAD"],
@@ -189,7 +234,7 @@ def commit_subtask(
     )
     commit_sha = sha_out.strip() if rc == 0 else None
 
-    # 4. git push (optional).
+    # 5. git push (optional).
     if push:
         rc, out, err = exec_in(
             handle,
