@@ -17,7 +17,8 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,7 +28,13 @@ log = logging.getLogger("quikode.worktree")
 
 if TYPE_CHECKING:
     from .docker_env import TaskContainer
+    from .scope_review import ScopeReviewResult
     from .subtask_schema import Subtask
+
+# Callback type for advisory lane review. Worker passes a closure that
+# wraps `scope_review.review_scope_drift` with the cfg + handle bound.
+# Signature: (subtask, declared_files, actually_touched_files) → review result.
+LaneReviewFn = Callable[["Subtask", list[str], list[str]], "ScopeReviewResult"]
 
 _worktree_lock = threading.RLock()
 
@@ -40,12 +47,19 @@ class CommitResult:
     """Outcome of `commit_subtask`. `success=True` iff add+commit+push all
     landed (or push was skipped). On failure, `transient` distinguishes
     container/network glitches (free retry) from real failures (burns a
-    retry, surfaces as a checker-style FAIL)."""
+    retry, surfaces as a checker-style FAIL).
+
+    `accepted_files` is the effective lane after scope review — equals
+    `subtask.files_to_touch` when no drift, or the reviewer-accepted
+    actual touched set when drift was deemed legitimate. Empty on
+    failure paths.
+    """
 
     success: bool
     commit_sha: str | None
     transient: bool
     output: str
+    accepted_files: list[str] = field(default_factory=list)
 
 
 # stderr fragments that mean "git push failed because the network/remote
@@ -89,14 +103,26 @@ def commit_subtask(
     push: bool = True,
     log_path: Path | None = None,
     timeout: int = 300,
+    lane_review_fn: LaneReviewFn | None = None,
 ) -> CommitResult:
-    """Run `git add <files_to_touch> && git commit -m <message> && git push`
-    inside the container at /workspace.
+    """Run `git add -A && git commit -m <message> && git push` inside
+    the container at /workspace, with optional advisory lane review.
 
-    Only files declared in `subtask.files_to_touch` are added — if a doer
-    wrote outside its lane, those files stay untracked and surface in the
-    next checker / progress check. This is intentional: the planner's
-    declared scope is the contract.
+    The planner declares `subtask.files_to_touch` as the *intended*
+    lane, but `git add -A` stages whatever the doer + pre-commit hooks
+    actually produced (auto-generated outputs, refactor splits, companion
+    tests). When the actual diff drifts from the declared lane,
+    `lane_review_fn` is invoked — a fast LLM judge that decides whether
+    the drift is a legitimate evolution of the lane or genuine overreach.
+
+    Strict file-list staging was the prior design; it failed when the
+    planner couldn't predict generated/refactored outputs. See
+    `scope_review.py` for the rationale.
+
+    `lane_review_fn` is None-safe: when not provided (e.g. unit tests,
+    legacy callers) the commit lands without review — the caller takes
+    responsibility for boundary discipline. Production callers should
+    always pass a reviewer.
 
     Returns a `CommitResult`. `transient=True` means a free retry is safe
     (network blip, container glitch). On non-transient failure the caller
@@ -110,57 +136,12 @@ def commit_subtask(
             transient=False,
             output="commit_subtask: subtask declared no files_to_touch; nothing to add",
         )
-
-    # 1. Filter files_to_touch to only paths that actually exist in the worktree.
-    # The planner declares files speculatively — for auto-generated outputs
-    # (e.g. Paraglide message bundles, openapi-typegen output) the actual on-disk
-    # name may differ from what the planner guessed (.ts vs .js, or generated
-    # at all). Without this filter, `git add -- <missing>` fails rc=1 with
-    # `pathspec did not match any files`, the worker synthesizes a checker FAIL,
-    # triage retries the doer, doer no-ops because the implementation is
-    # already committed, and the loop runs the full retry budget. Boundary
-    # discipline is preserved: we still only add files the planner declared,
-    # we just don't reject the whole commit because one declared file is a
-    # ghost.
     declared = list(subtask.files_to_touch)
-    _rc_check, check_out, _ = exec_in(
-        handle,
-        [
-            "bash",
-            "-lc",
-            "cd /workspace && for f in "
-            + " ".join(shlex.quote(p) for p in declared)
-            + '; do [ -e "$f" ] && echo "$f"; done',
-        ],
-        log_path=log_path,
-        timeout=30,
-    )
-    existing = [line for line in (check_out or "").splitlines() if line.strip()]
-    missing = [p for p in declared if p not in existing]
-    if not existing:
-        return CommitResult(
-            success=False,
-            commit_sha=None,
-            transient=False,
-            output=(
-                "commit_subtask: none of the planner-declared files_to_touch exist "
-                f"on disk: {declared!r}. Doer likely wrote nothing OR planner declared "
-                "ghost paths. Treating as a real failure so triage can re-prompt."
-            ),
-        )
-    if missing and log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a") as f:
-            f.write(
-                f"[commit_subtask] {len(missing)} declared file(s) missing on disk "
-                f"(skipped from `git add`): {missing!r}\n"
-            )
 
-    # 2. git add — only the existing, planner-declared files.
-    quoted = " ".join(shlex.quote(p) for p in existing)
+    # 1. Stage everything the doer + hooks produced.
     rc, out, err = exec_in(
         handle,
-        ["bash", "-lc", f"cd /workspace && git add -- {quoted}"],
+        ["bash", "-lc", "cd /workspace && git add -A"],
         log_path=log_path,
         timeout=timeout,
     )
@@ -168,11 +149,59 @@ def commit_subtask(
         return CommitResult(
             success=False,
             commit_sha=None,
-            transient=False,  # `git add` doesn't network — failure is real
-            output=f"git add failed (rc={rc}):\n{out}\n{err}",
+            transient=False,
+            output=f"git add -A failed (rc={rc}):\n{out}\n{err}",
         )
 
-    # 3. git commit -m <message>. If there's nothing staged it usually
+    # 2. Compute the actual touched set from the staging area.
+    rc, diff_out, _ = exec_in(
+        handle,
+        ["bash", "-lc", "cd /workspace && git diff --cached --name-only"],
+        log_path=log_path,
+        timeout=30,
+    )
+    actually_touched = [line for line in (diff_out or "").splitlines() if line.strip()]
+    accepted_files = list(actually_touched)
+
+    # 3. Advisory lane review — only when there's drift AND we have a reviewer.
+    # Pure subset of declared → skip the agent entirely (cheap path).
+    if lane_review_fn is not None and actually_touched and not (set(actually_touched) <= set(declared)):
+        review = lane_review_fn(subtask, declared, actually_touched)
+        if not review.legitimate:
+            # Roll back the staged changes so the worktree returns to a
+            # clean re-runnable state. The doer's edits stay on disk
+            # (un-staged) — triage feedback in the next attempt will
+            # tell the doer to revert/scope-down before retrying.
+            _rc_reset, reset_out, reset_err = exec_in(
+                handle,
+                ["bash", "-lc", "cd /workspace && git reset HEAD -- ."],
+                log_path=log_path,
+                timeout=30,
+            )
+            return CommitResult(
+                success=False,
+                commit_sha=None,
+                transient=False,
+                output=(
+                    f"scope review rejected commit as overreach: {review.reason}\n\n"
+                    f"declared lane: {declared!r}\n"
+                    f"actually touched: {actually_touched!r}\n"
+                    f"out-of-lane files: {sorted(set(actually_touched) - set(declared))!r}\n\n"
+                    f"git reset output:\n{reset_out}\n{reset_err}"
+                ),
+            )
+        accepted_files = list(review.accepted_files) or list(actually_touched)
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a") as f:
+                f.write(
+                    f"[commit_subtask] scope review accepted lane drift for "
+                    f"{subtask.id}: {review.reason}\n"
+                    f"  declared:  {declared!r}\n"
+                    f"  accepted:  {accepted_files!r}\n"
+                )
+
+    # 4. git commit -m <message>. If there's nothing staged it usually
     # means the doer made no diff — but it can ALSO mean a prior attempt
     # already committed this subtask's work and the worker re-entered.
     # Detect the second case by checking whether HEAD has commits beyond
@@ -225,7 +254,7 @@ def commit_subtask(
             )
         # Fall through with ahead > 0 — capture HEAD + push (idempotent).
 
-    # 4. capture the new HEAD sha.
+    # 5. capture the new HEAD sha.
     rc, sha_out, _sha_err = exec_in(
         handle,
         ["bash", "-lc", "cd /workspace && git rev-parse HEAD"],
@@ -234,7 +263,7 @@ def commit_subtask(
     )
     commit_sha = sha_out.strip() if rc == 0 else None
 
-    # 5. git push (optional).
+    # 6. git push (optional).
     if push:
         rc, out, err = exec_in(
             handle,
@@ -260,6 +289,7 @@ def commit_subtask(
         commit_sha=commit_sha,
         transient=False,
         output="ok",
+        accepted_files=accepted_files,
     )
 
 

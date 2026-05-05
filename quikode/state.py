@@ -111,6 +111,11 @@ class SubtaskRow(TypedDict):
     pre_commit_failures: NotRequired[int | None]
     # v3 fixup decomposition: 'spec' / 'fixup-final' / 'fixup-ci' / 'fixup-review'.
     kind: NotRequired[str | None]
+    # v3.5 retry-cause classification: JSON array of retry reasons.
+    retry_reasons: NotRequired[str | None]
+    # v3.7 advisory scope review: comma-separated effective lane after the
+    # scope-reviewer accepted drift from declared `files_to_touch`.
+    accepted_files: NotRequired[str | None]
     created_at: NotRequired[float | None]
     updated_at: NotRequired[float | None]
 
@@ -410,6 +415,10 @@ CREATE TABLE IF NOT EXISTS subtasks (
     -- Each retry (real OR transient) appends an entry so `quikode show`
     -- can render a "why did this retry?" histogram per subtask.
     retry_reasons TEXT,
+    -- v3.7 advisory scope review: comma-separated effective lane after
+    -- the scope-reviewer accepted drift from `files_to_touch`. NULL when
+    -- the actual diff matched the planner's declared lane exactly.
+    accepted_files TEXT,
     created_at REAL,
     updated_at REAL,
     UNIQUE(task_id, subtask_id)
@@ -581,6 +590,13 @@ class Store:
                 # v3.5 retry-cause classification: JSON array, see schema
                 # docstring above.
                 ("retry_reasons", "TEXT"),
+                # v3.7 advisory scope review: comma-separated effective lane
+                # after the scope-reviewer accepted drift from
+                # `files_to_touch` (auto-gen outputs, refactor splits,
+                # companion files). NULL when the actual diff matched the
+                # planner's declared lane exactly. Surfaced in `quikode show`
+                # so the operator can see how a subtask's scope evolved.
+                ("accepted_files", "TEXT"),
             ],
             "agent_calls": [
                 # v2 Phase 0: scope agent_calls to a specific subtask

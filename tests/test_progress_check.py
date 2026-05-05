@@ -581,7 +581,9 @@ def test_transient_retries_do_not_count_toward_attempts(tmp_path):
 
     call_count = {"n": 0}
 
-    def fake_commit(handle, subtask, message, *, branch, remote, push, log_path, timeout=300):
+    def fake_commit(
+        handle, subtask, message, *, branch, remote, push, log_path, timeout=300, lane_review_fn=None
+    ):
         call_count["n"] += 1
         if call_count["n"] <= 3:
             return CommitResult(success=False, commit_sha=None, transient=True, output="network blip")

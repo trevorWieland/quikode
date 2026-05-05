@@ -19,7 +19,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from . import (
     docker_env,
@@ -30,6 +30,7 @@ from . import (
     prompts,
     retry_classify,
     scheduler,
+    scope_review,
     sound,
     stacking,
     worktree,
@@ -1603,9 +1604,22 @@ class TaskWorker:
             )
             return _SubtaskPassOutcome(kind="fail", synthesized_checker_text=checker_text)
 
-        # 2. commit + push
+        # 2. commit + push (with advisory scope review for lane drift)
         branch = str(self._row()["branch"])
         commit_msg = f"subtask({subtask.id}): {subtask.title}"
+
+        def _lane_review(
+            sub: Subtask, declared: list[str], actually_touched: list[str]
+        ) -> scope_review.ScopeReviewResult:
+            return scope_review.review_scope_drift(
+                cfg=self.cfg,
+                handle=self._h,
+                subtask=sub,
+                declared=declared,
+                actually_touched=actually_touched,
+                log_path=self.log_path,
+            )
+
         result = worktree.commit_subtask(
             self._h,
             subtask,
@@ -1614,6 +1628,7 @@ class TaskWorker:
             remote=self.cfg.pr_remote,
             push=True,
             log_path=self.log_path,
+            lane_review_fn=_lane_review,
         )
         if not result.success:
             if result.transient:
@@ -1634,8 +1649,12 @@ class TaskWorker:
             checker_text = f"VERDICT: FAIL\nROOT_CAUSE: commit/push failed\nDETAILS:\n{result.output[:4000]}"
             return _SubtaskPassOutcome(kind="fail", synthesized_checker_text=checker_text)
 
-        # 3. settled
-        self.store.update_subtask(self.node.id, subtask.id, commit_sha=result.commit_sha)
+        # 3. settled. Persist any reviewer-accepted lane evolution so it's
+        # visible in `quikode show` and accumulates across attempts.
+        update_fields: dict[str, Any] = {"commit_sha": result.commit_sha}
+        if result.accepted_files and set(result.accepted_files) != set(subtask.files_to_touch):
+            update_fields["accepted_files"] = ",".join(result.accepted_files)
+        self.store.update_subtask(self.node.id, subtask.id, **update_fields)
         self._mark_subtask_done(subtask)
         return _SubtaskPassOutcome(kind="settled")
 
