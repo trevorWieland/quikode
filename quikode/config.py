@@ -222,31 +222,13 @@ class Config(BaseModel):
         default=1200,
         ge=120,
         le=3600,
-        description=(
-            "Hard timeout for a single fixup planner agent invocation. The audit "
-            "decomposition path (`fixup-pre-pr-audit`) feeds the planner a bundle "
-            "that can include 20-30 findings each requiring a per-subtask mapping; "
-            "the planner has to read every finding, decide a partition into 1-5 "
-            "subtasks (or more), AND emit a complete `findings_addressed` array — "
-            "with the v3.7 thorough audit prompts the resulting JSON can be 4-8KB "
-            "of structured output, which codex routinely takes 8-12 minutes to "
-            "produce. The previous 600s ceiling fired with empty stdout (rc=124) "
-            "and the worker BLOCKed the task; 20 minutes gives genuine convergence "
-            "room without being so wide that a real hang goes unnoticed."
-        ),
+        description="Per-invocation timeout for the fixup planner. 20m absorbs the audit-bundle decomposition path (large structured JSON output).",
     )
     fixup_planner_retries_on_transient: int = Field(
         default=2,
         ge=0,
         le=5,
-        description=(
-            "When the fixup planner returns rc=124 (timeout or transient container "
-            "failure per `agents.base._is_transient_container_failure`), retry the "
-            "agent invocation up to N times before giving up. Each retry is a fresh "
-            "agent.run with the same prompt; this absorbs codex CLI flakes and "
-            "occasional bursty backpressure without burning the fixup_max_rounds "
-            "budget on infrastructure noise. Set 0 to disable."
-        ),
+        description="Free retries when the fixup planner returns rc=124 (timeout / transient container failure). Doesn't burn `fixup_max_rounds`.",
     )
     preempt_at_subtask_boundary: bool = Field(
         default=False,
@@ -493,29 +475,13 @@ class Config(BaseModel):
     )
     subtask_check_command: str = Field(
         default="just check",
-        description=(
-            "Fast objective gate run AT THE START of the per-subtask checker, "
-            "BEFORE the LLM verdict. Default 'just check' is tanren's "
-            "lightweight bundle: deps-locked / format / workflow lint / docs "
-            "lint / line-budget — runs in seconds with a hot cache. Catches "
-            "compile + lint regressions at the subtask boundary instead of "
-            "letting them accumulate until the local-CI gate fires post-DAG, "
-            "which is what made R-0021 burn 10 subtasks before the audit "
-            "stage caught a missing `check_host_access` method. Set to "
-            "empty string to disable; if your repo doesn't have a 'just' "
-            "harness, override (e.g. 'cargo check --workspace && pnpm lint')."
-        ),
+        description="Layer-1 objective gate, runs before the LLM checker on every subtask. Empty string disables.",
     )
     subtask_check_timeout_s: int = Field(
         default=300,
         ge=10,
         le=1800,
-        description=(
-            "Timeout for the per-subtask check command. Defaults to 5min — "
-            "the gate is meant to be fast (no full test runs); a hang past "
-            "5min suggests the command is doing too much and should be "
-            "narrowed."
-        ),
+        description="Timeout for the per-subtask check command.",
     )
     pre_pr_rubric_categories: list[str] = Field(
         default_factory=lambda: [
@@ -558,16 +524,7 @@ class Config(BaseModel):
         default=10,
         ge=1,
         le=20,
-        description=(
-            "How many full pipeline cycles (CI + 3 audits → triage → fixup → "
-            "subtask loop → re-run pipeline) before BLOCKing. The earlier "
-            "default of 3 was too tight: when initial audit findings exceeded "
-            "what one fixup-planner round could decompose, genuine fixes were "
-            "still in flight when the cap fired. 10 gives the convergence "
-            "loop room to address all findings (rubric ≥7 every category, "
-            "zero medium+ standards findings, every behavior verified) "
-            "rather than just enough to pass."
-        ),
+        description="Pipeline cycles (CI + 3 audits → triage → fixup → subtask loop → re-run) before BLOCKing.",
     )
     pre_pr_audit_timeout_s: int = Field(
         default=1200,

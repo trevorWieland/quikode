@@ -27,6 +27,15 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["quikode"]
 
+# Ship the prompt templates and docker assets inside the wheel.
+# `quikode/prompts.py` resolves `_BUNDLED_PROMPTS` as `<package>/../prompts`
+# so a sibling `prompts/` dir at the wheel root is what gets loaded when
+# the user hasn't overridden `cfg.prompts_dir`. The docker/ dir holds the
+# Dockerfile + entrypoint scripts the dev-image builder copies.
+[tool.hatch.build.targets.wheel.force-include]
+"prompts" = "prompts"
+"docker" = "docker"
+
 [tool.ruff]
 line-length = 110
 target-version = "py312"

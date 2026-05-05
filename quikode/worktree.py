@@ -105,30 +105,7 @@ def commit_subtask(
     timeout: int = 300,
     lane_review_fn: LaneReviewFn | None = None,
 ) -> CommitResult:
-    """Run `git add -A && git commit -m <message> && git push` inside
-    the container at /workspace, with optional advisory lane review.
-
-    The planner declares `subtask.files_to_touch` as the *intended*
-    lane, but `git add -A` stages whatever the doer + pre-commit hooks
-    actually produced (auto-generated outputs, refactor splits, companion
-    tests). When the actual diff drifts from the declared lane,
-    `lane_review_fn` is invoked — a fast LLM judge that decides whether
-    the drift is a legitimate evolution of the lane or genuine overreach.
-
-    Strict file-list staging was the prior design; it failed when the
-    planner couldn't predict generated/refactored outputs. See
-    `scope_review.py` for the rationale.
-
-    `lane_review_fn` is None-safe: when not provided (e.g. unit tests,
-    legacy callers) the commit lands without review — the caller takes
-    responsibility for boundary discipline. Production callers should
-    always pass a reviewer.
-
-    Returns a `CommitResult`. `transient=True` means a free retry is safe
-    (network blip, container glitch). On non-transient failure the caller
-    should synthesize a Verdict.FAIL with the captured output as triage
-    feedback.
-    """
+    """`git add -A && git commit && git push` for one subtask, with optional advisory lane review on drift from `subtask.files_to_touch`. `transient=True` on the result → free retry."""
     if not subtask.files_to_touch:
         return CommitResult(
             success=False,
