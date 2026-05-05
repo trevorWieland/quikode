@@ -19,7 +19,10 @@ from quikode.dag import DAG
 from quikode.state import State, Store, SubtaskState
 from quikode.subtask_schema import Plan, Subtask
 from quikode.types import Verdict
-from quikode.worker import TaskWorker
+from quikode.worker import (
+    TaskWorker,
+    _CheckerOutcome,
+)
 from quikode.worktree import CommitResult
 
 
@@ -301,7 +304,13 @@ def test_e2e_pre_commit_failure_then_pass_converges(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.PASS, "VERDICT: PASS", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_pre_commit_gate", side_effect=fake_gate),
         patch.object(worker, "_triage_subtask", return_value="reformat the code"),
         patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit),

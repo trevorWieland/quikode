@@ -64,6 +64,21 @@ class WorkerOutcome:
 
 
 @dataclass
+class _CheckerOutcome:
+    """Structured result from `_check_subtask`. Carries the verdict + the
+    full subprocess shape (rc, stdout, stderr) so callers can drive both
+    the FAIL-handler path AND the retry-cause classifier with real data
+    instead of `rc=?` placeholders.
+    """
+
+    verdict: Verdict
+    checker_text: str
+    transient: bool
+    rc: int | None
+    stderr: str
+
+
+@dataclass
 class _SubtaskPassOutcome:
     """Result of running the pre-commit + commit + push gate after a
     Verdict.PASS from the checker.
@@ -1202,7 +1217,8 @@ class TaskWorker:
             while attempt < hard_max:
                 attempt += 1
                 self._do_subtask(subtask, attempt, triage_notes)
-                verdict, checker_text, transient = self._check_subtask(subtask)
+                outcome = self._check_subtask(subtask)
+                verdict, checker_text, transient = outcome.verdict, outcome.checker_text, outcome.transient
                 if transient:
                     # Container-level / fast-fail noise from the checker.
                     # Free-retry: don't bump attempt or trigger triage. Cap
@@ -1221,9 +1237,9 @@ class TaskWorker:
                     # so the operator can distinguish "container vanished 8x"
                     # from "doer produced bad code 8x".
                     cat, sig = retry_classify.classify_retry(
-                        rc=None,
-                        stderr=checker_text or "",
-                        stdout="",
+                        rc=outcome.rc,
+                        stderr=outcome.stderr,
+                        stdout=outcome.checker_text,
                         hint="checker",
                     )
                     self.store.append_retry_reason(
@@ -1264,15 +1280,16 @@ class TaskWorker:
                     self.node.id, subtask.id, triage_notes=triage_notes, state=SubtaskState.TRIAGING.value
                 )
                 self.store.increment_subtask_retries(self.node.id, subtask.id)
-                # v3.5 retry classification: real verdict-FAIL retry. Pass the
-                # checker_text as stderr so pattern matching can pluck out
-                # rate-limit / OOM / network signatures if any. The hint
-                # ensures the catch-all bucket is `doer_output_invalid` rather
-                # than `other` when no pattern matches.
+                # v3.5 retry classification: real verdict-FAIL retry. Pass
+                # the actual subprocess rc + stderr from `_check_subtask` so
+                # the classifier has real signal (not `rc=?` placeholders).
+                # The hint ensures the catch-all bucket is
+                # `doer_output_invalid` rather than `other` when no pattern
+                # matches.
                 cat, sig = retry_classify.classify_retry(
-                    rc=None,
-                    stderr=checker_text or "",
-                    stdout="",
+                    rc=outcome.rc,
+                    stderr=outcome.stderr,
+                    stdout=outcome.checker_text,
                     hint="checker",
                 )
                 self.store.append_retry_reason(
@@ -1523,8 +1540,11 @@ class TaskWorker:
         self.last_doer_summary = result.stdout[-2000:]
         self.store.add_artifact(self.node.id, f"subtask_doer:{subtask.id}", result.stdout)
 
-    def _check_subtask(self, subtask: Subtask) -> tuple[Verdict, str, bool]:
-        """Run the per-subtask checker. Returns (verdict, checker_text, transient).
+    def _check_subtask(self, subtask: Subtask) -> _CheckerOutcome:
+        """Run the per-subtask checker. Returns a `_CheckerOutcome` carrying
+        verdict + the full subprocess shape (rc, stdout, stderr) so callers
+        can drive both the FAIL-handler path AND the retry-cause classifier
+        with structured data.
 
         `transient=True` means the checker run itself failed in a way that
         looks like infrastructure (rc=124 timeout, container daemon error,
@@ -1567,7 +1587,13 @@ class TaskWorker:
             and "VERDICT:" not in (result.stdout or "")
         ):
             transient = True
-        return _parse_verdict(result.stdout), result.stdout, transient
+        return _CheckerOutcome(
+            verdict=_parse_verdict(result.stdout),
+            checker_text=result.stdout or "",
+            transient=transient,
+            rc=int(result.rc) if result.rc is not None else None,
+            stderr=getattr(result, "stderr", "") or "",
+        )
 
     def _triage_subtask(self, subtask: Subtask, attempt: int, budget: int, checker_output: str) -> str:
         agent = build_agent(self.cfg.triage)
@@ -3106,7 +3132,9 @@ class TaskWorker:
             settled = False
             for attempt in range(1, hard_max + 1):
                 self._do_subtask(subtask, attempt, triage_notes)
-                verdict, checker_text = self._check_subtask(subtask)
+                outcome = self._check_subtask(subtask)
+                verdict = outcome.verdict
+                checker_text = outcome.checker_text
                 if verdict == "PASS":
                     self._mark_subtask_done(subtask)
                     settled = True
@@ -3121,11 +3149,13 @@ class TaskWorker:
                     self.node.id, subtask.id, triage_notes=triage_notes, state=SubtaskState.TRIAGING.value
                 )
                 self.store.increment_subtask_retries(self.node.id, subtask.id)
-                # v3.5 retry classification (post-replan resume path)
+                # v3.5 retry classification (post-replan resume path) — pass
+                # the structured rc/stderr/stdout from the checker outcome
+                # so signatures are real, not `rc=?` placeholders.
                 cat, sig = retry_classify.classify_retry(
-                    rc=None,
-                    stderr=checker_text or "",
-                    stdout="",
+                    rc=outcome.rc,
+                    stderr=outcome.stderr,
+                    stdout=outcome.checker_text,
                     hint="checker",
                 )
                 self.store.append_retry_reason(

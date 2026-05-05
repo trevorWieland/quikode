@@ -26,7 +26,10 @@ from quikode.dag import DAG
 from quikode.state import State, Store, SubtaskState
 from quikode.subtask_schema import Plan, Subtask
 from quikode.types import Verdict
-from quikode.worker import TaskWorker
+from quikode.worker import (
+    TaskWorker,
+    _CheckerOutcome,
+)
 from quikode.worktree import CommitResult
 
 
@@ -130,7 +133,13 @@ def test_pass_with_clean_commit_marks_done_and_records_sha(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.PASS, "VERDICT: PASS", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_pre_commit_gate", return_value=(True, "skipped")),
         patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit_subtask),
     ):
@@ -167,7 +176,13 @@ def test_pass_with_transient_push_failure_retries_without_burning_budget(tmp_pat
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.PASS, "VERDICT: PASS", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_pre_commit_gate", return_value=(True, "skipped")),
         patch.object(worker, "_triage_subtask", return_value="should not be called"),
         patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit),
@@ -207,7 +222,13 @@ def test_pass_with_real_commit_failure_falls_into_triage_and_bumps_retries(tmp_p
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.PASS, "VERDICT: PASS", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_pre_commit_gate", return_value=(True, "skipped")),
         patch.object(worker, "_triage_subtask", side_effect=fake_triage),
         patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit),
@@ -246,7 +267,13 @@ def test_pre_commit_gate_failure_synthesizes_checker_fail(tmp_path):
     # Both attempts fail the gate → subtask BLOCKs.
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.PASS, "VERDICT: PASS", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_pre_commit_gate", side_effect=fake_gate),
         patch.object(worker, "_triage_subtask", side_effect=fake_triage),
     ):

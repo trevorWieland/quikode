@@ -37,7 +37,10 @@ from quikode.dag import DAG
 from quikode.state import State, Store, SubtaskState
 from quikode.subtask_schema import Plan, Subtask
 from quikode.types import AgentResult, Verdict
-from quikode.worker import TaskWorker
+from quikode.worker import (
+    TaskWorker,
+    _CheckerOutcome,
+)
 from quikode.worktree import CommitResult
 
 # ----- helpers shared with other tests -----
@@ -351,7 +354,13 @@ def test_progress_check_cadence_seeds_attempt_from_retries_after_resume(tmp_path
 
     with (
         patch.object(worker, "_do_subtask", side_effect=fake_do),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.FAIL, "VERDICT: FAIL", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_triage_subtask", return_value="x"),
         patch.object(worker, "_run_progress_check", side_effect=fake_progress),
         patch.object(worker, "_handle_parent_rebase_if_needed", return_value=None),
@@ -417,7 +426,13 @@ def test_loop_blocks_when_progress_flatlines(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=fake_do),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.FAIL, "VERDICT: FAIL", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_triage_subtask", return_value="fix it"),
         patch("quikode.worker.build_progress_agent", return_value=fake_progress),
     ):
@@ -455,7 +470,13 @@ def test_loop_runs_to_hard_max_when_always_progressing(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=fake_do),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.FAIL, "VERDICT: FAIL", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_triage_subtask", return_value="fix it"),
         patch("quikode.worker.build_progress_agent", return_value=fake_progress),
     ):
@@ -492,7 +513,13 @@ def test_progressing_resets_flatline_count(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.FAIL, "VERDICT: FAIL", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_triage_subtask", return_value="fix it"),
         patch("quikode.worker.build_progress_agent", return_value=fake_progress),
     ):
@@ -527,7 +554,13 @@ def test_uncertain_does_not_bump_flatline_count(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.FAIL, "VERDICT: FAIL", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_triage_subtask", return_value="fix it"),
         patch("quikode.worker.build_progress_agent", return_value=fake_progress),
     ):
@@ -556,7 +589,13 @@ def test_transient_retries_do_not_count_toward_attempts(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.PASS, "VERDICT: PASS", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_pre_commit_gate", return_value=(True, "skipped")),
         patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit),
     ):
@@ -588,7 +627,13 @@ def test_progress_check_audit_rows_written(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.FAIL, "VERDICT: FAIL", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_triage_subtask", return_value="fix it"),
         patch("quikode.worker.build_progress_agent", return_value=fake_progress),
     ):
@@ -621,7 +666,13 @@ def test_loop_blocks_immediately_when_first_check_already_flatlines_at_block_cou
 
     with (
         patch.object(worker, "_do_subtask", side_effect=fake_do),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.FAIL, "VERDICT: FAIL", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_triage_subtask", return_value="fix it"),
         patch("quikode.worker.build_progress_agent", return_value=fake_progress),
     ):

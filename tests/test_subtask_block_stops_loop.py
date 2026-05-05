@@ -22,7 +22,11 @@ from quikode.dag import DAG
 from quikode.state import State, Store, SubtaskState
 from quikode.subtask_schema import Plan, Subtask
 from quikode.types import Verdict
-from quikode.worker import TaskWorker, _SubtaskPassOutcome
+from quikode.worker import (
+    TaskWorker,
+    _CheckerOutcome,
+    _SubtaskPassOutcome,
+)
 
 
 def _build_dag(tmp_path: Path) -> DAG:
@@ -128,7 +132,13 @@ def test_block_on_first_subtask_skips_remaining_and_returns_blocked(tmp_path):
 
     def fake_check(subtask):
         check_calls.append(subtask.id)
-        return Verdict.FAIL, "VERDICT: FAIL\nROOT_CAUSE: nope", False
+        return _CheckerOutcome(
+            verdict=Verdict.FAIL,
+            checker_text="VERDICT: FAIL\nROOT_CAUSE: nope",
+            transient=False,
+            rc=0,
+            stderr="",
+        )
 
     def fake_triage(subtask, attempt, budget, checker_text):
         return "fix it"
@@ -177,8 +187,12 @@ def test_block_on_middle_subtask_skips_only_later(tmp_path):
     def fake_check(subtask):
         # S-01 passes, S-02 always fails
         if subtask.id == "S-01":
-            return Verdict.PASS, "VERDICT: PASS", False
-        return Verdict.FAIL, "VERDICT: FAIL", False
+            return _CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            )
+        return _CheckerOutcome(
+            verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+        )
 
     def fake_pass(subtask):
         # Stub the v3 commit gate: PASS branch always settles cleanly.
@@ -221,7 +235,13 @@ def test_all_pass_returns_none_so_final_check_runs(tmp_path):
 
     with (
         patch.object(worker, "_do_subtask", side_effect=fake_do),
-        patch.object(worker, "_check_subtask", return_value=(Verdict.PASS, "VERDICT: PASS", False)),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            ),
+        ),
         patch.object(worker, "_handle_subtask_pass", side_effect=fake_pass),
     ):
         outcome = worker._subtask_loop()
@@ -256,7 +276,7 @@ def test_transient_checker_failures_capped_not_treated_as_real_attempts(tmp_path
     def fake_check(subtask):
         check_calls.append(subtask.id)
         # Always return transient — simulate vanished container.
-        return Verdict.FAIL, "", True
+        return _CheckerOutcome(verdict=Verdict.FAIL, checker_text="", transient=True, rc=0, stderr="")
 
     triage_was_called = False
 
