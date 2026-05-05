@@ -13,7 +13,7 @@ You are the **intent reviewer**. Another task just merged into `main`. Your job:
 {% endif %}
 
 {% if node.expected_evidence %}### Expected evidence
-{% for ev in node.expected_evidence %}- **{{ ev.kind }}**{% if ev.behavior_id %} for `{{ ev.behavior_id }}`{% endif %}: {{ ev.description }}
+{% for ev in node.expected_evidence %}- **{{ ev.kind }}**{% if ev.get('behavior_id') %} for `{{ ev.behavior_id }}`{% endif %}: {{ ev.description }}
 {% endfor %}{% endif %}
 
 ## What this task has implemented so far

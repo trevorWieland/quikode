@@ -21,7 +21,7 @@ The orchestrator drives a per-subtask doer/checker loop in topological order. Ea
 {% endfor %}{% endif %}
 
 {% if node.expected_evidence %}### Expected evidence
-{% for ev in node.expected_evidence %}- **{{ ev.kind }}**{% if ev.behavior_id %} for `{{ ev.behavior_id }}`{% endif %}{% if ev.interfaces %} across interfaces {{ ev.interfaces }}{% endif %}{% if ev.witnesses %} — witnesses {{ ev.witnesses }}{% endif %}
+{% for ev in node.expected_evidence %}- **{{ ev.kind }}**{% if ev.get('behavior_id') %} for `{{ ev.behavior_id }}`{% endif %}{% if ev.get('interfaces') %} across interfaces {{ ev.interfaces }}{% endif %}{% if ev.get('witnesses') %} — witnesses {{ ev.witnesses }}{% endif %}
   {{ ev.description }}
 {% endfor %}{% endif %}
 
