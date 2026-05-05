@@ -26,6 +26,7 @@ from . import (
     github,
     github_graphql,
     manual_probe,
+    pre_pr_audit,
     prompts,
     retry_classify,
     scheduler,
@@ -138,6 +139,13 @@ class TaskWorker:
             outcome = self._commit_push()
             if outcome:
                 return outcome
+            # v3.6: 4-stage gate (local-CI + 3 audits) BEFORE opening the PR.
+            # Catches issues early so reviewers see fewer nits and the fixup
+            # cycle happens in-process instead of through review threads.
+            if self.cfg.pre_pr_pipeline_enabled:
+                outcome = self._run_pre_pr_pipeline()
+                if outcome:
+                    return outcome
             outcome = self._open_pr()
             if outcome:
                 return outcome
@@ -2351,6 +2359,158 @@ class TaskWorker:
             self.store.transition(self.node.id, State.BLOCKED, note=f"push still failing: {out[:200]}")
             return WorkerOutcome(State.BLOCKED, "push retry failed")
         return None
+
+    # ----- v3.6 phase: pre-PR pipeline (local-CI + 3 audits) -----
+
+    def _run_pre_pr_pipeline(self) -> WorkerOutcome | None:
+        """4-stage gate before opening a PR. Returns:
+
+          - `None` on full pass (caller proceeds to `_open_pr`).
+          - `WorkerOutcome(BLOCKED)` when `cfg.pre_pr_audit_max_cycles`
+            cycles all fail — operator decides next steps via the
+            BLOCK-forensics report.
+
+        Each cycle runs all four stages (local-CI, rubric, standards,
+        behavior) regardless of failure along the way — we want a single
+        consolidated report rather than serial fail-fast that misses
+        downstream issues. Failures merge into a triage bundle, the fixup
+        planner emits subtasks (`kind="fixup-pre-pr-audit"`), the
+        per-subtask loop addresses them, then we re-enter the pipeline
+        from the top.
+        """
+        for cycle in range(1, self.cfg.pre_pr_audit_max_cycles + 1):
+            self.store.transition(
+                self.node.id,
+                State.LOCAL_CI_CHECKING,
+                note=f"pre-pr cycle {cycle}: local-ci",
+            )
+            log.info(
+                "task %s: pre-pr pipeline cycle %d/%d", self.node.id, cycle, self.cfg.pre_pr_audit_max_cycles
+            )
+
+            # Build the diff excerpt against the base branch — every audit
+            # consumes this. Compute once per cycle (commits may have
+            # changed during the prior cycle's fixup loop).
+            diff_excerpt = self._compute_branch_diff_excerpt()
+            plan_text = str(self._row().get("plan_text") or "")
+
+            # Stage 0: local CI gate (inside dev container).
+            local_ci = pre_pr_audit.run_local_ci_gate(
+                cfg=self.cfg,
+                handle=self._h,
+                log_path=self.log_path,
+            )
+
+            # Stages 1-3: audit agents.
+            self.store.transition(
+                self.node.id,
+                State.PRE_PR_AUDITING,
+                note=f"pre-pr cycle {cycle}: audits (rubric/standards/behavior)",
+            )
+            standards_text = pre_pr_audit.collect_standards_text(self.cfg)
+            rubric = pre_pr_audit.run_rubric_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                diff_excerpt=diff_excerpt,
+                plan_text=plan_text,
+                log_path=self.log_path,
+            )
+            standards = pre_pr_audit.run_standards_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                diff_excerpt=diff_excerpt,
+                standards_text=standards_text,
+                log_path=self.log_path,
+            )
+            behavior = pre_pr_audit.run_behavior_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                expected_evidence=list(self.node.expected_evidence or []),
+                diff_excerpt=diff_excerpt,
+                plan_text=plan_text,
+                log_path=self.log_path,
+            )
+
+            cycle_result = pre_pr_audit.PipelineCycleResult(
+                cycle=cycle,
+                stages=[local_ci, rubric, standards, behavior],
+            )
+            for s in cycle_result.stages:
+                log.info(
+                    "task %s pre-pr cycle %d stage `%s`: %s",
+                    self.node.id,
+                    cycle,
+                    s.name,
+                    "PASS" if s.passed else "FAIL",
+                )
+
+            if cycle_result.passed:
+                log.info(
+                    "task %s pre-pr pipeline passed on cycle %d/%d — proceeding to open PR",
+                    self.node.id,
+                    cycle,
+                    self.cfg.pre_pr_audit_max_cycles,
+                )
+                return None
+
+            # Failure path: merge findings → triage → fixup planner.
+            self.store.transition(
+                self.node.id,
+                State.PRE_PR_TRIAGING,
+                note=(
+                    f"pre-pr cycle {cycle} failed: " + ", ".join(s.name for s in cycle_result.failed_stages)
+                ),
+            )
+            findings_block = pre_pr_audit.merge_failed_stage_reports(cycle_result.failed_stages)
+            self.store.add_artifact(
+                self.node.id,
+                f"pre_pr_audit:cycle_{cycle}",
+                findings_block,
+            )
+            outcome = self._run_fixup_round(
+                kind="fixup-pre-pr-audit",
+                round_no=cycle,
+                trigger="pre_pr_audit",
+                triage_root_cause=findings_block[:8000],
+            )
+            if outcome and outcome.final_state == State.BLOCKED:
+                # Fixup ceiling exhausted on the audit round — surface as
+                # a task BLOCK with the merged findings as the operator
+                # context. The block-forensics dump (separate path) picks
+                # this up automatically since the artifact is on the row.
+                return outcome
+            # Loop back to the top — re-run the full pipeline against
+            # whatever the doer just landed.
+
+        # Exhausted cycles.
+        note = (
+            f"pre-PR audit pipeline exhausted {self.cfg.pre_pr_audit_max_cycles} "
+            "cycle(s) without a clean pass — manual review required"
+        )
+        self.store.transition(
+            self.node.id,
+            State.BLOCKED,
+            note=note,
+            last_error=note[:1000],
+        )
+        return WorkerOutcome(State.BLOCKED, note)
+
+    def _compute_branch_diff_excerpt(self, max_lines: int = 1500) -> str:
+        """Capture the worktree branch diff against `cfg.base_branch`. Used
+        by the audit agents as the canonical "what changed" reference.
+
+        Truncated to `max_lines` so the prompts stay within model context
+        windows. The audit prompts further truncate per-stage based on
+        which stage is most diff-hungry."""
+        rc, out = self._git_in_workspace(["diff", f"{self.cfg.pr_remote}/{self.cfg.base_branch}...HEAD"])
+        if rc != 0 or not out:
+            return ""
+        lines = out.splitlines()
+        if len(lines) > max_lines:
+            head = lines[:max_lines]
+            head.append(f"... (diff truncated; {len(lines) - max_lines} more lines)")
+            return "\n".join(head)
+        return out
 
     # ----- phase: open PR + poll -----
 

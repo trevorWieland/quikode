@@ -839,6 +839,37 @@ def unblock(
     last_err = row.get("last_error") or ""
     if last_err:
         console.print(f"\n[bold]Reason:[/] {str(last_err)[:400]}")
+
+    # v3.6 BLOCKED-as-bug: surface the forensics dump so the operator can
+    # see retry pattern, recent checker outputs, and what the system was
+    # missing. The premise: a BLOCK is a system shortcoming, not a graceful
+    # gate. The dump frames "what should we have done differently?"
+    forensics = store.get_block_forensics(task_id)
+    if forensics:
+        console.print("\n[bold]Forensics:[/]")
+        cats = forensics.get("retry_categories_total") or {}
+        if cats:
+            cats_str = " ".join(
+                f"{c}={n}" for c, n in sorted(cats.items(), key=lambda kv: -kv[1])
+            )
+            console.print(f"  retry categories: [dim]{cats_str}[/]")
+        for ps in forensics.get("per_subtask") or []:
+            r = ps.get("retries") or 0
+            tr = ps.get("transient_retries") or 0
+            fl = ps.get("flatline_count") or 0
+            if r or tr or fl:
+                console.print(
+                    f"  [cyan]{ps.get('subtask_id')}[/]: retries={r} transient={tr} "
+                    f"flatline={fl}"
+                )
+        last_co = (forensics.get("last_checker_outputs") or [])[:1]
+        if last_co:
+            excerpt = (last_co[0].get("excerpt") or "")[:300]
+            console.print(f"\n  [dim]last checker output excerpt:[/]\n  {excerpt}")
+        peak = forensics.get("peak_mem_bytes")
+        if peak:
+            console.print(f"\n  peak rss: [dim]{peak / (1024**3):.1f} GB[/]")
+
     console.print("\n[bold]To unblock:[/]")
     console.print(f"  - cd {worktree_path}")
     console.print("  - investigate; commit fixes")

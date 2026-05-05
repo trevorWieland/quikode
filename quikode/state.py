@@ -19,6 +19,7 @@ are connection-bound.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -27,6 +28,8 @@ from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
+
+log = logging.getLogger("quikode.state")
 
 # ---------- Row type stubs (TypedDict — runtime is just a dict, but the
 # typechecker now knows what keys exist and what they hold). Keeps the
@@ -179,6 +182,15 @@ class State(StrEnum):
     # appended). Distinct from REPLANNING because the original spec plan
     # is preserved — fixup slices are *additive*, not replacements.
     FIXUP_PLANNING = "fixup_planning"
+    # ----- v3.6 pre-PR pipeline (4-stage gate before _open_pr) -----
+    # Final-check passing + per-subtask commits landed is no longer enough
+    # to open a PR — we run the full local-CI suite and three audit agents
+    # first. Any failure routes back through the fixup-planner with a
+    # different `kind` so the subtask loop addresses the findings before
+    # we re-run the gate.
+    LOCAL_CI_CHECKING = "local_ci_checking"  # `just ci` (or cfg-configurable) inside the dev container
+    PRE_PR_AUDITING = "pre_pr_auditing"  # rubric + standards + behavior audits
+    PRE_PR_TRIAGING = "pre_pr_triaging"  # merging audit findings → triage → fixup plan
     # ----- post-PR-open states (v3.5: split from the legacy AWAITING_MERGE) -----
     # The legacy AWAITING_MERGE was overloaded with three distinct conditions:
     #   1. PR submitted, CI still running → PENDING_CI
@@ -247,6 +259,9 @@ ACTIVE = {
     State.FIXUP_PLANNING,
     State.TRIAGING_FEEDBACK,
     State.ADDRESSING_FEEDBACK,
+    State.LOCAL_CI_CHECKING,
+    State.PRE_PR_AUDITING,
+    State.PRE_PR_TRIAGING,
     State.REBASING_TO_MAIN,
 }
 
@@ -548,6 +563,12 @@ class Store:
                 # sees a different tip, every descendant whose merge-base
                 # depended on this branch is queued for rebase.
                 ("last_observed_branch_tip_sha", "TEXT"),
+                # v3.6 BLOCKED-as-bug forensics: when a task transitions to
+                # BLOCKED, dump a comprehensive snapshot (last checker
+                # outputs, retry-reason histogram, progress-check verdicts,
+                # peak rss, last subtask state timeline) so post-mortem
+                # diagnosis doesn't require log-grepping. JSON column.
+                ("block_forensics", "TEXT"),
                 # v2.2 resume: skip the planner agent on the next provision
                 # and reconstruct Plan from the existing subtasks rows. Set by
                 # `quikode resume <id>`; cleared by the worker on consume.
@@ -749,6 +770,17 @@ class Store:
                 "INSERT INTO state_log (task_id, from_state, to_state, note, ts) VALUES (?, ?, ?, ?, ?)",
                 (task_id, from_state, new_state.value, note, now),
             )
+        # v3.6 BLOCKED-as-bug: every BLOCKED transition triggers a forensics
+        # snapshot. Best-effort — a failure here must not crash the worker
+        # (the BLOCK itself is what the operator needs first; the dump is
+        # diagnostic, not load-bearing). We avoid re-capturing if the
+        # `from_state` was already BLOCKED (defensive: re-blocking shouldn't
+        # overwrite the original snapshot's framing).
+        if new_state is State.BLOCKED and from_state != State.BLOCKED.value:
+            try:
+                self.capture_block_forensics(task_id)
+            except Exception as e:
+                log.warning("capture_block_forensics(%s) raised: %s — continuing", task_id, e)
 
     def get(self, task_id: str) -> TaskRow | None:
         # _tx_lock serializes ALL connection access (reads + writes), not
@@ -1182,6 +1214,170 @@ class Store:
                     task_id,
                 ),
             )
+
+    def get_block_forensics(self, task_id: str) -> dict | None:
+        """Read the BLOCKED-forensics JSON dump for a task. None when no
+        block has occurred (or the column is empty)."""
+        with self._tx_lock:
+            r = self.conn.execute("SELECT block_forensics FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if r is None or not r["block_forensics"]:
+            return None
+        try:
+            data = json.loads(r["block_forensics"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def set_block_forensics(self, task_id: str, snapshot: dict) -> None:
+        """Persist a forensics snapshot. Caller assembles the dict; this
+        just stores it. Snapshot is JSON-serializable; non-serializable
+        values are dropped via `default=str`."""
+        try:
+            blob = json.dumps(snapshot, default=str)[:200000]
+        except (TypeError, ValueError):
+            blob = json.dumps({"_serialization_error": True})
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET block_forensics = ?, updated_at = ? WHERE id = ?",
+                (blob, time.time(), task_id),
+            )
+
+    def capture_block_forensics(self, task_id: str) -> dict:
+        """Build + persist a comprehensive BLOCKED-forensics snapshot.
+
+        Designed for the operator's "what should the system have done
+        differently?" question — not just "what failed." Captures:
+
+          - retry-reason histogram across all subtasks
+          - last 5 distinct checker outputs (deduped on first 80 chars)
+          - last 5 triage notes
+          - last 3 progress-check verdicts
+          - peak container RSS observed
+          - last 20 state-log transitions
+          - subtasks state distribution
+
+        Returns the snapshot dict (caller can also read via
+        `get_block_forensics`).
+        """
+        snapshot: dict = {"task_id": task_id, "captured_at": time.time()}
+
+        # retry_reasons aggregate
+        with self._tx_lock:
+            sub_rows = self.conn.execute(
+                "SELECT subtask_id, retries, transient_retries, flatline_count, "
+                "pre_commit_failures, retry_reasons FROM subtasks WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        retry_summary: dict[str, int] = {}
+        per_subtask_retries: list[dict] = []
+        for sr in sub_rows:
+            d = dict(sr)
+            try:
+                rr = json.loads(d.get("retry_reasons") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                rr = []
+            cats = {}
+            for entry in rr:
+                cat = entry.get("category", "other")
+                cats[cat] = cats.get(cat, 0) + 1
+                retry_summary[cat] = retry_summary.get(cat, 0) + 1
+            per_subtask_retries.append(
+                {
+                    "subtask_id": d.get("subtask_id"),
+                    "retries": d.get("retries") or 0,
+                    "transient_retries": d.get("transient_retries") or 0,
+                    "flatline_count": d.get("flatline_count") or 0,
+                    "pre_commit_failures": d.get("pre_commit_failures") or 0,
+                    "retry_categories": cats,
+                    "recent_retry_examples": rr[-3:],
+                }
+            )
+        snapshot["retry_categories_total"] = retry_summary
+        snapshot["per_subtask"] = per_subtask_retries
+
+        # Last 5 distinct checker outputs
+        with self._tx_lock:
+            arts = self.conn.execute(
+                "SELECT kind, content FROM artifacts WHERE task_id = ? "
+                "AND kind LIKE 'subtask_checker:%' ORDER BY id DESC LIMIT 20",
+                (task_id,),
+            ).fetchall()
+        seen_starts: set[str] = set()
+        last_checker_outputs: list[dict] = []
+        for art in arts:
+            content = (art["content"] or "")[:1500]
+            head = content[:80]
+            if head in seen_starts:
+                continue
+            seen_starts.add(head)
+            last_checker_outputs.append({"kind": art["kind"], "excerpt": content})
+            if len(last_checker_outputs) >= 5:
+                break
+        snapshot["last_checker_outputs"] = last_checker_outputs
+
+        # Last 5 triage notes
+        with self._tx_lock:
+            tarts = self.conn.execute(
+                "SELECT kind, content FROM artifacts WHERE task_id = ? "
+                "AND kind LIKE 'subtask_triage:%' ORDER BY id DESC LIMIT 5",
+                (task_id,),
+            ).fetchall()
+        snapshot["last_triage_notes"] = [
+            {"kind": t["kind"], "excerpt": (t["content"] or "")[:1500]} for t in tarts
+        ]
+
+        # Last 3 progress-check verdicts
+        with self._tx_lock:
+            pc = self.conn.execute(
+                "SELECT subtask_id, verdict, rationale, ts FROM progress_checks "
+                "WHERE task_id = ? ORDER BY ts DESC LIMIT 3",
+                (task_id,),
+            ).fetchall()
+        snapshot["last_progress_checks"] = [
+            {
+                "subtask_id": p["subtask_id"],
+                "verdict": p["verdict"],
+                "rationale": (p["rationale"] or "")[:500],
+                "ts": p["ts"],
+            }
+            for p in pc
+        ]
+
+        # Peak RSS
+        with self._tx_lock:
+            rss = self.conn.execute(
+                "SELECT MAX(mem_bytes) FROM container_stats WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        snapshot["peak_mem_bytes"] = int(rss[0]) if rss and rss[0] else None
+
+        # Last 20 state transitions
+        with self._tx_lock:
+            sl = self.conn.execute(
+                "SELECT from_state, to_state, ts, note FROM state_log "
+                "WHERE task_id = ? ORDER BY ts DESC LIMIT 20",
+                (task_id,),
+            ).fetchall()
+        snapshot["recent_state_log"] = [
+            {
+                "from_state": s["from_state"],
+                "to_state": s["to_state"],
+                "ts": s["ts"],
+                "note": (s["note"] or "")[:200],
+            }
+            for s in sl
+        ]
+
+        # Subtask state distribution
+        with self._tx_lock:
+            sd = self.conn.execute(
+                "SELECT state, COUNT(*) AS n FROM subtasks WHERE task_id = ? GROUP BY state",
+                (task_id,),
+            ).fetchall()
+        snapshot["subtask_states"] = {row["state"]: int(row["n"]) for row in sd}
+
+        self.set_block_forensics(task_id, snapshot)
+        return snapshot
 
     def get_last_observed_branch_tip_sha(self, task_id: str) -> str | None:
         """Read the cascade-on-push tracker: the most recent remote-branch tip

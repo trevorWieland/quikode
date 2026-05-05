@@ -446,6 +446,88 @@ class Config(BaseModel):
         ),
     )
 
+    # ----- v3.6 pre-PR pipeline: local CI gate + 3-stage audit -----
+    pre_pr_pipeline_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the local-CI + rubric + standards + behavior gate before "
+            "opening a PR. When False, falls back to the legacy "
+            "final-check → commit → push → open-pr path."
+        ),
+    )
+    local_ci_command: str = Field(
+        default="just ci",
+        description=(
+            "Shell command run inside the dev container as the local-CI gate. "
+            "Default 'just ci' matches the tanren / fixture convention. "
+            "Output is parsed via `triage.parse_ci_failure` for structured "
+            "findings. Empty string disables the local-CI step."
+        ),
+    )
+    local_ci_timeout_s: int = Field(
+        default=1800,
+        ge=60,
+        le=7200,
+        description=(
+            "Timeout for the local-CI command. tanren's full `just ci` runs "
+            "~25min on a clean cache; 30min default leaves headroom."
+        ),
+    )
+    pre_pr_rubric_categories: list[str] = Field(
+        default_factory=lambda: [
+            "security",
+            "scalability",
+            "maintainability",
+            "extensibility",
+            "performance",
+            "type_strictness",
+        ],
+        description=(
+            "Categories the rubric agent rates 1-10. Default covers the "
+            "operator-cited concerns; add or remove via TOML override."
+        ),
+    )
+    pre_pr_rubric_min_score: int = Field(
+        default=7,
+        ge=1,
+        le=10,
+        description=(
+            "Minimum score in EVERY rubric category for the audit to pass. "
+            "Anything below this fails the gate, routing the findings into "
+            "the triage merge bundle."
+        ),
+    )
+    pre_pr_standards_profile_globs: list[str] = Field(
+        default_factory=lambda: [
+            "docs/standards/**/*.md",
+            "docs/architecture/**/*.md",
+            "AGENTS.md",
+            "CONTRIBUTING.md",
+        ],
+        description=(
+            "Glob patterns (relative to repo_path) the standards-audit agent "
+            "reads as the canonical repo standards. The agent compares the "
+            "branch's diff against these and flags non-alignment."
+        ),
+    )
+    pre_pr_audit_max_cycles: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description=(
+            "How many full pipeline cycles (CI + 3 audits → triage → fixup → "
+            "subtask loop → re-run pipeline) before BLOCKing. Each cycle is "
+            "expensive; 3 is enough that genuine fixes converge while real "
+            "stuck-points get surfaced for human review."
+        ),
+    )
+    pre_pr_audit_timeout_s: int = Field(
+        default=1200,
+        ge=60,
+        le=3600,
+        description="Per-audit-agent timeout. Each of rubric / standards / behavior runs once per cycle.",
+    )
+
     # ----- v3 Phase C: daemon supervisor -----
     daemon_heartbeat_staleness_s: int = Field(
         default=30,
@@ -691,6 +773,16 @@ def load_config(root: Path | None = None) -> Config:
         rebase_coalesce_window_s=int(
             stacking.get("rebase_coalesce_window_s", defaults.rebase_coalesce_window_s)
         ),
+        pre_pr_pipeline_enabled=bool(raw.get("pre_pr_pipeline_enabled", defaults.pre_pr_pipeline_enabled)),
+        local_ci_command=str(raw.get("local_ci_command", defaults.local_ci_command)),
+        local_ci_timeout_s=int(raw.get("local_ci_timeout_s", defaults.local_ci_timeout_s)),
+        pre_pr_rubric_categories=list(raw.get("pre_pr_rubric_categories", defaults.pre_pr_rubric_categories)),
+        pre_pr_rubric_min_score=int(raw.get("pre_pr_rubric_min_score", defaults.pre_pr_rubric_min_score)),
+        pre_pr_standards_profile_globs=list(
+            raw.get("pre_pr_standards_profile_globs", defaults.pre_pr_standards_profile_globs)
+        ),
+        pre_pr_audit_max_cycles=int(raw.get("pre_pr_audit_max_cycles", defaults.pre_pr_audit_max_cycles)),
+        pre_pr_audit_timeout_s=int(raw.get("pre_pr_audit_timeout_s", defaults.pre_pr_audit_timeout_s)),
         daemon_heartbeat_staleness_s=int(
             daemon.get("heartbeat_staleness_s", defaults.daemon_heartbeat_staleness_s)
         ),
