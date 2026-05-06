@@ -48,3 +48,55 @@ def test_opencode_invocation_skips_permissions_and_sets_dir():
     assert "--dir /workspace" in cmd
     assert "--model zai-coding-plan/glm-5.1" in cmd
     assert cmd.startswith("cat |")  # stdin pattern
+
+
+# ----- quota-exhausted detection (plan 19A) -----
+
+from quikode.agents.base import _is_quota_exhausted  # noqa: E402
+
+
+def test_quota_exhausted_zero_rc_never_matches():
+    """Even if stdout contains '429' (e.g. an agent discussing rate-limit code),
+    a successful agent call must not be classified as quota-exhausted."""
+    assert _is_quota_exhausted(0, "implementing HTTP 429 handler", "") is False
+    assert _is_quota_exhausted(0, "", "rate_limit_exceeded sample text") is False
+
+
+def test_quota_exhausted_claude_session_limit():
+    stderr = "You've hit your session limit · resets 3:45pm"
+    assert _is_quota_exhausted(1, "", stderr) is True
+
+
+def test_quota_exhausted_claude_weekly_limit():
+    stderr = "You've hit your weekly limit · resets Mon 12:00am"
+    assert _is_quota_exhausted(1, "", stderr) is True
+
+
+def test_quota_exhausted_claude_opus_limit():
+    stderr = "You've hit your Opus limit; please switch model."
+    assert _is_quota_exhausted(1, "", stderr) is True
+
+
+def test_quota_exhausted_codex_rate_limit_exceeded():
+    """Codex JSONL emits turn.failed / error with code: 'rate_limit_exceeded'."""
+    stderr = '{"type":"turn.failed","error":{"code":"rate_limit_exceeded"}}'
+    assert _is_quota_exhausted(1, "", stderr) is True
+
+
+def test_quota_exhausted_generic_429():
+    """opencode forwards upstream 429s from zai-coding-plan / anthropic."""
+    stderr = "HTTP 429 Too Many Requests"
+    assert _is_quota_exhausted(1, "", stderr) is True
+
+
+def test_quota_exhausted_quota_exceeded_phrasing():
+    stderr = "Your usage limit has been exceeded for the current period."
+    assert _is_quota_exhausted(1, "", stderr) is True
+
+
+def test_quota_exhausted_unrelated_failure_does_not_match():
+    """A normal compile error or panic shouldn't be classified as quota."""
+    stderr = "error[E0599]: no method named `foo` found in scope"
+    assert _is_quota_exhausted(101, "", stderr) is False
+    stderr = "thread 'main' panicked at 'index out of bounds'"
+    assert _is_quota_exhausted(101, "", stderr) is False
