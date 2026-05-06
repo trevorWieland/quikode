@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from quikode import fsm_runtime
 from quikode import github as gh_mod
 from quikode.config import Config
 from quikode.dag import Node
@@ -113,6 +114,79 @@ def test_commit_push_clean_tree_with_branch_ahead_pushes(tmp_path, monkeypatch):
     assert push_called == [("quikode/t-1-abc123", w.cfg.pr_remote)]
     row = w._row()
     assert row["state"] == State.PUSHING.value
+
+
+def test_commit_push_skips_redundant_commit_when_already_pushing(tmp_path, monkeypatch):
+    """v3 regression: per-subtask commit+push leaves the task in PUSHING when
+    the LAST subtask completes. _commit_push() previously fired SUBTASK_PASSED
+    unconditionally → InvalidTransition (PUSHING ↛ COMMITTING) → task FAILED
+    just before its first PR. Fix: detect PUSHING and advance directly to
+    LOCAL_CI_CHECKING."""
+    w = _worker(tmp_path)
+    w.store.upsert_pending("T-1")
+    w.handle = MagicMock(container_name="qk-stub")
+    # Walk through the FSM to PUSHING state legally.
+    w.store.transition("T-1", State.CHECKING_SUBTASK)
+    w.store.transition("T-1", State.COMMITTING)
+    w.store.transition("T-1", State.PUSHING)
+    w.store.set_field("T-1", branch="quikode/t-1-abc123")
+
+    # commit_all / push must NOT be called — the per-subtask flow already did
+    # both. If the guard is missing, _commit_push will call enter_committing,
+    # raise InvalidTransition, and these stubs would never run anyway.
+    def _no_call(*args, **kwargs):
+        raise AssertionError("commit/push should not be called when already in PUSHING")
+
+    monkeypatch.setattr(gh_mod, "commit_all", _no_call)
+    monkeypatch.setattr(gh_mod, "push", _no_call)
+
+    outcome = w._commit_push()
+
+    assert outcome is None, "fall through to pre-PR pipeline"
+    row = w._row()
+    assert row["state"] == State.LOCAL_CI_CHECKING.value
+
+
+def test_commit_push_resume_from_planning_with_all_subtasks_done(tmp_path, monkeypatch):
+    """Resume bug: when `qk resume <id>` runs on a task that had all subtasks
+    DONE in the store, _plan() lands the task in PLANNING and _subtask_loop
+    returns None without entering any subtask body. _commit_push then tried
+    to fire SUBTASK_PASSED from PLANNING → InvalidTransition. Fix: detect any
+    of {PUSHING, PLANNING, DOING_SUBTASK} and walk synthetic transitions to
+    LOCAL_CI_CHECKING."""
+    w = _worker(tmp_path)
+    w.store.upsert_pending("T-1")
+    w.handle = MagicMock(container_name="qk-stub")
+    # Land in PLANNING — the state where resume's _plan() leaves us.
+    w.store.transition("T-1", State.PROVISIONING)
+    w.store.transition("T-1", State.PLANNING)
+    w.store.set_field("T-1", branch="quikode/t-1-resumed")
+
+    def _no_call(*args, **kwargs):
+        raise AssertionError("commit/push should not run on a fully-done resume")
+
+    monkeypatch.setattr(gh_mod, "commit_all", _no_call)
+    monkeypatch.setattr(gh_mod, "push", _no_call)
+
+    outcome = w._commit_push()
+
+    assert outcome is None
+    row = w._row()
+    assert row["state"] == State.LOCAL_CI_CHECKING.value
+
+
+def test_enter_local_ci_checking_idempotent(tmp_path):
+    """Pipeline cycle 1 calls enter_local_ci_checking after _commit_push's
+    fast-forward already landed us in LOCAL_CI_CHECKING. Without the
+    idempotency guard, the second call fires ALL_SUBTASKS_DONE from
+    LOCAL_CI_CHECKING — InvalidTransition, task FAILS at the start of the
+    pre-PR pipeline."""
+    w = _worker(tmp_path)
+    w.store.upsert_pending("T-1")
+    w.store.transition("T-1", State.LOCAL_CI_CHECKING)
+    # Should not raise — this is the call from pre_pr.py:_run_pre_pr_pipeline.
+    fsm_runtime.enter_local_ci_checking(w.store, "T-1", note="cycle 1")
+    assert w._row()["state"] == State.LOCAL_CI_CHECKING.value
 
 
 def test_commit_push_clean_tree_no_commits_marks_no_diff(tmp_path, monkeypatch):

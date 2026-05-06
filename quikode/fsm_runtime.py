@@ -62,6 +62,9 @@ def enter_pushing(store: Any, task_id: str, *, note: str | None = None, **fields
 
 
 def enter_local_ci_checking(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+    state = current_state(store, task_id)
+    if state is State.LOCAL_CI_CHECKING:
+        return state
     return store.apply_event(task_id, Event.ALL_SUBTASKS_DONE, note=note, **fields)
 
 

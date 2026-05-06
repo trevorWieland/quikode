@@ -323,6 +323,10 @@ class PrePrWorkerMixin:
         rebase_outcome = self._handle_parent_rebase_if_needed()
         if rebase_outcome:
             return rebase_outcome
+        # Per-subtask flow already commit+push'd; fast-forward when the loop
+        # left us in PUSHING / PLANNING (full resume) / DOING_SUBTASK (partial).
+        if self._fast_forward_to_local_ci_if_subtasks_done():
+            return None
         fsm_runtime.enter_committing(self.store, self.node.id)
         msg = f"{self.node.id}: {self.node.title}\n\nPlanned and implemented by quikode."
         rc, out = _tw.github.commit_all(self._h, msg, log_path=self.log_path)
@@ -560,6 +564,22 @@ class PrePrWorkerMixin:
             last_error=note[:1000],
         )
         return WorkerOutcome(State.BLOCKED, note)
+
+    def _fast_forward_to_local_ci_if_subtasks_done(self: Any) -> bool:
+        cur = fsm_runtime.current_state(self.store, self.node.id)
+        if cur not in (State.PUSHING, State.PLANNING, State.DOING_SUBTASK):
+            return False
+        if cur is State.PLANNING:
+            fsm_runtime.enter_doing_subtask(self.store, self.node.id, note="resume: subtasks already DONE")
+            cur = State.DOING_SUBTASK
+        if cur is State.DOING_SUBTASK:
+            fsm_runtime.enter_checking_subtask(self.store, self.node.id, note="fast-forward")
+            fsm_runtime.enter_committing(self.store, self.node.id, note="fast-forward")
+            fsm_runtime.enter_pushing(self.store, self.node.id, note="fast-forward")
+        fsm_runtime.enter_local_ci_checking(
+            self.store, self.node.id, note="all subtasks committed and pushed via per-subtask flow"
+        )
+        return True
 
     def _compute_branch_diff_excerpt(self: Any, max_lines: int = 1500) -> str:
         """Capture the worktree branch diff against `cfg.base_branch`. Used
