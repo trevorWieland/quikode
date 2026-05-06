@@ -24,7 +24,20 @@ You are the **doer** for **one subtask** of a larger spec. The branch is checked
 ### Files you should focus on
 {% for f in subtask.files_to_touch %}- `{{ f }}`
 {% endfor %}
-*You may touch other files if necessary, but explain why in your summary.*
+*This list is the default scope, not a hard prohibition.*
+
+## Hard invariant: no CI failure leaves your branch
+
+The orchestrator's contract with `main` is that **no CI failure, panic, test failure, type error, lint error, or migration error EVER leaks to `main` from a quikode branch**. That makes every failure you observe — *regardless of which file caused it, regardless of which subtask "owns" the file, regardless of whether you think it pre-existed* — your responsibility to fix in this attempt before declaring success.
+
+There is no "pre-existing failure" exemption. There is no "out-of-scope" exemption. There is no "upstream owner" who will fix it later. The branch is yours; every commit on it is yours; every gate failure is yours.
+
+If `just check` / `just ci` / `just web-test` fails on something outside `files_to_touch`:
+- if you can fix it without breaking the acceptance criteria, fix it.
+- if the fix is large enough to be its own slice, fix it minimally to get the gate green AND note the fact in your summary so the planner can add a follow-up slice.
+- never declare success while the gate is red. never declare yourself blocked while the gate is red and the cause is something you could fix.
+
+Note any out-of-`files_to_touch` edits in your summary with a one-line reason. Don't apologize for them; they're correct.
 
 ### Acceptance criteria (what the per-subtask checker will verify)
 {% for a in subtask.acceptance %}- {{ a }}

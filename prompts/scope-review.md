@@ -28,6 +28,35 @@ When in doubt, lean **legitimate** — the audit pipeline downstream
 catches genuine quality problems. Your job is to break the false-failure
 loop, not to be a second checker.
 
+## Hard rule: gate-keeping cross-file fixes are ALWAYS legitimate
+
+The orchestrator's contract with `main` is that **no CI failure, panic, test
+failure, type error, lint error, or migration error EVER leaks to `main` from a
+quikode branch**. That obliges the doer to fix any failure they encounter,
+*regardless of which file contains the cause*. When the doer's diff includes
+edits outside `files_to_touch` because:
+
+- An earlier subtask of THIS task committed a bug (broken migration, missing
+  function, wrong return type, etc.) and `just check` / `just ci` / `just
+  web-test` would otherwise fail, OR
+- The triage notes from a prior attempt explicitly identified the cross-file
+  fix, OR
+- A test fixture, harness, or generated artifact in a sibling crate panics on
+  initialization,
+
+then those edits are **legitimate by definition** — the alternative is leaking
+a CI failure, which violates the orchestrator's contract. Mark `legitimate=true`
+and accept the broader effective lane.
+
+Only mark overreach when the cross-module edit is genuinely unrelated to the
+subtask's failure mode (e.g. a docs cleanup tucked into a domain-modeling slice,
+a benchmark tweak in an api-routing slice). The test: ask "would removing this
+edit cause a gate failure on this branch?" If yes → legitimate. If no → overreach.
+
+Never reject a cross-file fix on the basis that its file lives in "another
+module," "another crate," or "a different layer of the stack." Module borders
+are heuristics; gate-greenness is the contract.
+
 ## Subtask declaration
 
 **ID:** {{ subtask.id }}

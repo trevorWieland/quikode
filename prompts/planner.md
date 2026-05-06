@@ -124,12 +124,16 @@ The JSON must validate against this shape:
       "id": "S-09-bdd-B-0001",                        // BDD subtask: one per completes_behaviors entry
       "title": "Behavior proof for B-0001 (sign in)",
       "depends_on": ["S-05-api-routes", "S-07-cli-subcommands"],  // depends on the surfaces it witnesses
-      "files_to_touch": ["tests/bdd/features/B-0001-sign-in.feature"],
-      "boundary": "One feature file. No production-code edits.",
+      "files_to_touch": [
+        "tests/bdd/features/B-0001-sign-in.feature",
+        "tests/bdd/steps/account.steps.ts"            // step defs commonly need new bindings
+      ],
+      "boundary": "Behavior-proof slice. Feature file + the step-definition files it requires + any harness wiring needed to make the scenarios runnable. If a production bug surfaces during `just web-test`/`just bdd`, fix it here too rather than deferring — see the no-CI-leak invariant above.",
       "acceptance": [
         "feature file at tests/bdd/features/B-0001-sign-in.feature with @B-0001 feature tag",
         "@positive + @falsification scenarios for every interface in B-0001's interfaces: set",
-        "just check-bdd-tags passes against this feature"
+        "just check-bdd-tags passes against this feature",
+        "the BDD scenarios themselves run green — not just the tag checker"
       ],
       "interfaces": ["web", "api"],                   // pulled from docs/behaviors/B-0001.md frontmatter
       "notes": "Follow docs/architecture/subsystems/behavior-proof.md BDD Tagging And File Convention."
@@ -141,6 +145,16 @@ The JSON must validate against this shape:
   ]
 }
 ```
+
+## Hard invariant: no CI failure leaks to main
+
+The orchestrator's contract with `main` is that **no quikode branch ships a commit that breaks `just ci` (compile / lint / fmt / test / migration-runner / line-budget / BDD-tag / dep-boundary / etc.)**. There is no "pre-existing failure" exemption; whatever happens on this task's branch is this task's responsibility.
+
+That has two implications for your plan:
+
+1. **Subtask acceptance must include runtime exercise, not just compile-time presence.** A migration subtask's acceptance must include "the migration actually runs against a fresh DB" — not just "the file exists with the right column names." A fixture subtask must include "the fixture initializes without panicking." A surface subtask must include "the surface starts up against the test environment." The per-subtask checker uses your acceptance verbatim, so under-spec'd acceptance lets a runtime bug slip into a later subtask's lap.
+
+2. **Don't sequence subtasks so that one's runtime correctness depends on a later subtask "owning" the fix.** If S-02 commits a migration, the migration must work the moment S-02 lands — not "later when S-07 patches it." Otherwise S-03..S-06 inherit a broken DB and waste retries.
 
 ## How to break the work down
 

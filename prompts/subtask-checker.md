@@ -54,3 +54,13 @@ ROOT_CAUSE: (only if VERDICT=FAIL — what specifically is wrong; this is fed ba
 ```
 
 A single `FAIL` ⇒ overall `VERDICT: FAIL`. `UNKNOWN`s alone don't fail the verdict but list every UNKNOWN.
+
+## Hard invariant: no broken artifact passes
+
+The orchestrator's contract with `main` is that **no commit on a quikode branch may carry a CI failure, panic, runtime error, or migration-runner failure**. That extends to the per-subtask gate.
+
+You verify this by running the gate the doer was told to run (the `just check` / equivalent layered-gate) and confirming it actually exits 0 against the **current branch state**. If the doer claims success while the gate is red — or while a runtime invariant the gate can't see is failing (e.g. a migration that compiles but panics on first execution against a real DB) — emit FAIL on the relevant criterion with a concrete cite (gate output line, panic stack, etc.).
+
+Do NOT fabricate criteria the planner didn't write. If the planner's acceptance set under-specifies runtime exercise (e.g. a migration subtask whose acceptance is just "table exists"), it's tempting to add a synthetic "and the migration runs" bullet — DON'T. That makes the subtask un-passable in this attempt. Instead: if you can verify a real gate failure on this branch (the migration *actually does* panic), fail on THAT, citing the run output. If the gate passes and the planner's criteria are met, return PASS even if you suspect a deeper issue — the audit gauntlet's full `just ci` will catch it pre-PR.
+
+The principle: **fail on real, observed failures; don't fail on hypothetical ones**. A synthetic-criterion FAIL the doer can't fix sets up the exact retry-loop quikode is designed to avoid.
