@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 
 from quikode.config import Config
 from quikode.dag import DAG, Node
+from quikode.docker_env import make_handle
 from quikode.manual_probe import (
     ManualProbe,
     ManualProbeRunner,
@@ -76,8 +77,8 @@ def test_parse_returns_none_on_unrecoverable_malformed():
 def test_parse_handles_non_dict_input():
     """Passing a non-dict (which can happen if expected_evidence is
     malformed) is logged + skipped, never raised."""
-    assert parse_evidence_to_probe("a string") is None  # type: ignore[arg-type]
-    assert parse_evidence_to_probe(None) is None  # type: ignore[arg-type]
+    assert parse_evidence_to_probe("a string") is None
+    assert parse_evidence_to_probe(None) is None
 
 
 def test_collect_probes_filters_and_skips():
@@ -143,16 +144,16 @@ def _make_exec_in_stub() -> MagicMock:
         return (0, "", "")
 
     stub.side_effect = _exec
-    stub.responses = responses  # type: ignore[attr-defined]
+    stub.responses = responses
     return stub
 
 
 def test_runner_start_service_allocates_port_and_runs_in_background():
     exec_stub = _make_exec_in_stub()
     # Make `cat /tmp/qk-probe-foo.pid` return a pid.
-    exec_stub.responses["cat /tmp/qk-probe-foo.pid"] = (0, "12345\n", "")  # type: ignore[attr-defined]
+    exec_stub.responses["cat /tmp/qk-probe-foo.pid"] = (0, "12345\n", "")
     # Health check fast-pass.
-    exec_stub.responses["curl -sf"] = (0, "", "")  # type: ignore[attr-defined]
+    exec_stub.responses["curl -sf"] = (0, "", "")
 
     runner = ManualProbeRunner(handle=object(), exec_in=exec_stub)
     port = runner.start_service("foo")
@@ -169,7 +170,7 @@ def test_runner_start_service_handles_failure_cleanly():
     """When the start command fails, runner records a placeholder entry
     so probes get a clean ERROR result instead of crashing."""
     exec_stub = _make_exec_in_stub()
-    exec_stub.responses["nohup"] = (127, "", "binary not found")  # type: ignore[attr-defined]
+    exec_stub.responses["nohup"] = (127, "", "binary not found")
 
     runner = ManualProbeRunner(handle=object(), exec_in=exec_stub)
     port = runner.start_service("missing-svc")
@@ -183,7 +184,7 @@ def test_runner_start_service_handles_failure_cleanly():
 
 def test_runner_run_probe_substitutes_ports():
     exec_stub = _make_exec_in_stub()
-    exec_stub.responses["18901"] = (0, "ok", "")  # type: ignore[attr-defined]
+    exec_stub.responses["18901"] = (0, "ok", "")
 
     runner = ManualProbeRunner(handle=object(), exec_in=exec_stub)
     probe = ManualProbe(
@@ -205,7 +206,7 @@ def test_runner_run_probe_substitutes_ports():
 def test_runner_run_probe_handles_dashes_in_service_name():
     """`$PORT_tanren-mcp` and `$PORT_tanren_mcp` both substitute."""
     exec_stub = _make_exec_in_stub()
-    exec_stub.responses["19000"] = (0, "ok", "")  # type: ignore[attr-defined]
+    exec_stub.responses["19000"] = (0, "ok", "")
 
     runner = ManualProbeRunner(handle=object(), exec_in=exec_stub)
     probe = ManualProbe(
@@ -229,11 +230,11 @@ def test_runner_run_probe_captures_exec_exception_as_error_result():
 
 def test_runner_run_all_probes_starts_each_service_once():
     exec_stub = _make_exec_in_stub()
-    exec_stub.responses["cat /tmp/qk-probe-svc.pid"] = (0, "111\n", "")  # type: ignore[attr-defined]
-    exec_stub.responses["curl -sf http://localhost:18900"] = (0, "", "")  # type: ignore[attr-defined]
+    exec_stub.responses["cat /tmp/qk-probe-svc.pid"] = (0, "111\n", "")
+    exec_stub.responses["curl -sf http://localhost:18900"] = (0, "", "")
     # Probe execution.
-    exec_stub.responses["curl http://localhost:18900/a"] = (0, "okA", "")  # type: ignore[attr-defined]
-    exec_stub.responses["curl http://localhost:18900/b"] = (0, "okB", "")  # type: ignore[attr-defined]
+    exec_stub.responses["curl http://localhost:18900/a"] = (0, "okA", "")
+    exec_stub.responses["curl http://localhost:18900/b"] = (0, "okB", "")
 
     runner = ManualProbeRunner(handle=object(), exec_in=exec_stub)
     probes = [
@@ -250,7 +251,7 @@ def test_runner_run_all_probes_starts_each_service_once():
 
 def test_runner_context_manager_tears_down():
     exec_stub = _make_exec_in_stub()
-    exec_stub.responses["cat /tmp/qk-probe-svc.pid"] = (0, "777\n", "")  # type: ignore[attr-defined]
+    exec_stub.responses["cat /tmp/qk-probe-svc.pid"] = (0, "777\n", "")
 
     with ManualProbeRunner(handle=object(), exec_in=exec_stub) as runner:
         runner.start_service("svc")
@@ -325,7 +326,7 @@ def test_worker_run_manual_probes_returns_block_when_evidence_present(monkeypatc
     worker = TaskWorker(cfg, dag, store, node)
     # Pretend the container handle exists; the runner exec_in is patched
     # at the module level so the actual handle is irrelevant.
-    worker.handle = object()  # type: ignore[assignment]
+    worker.handle = make_handle("T-1")
 
     # Patch the manual_probe.exec_in injection point. Worker uses
     # `manual_probe.ManualProbeRunner(... exec_in=exec_in)` — to substitute
@@ -373,7 +374,7 @@ def test_worker_run_manual_probes_returns_empty_when_no_evidence(tmp_path):
     store.upsert_pending("T-2")
     dag = DAG(nodes={"T-2": node}, milestones={}, raw={})
     worker = TaskWorker(cfg, dag, store, node)
-    worker.handle = object()  # type: ignore[assignment]
+    worker.handle = make_handle("T-2")
 
     block = worker._run_manual_probes()
     assert block == ""

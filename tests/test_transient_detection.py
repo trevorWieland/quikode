@@ -85,7 +85,7 @@ def test_exec_timeout_marks_transient():
     batch) can free-retry."""
 
     def fake_exec_in(handle, cmd, log_path=None, stdin=None, timeout=None):
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=b"partial", stderr=b"")
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout or 0, output=b"partial", stderr=b"")
 
     with patch("quikode.agents.base.exec_in", side_effect=fake_exec_in):
         result = _exec(_StubHandle(), ["bash", "-lc", "x"], timeout=5)

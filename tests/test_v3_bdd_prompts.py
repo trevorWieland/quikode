@@ -160,7 +160,7 @@ def test_subtask_interfaces_accepts_list_from_json():
         files_to_touch=("tests/bdd/features/B-0001-sign-in.feature",),
         boundary="One feature file.",
         acceptance=("just check-bdd-tags passes",),
-        interfaces=["web", "api", "cli"],  # type: ignore[arg-type]
+        interfaces=["web", "api", "cli"],
     )
     assert s.interfaces == ("web", "api", "cli")
 

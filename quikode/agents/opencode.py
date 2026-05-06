@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..docker_env import TaskContainer
 from . import ccusage
 from .base import AgentResult, _exec
 
@@ -24,7 +23,7 @@ class OpencodeAgent:
         self.extra_args = list(extra_args or [])
 
     def run(
-        self, prompt: str, *, handle: TaskContainer, log_path: Path | None = None, timeout: int | None = None
+        self, prompt: str, *, handle: object, log_path: Path | None = None, timeout: int | None = None
     ) -> AgentResult:
         cmd = ["bash", "-lc", self._shell_invocation()]
         # Snapshot ccusage totals before/after to attribute this call's

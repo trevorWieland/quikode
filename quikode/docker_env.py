@@ -20,6 +20,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .config import Config
 
@@ -333,7 +334,7 @@ def wait_dev_ready(handle: TaskContainer, timeout_s: int = 30) -> None:
 
 
 def exec_in(
-    handle: TaskContainer,
+    handle: Any,
     cmd: list[str],
     log_path: Path | None = None,
     stdin: str | None = None,
@@ -459,7 +460,7 @@ def cleanup_all_quikode(cfg: Config | None = None) -> int:
 
     With `cfg` provided, filters by `qk_workspace=<hash>` label so we don't
     touch other workspaces' containers. Without `cfg`, falls back to global
-    cleanup (legacy behavior — used by tests / older callers)."""
+    cleanup (used by tests / older callers)."""
     label = workspace_label(cfg) if cfg else None
     n = 0
     for c in list_quikode_containers(label=label):

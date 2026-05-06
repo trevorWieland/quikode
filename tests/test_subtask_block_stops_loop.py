@@ -96,6 +96,7 @@ def _build_worker(tmp_path: Path, plan: Plan) -> TaskWorker:
     dag = _build_dag(tmp_path)
     store = Store(cfg.state_dir / "quikode.db")
     store.upsert_pending("R-001")
+    store.transition("R-001", State.PLANNING)
     store.upsert_subtasks(
         "R-001",
         [

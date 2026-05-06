@@ -75,7 +75,7 @@ def test_open_pr_skips_create_when_pr_already_exists(tmp_path):
     w.store.upsert_pending("T-CHILD")
     w.store.transition(
         "T-CHILD",
-        State.PUSHING,
+        State.PRE_PR_AUDITING,
         branch="quikode/t-child-abc",
         pr_number=144,
         pr_url="https://github.com/owner/repo/pull/144",

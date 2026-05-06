@@ -691,4 +691,4 @@ def test_merge_into_result_rejects_non_agentresult():
         raw_json="",
     )
     with pytest.raises(TypeError):
-        ccusage.merge_into_result({"rc": 0}, stats)  # type: ignore[arg-type]
+        ccusage.merge_into_result({"rc": 0}, stats)

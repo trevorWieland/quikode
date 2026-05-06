@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from quikode import stacking
-from quikode.config import Config
+from quikode.config import Config, StackingStrategy
 from quikode.dag import DAG
 from quikode.orchestrator import Orchestrator
 from quikode.state import State, Store
@@ -110,7 +110,8 @@ def test_construct_merge_base_octopus_succeeds(tmp_path, monkeypatch):
 def test_construct_merge_base_octopus_fails_falls_back_to_sequential(tmp_path, monkeypatch):
     """When octopus fails, the helper aborts + retries pairwise. Sequential
     success → returns sha."""
-    state = {"phase": "octopus", "merges_done": 0}
+    phase = ["octopus"]
+    merges_done = [0]
 
     def _fake_run(cmd, **kwargs):
         # Strip the leading `git` plus any `-c key=value` options so we
@@ -123,16 +124,13 @@ def test_construct_merge_base_octopus_fails_falls_back_to_sequential(tmp_path, m
         if verb == "checkout" and rest[:1] == ["-B"]:
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if verb == "merge" and "--abort" in rest:
-            state["phase"] = "sequential"
+            phase[0] = "sequential"
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if verb == "merge" and "--no-ff" in rest:
-            if (
-                state["phase"] == "octopus"
-                and cmd.count("quikode/r-001-aaa") + cmd.count("quikode/r-002-bbb") == 2
-            ):
+            if phase[0] == "octopus" and cmd.count("quikode/r-001-aaa") + cmd.count("quikode/r-002-bbb") == 2:
                 return subprocess.CompletedProcess(cmd, 1, "", "CONFLICT")
             # Sequential form has a single branch.
-            state["merges_done"] += 1
+            merges_done[0] += 1
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if verb == "rev-parse" and rest[:1] == ["HEAD"]:
             return subprocess.CompletedProcess(cmd, 0, "deadbeef00\n", "")
@@ -145,7 +143,7 @@ def test_construct_merge_base_octopus_fails_falls_back_to_sequential(tmp_path, m
         branch_name="quikode/r-099-base-deadbe",
     )
     assert sha == "deadbeef00"
-    assert state["merges_done"] == 2  # both sequential merges ran
+    assert merges_done[0] == 2  # both sequential merges ran
 
 
 def test_construct_merge_base_returns_none_on_unrecoverable_conflict(tmp_path, monkeypatch):
@@ -216,7 +214,7 @@ def _make_dag(tmp_path: Path, edges: list[tuple[str, list[str]]]) -> DAG:
 
 def test_picker_stamps_multi_parent_chain(tmp_path):
     """When a child has 2 stack-ready parents, the picker writes both to
-    parent_task_ids. The legacy scalar column gets the FIRST sorted id."""
+    parent_task_ids. The old scalar column gets the FIRST sorted id."""
     edges = [
         ("R-001", []),
         ("R-002", []),
@@ -226,7 +224,7 @@ def test_picker_stamps_multi_parent_chain(tmp_path):
     cfg = Config(
         repo_path=tmp_path,
         dag_path=tmp_path / "dag.json",
-        stacking_strategy="within-milestone",
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
     )
     store = Store(tmp_path / "q.db")
     o = Orchestrator(cfg, dag, store)
@@ -278,7 +276,7 @@ def test_picker_single_parent_unchanged(tmp_path):
     cfg = Config(
         repo_path=tmp_path,
         dag_path=tmp_path / "dag.json",
-        stacking_strategy="within-milestone",
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
     )
     store = Store(tmp_path / "q.db")
     o = Orchestrator(cfg, dag, store)
@@ -309,7 +307,7 @@ def test_stack_depth_uses_max_path_in_dag(tmp_path):
     store.set_parent_chain("R-099", parent_task_ids=["R-001", "R-002"], parent_branches=["a", "b"])
     # R-099 → max(R-001 depth=1, R-002 depth=2) + 1 = 3
     assert o._stack_depth("R-099") == 3
-    # R-001 has no parents → depth 1 (counts itself, matches legacy semantics)
+    # R-001 has no parents → depth 1 (counts itself, matches old semantics)
     assert o._stack_depth("R-001") == 1
 
 
@@ -407,7 +405,7 @@ def test_cascade_rebase_recurses_into_grandchildren(tmp_path, monkeypatch):
     cfg = Config(
         repo_path=tmp_path,
         dag_path=tmp_path / "dag.json",
-        stacking_strategy="within-milestone",
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
     )
     store = Store(tmp_path / "q.db")
     o = Orchestrator(cfg, dag, store)
@@ -452,7 +450,7 @@ def test_cascade_rebase_skips_terminal_descendants(tmp_path, monkeypatch):
     cfg = Config(
         repo_path=tmp_path,
         dag_path=tmp_path / "dag.json",
-        stacking_strategy="within-milestone",
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
     )
     store = Store(tmp_path / "q.db")
     o = Orchestrator(cfg, dag, store)

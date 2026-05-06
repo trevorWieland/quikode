@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from rich.markup import escape
 from textual.app import ComposeResult
@@ -162,15 +162,16 @@ class SettingsModal(ModalScreen[bool]):
         for name, kind in _MODAL_FIELDS:
             widget = self.query_one(f"#field-{name}")
             if kind == "int":
+                input_widget = cast(Input, widget)
                 try:
-                    update[name] = int(widget.value)  # type: ignore[attr-defined]
+                    update[name] = int(input_widget.value)
                 except (ValueError, TypeError):
                     self._show_error(f"{name}: must be an integer")
                     return
             elif kind == "bool":
-                update[name] = bool(widget.value)  # type: ignore[attr-defined]
+                update[name] = bool(cast(Switch, widget).value)
             elif kind == "enum":
-                v = widget.value  # type: ignore[attr-defined]
+                v = cast(Select, widget).value
                 if v in (None, Select.BLANK):
                     self._show_error(f"{name}: pick a value")
                     return

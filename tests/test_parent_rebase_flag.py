@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from concurrent.futures import Future
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
@@ -84,7 +85,7 @@ def _make_pool() -> MagicMock:
     return pool
 
 
-def _seed_parent_awaiting_merge(o: Orchestrator) -> None:
+def _seed_parent_pending_ci(o: Orchestrator) -> None:
     o.store.upsert_pending("PARENT")
     o.store.transition(
         "PARENT",
@@ -114,7 +115,7 @@ def test_active_child_gets_flag_no_duplicate_future(tmp_path):
     """An in-flight child gets `needs_parent_rebase=1` set but no extra
     worker future submitted."""
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
 
     pool = _make_pool()
@@ -140,7 +141,7 @@ def test_idle_child_gets_flag_and_rebase_future(tmp_path):
     will actually drive the rebase; the flag is harmless since the rebase
     worker clears it on success."""
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.PENDING_CI, pr_number=11)
 
     pool = _make_pool()
@@ -164,8 +165,8 @@ def test_parent_closed_clears_children_parent_branch(tmp_path):
     CLOSED (not merged), it clears `parent_pr_branch` on every non-terminal
     child so their next pick/provision goes against main."""
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
-    # Only seed CHILD-A — keeping CHILD-B out of the AWAITING_MERGE poll set
+    _seed_parent_pending_ci(o)
+    # Only seed CHILD-A — keeping CHILD-B out of the PENDING_CI poll set
     # so the per-PR-number mock below doesn't have to disambiguate.
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
 
@@ -202,7 +203,7 @@ def test_parent_closed_clears_multiple_active_children(tmp_path):
     """Multiple children stacked on a parent that closes without merge —
     all non-terminal ones get their stack metadata cleared."""
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
     _seed_stacked_child(o, "CHILD-B", state=State.PROVISIONING)
 
@@ -255,7 +256,7 @@ def _node(task_id: str = "T-CHILD") -> Node:
     )
 
 
-def _worker(tmp_path) -> TaskWorker:
+def _worker(tmp_path) -> Any:
     cfg = Config(repo_path=tmp_path, dag_path=tmp_path)
     store = Store(tmp_path / "q.db")
 
@@ -312,7 +313,7 @@ def test_handle_parent_rebase_runs_rebase_and_clears(tmp_path, monkeypatch):
         # rebase + push
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
 
     outcome = w._handle_parent_rebase_if_needed()
     assert outcome is None  # success → continue worker
@@ -355,7 +356,7 @@ def test_handle_parent_rebase_fails_returns_blocked(tmp_path, monkeypatch):
             return 1, "rejected"
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
     # Stub spawn_conflict_resolver to None (no conflict, so unused)
     monkeypatch.setattr(TaskWorker, "_spawn_conflict_resolver", lambda self: None)
 

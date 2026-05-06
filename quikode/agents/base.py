@@ -6,9 +6,9 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
-from ..docker_env import TaskContainer, exec_in
+from ..docker_env import exec_in
 from ..types import AgentResult
 
 # Re-export so existing `from .base import AgentResult` still works.
@@ -83,14 +83,14 @@ class Agent(Protocol):
         self,
         prompt: str,
         *,
-        handle: TaskContainer,
+        handle: Any,
         log_path: Path | None = None,
         timeout: int | None = None,
     ) -> AgentResult: ...
 
 
 def _exec(
-    handle: TaskContainer,
+    handle: Any,
     cmd: list[str],
     stdin: str | None = None,
     log_path: Path | None = None,

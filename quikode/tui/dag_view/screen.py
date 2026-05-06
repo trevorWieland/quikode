@@ -16,7 +16,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -26,7 +26,7 @@ from textual.screen import ModalScreen
 from textual.widget import Widget
 from textual.widgets import Static
 
-from quikode.config import load_config
+from quikode.config_loader import load_config
 from quikode.dag import DAG
 from quikode.state import Store
 
@@ -329,7 +329,7 @@ class DAGScreen(ModalScreen[str | None]):
         if verb == "filter" and args:
             kind = args[0]
             if kind in {"all", "blocked", "ready"}:
-                self._view.filter = Filter(kind=kind)  # type: ignore[arg-type]
+                self._view.filter = Filter(kind=cast(Literal["all", "blocked", "ready"], kind))
             elif kind == "milestone" and len(args) >= 2:
                 self._view.filter = Filter(kind="milestone", milestone=args[1])
             else:

@@ -107,12 +107,7 @@ def commit_subtask(
 ) -> CommitResult:
     """`git add -A && git commit && git push` for one subtask, with optional advisory lane review on drift from `subtask.files_to_touch`. `transient=True` on the result → free retry."""
     if not subtask.files_to_touch:
-        return CommitResult(
-            success=False,
-            commit_sha=None,
-            transient=False,
-            output="commit_subtask: subtask declared no files_to_touch; nothing to add",
-        )
+        return _commit_failure("commit_subtask: subtask declared no files_to_touch; nothing to add")
     declared = list(subtask.files_to_touch)
 
     # 1. Stage everything the doer + hooks produced.
@@ -123,12 +118,7 @@ def commit_subtask(
         timeout=timeout,
     )
     if rc != 0:
-        return CommitResult(
-            success=False,
-            commit_sha=None,
-            transient=False,
-            output=f"git add -A failed (rc={rc}):\n{out}\n{err}",
-        )
+        return _commit_failure(f"git add -A failed (rc={rc}):\n{out}\n{err}")
 
     # 2. Compute the actual touched set from the staging area.
     rc, diff_out, _ = exec_in(
@@ -137,8 +127,8 @@ def commit_subtask(
         log_path=log_path,
         timeout=30,
     )
-    actually_touched = [line for line in (diff_out or "").splitlines() if line.strip()]
-    accepted_files = list(actually_touched)
+    actually_touched: list[str] = [str(line) for line in (diff_out or "").splitlines() if line.strip()]
+    accepted_files: list[str] = list(actually_touched)
 
     # 3. Advisory lane review — only when there's drift AND we have a reviewer.
     # Pure subset of declared → skip the agent entirely (cheap path).
@@ -155,11 +145,8 @@ def commit_subtask(
                 log_path=log_path,
                 timeout=30,
             )
-            return CommitResult(
-                success=False,
-                commit_sha=None,
-                transient=False,
-                output=(
+            return _commit_failure(
+                (
                     f"scope review rejected commit as overreach: {review.reason}\n\n"
                     f"declared lane: {declared!r}\n"
                     f"actually touched: {actually_touched!r}\n"
@@ -199,12 +186,7 @@ def commit_subtask(
     nothing_to_commit = rc != 0 and "nothing to commit" in ((out or "") + (err or ""))
     if rc != 0 and not nothing_to_commit:
         combined = (out or "") + "\n" + (err or "")
-        return CommitResult(
-            success=False,
-            commit_sha=None,
-            transient=False,
-            output=f"git commit failed (rc={rc}):\n{combined}",
-        )
+        return _commit_failure(f"git commit failed (rc={rc}):\n{combined}")
     if nothing_to_commit:
         # Idempotent re-entry guard: if HEAD has at least one commit on
         # this branch beyond `main` (the base), the prior attempt's work
@@ -223,12 +205,7 @@ def commit_subtask(
             ahead = 0
         if ahead == 0:
             combined = (out or "") + "\n" + (err or "")
-            return CommitResult(
-                success=False,
-                commit_sha=None,
-                transient=False,
-                output=f"git commit failed (rc={rc}):\n{combined}",
-            )
+            return _commit_failure(f"git commit failed (rc={rc}):\n{combined}")
         # Fall through with ahead > 0 — capture HEAD + push (idempotent).
 
     # 5. capture the new HEAD sha.
@@ -241,6 +218,7 @@ def commit_subtask(
     commit_sha = sha_out.strip() if rc == 0 else None
 
     # 6. git push (optional).
+    result = _commit_success(commit_sha, accepted_files)
     if push:
         rc, out, err = exec_in(
             handle,
@@ -254,13 +232,19 @@ def commit_subtask(
         )
         if rc != 0:
             combined = (out or "") + "\n" + (err or "")
-            return CommitResult(
-                success=False,
+            result = _commit_failure(
+                f"git push failed (rc={rc}):\n{combined}",
                 commit_sha=commit_sha,
                 transient=_is_transient_git_failure(rc, combined),
-                output=f"git push failed (rc={rc}):\n{combined}",
             )
+    return result
 
+
+def _commit_failure(output: str, *, commit_sha: str | None = None, transient: bool = False) -> CommitResult:
+    return CommitResult(success=False, commit_sha=commit_sha, transient=transient, output=output)
+
+
+def _commit_success(commit_sha: str | None, accepted_files: list[str]) -> CommitResult:
     return CommitResult(
         success=True,
         commit_sha=commit_sha,
@@ -500,10 +484,16 @@ def prune_stale_worktrees(repo_path: Path, worktree_root: Path) -> list[Path]:
     removed: list[Path] = []
     if not worktree_root.exists():
         return removed
+    registered = _registered_worktree_paths(repo_path)
+    try:
+        removed = _remove_unregistered_worktree_dirs(worktree_root, registered)
+    except OSError as e:
+        log.warning("prune_stale_worktrees: iterdir failed on %s: %s", worktree_root, e)
+    _prune_git_worktree_records(repo_path)
+    return removed
 
-    # 1. Snapshot git's current worktree list. `git worktree list --porcelain`
-    # emits blank-line-separated stanzas; `worktree <path>` is the first line
-    # of each stanza.
+
+def _registered_worktree_paths(repo_path: Path) -> set[Path]:
     try:
         proc = subprocess.run(
             ["git", "worktree", "list", "--porcelain"],
@@ -514,7 +504,7 @@ def prune_stale_worktrees(repo_path: Path, worktree_root: Path) -> list[Path]:
         )
     except (subprocess.SubprocessError, OSError) as e:
         log.warning("prune_stale_worktrees: git worktree list failed: %s", e)
-        return removed
+        return set()
     registered: set[Path] = set()
     if proc.returncode == 0:
         for line in proc.stdout.splitlines():
@@ -523,50 +513,48 @@ def prune_stale_worktrees(repo_path: Path, worktree_root: Path) -> list[Path]:
                     registered.add(Path(line[len("worktree ") :]).resolve())
                 except OSError:
                     pass
+    return registered
 
-    # 2. Walk worktree_root and prune anything not registered. We only
-    # rmtree directories whose `.git` either doesn't exist or doesn't point
-    # back at our repo's `.git/worktrees/...` — that's the smell of a stale
-    # dir vs. one that git just hasn't re-listed yet.
-    try:
-        for child in worktree_root.iterdir():
-            if not child.is_dir():
-                continue
-            try:
-                resolved = child.resolve()
-            except OSError:
-                resolved = child
-            if resolved in registered:
-                continue
-            # If the child has a valid .git linkage, skip it — git might
-            # know about it via a different path normalization.
-            git_link = child / ".git"
-            if git_link.exists():
-                # `.git` is usually a file with `gitdir: ...` for worktrees.
-                try:
-                    if git_link.is_file():
-                        content = git_link.read_text().strip()
-                        if content.startswith("gitdir:"):
-                            # Still linked — leave it alone; the next
-                            # `git worktree prune` call below will clean
-                            # up git's records if the gitdir target is
-                            # itself stale.
-                            continue
-                    elif git_link.is_dir():
-                        # A bare nested repo, not a worktree — don't touch.
-                        continue
-                except OSError:
-                    pass
+
+def _remove_unregistered_worktree_dirs(worktree_root: Path, registered: set[Path]) -> list[Path]:
+    removed: list[Path] = []
+    for child in worktree_root.iterdir():
+        if _should_remove_worktree_dir(child, registered):
             try:
                 shutil.rmtree(child)
                 removed.append(child)
                 log.info("prune_stale_worktrees: removed stale dir %s", child)
             except OSError as e:
                 log.warning("prune_stale_worktrees: could not rmtree %s: %s", child, e)
-    except OSError as e:
-        log.warning("prune_stale_worktrees: iterdir failed on %s: %s", worktree_root, e)
+    return removed
 
-    # 3. Tell git to drop any registered worktrees whose paths are gone.
+
+def _should_remove_worktree_dir(child: Path, registered: set[Path]) -> bool:
+    if not child.is_dir():
+        return False
+    try:
+        resolved = child.resolve()
+    except OSError:
+        resolved = child
+    if resolved in registered:
+        return False
+    git_link = child / ".git"
+    return not _has_active_git_link(git_link)
+
+
+def _has_active_git_link(git_link: Path) -> bool:
+    if not git_link.exists():
+        return False
+    try:
+        if git_link.is_file():
+            return git_link.read_text().strip().startswith("gitdir:")
+        return git_link.is_dir()
+    except OSError as e:
+        log.debug("could not inspect git link %s: %s", git_link, e)
+        return False
+
+
+def _prune_git_worktree_records(repo_path: Path) -> None:
     try:
         subprocess.run(
             ["git", "worktree", "prune"],
@@ -577,8 +565,6 @@ def prune_stale_worktrees(repo_path: Path, worktree_root: Path) -> list[Path]:
         )
     except (subprocess.SubprocessError, OSError) as e:
         log.warning("prune_stale_worktrees: git worktree prune failed: %s", e)
-
-    return removed
 
 
 def list_worktrees(repo: Path) -> list[dict]:

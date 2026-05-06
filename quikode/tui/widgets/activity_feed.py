@@ -11,7 +11,7 @@ from textual.widgets import RichLog
 class ActivityEntry:
     timestamp: str  # already-formatted "HH:MM:SS"
     task_id: str
-    transition: str  # e.g. "doing → awaiting_merge"
+    transition: str  # e.g. "doing_subtask -> pending_ci"
     note: str = ""
 
 

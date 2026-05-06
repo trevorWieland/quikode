@@ -1,0 +1,579 @@
+"""Pre Pr worker mixin."""
+
+from __future__ import annotations
+
+import sys
+from typing import Any
+
+from quikode import fsm_runtime
+from quikode.state import State, SubtaskState
+from quikode.subtask_schema import FixupPlan, PlanValidationError
+from quikode.workers.outcomes import WorkerOutcome
+
+
+class _TaskWorkerGlobals:
+    def __getattr__(self: Any, name: str) -> Any:
+        return getattr(sys.modules["quikode.workers.task_worker"], name)
+
+
+_tw = _TaskWorkerGlobals()
+
+
+class PrePrWorkerMixin:
+    def _run_fixup_round(
+        self: Any,
+        *,
+        kind: str,
+        round_no: int,
+        trigger: str,
+        checker_output: str | None = None,
+        ci_excerpt: str | None = None,
+        review_threads_block: str | None = None,
+        triage_root_cause: str | None = None,
+        expected_finding_ids: list[str] | None = None,
+    ) -> WorkerOutcome | None:
+        """Plan a fixup round, append the slices to the subtasks table, and
+        run them through the same per-subtask machinery as spec subtasks.
+
+        On planner failure (parse error, empty output) falls back to the
+        monolithic `_do(attempt=...)` so we never get stuck without
+        ANY attempt at fixing the failure.
+
+        Returns:
+            None if all fixup subtasks settled (caller re-checks).
+            WorkerOutcome(BLOCKED) if a fixup subtask blocked or the
+                fixup planner failed AND the fallback also can't
+                make progress (which the caller surfaces as task BLOCKED).
+        """
+        if fsm_runtime.current_state(self.store, self.node.id) is not State.ADDRESSING_FEEDBACK:
+            fsm_runtime.enter_fixup_planning(
+                self.store,
+                self.node.id,
+                note=f"{kind} round {round_no} ({trigger})",
+            )
+        fixup_plan = self._invoke_fixup_planner(
+            kind=kind,
+            round_no=round_no,
+            trigger=trigger,
+            checker_output=checker_output,
+            ci_excerpt=ci_excerpt,
+            review_threads_block=review_threads_block,
+            triage_root_cause=triage_root_cause,
+        )
+        # Completeness check: for audit-driven fixup rounds, every
+        # `expected_finding_ids` entry must appear in the planner's
+        # `findings_addressed` AND in at least one subtask's
+        # `addresses_findings`. If any are missing, re-prompt the planner
+        # once with an explicit gap list. If still missing after the
+        # retry, BLOCK — better to surface to the operator than to ship
+        # a fixup that drops findings.
+        if (
+            fixup_plan is not None
+            and fixup_plan.subtasks
+            and expected_finding_ids
+            and kind == "fixup-pre-pr-audit"
+        ):
+            missing = self._missing_finding_coverage(fixup_plan, expected_finding_ids)
+            if missing:
+                _tw.log.warning(
+                    "fixup planner missed %d finding(s) for %s round %d; re-prompting: %s",
+                    len(missing),
+                    kind,
+                    round_no,
+                    ", ".join(sorted(missing)[:8]),
+                )
+                gap_addendum = (
+                    "## ⚠️ Coverage gap from your previous attempt\n\n"
+                    "Your previous plan missed the following finding ids — "
+                    "include each one in `findings_addressed` and assign "
+                    "each to a subtask's `addresses_findings`:\n\n"
+                    + "\n".join(f"- `{fid}`" for fid in sorted(missing))
+                    + "\n\n"
+                    "Re-emit the COMPLETE plan (do not emit only the deltas)."
+                )
+                augmented_root = (gap_addendum + "\n\n---\n\n" + (triage_root_cause or ""))[:16000]
+                fixup_plan = self._invoke_fixup_planner(
+                    kind=kind,
+                    round_no=round_no,
+                    trigger=trigger,
+                    checker_output=checker_output,
+                    ci_excerpt=ci_excerpt,
+                    review_threads_block=review_threads_block,
+                    triage_root_cause=augmented_root,
+                )
+                if fixup_plan is not None and fixup_plan.subtasks:
+                    still_missing = self._missing_finding_coverage(fixup_plan, expected_finding_ids)
+                    if still_missing:
+                        note = (
+                            f"fixup planner still missed {len(still_missing)} finding(s) "
+                            f"after re-prompt for {kind} round {round_no}: "
+                            f"{', '.join(sorted(still_missing)[:8])}; BLOCKing"
+                        )
+                        _tw.log.warning(note)
+                        fsm_runtime.block_current(
+                            self.store,
+                            self.node.id,
+                            note=note,
+                            last_error=note[:1000],
+                        )
+                        return WorkerOutcome(State.BLOCKED, note)
+        if fixup_plan is None or not fixup_plan.subtasks:
+            note = (
+                f"fixup planner returned empty/invalid plan for {kind} round "
+                f"{round_no} ({trigger}); BLOCKing for operator review"
+            )
+            _tw.log.warning(note)
+            fsm_runtime.block_current(
+                self.store,
+                self.node.id,
+                note=note,
+                last_error=note[:1000],
+            )
+            return WorkerOutcome(State.BLOCKED, note)
+
+        # Persist the new fixup subtasks (additive — does NOT delete spec rows).
+        self.store.append_subtasks(
+            self.node.id,
+            [
+                {
+                    "subtask_id": s.id,
+                    "title": s.title,
+                    "depends_on": list(s.depends_on),
+                    "files_to_touch": list(s.files_to_touch),
+                    "boundary": s.boundary,
+                    "acceptance": list(s.acceptance),
+                    "notes": s.notes,
+                    "kind": s.kind or kind,
+                }
+                for s in fixup_plan.subtasks
+            ],
+        )
+        _tw.log.info(
+            "fixup round %d (%s): planned %d subtask(s): %s",
+            round_no,
+            kind,
+            len(fixup_plan.subtasks),
+            ", ".join(s.id for s in fixup_plan.subtasks),
+        )
+        return self._run_subtask_set(list(fixup_plan.subtasks))
+
+    @staticmethod
+    def _missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -> set[str]:
+        """Compute the set of expected finding ids the plan does NOT cover.
+
+        Coverage = id appears in `plan.findings_addressed` OR in any
+        subtask's `addresses_findings`. The prompt asks the planner to
+        emit BOTH (top-level summary array + per-subtask traceability),
+        but real planners are sloppy — sometimes only one shows up.
+        Unioning the sources is the lenient + robust check: we'd rather
+        accept a plan where every finding lands in *some* slice than
+        re-prompt over a redundancy mismatch.
+        """
+        expected = set(expected_finding_ids)
+        covered: set[str] = set(plan.findings_addressed)
+        for s in plan.subtasks:
+            covered.update(s.addresses_findings)
+        return expected - covered
+
+    def _invoke_fixup_planner(
+        self: Any,
+        *,
+        kind: str,
+        round_no: int,
+        trigger: str,
+        checker_output: str | None,
+        ci_excerpt: str | None,
+        review_threads_block: str | None,
+        triage_root_cause: str | None,
+    ) -> FixupPlan | None:
+        """Run the fixup planner agent and parse its output. Returns None on
+        any error so the caller can fall back to the monolithic doer."""
+        agent = _tw.build_agent(self.cfg.planner)
+        # Build the context the planner needs: original final_acceptance,
+        # done spec subtasks, and any prior fixup subtasks (so the new round
+        # can avoid duplicating earlier fixup work).
+        rows = self.store.list_subtasks(self.node.id)
+        done_subtasks: list[dict] = []
+        prior_fixup_subtasks: list[dict] = []
+        for r in rows:
+            kind_val = (r.get("kind") or "spec") if isinstance(r, dict) else "spec"
+            row_view = {
+                "subtask_id": r["subtask_id"],
+                "title": r.get("title") or "",
+                "kind": kind_val,
+                "state": r["state"],
+            }
+            if kind_val == "spec":
+                if r["state"] == SubtaskState.DONE.value:
+                    done_subtasks.append(row_view)
+            else:
+                prior_fixup_subtasks.append(row_view)
+        original_final_acceptance: list[str] = []
+        if self.plan is not None:
+            original_final_acceptance = list(self.plan.final_acceptance)
+        prompt = _tw.prompts.fixup_planner_prompt(
+            self.cfg,
+            self.node,
+            kind=kind,
+            round_no=round_no,
+            max_rounds=self.cfg.fixup_max_rounds,
+            trigger=trigger,
+            original_final_acceptance=original_final_acceptance,
+            done_subtasks=done_subtasks,
+            prior_fixup_subtasks=prior_fixup_subtasks,
+            checker_output=checker_output,
+            ci_excerpt=ci_excerpt,
+            review_threads_block=review_threads_block,
+            triage_root_cause=triage_root_cause,
+        )
+        self._write_log_header(f"FIXUP PLANNER {kind} round {round_no}", prompt)
+
+        # rc=124 maps to either a real timeout or `agents.base._is_transient_container_failure`
+        # (codex CLI flake, container hiccup). Retry once or twice before giving up so
+        # infra noise doesn't burn fixup_max_rounds on a transient.
+        retries_left = self.cfg.fixup_planner_retries_on_transient
+        attempt_no = 0
+        while True:
+            attempt_no += 1
+            result = agent.run(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.fixup_planner_timeout_s,
+            )
+            self.store.record_agent_call(
+                self.node.id,
+                phase=f"fixup_planner:{kind}",
+                cli=self.cfg.planner.cli,
+                model=self.cfg.planner.model,
+                rc=result.rc,
+                duration_s=result.duration_s or 0,
+                tokens_used=result.tokens_used,
+                tokens_input=result.tokens_input,
+                tokens_output=result.tokens_output,
+                tokens_cached_read=result.tokens_cached_read,
+                tokens_cached_creation=result.tokens_cached_creation,
+                cost_usd=result.cost_usd,
+            )
+            self.store.add_artifact(
+                self.node.id,
+                f"fixup_planner_output:{kind}:{round_no}:attempt{attempt_no}",
+                result.stdout,
+            )
+            if result.rc == 0:
+                break
+            if result.rc == 124 and retries_left > 0:
+                retries_left -= 1
+                _tw.log.warning(
+                    "fixup planner rc=124 (timeout/transient) for %s round %d, retrying (%d left)",
+                    kind,
+                    round_no,
+                    retries_left,
+                )
+                continue
+            _tw.log.warning("fixup planner exited rc=%d (kind=%s round=%d)", result.rc, kind, round_no)
+            return None
+        try:
+            return _tw.parse_fixup_planner_output(result.stdout)
+        except PlanValidationError as e:
+            _tw.log.warning(
+                "fixup planner output didn't validate (kind=%s round=%d): %s",
+                kind,
+                round_no,
+                e,
+            )
+            return None
+
+    def _run_manual_probes(self: Any) -> str:
+        """Scan the node's `expected_evidence` for `kind="manual"` items,
+        run them through `ManualProbeRunner`, and return a pre-rendered
+        block to inject into the checker prompt.
+
+        Defensive: NEVER raises. Parse errors, runner failures, container
+        glitches all degrade to "no manual probes ran" — the checker
+        agent then judges PASS/FAIL on `just ci` + acceptance alone, the
+        same as the pre-runner behavior.
+        """
+        try:
+            probes = _tw.manual_probe.collect_probes_from_evidence(list(self.node.expected_evidence))
+        except Exception as e:
+            _tw.log.warning("manual probes: collect raised %s; skipping", e)
+            return ""
+        if not probes:
+            return ""
+        if self.handle is None:
+            _tw.log.info("manual probes: no container handle; skipping %d probe(s)", len(probes))
+            return ""
+        _tw.log.info("manual probes: running %d probe(s) for task %s", len(probes), self.node.id)
+        try:
+            with _tw.manual_probe.ManualProbeRunner(
+                handle=self.handle,
+                exec_in=_tw.exec_in,
+                log_path=self.log_path,
+                credentials=_tw.manual_probe.credentials_from_env(["TANREN_MCP_API_KEY", "TANREN_API_KEY"]),
+            ) as runner:
+                results = runner.run_all_probes(probes)
+        except Exception as e:
+            _tw.log.warning("manual probes: runner raised %s; degrading", e)
+            return ""
+        return _tw.manual_probe.render_probe_block(results)
+
+    def _commit_push(self: Any) -> WorkerOutcome | None:
+        # v3 stacked-diffs fix: parent merge may have landed during final-check.
+        rebase_outcome = self._handle_parent_rebase_if_needed()
+        if rebase_outcome:
+            return rebase_outcome
+        fsm_runtime.enter_committing(self.store, self.node.id)
+        msg = f"{self.node.id}: {self.node.title}\n\nPlanned and implemented by quikode."
+        rc, out = _tw.github.commit_all(self._h, msg, log_path=self.log_path)
+        branch = str(self._row()["branch"])
+        if rc != 0:
+            if "nothing to commit" in out or "no changes added to commit" in out:
+                # Working tree is clean. With v3 per-subtask commits, this is
+                # the common case: every subtask already committed its slice
+                # during the loop. Check if the branch carries those commits
+                # ahead of the base; if so, push and continue. Only treat as a
+                # genuine no-op when the branch is also empty.
+                ahead = _tw.github.ahead_count(
+                    self._h, branch, base=self.cfg.base_branch, log_path=self.log_path
+                )
+                if ahead > 0:
+                    _tw.log.info(
+                        "no uncommitted diff but branch is %d commits ahead of %s — proceeding to push",
+                        ahead,
+                        self.cfg.base_branch,
+                    )
+                    # fall through to push
+                else:
+                    fsm_runtime.enter_pushing(self.store, self.node.id, note="no diff before final push")
+                    fsm_runtime.enter_local_ci_checking(
+                        self.store,
+                        self.node.id,
+                        note="no diff - task already complete or doer made no changes",
+                    )
+                    _tw.sound.ding()
+                    return WorkerOutcome(State.PENDING_CI, "no diff")
+            else:
+                # commit failed for a real reason (hook gate, repo state) and
+                # the per-subtask flow already commits each slice — so a
+                # monolithic commit failure here means something the audit
+                # gauntlet would flag anyway. Block with the failure output;
+                # operator inspects the _tw.worktree.
+                raise RuntimeError(f"commit failed (post-subtasks): {out[:1000]}")
+
+        fsm_runtime.enter_pushing(self.store, self.node.id)
+        rc, out = _tw.github.push(self._h, branch, remote=self.cfg.pr_remote, log_path=self.log_path)
+        if rc != 0:
+            raise RuntimeError(f"push failed: {out[:1000]}")
+        return None
+
+    def _run_pre_pr_pipeline(self: Any) -> WorkerOutcome | None:
+        """4-stage gate before opening a PR. Returns:
+
+          - `None` on full pass (caller proceeds to `_open_pr`).
+          - `WorkerOutcome(BLOCKED)` when `cfg.pre_pr_audit_max_cycles`
+            cycles all fail — operator decides next steps via the
+            BLOCK-forensics report.
+
+        Each cycle runs all four stages (local-CI, rubric, standards,
+        behavior) regardless of failure along the way — we want a single
+        consolidated report rather than serial fail-fast that misses
+        downstream issues. Failures merge into a triage bundle, the fixup
+        planner emits subtasks (`kind="fixup-pre-pr-audit"`), the
+        per-subtask loop addresses them, then we re-enter the pipeline
+        from the top.
+        """
+        for cycle in range(1, self.cfg.pre_pr_audit_max_cycles + 1):
+            _tw.log.info(
+                "task %s: pre-pr pipeline cycle %d/%d", self.node.id, cycle, self.cfg.pre_pr_audit_max_cycles
+            )
+            # Seed the audit summary so the TUI shows queued / in-flight /
+            # done states for each stage as the cycle progresses.
+            self.store.begin_pre_pr_audit_cycle(self.node.id, cycle)
+            fsm_runtime.enter_local_ci_checking(
+                self.store,
+                self.node.id,
+                note=f"pre-pr cycle {cycle}: local-ci ({self.cfg.local_ci_command})",
+            )
+
+            # Build the diff excerpt against the base branch — every audit
+            # consumes this. Compute once per cycle (commits may have
+            # changed during the prior cycle's fixup loop).
+            diff_excerpt = self._compute_branch_diff_excerpt()
+            plan_text = str(self._row().get("plan_text") or "")
+
+            # Stage 0: local CI gate (inside dev container).
+            local_ci = _tw.pre_pr_audit.run_local_ci_gate(
+                cfg=self.cfg,
+                handle=self._h,
+                log_path=self.log_path,
+            )
+            self.store.update_pre_pr_audit_stage(
+                self.node.id,
+                cycle=cycle,
+                stage_name="local_ci",
+                passed=local_ci.passed,
+                summary=local_ci.summary,
+            )
+
+            # Stages 1-3: audit agents — each transitions PRE_PR_AUDITING
+            # with a stage-specific note so the TUI can show "rubric
+            # audit" rather than the opaque "auditing" umbrella state.
+            standards_text = _tw.pre_pr_audit.collect_standards_text(self.cfg)
+
+            fsm_runtime.enter_pre_pr_auditing(
+                self.store, self.node.id, note=f"pre-pr cycle {cycle}: rubric audit (codex)"
+            )
+            rubric = _tw.pre_pr_audit.run_rubric_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                diff_excerpt=diff_excerpt,
+                plan_text=plan_text,
+                log_path=self.log_path,
+            )
+            self.store.update_pre_pr_audit_stage(
+                self.node.id,
+                cycle=cycle,
+                stage_name="rubric",
+                passed=rubric.passed,
+                summary=rubric.summary,
+            )
+
+            fsm_runtime.enter_pre_pr_auditing(
+                self.store,
+                self.node.id,
+                note=f"pre-pr cycle {cycle}: standards audit (claude-opus)",
+            )
+            standards = _tw.pre_pr_audit.run_standards_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                diff_excerpt=diff_excerpt,
+                standards_text=standards_text,
+                log_path=self.log_path,
+            )
+            self.store.update_pre_pr_audit_stage(
+                self.node.id,
+                cycle=cycle,
+                stage_name="standards",
+                passed=standards.passed,
+                summary=standards.summary,
+            )
+
+            fsm_runtime.enter_pre_pr_auditing(
+                self.store, self.node.id, note=f"pre-pr cycle {cycle}: behavior audit (codex)"
+            )
+            behavior = _tw.pre_pr_audit.run_behavior_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                expected_evidence=list(self.node.expected_evidence or []),
+                diff_excerpt=diff_excerpt,
+                plan_text=plan_text,
+                log_path=self.log_path,
+            )
+            self.store.update_pre_pr_audit_stage(
+                self.node.id,
+                cycle=cycle,
+                stage_name="behavior",
+                passed=behavior.passed,
+                summary=behavior.summary,
+            )
+
+            cycle_result = _tw.pre_pr_audit.PipelineCycleResult(
+                cycle=cycle,
+                stages=[local_ci, rubric, standards, behavior],
+            )
+            for s in cycle_result.stages:
+                _tw.log.info(
+                    "task %s pre-pr cycle %d stage `%s`: %s",
+                    self.node.id,
+                    cycle,
+                    s.name,
+                    "PASS" if s.passed else "FAIL",
+                )
+
+            if cycle_result.passed:
+                _tw.log.info(
+                    "task %s pre-pr pipeline passed on cycle %d/%d — proceeding to open PR",
+                    self.node.id,
+                    cycle,
+                    self.cfg.pre_pr_audit_max_cycles,
+                )
+                return None
+
+            # Failure path: merge findings → triage → fixup planner.
+            fsm_runtime.enter_fixup_planning(
+                self.store,
+                self.node.id,
+                note=(
+                    f"pre-pr cycle {cycle} failed: " + ", ".join(s.name for s in cycle_result.failed_stages)
+                ),
+            )
+            findings_block = _tw.pre_pr_audit.merge_failed_stage_reports(cycle_result.failed_stages)
+            expected_finding_ids = _tw.pre_pr_audit.collect_finding_ids(cycle_result.failed_stages)
+            self.store.add_artifact(
+                self.node.id,
+                f"pre_pr_audit:cycle_{cycle}",
+                findings_block,
+            )
+            # Completeness-augmented findings block: prepend an explicit
+            # "every id below MUST appear in your `findings_addressed`"
+            # instruction so the planner cannot drop findings to fit a
+            # smaller subtask count.
+            if expected_finding_ids:
+                augmented = (
+                    "## Required finding coverage\n\n"
+                    "Every id below MUST appear in your output's "
+                    "`findings_addressed` array AND be referenced by at "
+                    "least one subtask's `addresses_findings` field. "
+                    "Dropping ids is forbidden.\n\n"
+                    + "\n".join(f"- `{fid}`" for fid in expected_finding_ids)
+                    + "\n\n---\n\n"
+                    + findings_block
+                )
+            else:
+                augmented = findings_block
+            outcome = self._run_fixup_round(
+                kind="fixup-pre-pr-audit",
+                round_no=cycle,
+                trigger="pre_pr_audit",
+                triage_root_cause=augmented[:16000],
+                expected_finding_ids=expected_finding_ids,
+            )
+            if outcome and outcome.final_state == State.BLOCKED:
+                # Fixup ceiling exhausted on the audit round — surface as
+                # a task BLOCK with the merged findings as the operator
+                # context. The block-forensics dump (separate path) picks
+                # this up automatically since the artifact is on the row.
+                return outcome
+            # Loop back to the top — re-run the full pipeline against
+            # whatever the doer just landed.
+
+        # Exhausted cycles.
+        note = (
+            f"pre-PR audit pipeline exhausted {self.cfg.pre_pr_audit_max_cycles} "
+            "cycle(s) without a clean pass — manual review required"
+        )
+        fsm_runtime.block_current(
+            self.store,
+            self.node.id,
+            note=note,
+            last_error=note[:1000],
+        )
+        return WorkerOutcome(State.BLOCKED, note)
+
+    def _compute_branch_diff_excerpt(self: Any, max_lines: int = 1500) -> str:
+        """Capture the worktree branch diff against `cfg.base_branch`. Used
+        by the audit agents as the canonical "what changed" reference.
+
+        Truncated to `max_lines` so the prompts stay within model context
+        windows. The audit prompts further truncate per-stage based on
+        which stage is most diff-hungry."""
+        rc, out = self._git_in_workspace(["diff", f"{self.cfg.pr_remote}/{self.cfg.base_branch}...HEAD"])
+        if rc != 0 or not out:
+            return ""
+        lines = out.splitlines()
+        if len(lines) > max_lines:
+            head = lines[:max_lines]
+            head.append(f"... (diff truncated; {len(lines) - max_lines} more lines)")
+            return "\n".join(head)
+        return out

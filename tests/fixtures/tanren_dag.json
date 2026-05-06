@@ -1,0 +1,71 @@
+{
+  "schema": "tanren-test",
+  "milestones": [
+    {"id": "M-0001", "title": "Foundation", "goal": "foundation", "status": "planned"},
+    {"id": "M-0002", "title": "Behaviors", "goal": "behaviors", "status": "planned"}
+  ],
+  "nodes": [
+    {
+      "id": "F-0001",
+      "kind": "foundation",
+      "milestone": "M-0001",
+      "title": "Foundation",
+      "scope": "core foundation",
+      "depends_on": [],
+      "merged_in_main": true,
+      "completes_behaviors": [],
+      "supports_behaviors": [],
+      "boundary_with_neighbors": "",
+      "expected_evidence": [],
+      "playbook": [],
+      "rationale": "",
+      "risks": []
+    },
+    {
+      "id": "R-0001",
+      "kind": "behavior",
+      "milestone": "M-0002",
+      "title": "First behavior",
+      "scope": "behavior one",
+      "depends_on": ["F-0001"],
+      "status": "merged",
+      "completes_behaviors": [],
+      "supports_behaviors": [],
+      "boundary_with_neighbors": "",
+      "expected_evidence": [],
+      "playbook": [],
+      "rationale": "",
+      "risks": []
+    },
+    {
+      "id": "R-0002",
+      "kind": "behavior",
+      "milestone": "M-0002",
+      "title": "Second behavior",
+      "scope": "behavior two",
+      "depends_on": ["R-0001"],
+      "completes_behaviors": [],
+      "supports_behaviors": [],
+      "boundary_with_neighbors": "",
+      "expected_evidence": [],
+      "playbook": [],
+      "rationale": "",
+      "risks": []
+    },
+    {
+      "id": "R-0003",
+      "kind": "behavior",
+      "milestone": "M-0002",
+      "title": "Third behavior",
+      "scope": "behavior three",
+      "depends_on": ["R-0001"],
+      "completes_behaviors": [],
+      "supports_behaviors": [],
+      "boundary_with_neighbors": "",
+      "expected_evidence": [],
+      "playbook": [],
+      "rationale": "",
+      "risks": []
+    }
+  ]
+}

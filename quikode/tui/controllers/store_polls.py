@@ -16,7 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from quikode.config import Config, load_config
+from quikode.config import Config
+from quikode.config_loader import load_config
 from quikode.dag import DAG
 from quikode.state import State
 
@@ -35,10 +36,7 @@ _SHORT_STATE = {
     "doing_subtask": "subtask_do",
     "checking_subtask": "subtask_check",
     "triaging_subtask": "subtask_triage",
-    "final_checking": "final_check",
-    "checking": "spec_check",  # v0.1 monolithic flow whole-spec checker
     "conflict_resolving": "conflict_res",
-    "intent_reviewing": "intent_rev",
     "triaging_feedback": "triaging_fb",
     "addressing_feedback": "addressing_fb",
     "pending_ci": "pending_ci",
@@ -46,33 +44,25 @@ _SHORT_STATE = {
     "merge_ready": "merge_ready",
     "local_ci_checking": "local_ci",
     "pre_pr_auditing": "pre_pr_audit",
-    "pre_pr_triaging": "pre_pr_triage",
+    "fixup_planning": "fixup_plan",
 }
 
 # Long-form descriptions used by the detail-panel phase line + briefing.
 # The state column in tables is too narrow for these.
 _LONG_STATE_DESCRIPTION = {
-    "checking": "whole-spec checker (v0.1 legacy)",
     "checking_subtask": "per-subtask checker",
     "triaging_subtask": "per-subtask triage (root-causing FAIL)",
-    "final_checking": "final whole-spec checker",
     "local_ci_checking": "local CI gate (just ci)",
     "pre_pr_auditing": "pre-PR audit gauntlet",
-    "pre_pr_triaging": "merging audit findings → fixup planner",
+    "fixup_planning": "planning fixup subtasks",
     "triaging_feedback": "Python triage of review threads",
     "addressing_feedback": "fixup planner + per-subtask doer",
     "conflict_resolving": "spawned conflict-resolver agent",
-    "intent_reviewing": "checking spec-compatibility after dep merge",
-    "rebasing": "rebasing onto current main",
     "rebasing_to_main": "rebasing onto main (parent merged)",
-    "fixup_planning": "planning fixup subtasks",
     "pending_ci": "PR open · CI running",
     "awaiting_review": "CI green · awaiting human/bot review",
     "merge_ready": "ready to merge",
     "doing_subtask": "running per-subtask doer",
-    "doing": "running whole-spec doer (v0.1 legacy)",
-    "triaging": "whole-spec triage (v0.1 legacy)",
-    "replanning": "replanning after intent review",
 }
 
 _NON_TERMINAL_AGGREGATES = {
@@ -85,12 +75,10 @@ _NON_TERMINAL_AGGREGATES = {
         State.COMMITTING.value,
         State.PUSHING.value,
         State.PR_OPENING.value,
-        State.POLLING_CI.value,
-        State.REBASING.value,
+        State.REBASING_TO_MAIN.value,
         State.CONFLICT_RESOLVING.value,
-        State.INTENT_REVIEWING.value,
-        State.REPLANNING.value,
         State.TRIAGING_FEEDBACK.value,
+        State.FIXUP_PLANNING.value,
         State.ADDRESSING_FEEDBACK.value,
     },
     "awaiting": {
@@ -183,12 +171,21 @@ class StorePoller:
         assert self._cfg is not None and self._conn is not None
         cfg = self._cfg
         c = self._conn
+        rows = self._task_rows(c)
+        task_rows, counts = self._build_task_rows(rows)
+        header = self._build_header(cfg, c, rows, counts)
+        detail = self._build_detail(selected_task_id, rows)
+        return PollSnapshot(
+            header=header,
+            tasks=task_rows,
+            activity=self._build_activity(c),
+            resources=self._build_resources(cfg, c, rows),
+            detail=detail,
+            error=None,
+        )
 
-        # --- tasks
-        # Pull every task for header counts; filter terminal states out of the
-        # main panel rows below. MERGED/ABORTED are static — they don't belong
-        # in a "live work" view, the header's `merged: N/total` covers them.
-        rows = c.execute(
+    def _task_rows(self, c: sqlite3.Connection) -> list[sqlite3.Row]:
+        return c.execute(
             "SELECT id, state, branch, pr_number, pr_url, worktree_path, "
             "ci_triage_retries, "
             "needs_intent_review, parent_task_ids, last_error, "
@@ -206,128 +203,117 @@ class StorePoller:
             "    WHEN 'pending' THEN 3 "
             "    ELSE 2 END, id"
         ).fetchall()
-        # States hidden from the primary tasks table — they're static or
-        # bulk and crowd out live work. PENDING especially: a fresh tanren
-        # workspace seeds 230+ pending rows that drown the in-flight set.
-        # All hidden buckets remain counted in the header (merged / pending
-        # implicit via `total_in_scope - merged - in_flight - awaiting -
-        # blocked`), so the operator still sees the totals.
-        _PANEL_HIDDEN = {State.MERGED.value, State.ABORTED.value, State.PENDING.value}
 
-        # last state-log entry per task (for in-state-for)
-        last_log_per_task: dict[str, float] = {}
-        for r in c.execute("SELECT task_id, MAX(ts) AS ts FROM state_log GROUP BY task_id").fetchall():
-            last_log_per_task[r["task_id"]] = float(r["ts"])
-
-        # Most recent `→ pending` transition per task — this is the start of the
-        # *current attempt*. `quikode retry` re-pends a task, so this resets
-        # naturally on retry rather than carrying lifecycle from prior runs.
-        attempt_start_per_task: dict[str, float] = {}
-        for r in c.execute(
-            "SELECT task_id, MAX(ts) AS ts FROM state_log WHERE to_state = 'pending' GROUP BY task_id"
-        ).fetchall():
-            attempt_start_per_task[r["task_id"]] = float(r["ts"])
-
+    def _build_task_rows(self, rows: list[sqlite3.Row]) -> tuple[list[TaskRowSnapshot], dict[str, int]]:
+        hidden = {State.MERGED.value, State.ABORTED.value, State.PENDING.value}
+        last_log_per_task = self._latest_state_log_ts()
+        attempt_start_per_task = self._attempt_start_ts()
         now = time.time()
+        dag = self._load_dag_cached()
         task_rows: list[TaskRowSnapshot] = []
         counts = {"in_flight": 0, "awaiting": 0, "blocked": 0, "merged": 0}
-        for r in rows:
-            state = r["state"]
+        for row in rows:
+            state = row["state"]
             for bucket, members in _NON_TERMINAL_AGGREGATES.items():
                 if state in members:
                     counts[bucket] += 1
-            if state in _PANEL_HIDDEN:
-                continue  # static; counted in header, omitted from main panel
-            in_state = _humanize_seconds(now - last_log_per_task.get(r["id"], r["created_at"]))
-            # Runtime = wall-clock since the most recent attempt began (last
-            # → pending transition). Resets on `quikode retry`, so a fresh
-            # restart shows a fresh runtime, not yesterday's accumulated hours.
-            runtime = _humanize_seconds(now - attempt_start_per_task.get(r["id"], r["created_at"]))
-            retries = str(r["ci_triage_retries"] or 0)
-            dag = self._load_dag_cached()
-            node = dag.nodes.get(r["id"]) if dag else None
+            if state in hidden:
+                continue
+            node = dag.nodes.get(row["id"]) if dag else None
             task_rows.append(
                 TaskRowSnapshot(
-                    task_id=r["id"],
+                    task_id=row["id"],
                     title=node.title if node else "",
                     milestone=node.milestone if node else "",
                     state=_SHORT_STATE.get(state, state),
-                    in_state_for=in_state,
-                    runtime=runtime,
-                    retries=retries,
-                    branch_or_pr=_branch_or_pr(r),
+                    in_state_for=_humanize_seconds(now - last_log_per_task.get(row["id"], row["created_at"])),
+                    runtime=_humanize_seconds(now - attempt_start_per_task.get(row["id"], row["created_at"])),
+                    retries=str(row["ci_triage_retries"] or 0),
+                    branch_or_pr=_branch_or_pr(row),
                 )
             )
+        return task_rows, counts
 
-        # --- activity feed: last 20 transitions
-        activity: list[ActivityEntry] = []
-        for r in c.execute(
+    def _latest_state_log_ts(self) -> dict[str, float]:
+        assert self._conn is not None
+        return {
+            row["task_id"]: float(row["ts"])
+            for row in self._conn.execute(
+                "SELECT task_id, MAX(ts) AS ts FROM state_log GROUP BY task_id"
+            ).fetchall()
+        }
+
+    def _attempt_start_ts(self) -> dict[str, float]:
+        assert self._conn is not None
+        return {
+            row["task_id"]: float(row["ts"])
+            for row in self._conn.execute(
+                "SELECT task_id, MAX(ts) AS ts FROM state_log WHERE to_state = 'pending' GROUP BY task_id"
+            ).fetchall()
+        }
+
+    def _build_activity(self, c: sqlite3.Connection) -> list[ActivityEntry]:
+        rows = c.execute(
             "SELECT task_id, from_state, to_state, note, ts FROM state_log ORDER BY ts DESC LIMIT 30"
-        ).fetchall():
-            ts_str = _dt.datetime.fromtimestamp(r["ts"], tz=ZoneInfo("UTC")).astimezone().strftime("%H:%M:%S")
-            from_s = r["from_state"] or "(start)"
-            to_s = r["to_state"]
-            activity.append(
-                ActivityEntry(
-                    timestamp=ts_str,
-                    task_id=r["task_id"],
-                    transition=f"{from_s} → {to_s}",
-                    note=r["note"] or "",
-                )
+        ).fetchall()
+        return [
+            ActivityEntry(
+                timestamp=_dt.datetime.fromtimestamp(row["ts"], tz=ZoneInfo("UTC"))
+                .astimezone()
+                .strftime("%H:%M:%S"),
+                task_id=row["task_id"],
+                transition=f"{row['from_state'] or '(start)'} → {row['to_state']}",
+                note=row["note"] or "",
             )
+            for row in rows
+        ]
 
-        # --- resources: latest container_stats per task
-        latest_stats: dict[str, sqlite3.Row] = {}
-        for r in c.execute(
-            "SELECT cs1.task_id, cs1.cpu_pct, cs1.mem_bytes "
-            "FROM container_stats cs1 "
-            "INNER JOIN ("
-            "  SELECT task_id, MAX(ts) AS mts FROM container_stats GROUP BY task_id"
-            ") cs2 ON cs1.task_id = cs2.task_id AND cs1.ts = cs2.mts"
-        ).fetchall():
-            latest_stats[r["task_id"]] = r
-        # Only show stats for tasks currently in an in-flight state.
-        in_flight_ids = {r["id"] for r in rows if r["state"] in _NON_TERMINAL_AGGREGATES["in_flight"]}
-        containers: list[ContainerSample] = []
-        for tid, r in latest_stats.items():
-            if tid not in in_flight_ids:
-                continue
-            cpu = float(r["cpu_pct"]) if r["cpu_pct"] is not None else None
-            rss = float(r["mem_bytes"]) / 1024**3 if r["mem_bytes"] is not None else None
-            containers.append(ContainerSample(task_id=tid, cpu_pct=cpu, rss_gb=rss))
-        containers.sort(key=lambda x: x.task_id)
-        host = _read_host_caps()
-
-        resources = ResourcesSnapshot(
-            host_cpus=host[0],
-            host_mem_gb=host[1],
+    def _build_resources(
+        self, cfg: Config, c: sqlite3.Connection, rows: list[sqlite3.Row]
+    ) -> ResourcesSnapshot:
+        in_flight_ids = {row["id"] for row in rows if row["state"] in _NON_TERMINAL_AGGREGATES["in_flight"]}
+        containers = [
+            sample for sample in self._latest_container_samples(c) if sample.task_id in in_flight_ids
+        ]
+        containers.sort(key=lambda sample: sample.task_id)
+        host_cpus, host_mem_gb = _read_host_caps()
+        return ResourcesSnapshot(
+            host_cpus=host_cpus,
+            host_mem_gb=host_mem_gb,
             cpu_per_task=cfg.cpu_per_task,
             mem_per_task_gb=cfg.mem_per_task_gb,
             max_parallel=cfg.max_parallel,
             containers=containers,
         )
 
-        # --- header
-        # total_in_scope is the DAG node count, not the seeded-task count —
-        # so the merged% reflects DAG progress, not just what's in SQLite.
-        dag = self._load_dag_cached()
-        if dag is not None:
-            total_tasks = len(dag.nodes)
-            seeded_ids = {r["id"] for r in rows}
-            merged_ids = {r["id"] for r in rows if r["state"] == State.MERGED.value}
-            dag_ready_unseeded = sum(
-                1
-                for nid, n in dag.nodes.items()
-                if nid not in seeded_ids and all(d in merged_ids for d in n.depends_on)
+    def _latest_container_samples(self, c: sqlite3.Connection) -> list[ContainerSample]:
+        rows = c.execute(
+            "SELECT cs1.task_id, cs1.cpu_pct, cs1.mem_bytes "
+            "FROM container_stats cs1 "
+            "INNER JOIN ("
+            "  SELECT task_id, MAX(ts) AS mts FROM container_stats GROUP BY task_id"
+            ") cs2 ON cs1.task_id = cs2.task_id AND cs1.ts = cs2.mts"
+        ).fetchall()
+        return [
+            ContainerSample(
+                task_id=row["task_id"],
+                cpu_pct=float(row["cpu_pct"]) if row["cpu_pct"] is not None else None,
+                rss_gb=float(row["mem_bytes"]) / 1024**3 if row["mem_bytes"] is not None else None,
             )
-        else:
-            total_tasks = len(rows)
-            dag_ready_unseeded = 0
-        # Tokens used this run: SUM(tokens_used) across all agent_calls. Best-effort —
-        # not every agent reports tokens, so this is a lower bound.
+            for row in rows
+        ]
+
+    def _build_header(
+        self,
+        cfg: Config,
+        c: sqlite3.Connection,
+        rows: list[sqlite3.Row],
+        counts: dict[str, int],
+    ) -> HeaderSnapshot:
+        total_tasks, dag_ready_unseeded = self._dag_progress(rows)
         tokens_row = c.execute("SELECT COALESCE(SUM(tokens_used), 0) AS t FROM agent_calls").fetchone()
         tokens_total = int(tokens_row["t"]) if tokens_row and tokens_row["t"] else None
-        header = HeaderSnapshot(
+        return HeaderSnapshot(
             workspace_path=str(self.workspace),
             stacking_strategy=cfg.stacking_strategy.value,
             max_parallel=cfg.max_parallel,
@@ -340,18 +326,21 @@ class StorePoller:
             total_in_scope=total_tasks,
             dag_ready_unseeded=dag_ready_unseeded,
             tokens_total=tokens_total,
-            orchestrator_running=False,  # wired up by app.py with parting status check
+            orchestrator_running=False,
         )
 
-        detail = self._build_detail(selected_task_id, rows)
-        return PollSnapshot(
-            header=header,
-            tasks=task_rows,
-            activity=activity,
-            resources=resources,
-            detail=detail,
-            error=None,
+    def _dag_progress(self, rows: list[sqlite3.Row]) -> tuple[int, int]:
+        dag = self._load_dag_cached()
+        if dag is None:
+            return len(rows), 0
+        seeded_ids = {row["id"] for row in rows}
+        merged_ids = {row["id"] for row in rows if row["state"] == State.MERGED.value}
+        dag_ready_unseeded = sum(
+            1
+            for node_id, node in dag.nodes.items()
+            if node_id not in seeded_ids and all(dep in merged_ids for dep in node.depends_on)
         )
+        return len(dag.nodes), dag_ready_unseeded
 
     def _build_detail(self, selected_task_id: str | None, all_rows: list[sqlite3.Row]) -> DetailSnapshot:
         if not selected_task_id or self._conn is None:
@@ -365,110 +354,16 @@ class StorePoller:
         node = dag.nodes.get(selected_task_id) if dag else None
         title = node.title if node else ""
 
-        # Phase context: latest state_log entry (note + ts) and worktree mtime.
-        # The phase line surfaces "whole-spec fixup attempt 1 · 32m in" so the
-        # user can tell something is running even when no subtask is in flight.
-        log_row = c.execute(
-            "SELECT to_state, note, ts FROM state_log WHERE task_id = ? ORDER BY ts DESC LIMIT 1",
-            (selected_task_id,),
-        ).fetchone()
-        now = time.time()
-        last_state_note = ""
-        in_state_for = ""
-        if log_row:
-            last_state_note = log_row["note"] or ""
-            in_state_for = _humanize_seconds(now - float(log_row["ts"]))
-        last_worktree_edit = ""
-        wt_path = match["worktree_path"]  # column included in the tasks SELECT above
-        if wt_path:
-            mtime = _worktree_recent_mtime(Path(wt_path))
-            if mtime is not None:
-                last_worktree_edit = _humanize_seconds(now - mtime)
-
-        # Subtasks — structured rows for the DataTable, with active-index hint.
-        sub_rows: list[SubtaskRowSnapshot] = []
-        active_idx = -1
-        active_states = {"doing", "checking", "triaging"}
-        for i, r in enumerate(
-            c.execute(
-                "SELECT subtask_id, state, retries, title FROM subtasks WHERE task_id = ? ORDER BY id",
-                (selected_task_id,),
-            ).fetchall()
-        ):
-            sub_rows.append(
-                SubtaskRowSnapshot(
-                    subtask_id=r["subtask_id"],
-                    title=r["title"] or "",
-                    state=r["state"],
-                    retries=int(r["retries"] or 0),
-                )
-            )
-            if r["state"] in active_states and active_idx < 0:
-                active_idx = i
-
-        # Agent calls — rendered newest-first (caller reverses on render).
-        calls = [
-            "  {ts}  {phase:<18s}  {cli:<8s}  rc={rc}  dur={dur}  tokens={tok}".format(
-                ts=_dt.datetime.fromtimestamp(r["ts"], tz=ZoneInfo("UTC")).astimezone().strftime("%H:%M:%S"),
-                phase=r["phase"],
-                cli=r["cli"],
-                rc=r["rc"],
-                dur=f"{r['duration_s']:.1f}s" if r["duration_s"] else "—",
-                tok=r["tokens_used"] or "—",
-            )
-            for r in c.execute(
-                "SELECT ts, phase, cli, rc, duration_s, tokens_used "
-                "FROM agent_calls WHERE task_id = ? ORDER BY ts DESC LIMIT 20",
-                (selected_task_id,),
-            ).fetchall()
-        ]
-
-        # v3 review-loop surfacing: when addressing_feedback, fish round
-        # count + active thread count out of intervention_request (JSON blob
-        # the worker stashes when it picks up a review). Best-effort — older
-        # rows may not have these fields; phase line falls back to a generic
-        # "responding to review feedback" note.
-        review_round: int | None = None
-        review_threads_count: int | None = None
-        try:
-            rr = match["review_round"]
-            review_round = int(rr) if rr is not None else None
-        except (KeyError, IndexError, ValueError, TypeError):
-            review_round = None
-        try:
-            blob = match["intervention_request"]
-            if blob:
-                parsed = json.loads(blob)
-                threads = parsed.get("threads") if isinstance(parsed, dict) else None
-                if isinstance(threads, list):
-                    review_threads_count = len(threads)
-        except (KeyError, IndexError, json.JSONDecodeError, TypeError):
-            review_threads_count = None
-
-        # v3.6 pre-PR audit gauntlet: parse the most recent cycle summary so
-        # the detail panel can render one row per stage with pass/fail/queued.
-        pre_pr_audit_cycle: int | None = None
-        pre_pr_audit_stages: list[dict] = []
-        try:
-            blob = match["pre_pr_audit_summary"]
-        except (KeyError, IndexError):
-            blob = None
-        if blob:
-            try:
-                parsed = json.loads(blob)
-                if isinstance(parsed, dict):
-                    pre_pr_audit_cycle = int(parsed["cycle"]) if parsed.get("cycle") is not None else None
-                    stages = parsed.get("stages") or []
-                    if isinstance(stages, list):
-                        pre_pr_audit_stages = [s for s in stages if isinstance(s, dict)]
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+        last_state_note, in_state_for, last_worktree_edit = self._detail_phase(selected_task_id, match)
+        sub_rows, active_idx = self._detail_subtasks(c, selected_task_id)
+        review_round, review_threads_count = _detail_review_context(match)
+        pre_pr_audit_cycle, pre_pr_audit_stages = _detail_pre_pr_audit(match)
 
         return DetailSnapshot(
             task_id=selected_task_id,
             title=title,
             subtasks=sub_rows,
-            agent_calls=calls,
+            agent_calls=self._detail_agent_calls(c, selected_task_id),
             active_subtask_idx=active_idx,
             task_state=match["state"],
             last_state_note=last_state_note,
@@ -480,8 +375,106 @@ class StorePoller:
             pre_pr_audit_stages=pre_pr_audit_stages,
         )
 
+    def _detail_phase(self, task_id: str, row: sqlite3.Row) -> tuple[str, str, str]:
+        assert self._conn is not None
+        log_row = self._conn.execute(
+            "SELECT to_state, note, ts FROM state_log WHERE task_id = ? ORDER BY ts DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        now = time.time()
+        last_state_note = log_row["note"] or "" if log_row else ""
+        in_state_for = _humanize_seconds(now - float(log_row["ts"])) if log_row else ""
+        last_worktree_edit = ""
+        wt_path = row["worktree_path"]
+        if wt_path:
+            mtime = _worktree_recent_mtime(Path(wt_path))
+            if mtime is not None:
+                last_worktree_edit = _humanize_seconds(now - mtime)
+        return last_state_note, in_state_for, last_worktree_edit
+
+    def _detail_subtasks(self, c: sqlite3.Connection, task_id: str) -> tuple[list[SubtaskRowSnapshot], int]:
+        rows = c.execute(
+            "SELECT subtask_id, state, retries, title FROM subtasks WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        active_idx = -1
+        sub_rows: list[SubtaskRowSnapshot] = []
+        active_states = {"doing", "checking", "triaging"}
+        for index, row in enumerate(rows):
+            sub_rows.append(
+                SubtaskRowSnapshot(
+                    subtask_id=row["subtask_id"],
+                    title=row["title"] or "",
+                    state=row["state"],
+                    retries=int(row["retries"] or 0),
+                )
+            )
+            if row["state"] in active_states and active_idx < 0:
+                active_idx = index
+        return sub_rows, active_idx
+
+    def _detail_agent_calls(self, c: sqlite3.Connection, task_id: str) -> list[str]:
+        rows = c.execute(
+            "SELECT ts, phase, cli, rc, duration_s, tokens_used "
+            "FROM agent_calls WHERE task_id = ? ORDER BY ts DESC LIMIT 20",
+            (task_id,),
+        ).fetchall()
+        return [
+            "  {ts}  {phase:<18s}  {cli:<8s}  rc={rc}  dur={dur}  tokens={tok}".format(
+                ts=_dt.datetime.fromtimestamp(row["ts"], tz=ZoneInfo("UTC"))
+                .astimezone()
+                .strftime("%H:%M:%S"),
+                phase=row["phase"],
+                cli=row["cli"],
+                rc=row["rc"],
+                dur=f"{row['duration_s']:.1f}s" if row["duration_s"] else "—",
+                tok=row["tokens_used"] or "—",
+            )
+            for row in rows
+        ]
+
 
 # ----- helpers -----
+
+
+def _detail_review_context(row: sqlite3.Row) -> tuple[int | None, int | None]:
+    review_round: int | None = None
+    review_threads_count: int | None = None
+    try:
+        rr = row["review_round"]
+        review_round = int(rr) if rr is not None else None
+    except (KeyError, IndexError, ValueError, TypeError):
+        review_round = None
+    try:
+        blob = row["intervention_request"]
+        if blob:
+            parsed = json.loads(blob)
+            threads = parsed.get("threads") if isinstance(parsed, dict) else None
+            if isinstance(threads, list):
+                review_threads_count = len(threads)
+    except (KeyError, IndexError, json.JSONDecodeError, TypeError):
+        review_threads_count = None
+    return review_round, review_threads_count
+
+
+def _detail_pre_pr_audit(row: sqlite3.Row) -> tuple[int | None, list[dict]]:
+    try:
+        blob = row["pre_pr_audit_summary"]
+    except (KeyError, IndexError):
+        blob = None
+    if not blob:
+        return None, []
+    try:
+        parsed = json.loads(blob)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None, []
+    if not isinstance(parsed, dict):
+        return None, []
+    cycle = int(parsed["cycle"]) if parsed.get("cycle") is not None else None
+    stages = parsed.get("stages") or []
+    if not isinstance(stages, list):
+        return cycle, []
+    return cycle, [stage for stage in stages if isinstance(stage, dict)]
 
 
 def _empty_snapshot(workspace: Path, *, error: str | None) -> PollSnapshot:

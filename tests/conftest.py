@@ -11,7 +11,7 @@ Auto-fixtures applied to every test:
   these threads, is the right future scheduled?" with deterministic input.
 
   The fixture replaces `quikode.triage.triage_review_threads` with a stub
-  that mirrors the legacy "all unresolved threads are actionable" behavior.
+  that mirrors the old "all unresolved threads are actionable" behavior.
   Tests that specifically want to verify classifier wiring should patch
   `triage_review_threads` themselves to override.
 """
@@ -25,7 +25,7 @@ from quikode import triage as triage_mod
 
 @pytest.fixture(autouse=True)
 def _disable_review_classifier(monkeypatch, request):
-    """Default: stub out the classifier; mirror legacy "all unresolved → actionable" semantics.
+    """Default: stub out the classifier; mirror old "all unresolved → actionable" semantics.
 
     Tests in `test_triage.py` (which exercise the classifier internals
     directly) opt out via the file-level `pytestmark = pytest.mark.no_classifier_stub`.

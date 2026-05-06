@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any, cast
 
-from ..docker_env import TaskContainer
 from ..types import AgentResult
 from . import ccusage
 from .base import _exec
@@ -32,7 +32,7 @@ class ClaudeAgent:
         self.extra_args = list(extra_args or [])
 
     def run(
-        self, prompt: str, *, handle: TaskContainer, log_path: Path | None = None, timeout: int | None = None
+        self, prompt: str, *, handle: object, log_path: Path | None = None, timeout: int | None = None
     ) -> AgentResult:
         cmd = ["bash", "-lc", self._shell_invocation()]
         # Snapshot ccusage totals before the call so we can fall back to a
@@ -134,7 +134,7 @@ def _safe_int(v: object) -> int | None:
     if v is None:
         return None
     try:
-        n = int(v)
+        n = int(cast(Any, v))
     except (TypeError, ValueError):
         return None
     return n if n >= 0 else None

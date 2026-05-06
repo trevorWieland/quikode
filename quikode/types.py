@@ -73,10 +73,10 @@ class AgentResult(BaseModel):
         ge=0,
         description="Tokens used to write a new cache entry.",
     )
-    cost_usd: float | None = Field(
-        default=None,
+    cost_usd: float = Field(
+        default=0.0,
         ge=0,
-        description="Provider-reported cost in USD for this invocation. None if not reported.",
+        description="Provider-reported cost in USD for this invocation. Zero if not reported.",
     )
     duration_s: float | None = Field(
         default=None,

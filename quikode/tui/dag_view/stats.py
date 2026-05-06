@@ -51,11 +51,11 @@ _IN_FLIGHT = {
     State.COMMITTING.value,
     State.PUSHING.value,
     State.PR_OPENING.value,
-    State.POLLING_CI.value,
-    State.REBASING.value,
+    State.PENDING_CI.value,
+    State.REBASING_TO_MAIN.value,
     State.CONFLICT_RESOLVING.value,
-    State.INTENT_REVIEWING.value,
-    State.REPLANNING.value,
+    State.TRIAGING_FEEDBACK.value,
+    State.FIXUP_PLANNING.value,
     State.ADDRESSING_FEEDBACK.value,
     State.REBASING_TO_MAIN.value,
 }
@@ -169,8 +169,8 @@ def compute_headline_stats(
         b
         for nid, s in states.items()
         if s == State.MERGED.value
-        for b in dag.nodes.get(nid).completes_behaviors  # type: ignore[union-attr]
         if nid in dag.nodes
+        for b in dag.nodes[nid].completes_behaviors
     }
 
     # Cost-so-far: SUM(cost_usd) over all agent_calls.

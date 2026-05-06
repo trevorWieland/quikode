@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 
 from quikode import scheduler
-from quikode.config import Config
+from quikode.config import Config, StackingStrategy
 from quikode.dag import DAG
 from quikode.orchestrator import Orchestrator
 from quikode.state import State, Store
@@ -98,7 +98,7 @@ def test_id_tiebreak_when_no_other_signal(tmp_path):
 
 
 def test_stacked_child_beats_fresh_root_with_no_dependents(tmp_path):
-    """A stacked R-002 (parent AWAITING_MERGE) should be picked over a fresh
+    """A stacked R-002 (parent PENDING_CI) should be picked over a fresh
     R-099 root. Stacking advances chain throughput; finishing a chain
     unblocks more downstream work than starting a new one."""
     edges = [
@@ -107,7 +107,7 @@ def test_stacked_child_beats_fresh_root_with_no_dependents(tmp_path):
         ("R-099", []),
     ]
     dag = _make_dag(tmp_path, edges)
-    o = _orch(tmp_path, dag, stacking_strategy="within-milestone")
+    o = _orch(tmp_path, dag, stacking_strategy=StackingStrategy.WITHIN_MILESTONE)
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
     o.store.upsert_pending("R-099")
@@ -133,7 +133,7 @@ def test_high_fan_out_root_beats_stacked_with_no_unblock(tmp_path):
     for i in range(200, 225):
         edges.append((f"R-{i:03d}", ["R-100"]))
     dag = _make_dag(tmp_path, edges)
-    o = _orch(tmp_path, dag, stacking_strategy="within-milestone")
+    o = _orch(tmp_path, dag, stacking_strategy=StackingStrategy.WITHIN_MILESTONE)
     for nid, _ in edges:
         o.store.upsert_pending(nid)
     o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
@@ -184,7 +184,7 @@ def test_resume_with_subtasks_done_beats_fresh_root(tmp_path):
 
 def test_resume_with_open_pr_beats_fresh_root(tmp_path):
     """Fresh-PENDING tasks with an existing PR (e.g. orphan-recovered after
-    AWAITING_MERGE → some path) outrank cold roots."""
+    PENDING_CI → some path) outrank cold roots."""
     edges = [("R-005", []), ("R-002", [])]
     dag = _make_dag(tmp_path, edges)
     o = _orch(tmp_path, dag)
@@ -260,7 +260,7 @@ def test_speculative_readiness_picks_child_in_addressing_feedback(tmp_path):
     parent that's ADDRESSING_FEEDBACK, mirroring v2 behavior."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
     dag = _make_dag(tmp_path, edges)
-    o = _orch(tmp_path, dag, stacking_strategy="within-milestone")
+    o = _orch(tmp_path, dag, stacking_strategy=StackingStrategy.WITHIN_MILESTONE)
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
     o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
@@ -278,7 +278,7 @@ def test_settled_readiness_skips_addressing_feedback_parent(tmp_path):
     o = _orch(
         tmp_path,
         dag,
-        stacking_strategy="within-milestone",
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
         stacking_readiness="settled",
         stack_settle_quiet_s=0,  # remove time gate; only state matters here.
     )
@@ -300,7 +300,7 @@ def test_settled_readiness_picks_when_parent_is_merge_ready(tmp_path):
     o = _orch(
         tmp_path,
         dag,
-        stacking_strategy="within-milestone",
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
         stacking_readiness="settled",
     )
     o.store.upsert_pending("R-001")
@@ -320,7 +320,7 @@ def test_settled_readiness_skips_pending_ci_parent(tmp_path):
     o = _orch(
         tmp_path,
         dag,
-        stacking_strategy="within-milestone",
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
         stacking_readiness="settled",
     )
     o.store.upsert_pending("R-001")

@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from quikode.config import DEFAULT_CONFIG_TOML, load_config
+from quikode.config_loader import load_config
+from quikode.config_template import DEFAULT_CONFIG_TOML
 from quikode.state import Store
 from quikode.tui.app import QuikodeTUI
 from quikode.tui.controllers.command_dispatch import _set_agent_role_in_toml
@@ -130,8 +131,8 @@ def test_render_entries_writes_oldest_first():
     Pure unit test — mock write() and assert order without spinning up the App."""
     feed = ActivityFeed.__new__(ActivityFeed)  # bypass Widget __init__
     written: list[str] = []
-    feed.clear = written.clear  # type: ignore[method-assign]
-    feed.write = written.append  # type: ignore[method-assign]
+    feed.clear = written.clear
+    feed.write = written.append
     entries = [
         ActivityEntry(timestamp="00:03:00", task_id="T-3", transition="C → D"),
         ActivityEntry(timestamp="00:02:00", task_id="T-2", transition="B → C"),

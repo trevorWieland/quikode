@@ -66,22 +66,18 @@ select = [
 ignore = [
     "E501",      # line length — handled by formatter
     "PLR0913",   # too many args — common in CLI handlers
-    "PLR0912",   # too many branches — orchestrator/worker have legitimately rich state machines
-    "PLR0915",   # too many statements — same
     "PLR2004",   # magic value comparisons — readable enough in this domain
     "RUF001",    # ambiguous unicode in strings — we use em-dashes intentionally
     "RUF002",    # same in docstrings
     "RUF003",    # same in comments
     "DTZ005",    # tz-naive datetime — we use time.time() for relative deltas, naive is fine
     "PERF401",   # listcomp suggestion — readability
-    "PLR0911",   # too many returns — state-machine code naturally has these
     "PLW0603",   # global statement — unused
     "SIM117",    # multiple with — readable as-is
     "ARG001",    # unused function args — typer flags often go unused in handlers
     "ARG002",    # unused method args
     "TID252",    # relative imports — package-internal, fine
     "PTH123",    # `open()` over Path — sometimes clearer
-    "PLR0904",   # too many public methods — workers/orchestrators are stateful
     "PLW1510",   # subprocess without check=True — we inspect rc deliberately
     "B008",      # function call in default argument — Path() defaults are idiomatic
     "RUF043",    # pytest match metacharacters — we know
@@ -92,13 +88,12 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["PLR2004", "S101", "ARG", "PLR0913", "T20", "B011"]
-"quikode/cli.py" = ["T20", "PLR0915"]   # cli is print-heavy by design
 
 [tool.ruff.format]
 # defaults are fine
 
-# `ty` is astral's typechecker (alpha). Treat it like a linter for now —
-# we run it manually and address the issues, not in CI yet.
+# `ty` is astral's typechecker (alpha). It is part of the required local
+# validation ladder alongside ruff and pytest.
 [tool.ty]
 # Configuration TBD; ty's config schema is still evolving.
 
@@ -107,7 +102,10 @@ python-version = "3.12"
 
 [dependency-groups]
 dev = [
+    "pytest>=9.0.0",
     "pytest-asyncio>=1.3.0",
+    "ruff>=0.15.0",
+    "ty>=0.0.1a21",
 ]
 
 [tool.pytest.ini_options]

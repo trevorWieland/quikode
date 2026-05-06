@@ -23,7 +23,7 @@ import secrets
 import time
 from pathlib import Path
 
-from ..docker_env import TaskContainer, exec_in
+from ..docker_env import exec_in
 from . import ccusage
 from .base import AgentResult, _is_transient_container_failure, parse_tokens
 
@@ -36,7 +36,7 @@ class CodexAgent:
         self.extra_args = list(extra_args or [])
 
     def run(
-        self, prompt: str, *, handle: TaskContainer, log_path: Path | None = None, timeout: int | None = None
+        self, prompt: str, *, handle: object, log_path: Path | None = None, timeout: int | None = None
     ) -> AgentResult:
         out_file = f"/tmp/qk_codex_{secrets.token_hex(4)}.txt"
         parts = [
@@ -95,10 +95,7 @@ class CodexAgent:
 
 
 def _enrich_with_ccusage(
-    base: AgentResult,
-    *,
-    handle: TaskContainer,
-    before: ccusage.CCUsageStats | None,
+    base: AgentResult, *, handle: object, before: ccusage.CCUsageStats | None
 ) -> AgentResult:
     """Override token + cost fields on `base` with the ccusage delta when
     available. ccusage is the source of truth for codex (the previous

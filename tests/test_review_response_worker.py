@@ -5,8 +5,8 @@ the fixup planner to break the threads into per-thread mini-subtasks
 instead of a monolithic doer call. These tests mock `_run_fixup_round`
 directly to assert the surrounding control flow: state transitions, thread
 resolution + addressed_in_commit_sha bookkeeping, review_round increment,
-empty-thread no-op, fixup-blocked → AWAITING_MERGE fallback, and crash
-→ AWAITING_MERGE recovery.
+empty-thread no-op, fixup-blocked → PENDING_CI fallback, and crash
+→ PENDING_CI recovery.
 """
 
 from __future__ import annotations
@@ -102,7 +102,7 @@ def _make_thread(thread_id: str = "PRRT_1") -> ReviewThread:
 
 def test_run_review_response_happy_path(tmp_path):
     """All fixup subtasks settle → threads resolved, addressed-sha stamped,
-    review_round incremented, task back to AWAITING_MERGE."""
+    review_round incremented, task back to PENDING_CI."""
     worker = _build_worker(tmp_path)
     threads = [_make_thread("PRRT_1"), _make_thread("PRRT_2")]
     resolve_calls: list[str] = []
@@ -133,8 +133,8 @@ def test_run_review_response_happy_path(tmp_path):
 
 
 def test_run_review_response_transitions_through_responding(tmp_path):
-    """State log shows AWAITING_MERGE → PROVISIONING → ADDRESSING_FEEDBACK
-    → AWAITING_MERGE (via fixup-decomposition path)."""
+    """State log shows PENDING_CI → PROVISIONING → ADDRESSING_FEEDBACK
+    → PENDING_CI (via fixup-decomposition path)."""
     worker = _build_worker(tmp_path)
     threads = [_make_thread()]
     with (
@@ -170,10 +170,10 @@ def test_run_review_response_empty_threads_noop(tmp_path):
     worker.store.conn.close()
 
 
-def test_run_review_response_fixup_blocked_returns_to_awaiting_merge(tmp_path):
+def test_run_review_response_fixup_blocked_returns_to_pending_ci(tmp_path):
     """When the fixup round itself blocks (e.g. a fixup subtask exhausts its
     hard-max attempts), the worker logs the partial progress and returns to
-    AWAITING_MERGE — review responses are human-driven, so the operator
+    PENDING_CI — review responses are human-driven, so the operator
     will re-trigger via a fresh thread or a manual retry."""
     worker = _build_worker(tmp_path)
     threads = [_make_thread()]
@@ -217,9 +217,9 @@ def test_run_review_response_resolve_failure_still_marks_addressed(tmp_path):
     worker.store.conn.close()
 
 
-def test_run_review_response_crash_returns_to_awaiting_merge(tmp_path):
+def test_run_review_response_crash_returns_to_pending_ci(tmp_path):
     """Any unexpected exception is caught and the task returns to
-    AWAITING_MERGE rather than FAILED — humans can re-comment to retry."""
+    PENDING_CI rather than FAILED — humans can re-comment to retry."""
     worker = _build_worker(tmp_path)
     threads = [_make_thread()]
     with (

@@ -29,7 +29,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -181,4 +181,5 @@ def _parse_progress_output(text: str) -> ProgressVerdict:
         )
 
     rationale = str(data.get("rationale") or "")[:500]
-    return ProgressVerdict(verdict=verdict_raw, rationale=rationale)  # type: ignore[arg-type]
+    verdict = cast(Literal["progressing", "flatlined", "uncertain"], verdict_raw)
+    return ProgressVerdict(verdict=verdict, rationale=rationale)

@@ -48,19 +48,15 @@ _IN_FLIGHT_STATES = {
     "doing_subtask",
     "checking_subtask",
     "triaging_subtask",
-    "final_checking",
     "committing",
     "pushing",
     "pr_opening",
-    "polling_ci",
-    "rebasing",
-    "conflict_resolving",
-    "intent_reviewing",
-    "replanning",
-    "fixup_planning",
-    "triaging_feedback",
-    "addressing_feedback",
+    "pending_ci",
     "rebasing_to_main",
+    "conflict_resolving",
+    "triaging_feedback",
+    "fixup_planning",
+    "addressing_feedback",
 }
 
 # State -> single-character glyph painted at the start of the node cell.
@@ -160,7 +156,11 @@ def critical_path_from(dag: DAG, anchor: str, states: dict[str, str]) -> set[str
         if not deps:
             cache_up[nid] = [nid] if is_unmerged(nid) else []
             return cache_up[nid]
-        best = max((best_up(d) for d in deps), key=len)
+        best: list[str] = []
+        for dep in deps:
+            candidate = best_up(dep)
+            if len(candidate) > len(best):
+                best = candidate
         cache_up[nid] = ([nid] if is_unmerged(nid) else []) + best
         return cache_up[nid]
 
@@ -249,6 +249,170 @@ def _glyph_for_segment(has_left: bool, has_right: bool, has_up: bool, has_down: 
     return table.get(bits, "·")
 
 
+class _EdgePainter:
+    def __init__(self, layout: _Layout, grid: list[list[Cell]]) -> None:
+        self.layout = layout
+        self.grid = grid
+        self.marks: dict[tuple[int, int], dict[str, bool]] = defaultdict(
+            lambda: {"left": False, "right": False, "up": False, "down": False, "is_path": False}
+        )
+        self.styles: dict[tuple[int, int], str] = {}
+
+    def mark(
+        self,
+        row: int,
+        col: int,
+        *,
+        left: bool = False,
+        right: bool = False,
+        up: bool = False,
+        down: bool = False,
+        style: str = "",
+        is_path: bool = False,
+    ) -> None:
+        if row < 0 or row >= self.layout.rows or col < 0 or col >= self.layout.cols:
+            return
+        mark = self.marks[(row, col)]
+        mark["left"] |= left
+        mark["right"] |= right
+        mark["up"] |= up
+        mark["down"] |= down
+        mark["is_path"] |= is_path
+        self._record_style(row, col, style, is_path)
+
+    def paint_edge(self, edge: Edge, layout_data: _CanvasLayout, states: dict[str, str]) -> None:
+        on_path = edge.source in layout_data.critical_path and edge.target in layout_data.critical_path
+        style = "cyan" if on_path else _edge_style(states.get(edge.source, ""), states.get(edge.target, ""))
+        waypoints = _edge_waypoints(edge, self.layout, layout_data.ranks, layout_data.columns)
+        for index in range(len(waypoints) - 1):
+            self._connect_waypoints(waypoints[index], waypoints[index + 1], style, on_path)
+
+    def render_edges(self) -> None:
+        for (row, col), mark in self.marks.items():
+            if row < 0 or row >= self.layout.rows or col < 0 or col >= self.layout.cols:
+                continue
+            glyph = _glyph_for_segment(mark["left"], mark["right"], mark["up"], mark["down"])
+            if self.grid[row][col].glyph == " ":
+                self.grid[row][col] = Cell(glyph=glyph, style=self.styles.get((row, col), ""))
+
+    def _record_style(self, row: int, col: int, style: str, is_path: bool) -> None:
+        prev = self.styles.get((row, col), "")
+        if is_path:
+            self.styles[(row, col)] = "cyan"
+        elif (style == "red" or prev != "red") and not (prev == "cyan" and style == "dim"):
+            self.styles[(row, col)] = style or prev
+
+    def _connect_waypoints(
+        self, first: tuple[int, int], second: tuple[int, int], style: str, on_path: bool
+    ) -> None:
+        row1, col1 = first
+        row2, col2 = second
+        if self.layout.rank_gap > 0:
+            for row in range(row1 + 1, row2):
+                self.mark(row, col1, up=True, down=True, style=style, is_path=on_path)
+        self.mark(row1, col1, down=True, style=style, is_path=on_path)
+        self._connect_horizontal(row2, col1, col2, style, on_path)
+        self.mark(row2, col2, up=True, style=style, is_path=on_path)
+
+    def _connect_horizontal(self, target_row: int, col1: int, col2: int, style: str, on_path: bool) -> None:
+        if col1 == col2:
+            return
+        horiz_row = target_row - 1 if self.layout.rank_gap > 0 else target_row
+        lo, hi = min(col1, col2), max(col1, col2)
+        for col in range(lo, hi + 1):
+            self.mark(
+                horiz_row,
+                col,
+                left=col > lo,
+                right=col < hi,
+                style=style,
+                is_path=on_path,
+            )
+        self.mark(horiz_row, col1, up=True, right=col2 > col1, left=col2 < col1, style=style, is_path=on_path)
+        self.mark(
+            horiz_row, col2, down=True, right=col2 < col1, left=col2 > col1, style=style, is_path=on_path
+        )
+
+
+@dataclass
+class _CanvasLayout:
+    keep: set[str] | None
+    layout: _Layout
+    ranks: dict[str, int]
+    columns: dict[str, int]
+    critical_path: set[str]
+
+
+def _edge_waypoints(
+    edge: Edge,
+    layout: _Layout,
+    ranks_map: dict[str, int],
+    columns_map: dict[str, int],
+) -> list[tuple[int, int]]:
+    waypoints = [(layout.row_of_rank(ranks_map[edge.source]), layout.col_of(columns_map[edge.source]) + 1)]
+    waypoints.extend((layout.row_of_rank(row), layout.col_of(col) + 1) for row, col in edge.cells)
+    waypoints.append(
+        (layout.row_of_rank(ranks_map[edge.target]), layout.col_of(columns_map[edge.target]) + 1)
+    )
+    return waypoints
+
+
+def _build_canvas_layout(
+    dag: DAG,
+    ranks_map: dict[str, int],
+    columns_map: dict[str, int],
+    states: dict[str, str],
+    filt: Filter | None,
+    rank_gap: int,
+    critical_path: set[str] | None,
+) -> _CanvasLayout | None:
+    keep = _filtered_ids(dag, states, filt)
+    if not ranks_map:
+        return None
+    n_cols_per_rank: dict[int, int] = defaultdict(int)
+    for node_id, rank in ranks_map.items():
+        if keep is None or node_id in keep:
+            n_cols_per_rank[rank] = max(n_cols_per_rank[rank], columns_map[node_id] + 1)
+    layout = _Layout(
+        n_ranks=max(ranks_map.values()) + 1,
+        n_cols=max(n_cols_per_rank.values(), default=0),
+        rank_gap=rank_gap,
+    )
+    if layout.rows == 0 or layout.cols == 0:
+        return None
+    return _CanvasLayout(keep, layout, ranks_map, columns_map, critical_path or set())
+
+
+def _paint_nodes(
+    dag: DAG,
+    grid: list[list[Cell]],
+    layout_data: _CanvasLayout,
+    *,
+    states: dict[str, str],
+    anchor: str | None,
+) -> None:
+    for node_id, node in dag.nodes.items():
+        if layout_data.keep is not None and node_id not in layout_data.keep:
+            continue
+        row = layout_data.layout.row_of_rank(layout_data.ranks[node_id])
+        col = layout_data.layout.col_of(layout_data.columns[node_id])
+        state = states.get(node_id, "")
+        style = "cyan" if node_id in layout_data.critical_path else _node_style(state)
+        label = _node_label(node_id, state, anchor)
+        for index, char in enumerate(label):
+            if col + index < layout_data.layout.cols:
+                grid[row][col + index] = Cell(glyph=char, style=style)
+        _ = node.milestone
+
+
+def _node_label(node_id: str, state: str, anchor: str | None) -> str:
+    glyph = _node_glyph(state)
+    label = f"{glyph}{node_id}"[:NODE_W]
+    if anchor == node_id and len(label) + 2 <= NODE_W:
+        return f"[{glyph}{node_id}]"[:NODE_W]
+    return label
+
+
 def ascii_canvas(
     dag: DAG,
     ranks_map: dict[str, int],
@@ -268,139 +432,21 @@ def ascii_canvas(
     `critical_path` (if given) is a set of node ids to render in cyan
     along with their incident edges.
     """
-    keep = _filtered_ids(dag, states, filter)
-    if not ranks_map:
+    layout_data = _build_canvas_layout(dag, ranks_map, columns_map, states, filter, rank_gap, critical_path)
+    if layout_data is None:
         return []
-    n_ranks = max(ranks_map.values()) + 1
-    n_cols_per_rank: dict[int, int] = defaultdict(int)
-    for nid, r in ranks_map.items():
-        if keep is not None and nid not in keep:
+    grid: list[list[Cell]] = [
+        [Cell() for _ in range(layout_data.layout.cols)] for _ in range(layout_data.layout.rows)
+    ]
+    painter = _EdgePainter(layout_data.layout, grid)
+    for edge in edges_list:
+        if layout_data.keep is not None and (
+            edge.source not in layout_data.keep or edge.target not in layout_data.keep
+        ):
             continue
-        n_cols_per_rank[r] = max(n_cols_per_rank[r], columns_map[nid] + 1)
-    n_cols = max(n_cols_per_rank.values(), default=0)
-    layout = _Layout(n_ranks=n_ranks, n_cols=n_cols, rank_gap=rank_gap)
-    if layout.rows == 0 or layout.cols == 0:
-        return []
-    grid: list[list[Cell]] = [[Cell() for _ in range(layout.cols)] for _ in range(layout.rows)]
-
-    # Track which cells get marked by edges; we coalesce glyphs per cell.
-    edge_marks: dict[tuple[int, int], dict[str, bool]] = defaultdict(
-        lambda: {"left": False, "right": False, "up": False, "down": False, "is_path": False}
-    )
-    edge_styles: dict[tuple[int, int], str] = {}
-
-    def _mark(rr: int, cc: int, *, left=False, right=False, up=False, down=False, style="", is_path=False):
-        if rr < 0 or rr >= layout.rows or cc < 0 or cc >= layout.cols:
-            return
-        m = edge_marks[(rr, cc)]
-        m["left"] |= left
-        m["right"] |= right
-        m["up"] |= up
-        m["down"] |= down
-        m["is_path"] |= is_path
-        # Highest-priority style wins: critical path > red > cyan > dim > default.
-        prev = edge_styles.get((rr, cc), "")
-        if is_path:
-            edge_styles[(rr, cc)] = "cyan"
-        elif (style == "red" or prev != "red") and not (prev == "cyan" and style == "dim"):
-            edge_styles[(rr, cc)] = style or prev
-
-    # 1) Paint edges first (so node cells overwrite any glyph collisions).
-    for e in edges_list:
-        if keep is not None and (e.source not in keep or e.target not in keep):
-            continue
-        ss = states.get(e.source, "")
-        ts = states.get(e.target, "")
-        on_path = bool(critical_path) and e.source in critical_path and e.target in critical_path
-        style = "cyan" if on_path else _edge_style(ss, ts)
-
-        sr, sc = ranks_map[e.source], columns_map[e.source]
-        tr, tc = ranks_map[e.target], columns_map[e.target]
-        # Build the chain of (row, col) waypoints.
-        waypoints: list[tuple[int, int]] = []
-        # Start: just below the source node cell
-        waypoints.append((layout.row_of_rank(sr), layout.col_of(sc) + 1))
-        # Intermediate dummy cells (long-edge midpoints)
-        for rr_intermed, cc_intermed in e.cells:
-            waypoints.append((layout.row_of_rank(rr_intermed), layout.col_of(cc_intermed) + 1))
-        waypoints.append((layout.row_of_rank(tr), layout.col_of(tc) + 1))
-
-        # Connect each waypoint pair: drop down rank_gap rows between, then
-        # slide horizontally to the target column. We mark "down" exits and
-        # "up" entrances on node rows, and horizontal sliding on the gap row.
-        for i in range(len(waypoints) - 1):
-            r1, c1 = waypoints[i]
-            r2, c2 = waypoints[i + 1]
-            # Drop from r1 to r1+rank_gap (vertical column of '│')
-            if rank_gap > 0:
-                for rr in range(r1 + 1, r2):
-                    _mark(rr, c1, up=True, down=True, style=style, is_path=on_path)
-            # Mark exit from source node row (down)
-            _mark(r1, c1, down=True, style=style, is_path=on_path)
-            # Horizontal slide on row r2 - 1 if columns differ
-            if c1 != c2:
-                horiz_row = r2 - 1 if rank_gap > 0 else r2
-                lo, hi = min(c1, c2), max(c1, c2)
-                for cc in range(lo, hi + 1):
-                    is_left = cc > lo
-                    is_right = cc < hi
-                    _mark(horiz_row, cc, left=is_left, right=is_right, style=style, is_path=on_path)
-                # corners: at lo end and hi end the vertical drop joins horizontal
-                # (already marked via the vertical loop's marks)
-                # Mark the corner where vertical from c1 meets horizontal:
-                #   above: c1 going down; below: horizontal extending toward c2
-                _mark(
-                    horiz_row,
-                    c1,
-                    up=True,
-                    right=(c2 > c1),
-                    left=(c2 < c1),
-                    style=style,
-                    is_path=on_path,
-                )
-                _mark(
-                    horiz_row,
-                    c2,
-                    down=True,
-                    right=(c2 < c1),
-                    left=(c2 > c1),
-                    style=style,
-                    is_path=on_path,
-                )
-            # Mark entry to target node (up)
-            _mark(r2, c2, up=True, style=style, is_path=on_path)
-
-    # Render edge cells from marks.
-    for (rr, cc), m in edge_marks.items():
-        if rr < 0 or rr >= layout.rows or cc < 0 or cc >= layout.cols:
-            continue
-        glyph = _glyph_for_segment(m["left"], m["right"], m["up"], m["down"])
-        if grid[rr][cc].glyph == " ":  # only paint where empty
-            grid[rr][cc] = Cell(glyph=glyph, style=edge_styles.get((rr, cc), ""))
-
-    # 2) Paint nodes (overwrites any conflicting edge glyphs at their cell).
-    for nid, n in dag.nodes.items():
-        if keep is not None and nid not in keep:
-            continue
-        rr = layout.row_of_rank(ranks_map[nid])
-        cc = layout.col_of(columns_map[nid])
-        st = states.get(nid, "")
-        on_path = bool(critical_path) and nid in critical_path
-        style = "cyan" if on_path else _node_style(st)
-        glyph = _node_glyph(st)
-        # Compose label: glyph + space + id, truncated to NODE_W.
-        label = f"{glyph}{nid}"[:NODE_W]
-        # Highlight anchor with brackets if it fits; else accept the truncation.
-        if anchor == nid and len(label) + 2 <= NODE_W:
-            label = f"[{glyph}{nid}]"[:NODE_W]
-        for i, ch in enumerate(label):
-            if cc + i < layout.cols:
-                grid[rr][cc + i] = Cell(glyph=ch, style=style)
-        # Mark milestone (used optionally by the `m` overlay) — n.milestone
-        # is read here but we don't draw boxes in v1. The screen widget
-        # can read this back from the layout + columns_map if it wants to.
-        _ = n.milestone
-
+        painter.paint_edge(edge, layout_data, states)
+    painter.render_edges()
+    _paint_nodes(dag, grid, layout_data, states=states, anchor=anchor)
     return grid
 
 

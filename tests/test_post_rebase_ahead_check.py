@@ -15,6 +15,7 @@ This test exercises the three rebase entry points:
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import quikode.worker as worker_mod
@@ -43,7 +44,7 @@ def _node(task_id: str = "T-X") -> Node:
     )
 
 
-def _worker(tmp_path) -> TaskWorker:
+def _worker(tmp_path) -> Any:
     cfg = Config(repo_path=tmp_path, dag_path=tmp_path)
     store = Store(tmp_path / "q.db")
 
@@ -81,7 +82,7 @@ def test_rebase_to_base_branch_blocks_when_ahead_zero(tmp_path):
             raise AssertionError("push should not run when branch is 0 ahead")
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
 
     ok = w._rebase_to_base_branch()
     assert ok is False
@@ -115,7 +116,7 @@ def test_rebase_to_base_branch_proceeds_when_ahead_positive(tmp_path):
             return 0, ""
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
 
     ok = w._rebase_to_base_branch()
     assert ok is True
@@ -161,7 +162,7 @@ def test_run_rebase_to_main_blocks_on_empty_branch(tmp_path, monkeypatch):
             raise AssertionError("push must not run when branch is 0 ahead")
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
 
     outcome = w.run_rebase_to_main()
     assert outcome.final_state == State.BLOCKED
@@ -199,7 +200,7 @@ def test_run_rebase_to_main_proceeds_on_nonempty_branch(tmp_path, monkeypatch):
             return 0, ""
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
 
     outcome = w.run_rebase_to_main()
     assert outcome.final_state == State.PENDING_CI
@@ -208,12 +209,12 @@ def test_run_rebase_to_main_proceeds_on_nonempty_branch(tmp_path, monkeypatch):
 # -------- _rebase_or_resolve (clean-rebase path) --------
 
 
-def test_rebase_or_resolve_blocks_on_empty_branch(tmp_path):
+def test_rebase_or_resolve_blocks_on_empty_branch(tmp_path, monkeypatch):
     """_rebase_or_resolve: clean rebase that produces a 0-commit-ahead
     branch → BLOCK before force-push."""
     w = _worker(tmp_path)
     w.store.upsert_pending("T-X")
-    w.store.transition("T-X", State.POLLING_CI, branch="quikode/t-x-abc")
+    w.store.transition("T-X", State.PENDING_CI, branch="quikode/t-x-abc")
     w.store.set_field("T-X", worktree_path="/tmp/wt-x")
     w.handle = MagicMock(container_name="qk-stub")
 
@@ -233,19 +234,13 @@ def test_rebase_or_resolve_blocks_on_empty_branch(tmp_path):
             raise AssertionError("push must not run when branch is 0 ahead")
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
-
-    # Stub github.push so any accidental call doesn't import-error
-    orig_push = worker_mod.github.push
+    w._git_in_workspace = fake_git
 
     def fail_push(*a, **kw):
         raise AssertionError("github.push should not run when branch is 0 ahead")
 
-    worker_mod.github.push = fail_push
-    try:
-        outcome = w._rebase_or_resolve()
-    finally:
-        worker_mod.github.push = orig_push
+    monkeypatch.setattr(worker_mod.github, "push", fail_push)
+    outcome = w._rebase_or_resolve()
 
     assert outcome is not None
     assert outcome.final_state == State.BLOCKED

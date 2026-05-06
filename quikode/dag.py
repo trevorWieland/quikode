@@ -97,9 +97,10 @@ class DAG:
         return out
 
     def ready_nodes(
-        self, completed_ids: set[str], in_progress_ids: set[str], skip_kinds: set[str] = frozenset()
+        self, completed_ids: set[str], in_progress_ids: set[str], skip_kinds: set[str] | None = None
     ) -> list[Node]:
         """Nodes whose deps are all in `completed_ids` and not yet started."""
+        skip_kinds = skip_kinds or set()
         ready: list[Node] = []
         for nid, n in self.nodes.items():
             if nid in completed_ids or nid in in_progress_ids:

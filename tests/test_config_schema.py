@@ -3,13 +3,14 @@
 These tests pin the contract that the TUI settings modal relies on:
 - All numeric Config fields carry bounds (`ge`/`le`).
 - All fields carry a description (so the modal can render labels).
-- StrEnum-valued fields parse legacy plain-string values from older configs.
+- StrEnum-valued fields parse old plain-string values from older configs.
 - AgentResult/IntentReviewOutcome/CheckerOutcome are frozen + JSON-serializable.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -24,7 +25,7 @@ from quikode.types import (
 )
 
 
-def _cfg(**kw):
+def _cfg(**kw: Any) -> Config:
     return Config(repo_path=Path("/tmp"), dag_path=Path("/tmp"), **kw)
 
 
@@ -59,7 +60,7 @@ def test_stacking_max_depth_lower_bound():
 # ----- enum coercion -----
 
 
-def test_stacking_strategy_accepts_legacy_string():
+def test_stacking_strategy_accepts_old_string():
     cfg = _cfg(stacking_strategy="within-milestone")
     assert cfg.stacking_strategy is StackingStrategy.WITHIN_MILESTONE
     # equality with bare string still works (StrEnum)
@@ -73,7 +74,7 @@ def test_stacking_strategy_rejects_unknown():
 
 def test_agent_role_cli_must_be_known():
     with pytest.raises(ValidationError):
-        AgentRole(cli="aider")
+        AgentRole.model_validate({"cli": "aider"})
 
 
 def test_agent_role_known_cli():
@@ -132,4 +133,4 @@ def test_config_validate_assignment_enforces_bounds():
     reject out-of-bounds at assignment, not just construction."""
     cfg = _cfg()
     with pytest.raises(ValidationError):
-        cfg.max_parallel = 0  # type: ignore[assignment]
+        cfg.max_parallel = 0

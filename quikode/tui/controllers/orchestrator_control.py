@@ -25,7 +25,7 @@ from pathlib import Path
 STOP_TIMEOUT_S = 60
 
 # Heartbeat staleness threshold used by the TUI when no Config-driven value is
-# available (e.g. legacy callers). The daemon module's get_status uses the
+# available (e.g. older callers). The daemon module's get_status uses the
 # config-derived value; this mirrors the default so behaviour is consistent.
 HEARTBEAT_STALENESS_S = 30
 

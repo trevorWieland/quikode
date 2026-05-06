@@ -67,7 +67,7 @@ def _orch(tmp_path: Path, **cfg_kw) -> Orchestrator:
     return Orchestrator(cfg, dag, store)
 
 
-def _seed_awaiting_merge(
+def _seed_pending_ci(
     o: Orchestrator,
     *,
     task_id: str = "R-001",
@@ -135,7 +135,7 @@ def _ci_failed_pr_status() -> PRStatus:
 
 def test_classify_new_unresolved_human_thread_addressed(tmp_path):
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     thread = _make_thread()
     to_address = o._classify_threads("R-001", [thread])
     assert len(to_address) == 1
@@ -149,7 +149,7 @@ def test_classify_new_unresolved_human_thread_addressed(tmp_path):
 
 def test_classify_resolved_thread_skipped(tmp_path):
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     thread = _make_thread(is_resolved=True)
     to_address = o._classify_threads("R-001", [thread])
     assert to_address == []
@@ -161,7 +161,7 @@ def test_classify_resolved_thread_skipped(tmp_path):
 
 def test_classify_bot_thread_skipped_by_default_off(tmp_path):
     o = _orch(tmp_path, respond_to_bot_reviews=False)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     thread = _make_thread(last_comment_author="dependabot[bot]", last_comment_is_bot=True)
     to_address = o._classify_threads("R-001", [thread])
     assert to_address == []
@@ -170,7 +170,7 @@ def test_classify_bot_thread_skipped_by_default_off(tmp_path):
 
 def test_classify_bot_thread_addressed_when_flag_on(tmp_path):
     o = _orch(tmp_path, respond_to_bot_reviews=True)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     thread = _make_thread(last_comment_author="chatgpt-codex-connector", last_comment_is_bot=True)
     to_address = o._classify_threads("R-001", [thread])
     assert len(to_address) == 1
@@ -181,7 +181,7 @@ def test_classify_already_addressed_no_new_comment_skipped(tmp_path):
     """Thread with addressed_in_commit_sha set and last_comment_ts unchanged
     is a thread we already responded to — don't re-respond."""
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     # Pre-seed: the thread was already addressed at last_comment_ts=1000.0.
     o.store.upsert_review_thread(
         "R-001",
@@ -205,7 +205,7 @@ def test_classify_already_addressed_no_new_comment_skipped(tmp_path):
 def test_classify_already_addressed_new_comment_addressed_again(tmp_path):
     """A new human comment on a previously-addressed thread → respond again."""
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     o.store.upsert_review_thread(
         "R-001",
         thread_id="PRRT_1",
@@ -240,7 +240,7 @@ def _make_pool() -> MagicMock:
 
 def test_poll_first_observation_unresolved_thread_schedules_response(tmp_path):
     o = _orch(tmp_path, max_parallel=3)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -270,7 +270,7 @@ def test_poll_first_observation_unresolved_thread_schedules_response(tmp_path):
 def test_poll_throttles_within_interval(tmp_path):
     """A second call within `review_poll_interval_s` should not re-poll."""
     o = _orch(tmp_path, review_poll_interval_s=60)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -292,7 +292,7 @@ def test_poll_throttles_within_interval(tmp_path):
 
 def test_poll_pr_merged_transitions_to_merged(tmp_path):
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -321,7 +321,7 @@ def test_poll_pr_merged_transitions_to_merged(tmp_path):
 
 def test_poll_pr_closed_transitions_to_aborted(tmp_path):
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -347,12 +347,12 @@ def test_poll_pr_closed_transitions_to_aborted(tmp_path):
 
 def test_poll_dispatches_ci_fix_on_post_merge_failure(tmp_path):
     """Live regression on R-0002: GitHub CI flipped to FAILURE while the
-    task was AWAITING_MERGE (response push triggered CI re-run, CI failed).
+    task was PENDING_CI (response push triggered CI re-run, CI failed).
     The daemon's review-watcher must detect this + dispatch a ci-fix
-    cycle. Without this, the task sits at AWAITING_MERGE indefinitely."""
+    cycle. Without this, the task sits at PENDING_CI indefinitely."""
     o = _orch(tmp_path, max_parallel=3)
     o.cfg.review_response_extra_slots = 1
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -379,7 +379,7 @@ def test_poll_does_not_dispatch_ci_fix_when_pool_full(tmp_path):
     (max_parallel + review_response_extra_slots). At cap, defer."""
     o = _orch(tmp_path, max_parallel=1)
     o.cfg.review_response_extra_slots = 1
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {"OTHER-1": Future(), "OTHER-2": Future()}
     rrf: set[str] = set()
@@ -404,7 +404,7 @@ def test_poll_does_not_dispatch_ci_fix_when_no_failed_checks(tmp_path):
     don't dispatch. Only fire when we have concrete check rows to feed
     the fixup planner."""
     o = _orch(tmp_path, max_parallel=3)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -433,7 +433,7 @@ def test_poll_blocks_when_review_rounds_max_exhausted(tmp_path):
     'manual merge/close' message instead of dispatching round N+1.
     Prevents codex-find-everything-forever runaway."""
     o = _orch(tmp_path, max_parallel=3, review_rounds_max=5)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     # Bump review_round to the cap.
     o.store.set_field("R-001", review_round=5)
     pool = _make_pool()
@@ -458,7 +458,7 @@ def test_poll_dispatches_round_when_under_review_rounds_max(tmp_path):
     """Under the cap, normal dispatch happens. Verifies the cap doesn't
     fire prematurely."""
     o = _orch(tmp_path, max_parallel=3, review_rounds_max=15)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     o.store.set_field("R-001", review_round=14)  # one below cap
     pool = _make_pool()
     futures: dict[str, Future] = {}
@@ -483,7 +483,7 @@ def test_poll_skips_when_pool_full(tmp_path):
     once slack reopens."""
     o = _orch(tmp_path, max_parallel=1)
     o.cfg.review_response_extra_slots = 1  # default; explicit for clarity
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     # Pool saturated past the review cap (max_parallel=1 + extra=1 = 2; here 2 in-flight).
     futures: dict[str, Future] = {"OTHER-1": Future(), "OTHER-2": Future()}
@@ -496,7 +496,7 @@ def test_poll_skips_when_pool_full(tmp_path):
     ):
         o._poll_review_threads(pool, futures, rrf)
 
-    # No new future submitted; R-001 stays AWAITING_MERGE.
+    # No new future submitted; R-001 stays PENDING_CI.
     pool.submit.assert_not_called()
     assert "R-001" not in rrf
     assert o.store.get("R-001")["state"] in (
@@ -514,13 +514,13 @@ def test_poll_skips_when_pool_full(tmp_path):
 def test_poll_uses_extra_slots_for_reviews_when_workers_full(tmp_path):
     """Regression for the 2026-05-04 PR #143 starvation: with `max_parallel=3`
     and 3 long-running task workers occupying the pool, review responses on
-    AWAITING_MERGE PRs were deferred indefinitely. The fix: reviews can
+    PENDING_CI PRs were deferred indefinitely. The fix: reviews can
     exceed `max_parallel` by `cfg.review_response_extra_slots` (default 1),
     so a fresh thread on a parked PR dispatches even when regular workers
     saturate the pool."""
     o = _orch(tmp_path, max_parallel=3)
     o.cfg.review_response_extra_slots = 1
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     # Three regular task workers occupy the pool — at max_parallel exactly.
     futures: dict[str, Future] = {
@@ -571,7 +571,7 @@ def test_poll_skips_task_already_in_futures(tmp_path):
     """A task that already has an in-flight future (e.g. a review response
     that's still running) is skipped to avoid double-submitting."""
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     pending = Future()  # not yet done
     futures: dict[str, Future] = {"R-001": pending}
@@ -591,7 +591,7 @@ def test_poll_skips_task_already_in_futures(tmp_path):
 
 def test_poll_resolved_thread_no_response_scheduled(tmp_path):
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -614,7 +614,7 @@ def test_poll_resolved_thread_no_response_scheduled(tmp_path):
 
 def test_poll_bot_only_thread_no_response_when_disabled(tmp_path):
     o = _orch(tmp_path, respond_to_bot_reviews=False)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -656,14 +656,14 @@ def test_repo_identifier_falls_back_to_gh(tmp_path):
 
 def test_heartbeat_writes_payload(tmp_path):
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     o._write_heartbeat(in_flight=2, addressing_feedback_futures=1)
     hb_path = o.cfg.state_dir / "orchestrator.heartbeat"
     assert hb_path.exists()
     payload = json.loads(hb_path.read_text())
     assert payload["in_flight"] == 2
     assert payload["addressing_feedback_futures"] == 1
-    assert payload["awaiting_merge"] == 1
+    assert payload["pending_ci"] == 1
     assert "ts" in payload
     o.store.conn.close()
 
@@ -696,7 +696,7 @@ def test_poll_conflicting_pr_schedules_rebase_to_main(tmp_path):
     in the worker's _poll_pr_loop, but v3 hands it off to the daemon.
     """
     o = _orch(tmp_path, max_parallel=3)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -730,7 +730,7 @@ def test_poll_conflicting_pr_schedules_rebase_to_main(tmp_path):
 def test_poll_conflicting_skips_when_already_in_futures(tmp_path):
     """If a task's already mid-rebase, don't double-schedule."""
     o = _orch(tmp_path, max_parallel=3)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     fake_future = MagicMock()
     futures: dict[str, Future] = {"R-001": fake_future}
@@ -749,7 +749,7 @@ def test_poll_conflicting_skips_when_already_in_futures(tmp_path):
 
     # No new future was submitted — the in-flight one stands.
     pool.submit.assert_not_called()
-    # State stays AWAITING_MERGE since the already-running future will handle it.
+    # State stays PENDING_CI since the already-running future will handle it.
     assert o.store.get("R-001")["state"] in (
         State.PENDING_CI.value,
         State.AWAITING_REVIEW.value,

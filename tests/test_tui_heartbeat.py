@@ -20,7 +20,7 @@ def _write_pid(ws: Path, pid: int) -> None:
 
 
 def _write_hb(ws: Path, age_s: float = 0.0, **fields) -> None:
-    payload = {"ts": time.time() - age_s, "in_flight": 0, "awaiting_merge": 0}
+    payload = {"ts": time.time() - age_s, "in_flight": 0, "pending_ci": 0}
     payload.update(fields)
     (ws / ".quikode" / "orchestrator.heartbeat").write_text(json.dumps(payload))
 
@@ -38,7 +38,7 @@ def test_status_no_heartbeat_file(tmp_path):
 def test_status_fresh_heartbeat(tmp_path):
     ws = _make_workspace(tmp_path)
     _write_pid(ws, os.getpid())
-    _write_hb(ws, age_s=2.0, in_flight=3, awaiting_merge=1)
+    _write_hb(ws, age_s=2.0, in_flight=3, pending_ci=1)
     s = oc.status(ws)
     assert s.running is True
     assert s.heartbeat_age_s is not None

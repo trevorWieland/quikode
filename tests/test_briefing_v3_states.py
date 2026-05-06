@@ -1,7 +1,7 @@
 """`quikode briefing` surfaces v3 review-loop / rebase / blocked states.
 
 Phase D extends the briefing groups so the user can wake up and see what
-needs them: AWAITING_MERGE (just review/merge), ADDRESSING_FEEDBACK (auto-
+needs them: PENDING_CI (just review/merge), ADDRESSING_FEEDBACK (auto-
 working), REBASING_TO_MAIN (auto-working), BLOCKED (needs intervention,
 with a `quikode unblock` hint).
 
@@ -15,7 +15,7 @@ import json
 from typer.testing import CliRunner
 
 from quikode.cli import app
-from quikode.config import DEFAULT_CONFIG_TOML
+from quikode.config_template import DEFAULT_CONFIG_TOML
 from quikode.state import State, Store
 
 
@@ -55,7 +55,7 @@ def _bootstrap(tmp_path):
 
 def _seed_one_per_state(tmp_path):
     store = Store(tmp_path / ".quikode" / "quikode.db")
-    # AWAITING_MERGE
+    # PENDING_CI
     store.upsert_pending("R-AM")
     store.transition(
         "R-AM",
@@ -123,7 +123,7 @@ def test_briefing_json_groups_v3_states(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["briefing", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    # v3.5 split — pending_ci replaces the legacy awaiting_merge bucket.
+    # v3.5 split — pending_ci replaces the old pending_ci bucket.
     assert "pending_ci" in payload
     assert "awaiting_review" in payload
     assert "merge_ready" in payload

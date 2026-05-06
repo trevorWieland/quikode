@@ -19,7 +19,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable
 
-from quikode.config import load_config
+from quikode.config_loader import load_config
 from quikode.state import Store
 
 from .controllers import orchestrator_control

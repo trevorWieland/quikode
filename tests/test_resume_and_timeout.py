@@ -25,7 +25,8 @@ from typer.testing import CliRunner
 from quikode import worktree as wt
 from quikode.agents.base import _exec
 from quikode.cli import app
-from quikode.config import DEFAULT_CONFIG_TOML, Config
+from quikode.config import Config
+from quikode.config_template import DEFAULT_CONFIG_TOML
 from quikode.state import State, Store
 from quikode.types import AgentResult
 
@@ -43,7 +44,7 @@ def test_exec_returns_synthetic_result_on_timeout():
 
     def fake_exec_in(handle, cmd, log_path=None, stdin=None, timeout=None):
         # Simulate `subprocess.run(timeout=...)` firing
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=b"partial", stderr=b"")
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout or 0, output=b"partial", stderr=b"")
 
     with patch("quikode.agents.base.exec_in", side_effect=fake_exec_in):
         result = _exec(_StubHandle(), ["bash", "-lc", "echo hi"], timeout=5)
@@ -58,7 +59,7 @@ def test_exec_timeout_writes_to_log(tmp_path):
     log = tmp_path / "task.log"
 
     def fake_exec_in(handle, cmd, log_path=None, stdin=None, timeout=None):
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout or 0)
 
     with patch("quikode.agents.base.exec_in", side_effect=fake_exec_in):
         _exec(_StubHandle(), ["x"], timeout=10, log_path=log)
@@ -117,38 +118,13 @@ def _bootstrap_workspace(tmp_path) -> None:
 
 def test_tasks_schema_has_resume_column(tmp_path):
     """resume_from_existing_subtasks must be an INTEGER column on tasks
-    (added via SCHEMA + auto-migration)."""
+    in the fresh schema."""
     db = tmp_path / "fresh.db"
     Store(db).conn.close()
     conn = sqlite3.connect(db)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
     conn.close()
     assert "resume_from_existing_subtasks" in cols
-
-
-def test_migration_adds_resume_column_to_old_db(tmp_path):
-    """Older workspaces that already have a tasks table without the resume
-    column must auto-add it on Store init."""
-    db = tmp_path / "old.db"
-    conn = sqlite3.connect(db, isolation_level=None)
-    conn.execute("""
-        CREATE TABLE tasks (
-            id TEXT PRIMARY KEY, state TEXT NOT NULL,
-            created_at REAL NOT NULL, updated_at REAL NOT NULL
-        )
-    """)
-    conn.execute("INSERT INTO tasks (id, state, created_at, updated_at) VALUES ('R-OLD','failed',1.0,2.0)")
-    conn.close()
-
-    Store(db).conn.close()  # migrate
-
-    conn = sqlite3.connect(db)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
-    assert "resume_from_existing_subtasks" in cols
-    # Existing row preserved
-    state = conn.execute("SELECT state FROM tasks WHERE id='R-OLD'").fetchone()[0]
-    assert state == "failed"
-    conn.close()
 
 
 def test_resume_cli_command_sets_flag_and_preserves_state(tmp_path, monkeypatch):

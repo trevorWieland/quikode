@@ -41,14 +41,12 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Any, cast
 
 from ..docker_env import exec_in
 from ..types import AgentResult
-
-if TYPE_CHECKING:
-    from ..docker_env import TaskContainer
 
 log = logging.getLogger("quikode.ccusage")
 
@@ -98,7 +96,7 @@ def variant_for(cli: str) -> str | None:
     return _CCUSAGE_VARIANT.get(cli)
 
 
-def is_available(cli: str, *, handle: TaskContainer | None = None) -> bool:
+def is_available(cli: str, *, handle: Any | None = None) -> bool:
     """Probe whether the ccusage variant for `cli` exists and runs.
 
     When `handle` is provided we probe **inside the task container** (the
@@ -120,7 +118,7 @@ def is_available(cli: str, *, handle: TaskContainer | None = None) -> bool:
     return available
 
 
-def _probe(variant: str, *, handle: TaskContainer | None) -> bool:
+def _probe(variant: str, *, handle: Any | None) -> bool:
     """Run `<variant> --help`. Treat exit 0 as available."""
     cmd = ["npx", "-y", variant, "--help"]
     try:
@@ -136,7 +134,7 @@ def _probe(variant: str, *, handle: TaskContainer | None) -> bool:
 def fetch_session_stats(
     cli: str,
     *,
-    handle: TaskContainer | None = None,
+    handle: Any | None = None,
     timeout_s: float = 10.0,
 ) -> CCUsageStats | None:
     """Fetch aggregate token + cost totals across all sessions for `cli`.
@@ -164,7 +162,7 @@ def fetch_session_stats(
     return _parse_session_json(cli, raw)
 
 
-def merge_into_result(result: object, stats: CCUsageStats) -> object:
+def merge_into_result(result: object, stats: CCUsageStats) -> AgentResult:
     """Return a copy of `result` (an AgentResult) with token + cost fields
     overridden by `stats`. Preserves `rc`, `stdout`, `stderr`, `transient`,
     `duration_s`.
@@ -251,7 +249,7 @@ def snapshot_delta(
 def _run_capture(
     cmd: list[str],
     *,
-    handle: TaskContainer | None,
+    handle: Any | None,
     timeout_s: float,
 ) -> str | None:
     """Run `cmd` host-side or inside container. Return stdout or None on failure."""
@@ -293,7 +291,7 @@ def _parse_session_json(cli: str, raw: str) -> CCUsageStats | None:
     if data is None:
         return None
 
-    sessions = data.get("sessions") if isinstance(data, dict) else data
+    sessions = cast(Mapping[str, Any], data).get("sessions") if isinstance(data, dict) else data
     if not isinstance(sessions, list):
         return None
 
@@ -306,19 +304,20 @@ def _parse_session_json(cli: str, raw: str) -> CCUsageStats | None:
     for s in sessions:
         if not isinstance(s, dict):
             continue
-        total_input += _safe_int(s.get("inputTokens"))
-        total_output += _safe_int(s.get("outputTokens"))
-        total_cost += _safe_float(s.get("totalCost") or s.get("costUSD"))
+        session = cast(Mapping[str, Any], s)
+        total_input += _safe_int(session.get("inputTokens"))
+        total_output += _safe_int(session.get("outputTokens"))
+        total_cost += _safe_float(session.get("totalCost") or session.get("costUSD"))
 
         if cli == "codex":
             # codex variant: cachedInputTokens (read-only; no cache-creation
             # field). reasoningOutputTokens is a subset already counted in
             # totalTokens — we don't double-add it.
-            total_cached_read += _safe_int(s.get("cachedInputTokens"))
+            total_cached_read += _safe_int(session.get("cachedInputTokens"))
         else:
             # claude / opencode: split cache fields.
-            total_cached_read += _safe_int(s.get("cacheReadTokens"))
-            total_cached_creation += _safe_int(s.get("cacheCreationTokens"))
+            total_cached_read += _safe_int(session.get("cacheReadTokens"))
+            total_cached_creation += _safe_int(session.get("cacheCreationTokens"))
 
     return CCUsageStats(
         tokens_input=total_input,
@@ -355,7 +354,7 @@ def _safe_int(v: object) -> int:
     if v is None:
         return 0
     try:
-        n = int(v)
+        n = int(cast(Any, v))
     except (TypeError, ValueError):
         return 0
     return n if n >= 0 else 0
@@ -365,7 +364,7 @@ def _safe_float(v: object) -> float:
     if v is None:
         return 0.0
     try:
-        f = float(v)
+        f = float(cast(Any, v))
     except (TypeError, ValueError):
         return 0.0
     return f if f >= 0.0 else 0.0

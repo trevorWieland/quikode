@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Literal
 from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
@@ -80,7 +81,12 @@ def _build_plan(subtask_ids: list[str]) -> Plan:
     )
 
 
-def _build_worker(tmp_path: Path, plan: Plan, *, pre_commit_runner: str = "none") -> TaskWorker:
+def _build_worker(
+    tmp_path: Path,
+    plan: Plan,
+    *,
+    pre_commit_runner: Literal["auto", "lefthook", "pre-commit", "none"] = "none",
+) -> TaskWorker:
     cfg = Config(
         repo_path=tmp_path,
         dag_path=tmp_path / "dag.json",
@@ -94,13 +100,14 @@ def _build_worker(tmp_path: Path, plan: Plan, *, pre_commit_runner: str = "none"
         subtask_hard_max_attempts=2,
         subtask_progress_check_after=10,
         subtask_progress_check_every=10,
-        pre_commit_runner=pre_commit_runner,  # type: ignore[arg-type]
+        pre_commit_runner=pre_commit_runner,
     )
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
     dag = _build_dag(tmp_path)
     store = Store(cfg.state_dir / "quikode.db")
     store.upsert_pending("R-001")
+    store.transition("R-001", State.PLANNING)
     store.set_field("R-001", branch="quikode/r-001-abc123")
     store.upsert_subtasks(
         "R-001",

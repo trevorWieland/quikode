@@ -6,7 +6,7 @@ Uses a dummy `sleep` subprocess so we don't actually spawn quikode run.
 from __future__ import annotations
 
 import os
-import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -14,7 +14,7 @@ import pytest
 
 from quikode.tui.controllers import orchestrator_control as oc
 
-SLEEP_BIN = shutil.which("sleep")
+SLEEP_CMD = [sys.executable, "-c", "import time; time.sleep(30)"]
 
 
 def _make_workspace(tmp_path: Path) -> Path:
@@ -45,15 +45,13 @@ def test_status_invalid_pid_file_returns_not_running(tmp_path):
     assert s.running is False
 
 
-@pytest.mark.skipif(not SLEEP_BIN, reason="sleep binary unavailable")
 def test_spawn_writes_pid_file_and_status_reflects_running(tmp_path, monkeypatch):
     ws = _make_workspace(tmp_path)
-    # Override the binary so we don't actually exec quikode.
-    monkeypatch.setenv("QUIKODE_BIN", SLEEP_BIN)
+    monkeypatch.setenv("QUIKODE_BIN", sys.executable)
 
     # Build a custom argv that ignores the "run" subcommand quikode_run_argv adds.
     # Easier: monkeypatch _quikode_run_argv to a sleep invocation.
-    monkeypatch.setattr(oc, "_quikode_run_argv", lambda extra: [SLEEP_BIN, "5"])
+    monkeypatch.setattr(oc, "_quikode_run_argv", lambda extra: SLEEP_CMD)
 
     s = oc.spawn(ws)
     try:
@@ -75,10 +73,9 @@ def test_spawn_writes_pid_file_and_status_reflects_running(tmp_path, monkeypatch
                 pass
 
 
-@pytest.mark.skipif(not SLEEP_BIN, reason="sleep binary unavailable")
 def test_force_quit_kills_running_proc(tmp_path, monkeypatch):
     ws = _make_workspace(tmp_path)
-    monkeypatch.setattr(oc, "_quikode_run_argv", lambda extra: [SLEEP_BIN, "10"])
+    monkeypatch.setattr(oc, "_quikode_run_argv", lambda extra: SLEEP_CMD)
     s = oc.spawn(ws)
     assert s.running
     ok = oc.force_quit(ws)
@@ -90,11 +87,9 @@ def test_force_quit_kills_running_proc(tmp_path, monkeypatch):
     assert oc.status(ws).running is False
 
 
-@pytest.mark.skipif(not SLEEP_BIN, reason="sleep binary unavailable")
 def test_stop_sends_sigterm_and_proc_dies(tmp_path, monkeypatch):
     ws = _make_workspace(tmp_path)
-    # sleep respects SIGTERM and exits cleanly.
-    monkeypatch.setattr(oc, "_quikode_run_argv", lambda extra: [SLEEP_BIN, "30"])
+    monkeypatch.setattr(oc, "_quikode_run_argv", lambda extra: SLEEP_CMD)
     s = oc.spawn(ws)
     assert s.running
     ok = oc.stop(ws, timeout_s=5)
@@ -115,10 +110,9 @@ def test_parting_status_message_none_when_stopped(tmp_path):
     assert msg is None
 
 
-@pytest.mark.skipif(not SLEEP_BIN, reason="sleep binary unavailable")
 def test_parting_status_message_when_running(tmp_path, monkeypatch):
     ws = _make_workspace(tmp_path)
-    monkeypatch.setattr(oc, "_quikode_run_argv", lambda extra: [SLEEP_BIN, "5"])
+    monkeypatch.setattr(oc, "_quikode_run_argv", lambda extra: SLEEP_CMD)
     s = oc.spawn(ws)
     try:
         msg = oc.parting_status_message(ws)

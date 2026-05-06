@@ -104,7 +104,7 @@ def test_second_trigger_within_window_is_coalesced(tmp_path):
     assert o.store.get("CHILD-A")["state"] == State.REBASING_TO_MAIN.value
 
     # Reset state to mimic mid-rebase reentry — the pre-rebase stash is
-    # the AWAITING_MERGE state, so a second trigger 1s later finds the
+    # the PENDING_CI state, so a second trigger 1s later finds the
     # row in REBASING_TO_MAIN and would normally try to re-stash + submit.
     # Coalescing should skip it regardless.
     o._schedule_rebase_to_main("CHILD-A", pool, futures, rrf, trigger_reason="sibling_conflict")
@@ -127,7 +127,7 @@ def test_trigger_after_window_fires(tmp_path):
     o.store.set_last_rebase_scheduled("CHILD-A", time.time() - 31.0)
 
     # Reset row to a state where re-scheduling is meaningful (e.g. the
-    # first rebase finished and the row is back in AWAITING_MERGE).
+    # first rebase finished and the row is back in PENDING_CI).
     o.store.transition("CHILD-A", State.PENDING_CI)
 
     o._schedule_rebase_to_main("CHILD-A", pool, futures, rrf, trigger_reason="sibling_conflict")

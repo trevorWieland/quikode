@@ -171,18 +171,12 @@ def test_columns_minimize_crossings_diamond(tmp_path):
     assert count_crossings(d, r, cols) == 0
 
 
-def test_load_real_tanren_dag_layout_bounds():
-    """Smoke: the real tanren DAG fits within the size bound design says
-    we expect (~30 ranks, ~30 cols)."""
-    real = Path("/home/trevor/github/tanren/docs/roadmap/dag.json")
-    if not real.exists():
-        return
-    d = DAG.load(real)
+def test_tanren_like_dag_layout_bounds():
+    """Always-on layout smoke for a checked-in Tanren-like DAG."""
+    d = DAG.load(Path(__file__).parent / "fixtures" / "tanren_dag.json")
     r = ranks(d)
     cols = columns(d, r)
     max_rank = max(r.values())
     max_col = max(cols.values())
-    assert max_rank < 50, f"rank depth {max_rank} too tall"
-    # The DAG has up to ~50 wide rows (parallel-friendly fan-out at M-0004).
-    # 60 is loose but flags pathological layouts.
-    assert max_col < 80, f"col width {max_col} too wide"
+    assert max_rank == 2
+    assert max_col < 4

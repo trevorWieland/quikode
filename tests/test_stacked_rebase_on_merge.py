@@ -75,7 +75,7 @@ def _make_pool() -> MagicMock:
     return pool
 
 
-def _seed_parent_awaiting_merge(o: Orchestrator) -> None:
+def _seed_parent_pending_ci(o: Orchestrator) -> None:
     o.store.upsert_pending("PARENT")
     o.store.transition(
         "PARENT",
@@ -103,7 +103,7 @@ def _seed_stacked_child(o: Orchestrator, child_id: str, *, state: State, pr_numb
 
 def test_children_of_parent_branch_filters_terminal(tmp_path):
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
     _seed_stacked_child(o, "CHILD-B", state=State.MERGED)
     children = o.store.children_of_parent_branch("quikode/parent-aaa")
@@ -114,7 +114,7 @@ def test_children_of_parent_branch_filters_terminal(tmp_path):
 
 def test_clear_parent_branch_idempotent(tmp_path):
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
     o.store.clear_parent_branch("CHILD-A")
     row = o.store.get("CHILD-A")
@@ -131,8 +131,8 @@ def test_pre_rebase_state_roundtrip(tmp_path):
     assert o.store.get_pre_rebase_state("CHILD-A") is None
     o.store.set_pre_rebase_state("CHILD-A", "doing_subtask")
     assert o.store.get_pre_rebase_state("CHILD-A") == "doing_subtask"
-    o.store.set_pre_rebase_state("CHILD-A", "awaiting_merge")
-    assert o.store.get_pre_rebase_state("CHILD-A") == "awaiting_merge"
+    o.store.set_pre_rebase_state("CHILD-A", "pending_ci")
+    assert o.store.get_pre_rebase_state("CHILD-A") == "pending_ci"
     o.store.conn.close()
 
 
@@ -141,7 +141,7 @@ def test_pre_rebase_state_roundtrip(tmp_path):
 
 def test_schedule_rebase_to_main_transitions_and_stashes_pre_state(tmp_path):
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
     pool = _make_pool()
     futures: dict[str, Future] = {}
@@ -164,7 +164,7 @@ def test_schedule_rebase_to_main_transitions_and_stashes_pre_state(tmp_path):
 
 def test_merged_parent_schedules_rebase_for_all_active_children(tmp_path):
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
     _seed_stacked_child(o, "CHILD-B", state=State.PENDING_CI, pr_number=11)
     pool = _make_pool()
@@ -178,7 +178,7 @@ def test_merged_parent_schedules_rebase_for_all_active_children(tmp_path):
     assert pool.submit.call_count == 2
     assert o.store.get("CHILD-A")["state"] == State.REBASING_TO_MAIN.value
     assert o.store.get("CHILD-B")["state"] == State.REBASING_TO_MAIN.value
-    # CHILD-B's pre-rebase state should be AWAITING_MERGE so the rebase
+    # CHILD-B's pre-rebase state should be PENDING_CI so the rebase
     # worker restores it post-rebase.
     assert o.store.get("CHILD-B")["pre_rebase_state"] == State.PENDING_CI.value
     o.store.conn.close()
@@ -186,7 +186,7 @@ def test_merged_parent_schedules_rebase_for_all_active_children(tmp_path):
 
 def test_merged_parent_skips_terminal_children(tmp_path):
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.MERGED)
     pool = _make_pool()
     futures: dict[str, Future] = {}
@@ -204,7 +204,7 @@ def test_merged_parent_skips_when_child_already_in_futures(tmp_path):
     the `needs_parent_rebase` flag IS set so the active worker handles the
     rebase inline at its next checkpoint."""
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
     pool = _make_pool()
     pending = Future()
@@ -223,7 +223,7 @@ def test_merged_parent_skips_when_child_already_in_futures(tmp_path):
 
 def test_no_children_no_schedule(tmp_path):
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -242,7 +242,7 @@ def test_poll_pr_merged_triggers_child_rebase_scheduling(tmp_path):
     transition the parent to MERGED and schedule rebases for any stacked
     children."""
     o = _orch(tmp_path)
-    _seed_parent_awaiting_merge(o)
+    _seed_parent_pending_ci(o)
     _seed_stacked_child(o, "CHILD-A", state=State.DOING_SUBTASK)
     pool = _make_pool()
     futures: dict[str, Future] = {}

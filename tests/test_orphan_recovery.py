@@ -4,7 +4,7 @@ When the orchestrator process dies (SIGTERM, crash) it leaves rows in
 active states with no worker behind them. On the next `quikode run`,
 `Store.recover_orphan_tasks()` scans for these and rolls them back to
 PENDING (with `resume_from_existing_subtasks=1` for in-implementation
-states) or AWAITING_MERGE (for PR-already-opened states), resetting
+states) or PENDING_CI (for PR-already-opened states), resetting
 retry counters along the way.
 
 PENDING / MERGED / BLOCKED / FAILED / ABORTED are left alone — they're
@@ -44,7 +44,7 @@ def _seed(store: Store, task_id: str, state: State, **fields) -> None:
         State.TRIAGING_SUBTASK,
         State.COMMITTING,
         State.PUSHING,
-        State.REPLANNING,
+        State.FIXUP_PLANNING,
     ],
 )
 def test_in_implementation_state_resumes_to_pending(tmp_path, from_state):
@@ -78,7 +78,7 @@ def test_provisioning_clears_partial_artifacts(tmp_path):
     s.conn.close()
 
 
-def test_pr_opening_with_pr_number_goes_to_awaiting_merge(tmp_path):
+def test_pr_opening_with_pr_number_goes_to_pending_ci(tmp_path):
     s = _store(tmp_path)
     _seed(
         s,
@@ -106,15 +106,15 @@ def test_pr_opening_without_pr_number_resumes_to_pending(tmp_path):
     s.conn.close()
 
 
-def test_polling_ci_with_pr_number_goes_to_awaiting_merge(tmp_path):
+def test_pending_ci_with_pr_number_stays_pending_ci(tmp_path):
     s = _store(tmp_path)
-    _seed(s, "T-1", State.POLLING_CI, pr_number=42)
+    _seed(s, "T-1", State.PENDING_CI, pr_number=42)
     s.recover_orphan_tasks()
     assert s.get("T-1")["state"] == State.PENDING_CI.value
     s.conn.close()
 
 
-def test_addressing_feedback_goes_to_awaiting_merge(tmp_path):
+def test_addressing_feedback_goes_to_pending_ci(tmp_path):
     """The watcher will re-detect the open thread on the next poll tick
     and submit a fresh review-response future."""
     s = _store(tmp_path)
@@ -126,9 +126,9 @@ def test_addressing_feedback_goes_to_awaiting_merge(tmp_path):
 
 @pytest.mark.parametrize(
     "from_state",
-    [State.REBASING, State.CONFLICT_RESOLVING, State.INTENT_REVIEWING, State.REBASING_TO_MAIN],
+    [State.REBASING_TO_MAIN, State.CONFLICT_RESOLVING, State.TRIAGING_FEEDBACK, State.REBASING_TO_MAIN],
 )
-def test_pr_aware_states_with_pr_go_to_awaiting_merge(tmp_path, from_state):
+def test_pr_aware_states_with_pr_go_to_pending_ci(tmp_path, from_state):
     s = _store(tmp_path)
     _seed(s, "T-1", from_state, pr_number=42)
     s.recover_orphan_tasks()
@@ -138,7 +138,7 @@ def test_pr_aware_states_with_pr_go_to_awaiting_merge(tmp_path, from_state):
 
 @pytest.mark.parametrize(
     "from_state",
-    [State.REBASING, State.CONFLICT_RESOLVING, State.INTENT_REVIEWING, State.REBASING_TO_MAIN],
+    [State.REBASING_TO_MAIN, State.CONFLICT_RESOLVING, State.TRIAGING_FEEDBACK, State.REBASING_TO_MAIN],
 )
 def test_pr_aware_states_without_pr_resume_to_pending(tmp_path, from_state):
     s = _store(tmp_path)

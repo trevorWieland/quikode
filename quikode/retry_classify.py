@@ -35,7 +35,8 @@ Categories — keep this list stable; the audit table stores raw strings:
 from __future__ import annotations
 
 import re
-from typing import Final, Literal
+from collections.abc import Mapping
+from typing import Any, Final, Literal
 
 RetryCategory = Literal[
     "doer_output_invalid",
@@ -138,34 +139,41 @@ def classify_retry(
     blob = "\n".join(s for s in (stderr or "", stdout or "") if s)
     sig_default = f"rc={rc if rc is not None else '?'}"
 
-    # rc=137 is universally OOM — short-circuit before pattern scan.
     if rc == 137:
-        return ("container_oom", "rc=137 (OOMKilled)")
+        category: RetryCategory = "container_oom"
+        signature = "rc=137 (OOMKilled)"
+    else:
+        category, signature = _classify_retry_blob(blob, sig_default, hint, rc)
+    return (category, signature)
 
+
+def _classify_retry_blob(
+    blob: str, sig_default: str, hint: str | None, rc: int | None
+) -> tuple[RetryCategory, str]:
     for pat, category, _sig_ex in _PATTERNS:
         m = pat.search(blob)
         if m:
-            # Trim the matched substring to a readable signature.
             snippet = blob[max(0, m.start() - 15) : m.end() + 30].replace("\n", " ").strip()
             return (category, snippet[:120] or sig_default)
-
-    # Hint-driven fallbacks.
-    if hint == "pre_commit":
-        return ("pre_commit_hook_fail", sig_default)
-    if hint == "checker":
-        # If the checker emitted a structured verdict, it's a real fail.
-        m = _CHECKER_VERDICT_RE.search(blob)
-        if m and m.group("v").upper() == "FAIL":
-            return ("checker_fail", "verdict=FAIL")
-        # Doer ran, output didn't pass — the typical "real" retry shape.
-        return ("doer_output_invalid", sig_default)
-    if hint == "network":
-        return ("network_timeout", sig_default)
-
-    # Last-resort buckets.
+    hint_result = _classify_retry_hint(blob, sig_default, hint)
+    if hint_result is not None:
+        return hint_result
     if rc is None:
         return ("other", "rc=None")
     return ("other", sig_default)
+
+
+def _classify_retry_hint(blob: str, sig_default: str, hint: str | None) -> tuple[RetryCategory, str] | None:
+    if hint == "pre_commit":
+        return ("pre_commit_hook_fail", sig_default)
+    if hint == "network":
+        return ("network_timeout", sig_default)
+    if hint != "checker":
+        return None
+    m = _CHECKER_VERDICT_RE.search(blob)
+    if m and m.group("v").upper() == "FAIL":
+        return ("checker_fail", "verdict=FAIL")
+    return ("doer_output_invalid", sig_default)
 
 
 # ----- summary helpers used by `quikode show` -----
@@ -177,13 +185,13 @@ def histogram(reasons: list[dict]) -> dict[RetryCategory, int]:
     for r in reasons:
         cat = r.get("category", "other")
         if cat in ALL_CATEGORIES:
-            counts[cat] = counts.get(cat, 0) + 1  # type: ignore[index]
+            counts[cat] = counts.get(cat, 0) + 1
         else:
             counts["other"] = counts.get("other", 0) + 1
     return counts
 
 
-def format_histogram(counts: dict[RetryCategory, int]) -> str:
+def format_histogram(counts: Mapping[Any, int]) -> str:
     """Render a category histogram as `category=N category=N` for quikode show."""
     if not counts:
         return ""

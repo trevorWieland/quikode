@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from quikode.fsm import Event, InvalidTransition
 from quikode.state import State, Store
 
 
@@ -45,8 +48,25 @@ def test_completed_and_active_ids(tmp_path: Path):
     s.transition("D", State.BLOCKED)
     # E left PENDING
     assert s.completed_ids() == {"A"}
-    # active = anything not in (PENDING, MERGED, BLOCKED, FAILED, ABORTED, AWAITING_MERGE)
+    # active = anything not in (PENDING, MERGED, BLOCKED, FAILED, ABORTED, PENDING_CI)
     assert s.active_ids() == {"B"}
+
+
+def test_apply_event_rejects_invalid_transition(tmp_path: Path):
+    s = Store(tmp_path / "q.db")
+    s.upsert_pending("R-1")
+    with pytest.raises(InvalidTransition):
+        s.apply_event("R-1", Event.MERGED)
+
+
+def test_apply_event_records_target_state(tmp_path: Path):
+    s = Store(tmp_path / "q.db")
+    s.upsert_pending("R-1")
+    target = s.apply_event("R-1", Event.START_TASK)
+    row = s.get("R-1")
+    assert target is State.PROVISIONING
+    assert row is not None
+    assert row["state"] == State.PROVISIONING.value
 
 
 def test_increment(tmp_path: Path):

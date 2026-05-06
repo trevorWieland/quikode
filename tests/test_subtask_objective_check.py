@@ -15,6 +15,7 @@ gate catches that class of failure at the slice boundary.
 from __future__ import annotations
 
 import subprocess as sp
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
@@ -35,7 +36,7 @@ def _stub_subtask() -> Subtask:
     )
 
 
-def _make_worker(cfg: Config) -> TaskWorker:
+def _make_worker(cfg: Config) -> Any:
     """Construct a TaskWorker with just enough wiring for `_run_subtask_check_command`."""
     w = TaskWorker.__new__(TaskWorker)  # bypass __init__ — we don't need a real container
     w.cfg = cfg

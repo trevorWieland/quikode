@@ -16,7 +16,7 @@ Two complementary surfaces:
 
 Invoked from the orchestrator's review-watcher, in-process, no Docker
 container needed (host-side `claude -p`). Bounded in seconds; replaces the
-"30 minutes stuck in responding_to_review" failure mode.
+"30 minutes stuck in feedback handling" failure mode.
 
 Returns `TriageOutcome` aggregating all the categorized items so the
 orchestrator can persist counts + dispatch only what needs work.
@@ -31,7 +31,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from . import prompts as prompts_mod
 from .config import AgentRole, Config
@@ -129,9 +129,10 @@ def parse_ci_failure(log_text: str) -> list[CIFailure]:
             return
         seen.add(sig)
         excerpt = _excerpt_around(log_text, span[0], span[1])
+        failure_kind = cast(Literal["compile", "test", "lint", "fmt", "other"], kind)
         out.append(
             CIFailure(
-                kind=kind,  # type: ignore[arg-type]
+                kind=failure_kind,
                 file=file,
                 line=line,
                 message=msg.strip(),

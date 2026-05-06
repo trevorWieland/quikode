@@ -39,7 +39,7 @@ import re
 import shlex
 import time
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -133,7 +133,7 @@ _EXPECTED_RE = re.compile(
 )
 
 
-def parse_evidence_to_probe(item: dict[str, Any]) -> ManualProbe | None:
+def parse_evidence_to_probe(item: object) -> ManualProbe | None:
     """Parse one `expected_evidence` item into a `ManualProbe`.
 
     Returns None when the item isn't a manual probe or is malformed beyond
@@ -143,15 +143,16 @@ def parse_evidence_to_probe(item: dict[str, Any]) -> ManualProbe | None:
     if not isinstance(item, dict):
         log.warning("manual-probe parse: item is not a dict; skipping (%s)", type(item))
         return None
-    kind = str(item.get("kind", "")).strip().lower()
+    data = cast(dict[str, Any], item)
+    kind = str(data.get("kind", "")).strip().lower()
     if kind != "manual":
         return None
 
-    description = str(item.get("description", "")).strip()
-    service = str(item.get("service", "")).strip()
-    command = str(item.get("command", "")).strip()
-    expected = str(item.get("expected", "")).strip()
-    is_regex = bool(item.get("expected_is_regex", False))
+    description = str(data.get("description", "")).strip()
+    service = str(data.get("service", "")).strip()
+    command = str(data.get("command", "")).strip()
+    expected = str(data.get("expected", "")).strip()
+    is_regex = bool(data.get("expected_is_regex", False))
 
     if not command and description:
         # Free-text fallback: try to fish a curl command out of the description.

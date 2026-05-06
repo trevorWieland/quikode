@@ -6,9 +6,12 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 from textual.widgets import Input, Static
 
-from quikode.config import DEFAULT_CONFIG_TOML, Config, load_config
+from quikode.config import Config
+from quikode.config_loader import load_config
+from quikode.config_template import DEFAULT_CONFIG_TOML
 from quikode.tui.app import QuikodeTUI
 from quikode.tui.widgets.settings_modal import (
     _MODAL_FIELDS,
@@ -173,5 +176,5 @@ def test_modal_rejects_extra_fields_via_pydantic(tmp_path):
     (typos, removed fields) are caught by pydantic's extra='forbid'."""
     _bootstrap_workspace(tmp_path)
     cfg = load_config(tmp_path)
-    with pytest.raises(Exception):  # noqa: B017
+    with pytest.raises(ValidationError):
         Config.model_validate({**cfg.model_dump(), "totally_made_up_field": 1})

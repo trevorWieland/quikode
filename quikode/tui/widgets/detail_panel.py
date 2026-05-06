@@ -4,7 +4,7 @@ Two tabs: Subtasks (DataTable with active-subtask highlight) and Agent calls
 (RichLog with newest-at-bottom). Tab cycles between them.
 
 Phase status line at the top shows what the agent is actually doing right
-now — important when the worker drops into whole-spec fixup (state=DOING,
+now — important when the worker drops into monolithic fixup (state=DOING,
 no subtask_id on the call). Without it, the subtasks tab is frozen at the
 last per-subtask states and the user can't tell anything's running.
 """
@@ -50,7 +50,7 @@ class DetailSnapshot:
     # state is doing/checking/triaging). -1 if no subtask is active.
     active_subtask_idx: int = -1
     # Phase context — task's current state + the most recent state_log note
-    # + how long it's been there. Lets the detail panel surface "whole-spec
+    # + how long it's been there. Lets the detail panel surface "monolithic
     # fixup attempt 1 · 32m in" so the user can tell something's running
     # even when no subtask is in flight.
     task_state: str = ""
@@ -117,20 +117,20 @@ class DetailPanel(Container):
         st.add_columns("Subtask", "State", "Retries", "Title")
 
     def render_snapshot(self, snap: DetailSnapshot) -> None:
-        # Reset fingerprints when the selected task changes — we want a fresh
-        # render even if the new task happens to have the same row count.
         if snap.task_id != self._last_task_id:
-            self._subtasks_fp = ()
-            self._calls_fp = ()
-            self._phase_fp = ()
-            self._user_moved_subtask_cursor = False
-            self._last_task_id = snap.task_id
+            self._reset_fingerprints(snap.task_id)
+        self._render_phase(snap)
+        self._render_subtasks(snap)
+        self._render_agent_calls(snap)
 
-        # ---- Phase status line + (when present) audit-gauntlet block ----
-        # in_state_for re-stringifies every tick (incrementing seconds), so
-        # the fingerprint includes it and the line refreshes once per second.
-        # The cost is one Static.update() — way cheaper than the DataTable
-        # rebuild that the fingerprints below skip.
+    def _reset_fingerprints(self, task_id: str) -> None:
+        self._subtasks_fp = ()
+        self._calls_fp = ()
+        self._phase_fp = ()
+        self._user_moved_subtask_cursor = False
+        self._last_task_id = task_id
+
+    def _render_phase(self, snap: DetailSnapshot) -> None:
         gauntlet_fp = (
             snap.pre_pr_audit_cycle,
             tuple(
@@ -153,78 +153,63 @@ class DetailPanel(Container):
             self.query_one("#detail-phase", Static).update(phase_text)
             self._phase_fp = phase_fp
 
-        # ---- Subtasks tab ----
+    def _render_subtasks(self, snap: DetailSnapshot) -> None:
         sub_fp = tuple((s.subtask_id, s.state, s.retries) for s in snap.subtasks)
-        if sub_fp != self._subtasks_fp:
-            st = self.query_one("#subtasks-table", DataTable)
-            # Preserve cursor across re-render so it doesn't flick to row 0
-            # every time a subtask state changes.
-            prev_cursor_row = st.cursor_coordinate.row
-            st.clear()
-            # Add rows one at a time WITH explicit row keys so textual's
-            # internal state survives rapid update cycles. Live-observed
-            # bug: bulk `add_row()` calls in a tight loop occasionally lost
-            # the last 1-2 rows (R-0002 18 subtasks → only 16 rendered)
-            # — root cause was textual DataTable's internal row registry
-            # racing with the next render tick. The `key=` argument forces
-            # the row to register synchronously by subtask_id, ensuring
-            # every add_row commits before the loop continues.
-            add_errors: list[str] = []
-            for sub in snap.subtasks:
-                state_cell = _subtask_state_cell(sub.state)
-                try:
-                    st.add_row(
-                        sub.subtask_id,
-                        state_cell,
-                        str(sub.retries),
-                        sub.title[:60],
-                        key=sub.subtask_id,
-                    )
-                except Exception as e:
-                    # Defensive: if a duplicate-key error somehow surfaces
-                    # (key collision after clear), skip that row rather than
-                    # let one bad add abort the loop and leave a partial
-                    # table on screen. Log so the underlying issue surfaces
-                    # in /tmp/quikode-tui.log when QUIKODE_TUI_DEBUG=1.
-                    add_errors.append(f"{sub.subtask_id}:{type(e).__name__}:{e}")
-            if _log.isEnabledFor(logging.DEBUG):
-                try:
-                    rendered = st.row_count
-                except Exception:
-                    rendered = -1
-                _log.debug(
-                    "render_snapshot %s: snapshot=%d rendered=%d add_errors=%d %s",
-                    snap.task_id,
-                    len(snap.subtasks),
-                    rendered,
-                    len(add_errors),
-                    ("; ".join(add_errors)[:500]) if add_errors else "",
-                )
-            # Auto-follow the active subtask UNLESS the user has moved the
-            # cursor manually. Cursor + scroll updates are deferred to the
-            # next layout pass via `call_after_refresh` because Textual
-            # computes `virtual_size` asynchronously after the message
-            # handler returns — synchronous scroll attempts inside
-            # `render_snapshot` see the pre-add_row size and anchor wrong.
-            # That's the framework's API for "do this after layout
-            # settles", not a hack we can purge.
-            if snap.subtasks:
-                target = self._compute_scroll_target(snap, prev_cursor_row)
-                total = len(snap.subtasks)
-                self.app.call_after_refresh(self._apply_subtask_scroll, target, total)
-            self._subtasks_fp = sub_fp
+        if sub_fp == self._subtasks_fp:
+            return
+        st = self.query_one("#subtasks-table", DataTable)
+        prev_cursor_row = st.cursor_coordinate.row
+        st.clear()
+        add_errors = self._populate_subtask_rows(st, snap)
+        self._log_subtask_render(snap, st, add_errors)
+        if snap.subtasks:
+            target = self._compute_scroll_target(snap, prev_cursor_row)
+            self.app.call_after_refresh(self._apply_subtask_scroll, target, len(snap.subtasks))
+        self._subtasks_fp = sub_fp
 
-        # ---- Agent calls tab ----
+    def _populate_subtask_rows(self, table: DataTable, snap: DetailSnapshot) -> list[str]:
+        add_errors: list[str] = []
+        for sub in snap.subtasks:
+            try:
+                table.add_row(
+                    sub.subtask_id,
+                    _subtask_state_cell(sub.state),
+                    str(sub.retries),
+                    sub.title[:60],
+                    key=sub.subtask_id,
+                )
+            except Exception as e:
+                add_errors.append(f"{sub.subtask_id}:{type(e).__name__}:{e}")
+        return add_errors
+
+    def _log_subtask_render(self, snap: DetailSnapshot, table: DataTable, add_errors: list[str]) -> None:
+        if not _log.isEnabledFor(logging.DEBUG):
+            return
+        try:
+            rendered = table.row_count
+        except Exception:
+            rendered = -1
+        _log.debug(
+            "render_snapshot %s: snapshot=%d rendered=%d add_errors=%d %s",
+            snap.task_id,
+            len(snap.subtasks),
+            rendered,
+            len(add_errors),
+            ("; ".join(add_errors)[:500]) if add_errors else "",
+        )
+
+    def _render_agent_calls(self, snap: DetailSnapshot) -> None:
         calls_fp = tuple(snap.agent_calls)
-        if calls_fp != self._calls_fp:
-            calls = self.query_one("#calls-log", RichLog)
-            calls.clear()
-            if snap.agent_calls:
-                for line in reversed(snap.agent_calls):
-                    calls.write(line)
-            else:
-                calls.write("[dim]no agent calls yet[/]")
-            self._calls_fp = calls_fp
+        if calls_fp == self._calls_fp:
+            return
+        calls = self.query_one("#calls-log", RichLog)
+        calls.clear()
+        if snap.agent_calls:
+            for line in reversed(snap.agent_calls):
+                calls.write(line)
+        else:
+            calls.write("[dim]no agent calls yet[/]")
+        self._calls_fp = calls_fp
 
     def cycle_tab(self, direction: int = 1) -> None:
         tabs = self.query_one("#detail-tabs", TabbedContent)
@@ -276,15 +261,8 @@ def _subtask_state_cell(state: str) -> str:
 # State values where work is happening at the workspace level (no per-subtask
 # row to highlight). For these the subtasks tab can be misleading — surface
 # the phase explicitly.
-_WHOLE_SPEC_STATES = {
-    "doing",
-    "checking",
-    "triaging",
-    "final_checking",
-    "replanning",
-    # v3 states where the worker takes the wheel for the whole spec — the
-    # subtasks tab is frozen until the task either commits + pushes or
-    # transitions back to AWAITING_MERGE.
+_WHOLE_TASK_STATES = {
+    "fixup_planning",
     "addressing_feedback",
     "rebasing_to_main",
 }
@@ -295,8 +273,8 @@ def _phase_line(snap: DetailSnapshot) -> str:
 
     Examples:
       R-0001 · doing_subtask · S-07-mcp-tools attempt 2 · in-state 47s · edit 12s ago
-      R-0001 · doing · whole-spec fixup attempt 1 · in-state 32m · edit 42s ago
-      R-0001 · awaiting_merge · #57 green · in-state 14m
+      R-0001 · doing · monolithic fixup attempt 1 · in-state 32m · edit 42s ago
+      R-0001 · pending_ci · #57 green · in-state 14m
     """
     if not snap.task_id or snap.task_id == "(none)":
         return "[dim]No task selected — highlight a row above and press Enter.[/]"
@@ -310,8 +288,7 @@ def _phase_line(snap: DetailSnapshot) -> str:
     if snap.title:
         parts.append(f"[dim]{snap.title[:60]}[/]")
     # State display: short label with bracketed long description so the
-    # operator never has to remember what "checking" vs "checking_subtask"
-    # vs "final_checking" vs "local_ci_checking" actually means.
+    # operator never has to remember what the compact state label means.
     long_desc = _state_long_description(state)
     if long_desc:
         parts.append(f"[{color}]{state}[/] [dim]({long_desc})[/]")
@@ -324,14 +301,14 @@ def _phase_line(snap: DetailSnapshot) -> str:
     if state == "addressing_feedback":
         if snap.review_round is not None and snap.review_threads_count is not None:
             parts.append(f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads")
-    elif state in {"local_ci_checking", "pre_pr_auditing", "pre_pr_triaging"} and note:
+    elif state in {"local_ci_checking", "pre_pr_auditing", "fixup_planning"} and note:
         # Pipeline notes carry per-stage context ("rubric audit (codex)"); show.
         parts.append(f"[dim]{note[:80]}[/]")
     elif note:
         parts.append(f"[dim]{note[:80]}[/]")
     if in_state:
         parts.append(f"in-state [b]{in_state}[/]")
-    if edit and state in _WHOLE_SPEC_STATES | {"doing_subtask", "checking_subtask", "triaging_subtask"}:
+    if edit and state in _WHOLE_TASK_STATES | {"doing_subtask", "checking_subtask", "triaging_subtask"}:
         parts.append(f"edit [b]{edit}[/]")
     line = "  ·  ".join(parts)
     # Trailing notes — explain "why does the subtasks tab look frozen?" for
@@ -339,33 +316,25 @@ def _phase_line(snap: DetailSnapshot) -> str:
     # fully released this task, the daemon is the one polling.
     if state in {"pending_ci", "awaiting_review", "merge_ready"}:
         line += "\n[dim italic](no action required — auto-polling for CI + reviews)[/]"
-    elif state in _WHOLE_SPEC_STATES:
-        line += "\n[dim italic](whole-spec phase — subtask states below are frozen until this returns)[/]"
+    elif state in _WHOLE_TASK_STATES:
+        line += "\n[dim italic](task-level phase — subtask states below are frozen until this returns)[/]"
     return line
 
 
 _STATE_LONG_DESCRIPTION = {
-    "checking": "whole-spec checker (v0.1 legacy)",
     "checking_subtask": "per-subtask checker",
     "triaging_subtask": "per-subtask triage",
-    "final_checking": "final whole-spec checker",
     "local_ci_checking": "local CI gate (just ci)",
     "pre_pr_auditing": "pre-PR audit gauntlet",
-    "pre_pr_triaging": "merging audit findings → fixup planner",
+    "fixup_planning": "planning fixup subtasks",
     "triaging_feedback": "Python triage of review threads",
     "addressing_feedback": "fixup planner + per-subtask doer",
     "conflict_resolving": "spawned conflict-resolver agent",
-    "intent_reviewing": "checking spec-compatibility after dep merge",
-    "rebasing": "rebasing onto current main",
     "rebasing_to_main": "rebasing onto main (parent merged)",
-    "fixup_planning": "planning fixup subtasks",
     "pending_ci": "PR open · CI running",
     "awaiting_review": "CI green · awaiting review",
     "merge_ready": "ready to merge",
     "doing_subtask": "running per-subtask doer",
-    "doing": "running whole-spec doer (v0.1 legacy)",
-    "triaging": "whole-spec triage (v0.1 legacy)",
-    "replanning": "replanning after intent review",
 }
 
 
@@ -427,23 +396,14 @@ def _gauntlet_block(snap: DetailSnapshot) -> str | None:
 
 
 def _phase_color(state: str) -> str:
-    if state in {"merge_ready", "merged"}:
-        return "green"
-    if state == "awaiting_review":
-        return "blue"
-    if state == "pending_ci":
-        return "yellow"
-    if state in {"blocked", "failed", "aborted"}:
-        return "red"
-    if state in {"addressing_feedback", "triaging_feedback"}:
-        # Cyan to match other "agent actively working" states. Distinct from
-        # rebasing (yellow) so a glance differentiates "fixing feedback" from
-        # "untangling git" at the phase-line level.
-        return "cyan"
-    if state == "rebasing_to_main":
-        return "yellow"
-    if state in _WHOLE_SPEC_STATES | {"doing_subtask", "checking_subtask"}:
-        return "cyan"
-    if state in {"triaging_subtask", "rebasing", "intent_reviewing", "conflict_resolving"}:
-        return "yellow"
-    return "white"
+    color_sets = (
+        ("green", {"merge_ready", "merged"}),
+        ("blue", {"awaiting_review"}),
+        ("red", {"blocked", "failed", "aborted"}),
+        ("cyan", {"addressing_feedback"} | _WHOLE_TASK_STATES | {"doing_subtask", "checking_subtask"}),
+        (
+            "yellow",
+            {"pending_ci", "rebasing_to_main", "triaging_subtask", "triaging_feedback", "conflict_resolving"},
+        ),
+    )
+    return next((color for color, states in color_sets if state in states), "white")

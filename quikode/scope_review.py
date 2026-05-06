@@ -32,6 +32,7 @@ from . import prompts as prompts_mod
 from .agents import build_agent
 from .config import AgentRole, Config
 from .docker_env import TaskContainer
+from .json_extract import first_balanced_object
 from .subtask_schema import Subtask
 
 log = logging.getLogger("quikode.scope_review")
@@ -157,32 +158,10 @@ def _parse_envelope(text: str) -> dict | None:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    # Fallback: first balanced { ... } block.
-    start = text.find("{")
-    if start < 0:
+    blob = first_balanced_object(text)
+    if blob is None:
         return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start : i + 1])
-                except json.JSONDecodeError:
-                    return None
-    return None
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        return None

@@ -1,360 +1,67 @@
-# runbook — incident response
+# Incident Response
 
-What to do when things break. For day-to-day ops, see
-`runbook-operations.md`.
-
-Format: **symptom → first-look → recovery options**, ordered roughly
-from most-common to least-common.
-
-## Symptom: task BLOCKED
-
-The task hit its retry budget. Always recoverable; the question is *how*.
-
-**First look:**
+Start with:
 
 ```bash
-quikode show <id>             # state timeline + latest artifacts + costs
-quikode unblock <id>          # prints worktree path, branch, PR, last error, next-step hints (no state change)
-quikode subtasks <id>         # which subtask blocked, on what
+quikode daemon status
+quikode briefing
+quikode show <task-id>
+quikode subtasks <task-id>
+quikode tail <task-id>
 ```
 
-Read the last 3 transitions in the state timeline, the resolver / triage
-agent's last message, and the `last_error` field. Decide:
+## Invalid Transition
 
-| Want | Recovery |
-|---|---|
-| Push a fix from your laptop | `cd <worktree>; <edit>; git commit; git push`. Daemon detects new commits and resumes from the failing subtask via the standard flow. |
-| Guide the agent | Post a review-thread comment via `gh pr review --comment --body "..."`. Watcher picks it up next tick. |
-| Fix locally and re-pend | `quikode unblock <id>` (read-only context), do the work, then `quikode resume <id>` from the workspace dir. Reuses Plan + finished subtasks. |
-| Restart the task from scratch | `quikode retry <id>` — wipes worktree, re-plans, fresh budget. |
+First look: current task state, attempted event, and recent `state_log`.
 
-`unblock --edit` launches `$EDITOR` on the worktree path if you want a
-keystroke shortcut.
+Recovery: fix caller code to emit the correct event or add a deliberate FSM transition with a test. Do not direct-write around the FSM in runtime code.
 
-## Symptom: daemon crashed / heartbeat stale
+## Blocked Task
+
+First look:
 
 ```bash
-quikode daemon status         # exit 0 alive+fresh, 1 down, 2 stale
+quikode unblock <task-id>
 ```
 
-The heartbeat is written by the inner `quikode run`, not the supervisor.
-Stale heartbeat with the supervisor still alive means the inner
-orchestrator is hung but the supervisor hasn't noticed yet (it only
-restarts on actual exit).
+Recovery: inspect block forensics, latest checker output, retry categories, progress checks, and worktree state. Fix locally and `resume`, or intentionally `retry`.
 
-| Output | Meaning | Action |
-|---|---|---|
-| `daemon alive` + `heartbeat fresh` | Healthy. | None. |
-| `daemon alive` + `heartbeat STALE` | Inner orchestrator hung. | `tail -f .quikode/logs/daemon.log` to see what's happening; if truly stuck, `quikode daemon stop` then `daemon start` for a forced restart. |
-| `daemon not running` | Supervisor died (rare). | Check `.quikode/logs/daemon.log` for cause. Restart with `quikode daemon start`. |
+## Failed Invariant
 
-Supervisor crashes themselves are rare. The supervisor restarts the
-*child* on crash with backoff (`60s → 5m → 30m`, capped). If the inner
-`quikode run` ran for `cfg.daemon_min_run_for_backoff_reset_s` (default
-300s) before crashing, backoff resets to the first entry — so it's
-self-healing for transient crashes but doesn't tight-loop.
+First look: task log, artifact stream, and the state transition immediately before failure.
 
-## Symptom: orphan tasks after restart
+Recovery: preserve artifacts, add a direct regression test, and fix the invariant at the service boundary.
 
-Orphan recovery runs automatically on every `quikode run` startup
-(`state.py:Store.recover_orphan_tasks`). Tasks left in active states get
-reset:
+## Stale Heartbeat
 
-| State at crash | Recovery state |
-|---|---|
-| `provisioning` / `planning` (no plan_text) | `pending` (clean reset) |
-| `doing_subtask` / `checking_subtask` / `triaging_subtask` / `final_checking` / `committing` / `pushing` | `pending` + `resume_from_existing_subtasks=1` |
-| `pr_opening` / `polling_ci` (with pr_number) | `awaiting_merge` |
-| `responding_to_review` | `awaiting_merge` (watcher re-detects threads) |
-| `rebasing_to_main` / `conflict_resolving` | `awaiting_merge` if PR exists, else `pending` + resume |
-| `intent_reviewing` | `awaiting_merge` if PR exists, else `pending` + resume |
-| Terminal (`merged` / `blocked` / `failed` / `aborted` / `awaiting_merge`) | left alone |
-
-The recovered transition is logged with note `orphan recovery`. If a
-task remains stuck, `quikode show <id>` reveals the recovery transition
-and current state — pick from the BLOCKED options above.
-
-## Symptom: review comment ignored
-
-Only **review-thread** comments are picked up. The watcher polls via
-`github_graphql.get_review_threads`, which queries the GraphQL
-`reviewThreads` connection — plain `issueComments` are explicitly
-filtered out (intentional; otherwise every CI bot ping triggers a
-worker).
-
-Recovery: re-post the same body inside a review:
+First look:
 
 ```bash
-gh pr review <pr-number> --comment --body "..."
+quikode daemon status
 ```
 
-Or in the UI: "Files changed" → "Start a review" → comment on a line →
-"Submit review". Re-posting from "Conversation" tab as a regular comment
-won't trigger the watcher.
+Recovery: stop the daemon. The next start runs crash recovery through the FSM. If this repeats, inspect the active task log and subprocess waits.
 
-`cfg.respond_to_bot_reviews` (default `true`) controls whether
-bot-authored review threads (e.g., chatgpt-codex-connector) are
-addressed. Set to `false` to ignore bot reviews and address only
-human-authored threads.
+## PR Closed
 
-## Symptom: PR auto-closed by GitHub (base branch deleted)
+First look: `quikode show <id>`, GitHub PR state, and parent branch metadata.
 
-Happens when the parent task merges with `--delete-branch` (squash-merge
-with branch deletion is GitHub's default for tanren). Stacked children
-pointing at the deleted branch get auto-closed.
+Recovery: if parent-base deletion caused the close, use the rebase path. If a human closed the PR intentionally, decide between `abort`, `retry`, or local branch inspection.
 
-Recovery is automatic. The rebase worker detects the deleted base
-branch, runs `git rebase --onto origin/main <parent_sha>`, **creates a
-fresh PR** pointing at main (not just `gh pr edit --base main`, since
-the old PR is closed), and updates `tasks.pr_number` / `tasks.pr_url`.
-See `worker.py:run_rebase_to_main`.
+## Rebase Conflict Unresolved
 
-If you see an old closed PR + a new open PR for the same task, that's
-the auto-recreation path working as designed. The `state_log` will show
-a `REBASING_TO_MAIN → AWAITING_MERGE` transition with a note.
+First look: task worktree, conflict markers, and conflict resolver artifact.
 
-## Symptom: rebase loop / repeated rebase storms
+Recovery: resolve locally, commit as needed, then `resume`. If the branch is not usable, `retry`.
 
-`_schedule_rebases_for_merged_parent` only triggers a child rebase when
-the child's PR is `CONFLICTING` or its base branch is deleted. Other
-parent state changes do **not** schedule rebases. If you see repeats,
-something is regenerating the trigger condition — most likely a flaky
-mergeable check or repeated parent re-merging (shouldn't happen).
+## Feedback Cap Hit
 
-Look at `state_log` notes for the trigger reason on each
-`REBASING_TO_MAIN` entry. If you see two within seconds of each other,
-that's the known coalescing gap (see `future-work.md`).
+First look: review rounds, unresolved thread list, CI failures, and latest fixup artifacts.
 
-If a single rebase is itself failing repeatedly, the conflict resolver
-may be stuck on a semantic conflict. `quikode unblock <id>` and resolve
-manually.
+Recovery: operator chooses one of: merge externally, post guidance, `resume`, or `retry`.
 
-## Symptom: stuck in RESPONDING_TO_REVIEW
+## Seed Evidence Mismatch
 
-The agent is mid-fixup. There are two failure modes worth distinguishing:
+First look: DAG metadata, `origin/main` subjects, and any explicit evidence file used with `seed-from-main`.
 
-**Stalled future (no agent activity):** The orchestrator's
-`_check_stalls` watches for `responding_to_review` tasks with zero
-agent_call rows in the last `cfg.stall_warn_seconds` (default 1800s).
-On detection it force-cancels the future and resets the task to
-AWAITING_MERGE so the watcher can re-dispatch on next tick. This means
-"stuck for 30+ min with no agent activity" is *self-recovering* — wait
-a tick rather than reaching for `abort`. To check:
-
-```bash
-sqlite3 .quikode/quikode.db \
-  "SELECT phase, ts FROM agent_calls WHERE task_id = '<id>' ORDER BY ts DESC LIMIT 5;"
-```
-
-If the most recent row is fresh, the agent is mid-call (just slow).
-If it's older than 30 min, the stall detector should fire any tick
-now.
-
-**review_rounds_max hit:** `cfg.review_rounds_max` (default 15) caps
-the fixup-review cycle. When exceeded, the task BLOCKs with
-"manual merge/close required" — codex has been finding nits forever
-without converging. Operator decides: merge as-is via the GitHub UI,
-or `quikode abort <id> --reason "codex churn"` and address manually.
-
-**Genuinely hung agent CLI:**
-
-```bash
-quikode abort <id>            # per-task: kills only qk-<task-slug>-* containers
-quikode retry <id>            # back to PENDING for a fresh attempt
-```
-
-`quikode abort` is workspace-safe — it matches container names by the
-`qk-<task-slug>-*` prefix and won't touch other in-flight workers.
-
-## Symptom: subtask retrying without convergence
-
-The task is in `DOING_SUBTASK` / `CHECKING_SUBTASK` / `TRIAGING_SUBTASK`,
-attempt count is climbing past 4-5, and costs are mounting. The progress
-check should catch flatline in theory; in practice it can return
-`PROGRESSING` / `UNCERTAIN` even on a runaway loop where the doer is
-making cosmetically-different edits each iteration (different SHAs,
-identical content).
-
-**First look:**
-
-```bash
-quikode show <id>             # state timeline + per-attempt root_cause
-quikode subtasks <id>         # which subtask is looping, on what
-```
-
-Look at the recent transitions for a pattern of `S-NN attempt N
-failed` lines. If the failure root causes are repeating verbatim — same
-checker complaint, same triage notes — the agent's heuristic is failing
-in a way that the progress checker doesn't catch.
-
-**Check the progress agent's verdicts:**
-
-```bash
-sqlite3 .quikode/quikode.db \
-  "SELECT * FROM progress_checks WHERE task_id = '<id>' ORDER BY ts DESC LIMIT 5;"
-```
-
-If verdicts are PROGRESSING/UNCERTAIN despite repeated identical root
-causes, this is the "rotating-SHA loop" failure mode (Bug 2 from the
-2026-05-03 validation findings; the immediate trigger was fixed in
-`worktree.py`, but the underlying class of failure can recur if the doer
-finds another way to make superficial progress without actually
-addressing the checker's complaint).
-
-**Recovery:**
-
-```bash
-quikode daemon stop
-quikode retry <id>            # full reset; fresh subtask attempt
-quikode daemon start --max-parallel 3
-```
-
-`retry` is preferred over `resume` here — `resume` carries forward the
-existing subtask state, which is exactly what's stuck. `retry` wipes
-the worktree, re-plans, and gives the agent a fresh budget. If the
-loop reproduces immediately on retry, that's a deterministic
-quikode-side bug; capture the task log + state and file an issue.
-
-## Symptom: worktree missing or corrupted mid-run
-
-The task's `worktree_path` row points to a directory that doesn't exist
-on disk; the worker crashes on its first git command. Rare, but
-observed in Run 1 of the 2026-05-03 validation when an external process
-removed the worktree mid-flight.
-
-**First look:**
-
-```bash
-ls .quikode/worktrees/                        # see what's actually there
-quikode show <id>                             # see the row's stored worktree_path
-```
-
-If the worktree directory listed for the task is missing, that's the
-condition.
-
-**Recovery:** `quikode retry <id>` is the safest path — it wipes any
-stale state and re-plans from scratch. The orphan-recovery on the next
-daemon restart will also handle this case if the task is still in an
-active state, but `retry` gives you control over timing.
-
-```bash
-quikode retry <id>
-```
-
-If the task was AWAITING_MERGE with a real PR, you can sometimes
-preserve that PR by re-creating the worktree manually from the remote
-branch (`git worktree add <path> <branch>`) and then `quikode resume
-<id>` — but this is a power-user move; `retry` is fine 95% of the time.
-
-## Symptom: ccusage shows wrong cost
-
-`quikode/agents/ccusage.py` uses snapshot-delta (read JSONL state before
-and after each agent invocation). Costs are advisory and never block.
-
-If a known cost looks wrong:
-1. Check `agent_calls.cost_usd` directly: `sqlite3 .quikode/quikode.db 'select task_id, phase, cost_usd from agent_calls order by ts desc limit 20'`.
-2. ccusage failures fall through to `None`; the column is missing for that call. The total in `quikode briefing` is the sum of non-NULL `cost_usd` rows.
-3. claude-code's stream-json envelope is preferred over ccusage when present (see the docstring in `ccusage.py`).
-4. Single-call costs > $50 are clamped to 0 with a warning log (sanity
-   cap added 2026-05-04 after a parser misattribution issued a $292
-   reading on an 86-second call). If your real call legitimately
-   exceeds $50, raise `_MAX_PER_CALL_COST_USD` — but do verify against
-   `ccusage daily` first.
-
-## Symptom: task in AWAITING_MERGE while CI is failing
-
-GitHub CI can flip to FAILURE after the worker has handed off to
-AWAITING_MERGE — typical sequence: response cycle pushes a fixup
-commit, worker exits, GitHub re-runs CI, CI fails. The daemon's
-review-watcher (`_poll_review_threads`) detects this and dispatches
-`worker.run_ci_fix_response` via `_schedule_ci_fix_response`.
-
-If `quikode show <id>` shows AWAITING_MERGE for >5 min while
-`gh pr checks <pr>` shows failures, the dispatch should fire on next
-review-watcher tick (default 60s). If it doesn't:
-
-```bash
-quikode tail <id>                          # last events
-sqlite3 .quikode/quikode.db \
-  "SELECT * FROM state_log WHERE task_id = '<id>' ORDER BY ts DESC LIMIT 5;"
-```
-
-A task that doesn't transition to RESPONDING_TO_REVIEW within ~3
-review-watcher cycles after CI fail is a bug — capture log + state.
-
-## Symptom: branch divergence (operator hand-pushed to the same branch)
-
-When the operator (or a parallel quikode workspace) pushes commits to
-the child's branch mid-task, the worker's eventual `git push` fails
-non-fast-forward and budget exhaustion BLOCKs the task.
-
-Mitigation already in place: subtask-boundary detection via
-`worker.py:_handle_branch_divergence_if_needed`. Pure FF →
-`reset --hard`. Force-push that drops the worker's commits → BLOCK
-(operator did this on purpose; don't fight it). Diverged →
-`git rebase origin/<branch>` with conflict-resolver fallback.
-
-If you find a task BLOCKED with "branch diverged force-push" in the
-state-log note, decide whose work to keep:
-
-```bash
-# Inspect what's on the remote vs the worker's worktree
-git -C .quikode/worktrees/<id> log --all --oneline -20
-git -C .quikode/worktrees/<id> diff origin/<branch> HEAD
-```
-
-Pick the side, force-push if needed, then `quikode resume <id>`.
-
-## Symptom: task FAILED (vs BLOCKED)
-
-`FAILED` is unrecoverable crash — usually a code bug in quikode, an
-uncaught exception in the worker, or a docker daemon failure.
-
-`BLOCKED` is the orderly exit when retry budgets are exhausted.
-
-Recovery for FAILED:
-
-```bash
-quikode show <id>             # check last_error + state timeline
-quikode tail <id>             # task log will have the traceback
-# Fix the cause (file an issue if it's a quikode bug), then:
-quikode retry <id>            # back to PENDING
-```
-
-If the same task keeps FAILING, it's a deterministic bug. Capture the
-log and the SQLite state before retrying.
-
-## Symptom: container stranded after a crash
-
-`quikode run` startup runs `cleanup_all_quikode(cfg)` which kills every
-`qk-*` container labeled `qk_workspace=<this-workspace's-8hex>`. So a
-fresh `quikode run` cleans up. For mid-flight cleanup without
-restarting:
-
-```bash
-quikode clean-containers      # workspace-scoped; safe with parallel workspaces
-```
-
-The `qk_workspace` label is derived from the workspace's state-dir path,
-so this never touches another workspace's containers.
-
-## Symptom: `quikode reset` failed to delete remote branch
-
-`reset --close-prs` runs `git push --delete origin <ref>` per branch.
-If the user-token doesn't have repo:delete (or branch protection
-denies), the call fails silently — `subprocess.run` without
-`check=True`. Don't add `check=True` without a fallback; just delete
-the branch by hand on GitHub if needed.
-
-## Symptom: two orchestrators trying to run in the same workspace
-
-`quikode run` writes `.quikode/orchestrator.pid` and refuses to start
-if another fresh PID is on disk (within 60s). The daemon supervisor has
-its own `daemon.pid`. So:
-
-- Running `quikode daemon start` while another `daemon start` is alive → the second one prints "daemon already running" and exits 1.
-- Running `quikode run` while a daemon is alive → the second one detects the fresh `orchestrator.pid` and refuses.
-
-If the PID file is stale (older than 60s, no live process), the new
-invocation proceeds and overwrites it. To force-clear: `rm
-.quikode/orchestrator.pid .quikode/daemon.pid` (only when truly stale).
+Recovery: correct the evidence source and rerun seeding in a fresh workspace.

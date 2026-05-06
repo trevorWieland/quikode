@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from quikode.config import AgentCli, load_config
+from quikode.config import AgentCli
+from quikode.config_loader import load_config
 
 from ..widgets.activity_feed import ActivityFeed
 from ..widgets.confirm_modal import ConfirmModal

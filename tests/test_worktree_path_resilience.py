@@ -141,7 +141,7 @@ def test_run_rebase_to_main_handles_missing_worktree_cleanly(tmp_path):
     ):
         out = w.run_rebase_to_main()
 
-    # Row is restored to AWAITING_MERGE (the stashed pre-rebase state)
+    # Row is restored to PENDING_CI (the stashed pre-rebase state)
     # rather than left dangling in REBASING_TO_MAIN.
     row = w.store.get("T-003")
     assert row["state"] == State.PENDING_CI.value

@@ -10,20 +10,20 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import signal
 import subprocess
+import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
-import pytest
 from typer.testing import CliRunner
 
 from quikode import daemon as daemon_mod
 from quikode.cli import app
 from quikode.config import Config
 
-SLEEP_BIN = shutil.which("sleep")
+SLEEP_CMD = [sys.executable, "-c", "import time; time.sleep(30)"]
 
 
 def _make_cfg(tmp_path: Path) -> Config:
@@ -79,11 +79,18 @@ class _FakeChild:
         self.pid = 12345
         self.signals_received: list[int] = []
         self._terminated = False
+        self.wait_impl: Callable[[int | float | None], int] | None = None
+        self.send_signal_impl: Callable[[int], None] | None = None
 
-    def wait(self, timeout: float | None = None) -> int:
+    def wait(self, timeout: int | float | None = None) -> int:
         # `timeout` is accepted for parity with subprocess.Popen.wait — the
         # supervisor's heartbeat watchdog uses it to wake periodically and
         # check freshness. The fake just resolves immediately either way.
+        if self.wait_impl is not None:
+            return self.wait_impl(timeout)
+        return self._wait_default(timeout)
+
+    def _wait_default(self, timeout: int | float | None = None) -> int:
         del timeout
         if not self._exit_codes:
             raise RuntimeError("no more exit codes scripted")
@@ -95,6 +102,9 @@ class _FakeChild:
         return self.returncode
 
     def send_signal(self, sig: int) -> None:
+        if self.send_signal_impl is not None:
+            self.send_signal_impl(sig)
+            return
         self.signals_received.append(sig)
         # Simulate the child responding to SIGTERM by setting rc=0
         if sig == signal.SIGTERM:
@@ -233,12 +243,10 @@ def test_supervisor_sigterm_forwards_and_exits(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon_mod, "_install_signal_handlers", lambda s: None)
 
     # Use the real supervise but flip shutdown after the first wait
-    real_wait = child.wait
-
     def _wait_then_shutdown(timeout=None):
-        return real_wait(timeout=timeout)
+        return child._wait_default(timeout=timeout)
 
-    child.wait = _wait_then_shutdown
+    child.wait_impl = _wait_then_shutdown
 
     rc = daemon_mod.supervise(cfg, [], sleep_fn=_no_sleep)
     assert rc == 0
@@ -291,7 +299,7 @@ def test_failsafe_kill_fires_sigkill_when_child_ignores_sigterm():
         child.signals_received.append(sig)
         # NOTE: do NOT set returncode — child stays alive
 
-    child.send_signal = _ignore_sigterm  # type: ignore[assignment]
+    child.send_signal_impl = _ignore_sigterm
 
     timer = daemon_mod._schedule_failsafe_kill(child, timeout_s=0.1)
     timer.join(timeout=2.0)
@@ -312,12 +320,10 @@ def test_failsafe_kill_skips_sigkill_when_child_already_exited():
 # ----- daemon stop -----
 
 
-@pytest.mark.skipif(not SLEEP_BIN, reason="sleep binary unavailable")
 def test_daemon_stop_sends_sigterm_to_running(tmp_path, monkeypatch):
     cfg = _make_cfg(tmp_path)
-    # Spawn a real `sleep` and write its pid to daemon.pid
     proc = subprocess.Popen(
-        [SLEEP_BIN, "30"],
+        SLEEP_CMD,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -381,7 +387,7 @@ def test_daemon_status_running_fresh_heartbeat_json(tmp_path, monkeypatch):
             {
                 "ts": time.time(),
                 "in_flight": 2,
-                "awaiting_merge": 1,
+                "pending_ci": 1,
                 "addressing_feedback": 0,
             }
         )
@@ -402,7 +408,7 @@ def test_daemon_status_stale_heartbeat_returns_2(tmp_path, monkeypatch):
     (state / "daemon.pid").write_text(f"{os.getpid()}@{time.time():.0f}\n")
     # Heartbeat 10 minutes old
     (state / "orchestrator.heartbeat").write_text(
-        json.dumps({"ts": time.time() - 600, "in_flight": 0, "awaiting_merge": 0, "addressing_feedback": 0})
+        json.dumps({"ts": time.time() - 600, "in_flight": 0, "pending_ci": 0, "addressing_feedback": 0})
     )
     runner = CliRunner()
     res = runner.invoke(app, ["daemon", "status"])
@@ -445,7 +451,7 @@ def test_spawn_child_uses_workspace_dir_not_repo(tmp_path, monkeypatch):
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {}
 
     def fake_popen(argv, **kwargs):
         captured["cwd"] = kwargs.get("cwd")
@@ -604,15 +610,14 @@ def test_watchdog_disabled_when_threshold_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon_mod, "_install_signal_handlers", lambda s: None)
 
     waits = {"calls": 0}
-    real_wait = child.wait
 
     def _tracking_wait(timeout=None):
         waits["calls"] += 1
         # If the watchdog were enabled we'd see timeout != None.
         assert timeout is None, f"watchdog should be disabled but wait got timeout={timeout}"
-        return real_wait(timeout)
+        return child._wait_default(timeout)
 
-    child.wait = _tracking_wait
+    child.wait_impl = _tracking_wait
 
     rc = daemon_mod.supervise(cfg, [], sleep_fn=_no_sleep)
     assert rc == 0

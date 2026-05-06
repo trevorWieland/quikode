@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 from typer.testing import CliRunner
 
 from quikode.cli import app
-from quikode.config import DEFAULT_CONFIG_TOML
+from quikode.config_template import DEFAULT_CONFIG_TOML
 from quikode.state import Store
 
 

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from quikode import worktree
-from quikode.config import Config
+from quikode.config import Config, StackingStrategy
 from quikode.dag import DAG
 from quikode.state import Store
 from quikode.worker import TaskWorker
@@ -72,7 +72,7 @@ def _worker(tmp_path: Path, *, child_id: str = "CHILD") -> TaskWorker:
         log_dir=tmp_path / ".quikode" / "logs",
         worktree_root=tmp_path / ".quikode" / "worktrees",
         sccache_dir=tmp_path / ".quikode" / "sccache",
-        stacking_strategy="within-milestone",
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
     )
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     store = Store(cfg.state_dir / "q.db")
@@ -171,7 +171,7 @@ def test_add_worktree_off_branch_fetches_remote_when_given(tmp_path):
 
 
 def test_add_worktree_off_branch_skips_fetch_without_remote(tmp_path):
-    """Backward compat: no remote kw → no fetch (legacy v2 path)."""
+    """Backward compat: no remote kw → no fetch (old v2 path)."""
     repo = tmp_path / "repo"
     repo.mkdir()
     wt = tmp_path / "wt"

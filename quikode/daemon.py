@@ -1,23 +1,4 @@
-"""Daemon supervisor for `quikode run`.
-
-A thin wrapper that spawns `quikode run` as a child subprocess and restarts
-it on crash with exponential backoff. The supervisor:
-
-- Writes its OWN PID file at `state_dir/daemon.pid` (separate from
-  `orchestrator.pid` written by the inner `quikode run`).
-- Appends a daemon log at `state_dir/logs/daemon.log` (TODO: rotation).
-- On child clean exit (rc=0): supervisor exits 0. No restart.
-- On child crash (rc!=0): supervisor sleeps with backoff (per cfg
-  `daemon_backoff_schedule_s`, default `[60, 300, 1800]` = 1m/5m/30m,
-  capped). Backoff resets to the first entry after a successful run of at
-  least `cfg.daemon_min_run_for_backoff_reset_s` seconds (default 5m).
-- On supervisor SIGTERM/SIGINT: forwards SIGTERM to the child, waits up to
-  30s for graceful exit, then SIGKILL. Supervisor exits cleanly.
-
-Status is read from `daemon.pid` + `orchestrator.heartbeat`. The heartbeat
-is written by the inner orchestrator; the supervisor itself never writes
-it (otherwise stale-detection wouldn't work when the child crashes).
-"""
+"""Crash-restart supervisor for `quikode run`."""
 
 from __future__ import annotations
 
@@ -29,19 +10,31 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO, Protocol
 
 from . import worktree
 from .config import Config
 
 log = logging.getLogger(__name__)
 
-# How long we wait after sending SIGTERM to the child before SIGKILL.
 CHILD_TERM_TIMEOUT_S = 30
-
-# Polling interval while waiting on child termination.
 TERM_POLL_INTERVAL_S = 0.5
+
+
+class ChildProcess(Protocol):
+    pid: int
+    returncode: int | None
+
+    def wait(self, timeout: int | float | None = None) -> int: ...
+
+    def poll(self) -> int | None: ...
+
+    def send_signal(self, sig: int) -> None: ...
+
+    def kill(self) -> None: ...
 
 
 def daemon_pid_file(cfg: Config) -> Path:
@@ -207,18 +200,20 @@ def _spawn_child(cfg: Config, run_args: list[str], log_fp) -> subprocess.Popen:
     )
 
 
-def _terminate_child(child: subprocess.Popen, *, timeout_s: int = CHILD_TERM_TIMEOUT_S) -> int:
+def _terminate_child(child: ChildProcess, *, timeout_s: int | float = CHILD_TERM_TIMEOUT_S) -> int:
     """Send SIGTERM, wait up to timeout, then SIGKILL. Return final exit code."""
-    if child.poll() is not None:
-        return int(child.returncode)
+    rc = child.poll()
+    if rc is not None:
+        return int(rc)
     try:
         child.send_signal(signal.SIGTERM)
     except ProcessLookupError:
         return int(child.returncode or 0)
     deadline = time.time() + timeout_s
     while time.time() < deadline:
-        if child.poll() is not None:
-            return int(child.returncode)
+        rc = child.poll()
+        if rc is not None:
+            return int(rc)
         time.sleep(TERM_POLL_INTERVAL_S)
     # Hard kill
     try:
@@ -242,7 +237,7 @@ class _SupervisorState:
 
 
 def _schedule_failsafe_kill(
-    child: subprocess.Popen, timeout_s: int = CHILD_TERM_TIMEOUT_S
+    child: ChildProcess, timeout_s: int | float = CHILD_TERM_TIMEOUT_S
 ) -> threading.Timer:
     """Schedule SIGKILL on `child` after `timeout_s` if it's still alive.
 
@@ -459,102 +454,31 @@ def supervise(cfg: Config, run_args: list[str], *, sleep_fn=time.sleep) -> int:
 
     log_path = daemon_log_file(cfg)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    # Append-only for now. TODO: rotate (e.g., size-based or daily) once the
-    # daemon has soaked enough that we know typical log volumes.
     log_fp = log_path.open("ab")
-
     consecutive_crashes = 0
     schedule = list(cfg.daemon_backoff_schedule_s)
     min_run_reset = cfg.daemon_min_run_for_backoff_reset_s
 
     try:
         while not state.shutdown:
-            # Defensive worktree prune before each (re)spawn. A crashed inner
-            # `quikode run` can leave stale dirs that, if reused on the
-            # restart, confuse `git worktree add`. Best-effort: failures here
-            # are logged but never block the spawn.
-            try:
-                pruned = worktree.prune_stale_worktrees(cfg.repo_path, cfg.worktree_root)
-                if pruned:
-                    log_fp.write(
-                        f"--- [supervisor] pruned {len(pruned)} stale worktree dir(s) before spawn ---\n".encode()
-                    )
-                    log_fp.flush()
-            except Exception as e:
-                log_fp.write(f"--- [supervisor] worktree prune skipped: {e} ---\n".encode())
-                log_fp.flush()
-
+            _supervisor_prune_worktrees(cfg, log_fp)
             child_started = time.time()
-            log_fp.write(
-                f"\n--- [supervisor] spawn quikode run at {time.strftime('%Y-%m-%dT%H:%M:%S')} ---\n".encode()
-            )
-            log_fp.flush()
-            child = _spawn_child(cfg, run_args, log_fp)
-            state.current_child = child
-            log.info("supervisor spawned child pid=%d", child.pid)
-
-            # Watch the child with a heartbeat-stale watchdog. A crashed child
-            # exits and child.poll() flips; a *hung* child stays alive forever
-            # while the heartbeat goes cold — without intervention the
-            # supervisor would never restart it. Poll the heartbeat every
-            # ~5s and SIGTERM after two consecutive stale reads (the inner
-            # orchestrator writes its heartbeat on a timer, so a single
-            # missed window doesn't justify a kill).
-            try:
-                rc = _wait_with_watchdog(cfg, child, state, log_fp, sleep_fn)
-            except KeyboardInterrupt:
-                # If KeyboardInterrupt sneaks past the signal handler (race
-                # during install), force the same shutdown path.
-                state.shutdown = True
-                rc = _terminate_child(child)
-
+            child = _supervisor_spawn_child(cfg, run_args, log_fp, state)
+            rc = _supervisor_wait_for_child(cfg, child, state, log_fp, sleep_fn)
             state.current_child = None
             ran_for = time.time() - child_started
-            log_fp.write(f"--- [supervisor] child exited rc={rc} after {ran_for:.0f}s ---\n".encode())
-            log_fp.flush()
+            _supervisor_log(log_fp, f"--- [supervisor] child exited rc={rc} after {ran_for:.0f}s ---")
 
             if state.shutdown:
-                # We were asked to stop. If the child didn't exit cleanly on
-                # the SIGTERM we forwarded, finish it off.
-                if child.poll() is None:
-                    rc = _terminate_child(child)
-                log.info("supervisor shutting down (child rc=%d)", rc)
-                # Daemon was asked to stop. Always exit 0 — distinguishing
-                # "child obeyed SIGTERM" from "child crashed during shutdown"
-                # isn't meaningful from the operator's perspective: they asked
-                # for a stop and got one.
-                return 0
+                return _supervisor_shutdown_child(child, rc)
 
             if rc == 0:
                 log.info("inner quikode run completed cleanly — supervisor exiting 0")
                 return 0
 
-            # Crash path: backoff + restart
-            if ran_for >= min_run_reset:
-                consecutive_crashes = 1
-                log.info(
-                    "child ran %.0fs (>= %ds reset) before crashing rc=%d — backoff reset",
-                    ran_for,
-                    min_run_reset,
-                    rc,
-                )
-            else:
-                consecutive_crashes += 1
-                log.info(
-                    "child crashed rc=%d after %.0fs (consecutive=%d)",
-                    rc,
-                    ran_for,
-                    consecutive_crashes,
-                )
-
+            consecutive_crashes = _next_crash_count(consecutive_crashes, ran_for, min_run_reset, rc)
             backoff = _backoff_for_attempt(schedule, consecutive_crashes)
-            log_fp.write(
-                f"--- [supervisor] backoff {backoff}s before restart (consecutive={consecutive_crashes}) ---\n".encode()
-            )
-            log_fp.flush()
-            log.info("supervisor sleeping %ds before restart", backoff)
-            sleep_fn(backoff)
-            if state.shutdown:
+            if _supervisor_backoff(log_fp, sleep_fn, backoff, consecutive_crashes, state):
                 log.info("supervisor: shutdown requested during backoff sleep")
                 return 0
         return 0
@@ -564,6 +488,82 @@ def supervise(cfg: Config, run_args: list[str], *, sleep_fn=time.sleep) -> int:
         except OSError:
             pass
         _cleanup_pid_file(pid_path)
+
+
+def _supervisor_log(log_fp: IO[bytes], line: str) -> None:
+    log_fp.write((line + "\n").encode())
+    log_fp.flush()
+
+
+def _supervisor_prune_worktrees(cfg: Config, log_fp: IO[bytes]) -> None:
+    try:
+        pruned = worktree.prune_stale_worktrees(cfg.repo_path, cfg.worktree_root)
+    except Exception as e:
+        _supervisor_log(log_fp, f"--- [supervisor] worktree prune skipped: {e} ---")
+        return
+    if pruned:
+        _supervisor_log(
+            log_fp, f"--- [supervisor] pruned {len(pruned)} stale worktree dir(s) before spawn ---"
+        )
+
+
+def _supervisor_spawn_child(
+    cfg: Config, run_args: list[str], log_fp: IO[bytes], state: _SupervisorState
+) -> subprocess.Popen:
+    _supervisor_log(
+        log_fp, f"\n--- [supervisor] spawn quikode run at {time.strftime('%Y-%m-%dT%H:%M:%S')} ---"
+    )
+    child = _spawn_child(cfg, run_args, log_fp)
+    state.current_child = child
+    log.info("supervisor spawned child pid=%d", child.pid)
+    return child
+
+
+def _supervisor_wait_for_child(
+    cfg: Config,
+    child: subprocess.Popen,
+    state: _SupervisorState,
+    log_fp: IO[bytes],
+    sleep_fn: Callable[[float], object],
+) -> int:
+    try:
+        return _wait_with_watchdog(cfg, child, state, log_fp, sleep_fn)
+    except KeyboardInterrupt:
+        state.shutdown = True
+        return _terminate_child(child)
+
+
+def _supervisor_shutdown_child(child: subprocess.Popen, rc: int) -> int:
+    if child.poll() is None:
+        rc = _terminate_child(child)
+    log.info("supervisor shutting down (child rc=%d)", rc)
+    return 0
+
+
+def _next_crash_count(previous: int, ran_for: float, min_run_reset: int, rc: int) -> int:
+    if ran_for >= min_run_reset:
+        log.info(
+            "child ran %.0fs (>= %ds reset) before crashing rc=%d - backoff reset", ran_for, min_run_reset, rc
+        )
+        return 1
+    next_count = previous + 1
+    log.info("child crashed rc=%d after %.0fs (consecutive=%d)", rc, ran_for, next_count)
+    return next_count
+
+
+def _supervisor_backoff(
+    log_fp: IO[bytes],
+    sleep_fn: Callable[[float], object],
+    backoff: int,
+    consecutive_crashes: int,
+    state: _SupervisorState,
+) -> bool:
+    _supervisor_log(
+        log_fp, f"--- [supervisor] backoff {backoff}s before restart (consecutive={consecutive_crashes}) ---"
+    )
+    log.info("supervisor sleeping %ds before restart", backoff)
+    sleep_fn(backoff)
+    return state.shutdown
 
 
 def stop_daemon(cfg: Config, *, timeout_s: int = CHILD_TERM_TIMEOUT_S) -> bool:

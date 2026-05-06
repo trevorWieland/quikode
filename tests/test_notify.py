@@ -10,14 +10,15 @@ from __future__ import annotations
 import json
 import urllib.error
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
 from quikode.notify import SettledMessage, notify_settled, ntfy_send, slack_send
 
 
-def _cfg(tmp_path: Path, **kw) -> Config:
-    defaults = {
+def _cfg(tmp_path: Path, **kw: Any) -> Config:
+    defaults: dict[str, Any] = {
         "notify_ntfy_url": "https://ntfy.example",
         "notify_ntfy_topic": "quikode-test-secret",
         "notify_slack_webhook_url": "https://hooks.slack.com/services/T/B/X",

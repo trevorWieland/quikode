@@ -6,7 +6,7 @@ before any agent_call fired. The task sat in `addressing_feedback` for
 30+ minutes holding a pool slot, starving real work. The orchestrator's
 stall detector now spots this (no agent_call within stall_warn_seconds
 of entering ADDRESSING_FEEDBACK) and force-recovers by canceling the
-future + transitioning the task back to AWAITING_MERGE so the watcher's
+future + transitioning the task back to PENDING_CI so the watcher's
 next tick re-dispatches.
 """
 
@@ -69,7 +69,7 @@ def _orch(tmp_path: Path, **cfg_kw) -> Orchestrator:
 
 def test_stalled_review_response_force_recovers_after_threshold(tmp_path):
     """Task in addressing_feedback with no agent_call for > stall_warn_seconds
-    is reset to AWAITING_MERGE; future is dropped from tracking; pool slot
+    is reset to PENDING_CI; future is dropped from tracking; pool slot
     is freed for re-dispatch."""
     o = _orch(tmp_path, stall_warn_seconds=60)
     o.store.upsert_pending("R-001")

@@ -84,7 +84,7 @@ def test_new_cycle_clears_prior_results(tmp_path):
 def test_state_long_description_known():
     assert _state_long_description("local_ci_checking") == "local CI gate (just ci)"
     assert _state_long_description("checking_subtask") == "per-subtask checker"
-    assert _state_long_description("checking") == "whole-spec checker (v0.1 legacy)"
+    assert _state_long_description("fixup_planning") == "planning fixup subtasks"
     # Self-explanatory states return None.
     assert _state_long_description("pending") is None
     assert _state_long_description("merged") is None

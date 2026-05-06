@@ -29,6 +29,8 @@ from pydantic import (
     model_validator,
 )
 
+from quikode.json_extract import first_balanced_object
+
 
 class PlanValidationError(ValueError):
     """Raised when planner output doesn't conform to the v2 schema.
@@ -60,7 +62,7 @@ class Subtask(BaseModel):
         description="Concrete, independently verifiable acceptance criteria.",
     )
     notes: str = Field(default="")
-    interfaces: tuple[str, ...] = Field(
+    interfaces: tuple[str, ...] | list[str] = Field(
         default=(),
         description=(
             "Surfaces this subtask covers. For BDD subtasks driven by tanren's "
@@ -187,35 +189,13 @@ def extract_json(text: str) -> dict[str, Any]:
         except json.JSONDecodeError as e:
             raise PlanValidationError(f"fenced block was not valid JSON: {e}") from e
 
-    start = text.find("{")
-    if start < 0:
+    blob = first_balanced_object(text)
+    if blob is None:
         raise PlanValidationError("no JSON object found in planner output")
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                blob = text[start : i + 1]
-                try:
-                    return json.loads(blob)
-                except json.JSONDecodeError as e:
-                    raise PlanValidationError(f"unfenced JSON not parseable: {e}") from e
-    raise PlanValidationError("unterminated JSON object in planner output")
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError as e:
+        raise PlanValidationError(f"unfenced JSON not parseable: {e}") from e
 
 
 def validate_and_build_plan(raw: dict[str, Any], *, expected_node_id: str | None = None) -> Plan:

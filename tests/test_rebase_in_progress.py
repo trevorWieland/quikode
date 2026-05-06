@@ -1,6 +1,6 @@
 """v3 stacked-diffs fix: improved `_rebase_in_progress()` accuracy.
 
-The legacy detector relied on `git rev-parse --verify REBASE_HEAD`, which
+The old detector relied on `git rev-parse --verify REBASE_HEAD`, which
 only exists during specific rebase phases. The fixed implementation
 walks `git rev-parse --git-path rebase-merge` and `rebase-apply`, then
 checks for the resolved directory's existence via `test -d` — which is
@@ -9,6 +9,7 @@ the canonical way git itself probes its own rebase state.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
@@ -36,7 +37,7 @@ def _node() -> Node:
     )
 
 
-def _worker(tmp_path) -> TaskWorker:
+def _worker(tmp_path) -> Any:
     cfg = Config(repo_path=tmp_path, dag_path=tmp_path)
     store = Store(tmp_path / "q.db")
 
@@ -57,7 +58,7 @@ def test_rebase_in_progress_true_for_rebase_merge(tmp_path):
             return 0, ".git/rebase-merge\n"
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
     with patch("quikode.worker.exec_in", return_value=(0, "", "")):
         assert w._rebase_in_progress() is True
 
@@ -72,7 +73,7 @@ def test_rebase_in_progress_true_for_rebase_apply(tmp_path):
             return 0, f".git/{args[2]}\n"
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
 
     test_calls: list[list[str]] = []
 
@@ -100,7 +101,7 @@ def test_rebase_in_progress_false_when_no_state_dirs(tmp_path):
             return 0, f".git/{args[2]}\n"
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
     # Both `test -d` checks fail.
     with patch("quikode.worker.exec_in", return_value=(1, "", "")):
         assert w._rebase_in_progress() is False
@@ -116,7 +117,7 @@ def test_rebase_in_progress_false_when_rev_parse_fails(tmp_path):
             return 1, "fatal\n"
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
     assert w._rebase_in_progress() is False
 
 
@@ -126,6 +127,7 @@ def test_resolver_loop_no_conflicts_tries_continue_first(tmp_path, monkeypatch):
     --continue advanced past one commit and git is between commits."""
     w = _worker(tmp_path)
     w.store.upsert_pending("T-1")
+    w.store.transition("T-1", State.CONFLICT_RESOLVING)
     w.handle = MagicMock(container_name="qk-stub")
 
     git_calls: list[list[str]] = []
@@ -140,7 +142,7 @@ def test_resolver_loop_no_conflicts_tries_continue_first(tmp_path, monkeypatch):
         # Defaults: diff/log lookups
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
 
     out = w._resolve_one_conflict_step(iteration=2)
     assert out is None  # the bare --continue path returns None on success
@@ -155,6 +157,7 @@ def test_resolver_loop_no_conflicts_aborts_when_continue_fails(tmp_path, monkeyp
     """When `--continue` also fails AND no conflicts surfaced, abort + BLOCKED."""
     w = _worker(tmp_path)
     w.store.upsert_pending("T-1")
+    w.store.transition("T-1", State.CONFLICT_RESOLVING)
     w.handle = MagicMock(container_name="qk-stub")
 
     def fake_git(args):
@@ -168,7 +171,7 @@ def test_resolver_loop_no_conflicts_aborts_when_continue_fails(tmp_path, monkeyp
             return 0, "branch\n"
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
 
     out = w._resolve_one_conflict_step(iteration=2)
     assert out is not None
@@ -189,7 +192,7 @@ def test_ensure_on_branch_noop_when_already_on_branch(tmp_path):
             return 0, "main\n"
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
     w._ensure_on_branch()
     # Only the probe call, no fix-up call.
     assert len(git_calls) == 1
@@ -210,6 +213,6 @@ def test_ensure_on_branch_fixes_detached_head(tmp_path):
             return 1, ""  # detached
         return 0, ""
 
-    w._git_in_workspace = fake_git  # type: ignore[method-assign]
+    w._git_in_workspace = fake_git
     w._ensure_on_branch()
     assert any(c == ["symbolic-ref", "HEAD", "refs/heads/quikode/t-1-abc"] for c in git_calls)

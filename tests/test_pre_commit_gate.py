@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Literal
 from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
@@ -53,7 +54,11 @@ def _build_dag(tmp_path: Path) -> DAG:
     return DAG.load(p)
 
 
-def _build_worker(tmp_path: Path, *, pre_commit_runner: str = "auto") -> TaskWorker:
+def _build_worker(
+    tmp_path: Path,
+    *,
+    pre_commit_runner: Literal["auto", "lefthook", "pre-commit", "none"] = "auto",
+) -> TaskWorker:
     cfg = Config(
         repo_path=tmp_path,
         dag_path=tmp_path / "dag.json",
@@ -62,13 +67,14 @@ def _build_worker(tmp_path: Path, *, pre_commit_runner: str = "auto") -> TaskWor
         prompts_dir=tmp_path / "missing-prompts",
         worktree_root=tmp_path / ".quikode" / "worktrees",
         sccache_dir=tmp_path / ".quikode" / "sccache",
-        pre_commit_runner=pre_commit_runner,  # type: ignore[arg-type]
+        pre_commit_runner=pre_commit_runner,
     )
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
     dag = _build_dag(tmp_path)
     store = Store(cfg.state_dir / "quikode.db")
     store.upsert_pending("R-001")
+    store.transition("R-001", State.PLANNING)
     store.set_field("R-001", branch="quikode/r-001-abc")
     worker = TaskWorker(cfg, dag, store, dag.nodes["R-001"])
     worker.handle = MagicMock()
@@ -235,7 +241,7 @@ def test_timeout_is_real_failure_not_transient(tmp_path):
     worker = _build_worker(tmp_path, pre_commit_runner="lefthook")
 
     def fake_exec(handle, cmd, log_path=None, stdin=None, timeout=None):
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout or 0)
 
     with patch("quikode.worker.exec_in", side_effect=fake_exec):
         ok, out = worker._pre_commit_gate(_subtask())

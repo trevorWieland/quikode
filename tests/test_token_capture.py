@@ -95,7 +95,7 @@ def test_claude_shell_invocation_uses_json_output_format():
     assert "--model claude-opus-4-7" in cmd
 
 
-# ----- agent_calls schema migration -----
+# ----- agent_calls schema -----
 
 
 def test_agent_calls_has_token_split_columns(tmp_path):
@@ -114,44 +114,6 @@ def test_agent_calls_has_token_split_columns(tmp_path):
     }
     missing = expected - cols
     assert not missing, f"missing token columns: {missing}"
-
-
-def test_agent_calls_migration_adds_columns_to_old_db(tmp_path):
-    """Older workspaces that already have agent_calls without the v2.1 columns
-    must auto-migrate, mirroring the v2 column migration."""
-    db = tmp_path / "old.db"
-    conn = sqlite3.connect(db, isolation_level=None)
-    conn.execute("""
-        CREATE TABLE agent_calls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            task_id TEXT NOT NULL,
-            phase TEXT NOT NULL,
-            cli TEXT NOT NULL,
-            model TEXT,
-            rc INTEGER,
-            duration_s REAL,
-            tokens_used INTEGER,
-            ts REAL NOT NULL
-        )
-    """)
-    # Pre-existing row mimics older runs
-    conn.execute(
-        "INSERT INTO agent_calls (task_id, phase, cli, model, rc, duration_s, tokens_used, ts) "
-        "VALUES ('R-OLD', 'planner', 'claude', 'claude-opus-4-7', 0, 12.0, 4321, 100.0)"
-    )
-    conn.close()
-
-    Store(db).conn.close()  # triggers migration
-
-    conn = sqlite3.connect(db)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(agent_calls)")}
-    assert "tokens_input" in cols
-    assert "cost_usd" in cols
-    # Existing row preserved
-    row = conn.execute("SELECT tokens_used, tokens_input FROM agent_calls WHERE task_id='R-OLD'").fetchone()
-    assert row[0] == 4321  # old totals preserved
-    assert row[1] is None  # new column NULL for old rows
-    conn.close()
 
 
 def test_record_agent_call_persists_token_breakdown(tmp_path):

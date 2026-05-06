@@ -120,6 +120,7 @@ def _build_worker(
     dag = _build_dag(tmp_path)
     store = Store(cfg.state_dir / "quikode.db")
     store.upsert_pending("R-001")
+    store.transition("R-001", State.PLANNING)
     store.set_field("R-001", branch="quikode/r-001-abc")
     store.upsert_subtasks(
         "R-001",

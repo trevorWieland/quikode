@@ -5,7 +5,7 @@ parallel quikode workspace, GitHub web-UI commit), the worker checks at
 each subtask boundary whether the remote has new commits and either:
   - Pure FF (we have no local commits ahead): reset --hard origin/<branch>
   - Force-push (history rewritten, base sha not reachable): BLOCK
-  - Diverged but mergeable: falls through to legacy push-fail handling
+  - Diverged but mergeable: falls through to old push-fail handling
     (future: pull --rebase + conflict-resolver)
 """
 

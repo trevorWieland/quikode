@@ -1,6 +1,6 @@
-"""Item 2: opt-in auto-merge for clean AWAITING_MERGE tasks.
+"""Item 2: opt-in auto-merge for clean PENDING_CI tasks.
 
-Daemon polls AWAITING_MERGE PRs. When `cfg.auto_merge_when_clean` is True
+Daemon polls PENDING_CI PRs. When `cfg.auto_merge_when_clean` is True
 and the PR is OPEN+MERGEABLE+success-checks+threads-all-resolved AND
 the task has been parked >= `cfg.auto_merge_min_age_s`, the daemon
 issues `gh pr merge --squash --delete-branch`.
@@ -181,7 +181,7 @@ def test_no_auto_merge_when_unresolved_thread(tmp_path):
 
 def test_no_auto_merge_before_age_threshold(tmp_path):
     o = _orch(tmp_path, auto_merge_when_clean=True, auto_merge_min_age_s=600)
-    # Task entered AWAITING_MERGE 30s ago; threshold is 600s → blocked.
+    # Task entered PENDING_CI 30s ago; threshold is 600s → blocked.
     _seed(o, state_age_s=30.0)
     with (
         patch("quikode.orchestrator.github.poll_pr", return_value=_pr()),

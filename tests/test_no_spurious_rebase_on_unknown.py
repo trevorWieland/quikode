@@ -82,7 +82,7 @@ def _make_pool() -> MagicMock:
     return pool
 
 
-def _seed_awaiting_merge(o: Orchestrator, pr_number: int = 33) -> None:
+def _seed_pending_ci(o: Orchestrator, pr_number: int = 33) -> None:
     o.store.upsert_pending("T-001")
     o.store.transition(
         "T-001",
@@ -116,7 +116,7 @@ def test_orchestrator_unknown_mergeable_does_not_schedule_rebase(tmp_path):
     Treating it as CONFLICTING was the Run-1 bug that ate T-001's work.
     """
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -139,7 +139,7 @@ def test_orchestrator_unknown_mergeable_does_not_schedule_rebase(tmp_path):
 def test_orchestrator_mergeable_does_not_schedule_rebase(tmp_path):
     """mergeable=MERGEABLE → no rebase scheduled."""
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -160,7 +160,7 @@ def test_orchestrator_mergeable_does_not_schedule_rebase(tmp_path):
 def test_orchestrator_conflicting_does_schedule_rebase(tmp_path):
     """Positive case: mergeable=CONFLICTING → rebase IS scheduled."""
     o = _orch(tmp_path)
-    _seed_awaiting_merge(o)
+    _seed_pending_ci(o)
     pool = _make_pool()
     futures: dict[str, Future] = {}
     rrf: set[str] = set()
@@ -215,7 +215,7 @@ def _worker_with_pr(tmp_path) -> TaskWorker:
     w.store.upsert_pending("T-001")
     w.store.transition(
         "T-001",
-        State.POLLING_CI,
+        State.PENDING_CI,
         branch="quikode/t-001-abc",
         pr_number=33,
         pr_url="https://github.com/owner/repo/pull/33",
@@ -233,7 +233,7 @@ def test_worker_poll_pr_loop_does_not_rebase_on_unknown(tmp_path, monkeypatch):
 
     # Capture whether _rebase_or_resolve was called. Make poll_pr cycle:
     # first call returns UNKNOWN (the spurious case), second call returns
-    # MERGEABLE (so the loop exits to AWAITING_MERGE and we don't hang).
+    # MERGEABLE (so the loop exits to PENDING_CI and we don't hang).
     poll_calls = [
         PRStatus(33, "url", "OPEN", "UNKNOWN", "success", []),
         PRStatus(33, "url", "OPEN", "MERGEABLE", "success", []),
@@ -264,7 +264,7 @@ def test_worker_poll_pr_loop_does_not_rebase_on_unknown(tmp_path, monkeypatch):
 
 def test_worker_poll_pr_loop_does_not_rebase_on_mergeable(tmp_path, monkeypatch):
     """Worker `_poll_pr_loop`: mergeable=MERGEABLE → exits to
-    AWAITING_MERGE with no rebase."""
+    PENDING_CI with no rebase."""
     w = _worker_with_pr(tmp_path)
 
     rebase_called = {"hit": False}

@@ -134,15 +134,11 @@ def test_milestone_filter(tmp_path):
     assert d.filter(milestone="M-2") == {"B"}
 
 
-def test_real_tanren_dag_loads():
-    """Smoke test against the real tanren dag if it's locally available."""
-    p = Path("/home/trevor/github/tanren/docs/roadmap/dag.json")
-    if not p.exists():
-        pytest.skip("tanren dag not available")
-    d = DAG.load(p)
+def test_tanren_like_dag_fixture_loads():
+    """Always-on smoke test against a checked-in Tanren-like DAG."""
+    d = DAG.load(Path(__file__).parent / "fixtures" / "tanren_dag.json")
     s = d.stats()
-    assert s["node_count"] >= 100
-    assert s["depth"] >= 5
-    # F-0001 is the foundation
+    assert s["node_count"] == 4
+    assert s["depth"] == 3
     assert "F-0001" in d.nodes
     assert d.nodes["F-0001"].kind == "foundation"

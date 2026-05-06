@@ -49,17 +49,18 @@ for arg in "$@"; do
 done
 
 if [[ -d .venv ]]; then
-    # shellcheck disable=SC1091
     source .venv/bin/activate
 fi
 
 if [[ "$SKIP_TESTS" -eq 0 ]]; then
     echo "==> ruff check"
-    ruff check quikode/ tests/
+    uv run ruff check quikode tests
     echo "==> ruff format --check"
-    ruff format --check quikode/ tests/
+    uv run ruff format --check quikode tests
+    echo "==> ty check"
+    uv run ty check quikode tests
     echo "==> pytest"
-    python -m pytest tests/ -q
+    uv run pytest tests/ -q
 fi
 
 echo "==> uv tool install --reinstall ."

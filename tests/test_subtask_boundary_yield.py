@@ -18,6 +18,7 @@ from quikode.dag import DAG
 from quikode.state import State, Store, SubtaskState
 from quikode.subtask_schema import Plan, Subtask
 from quikode.worker import TaskWorker
+from quikode.workers.outcomes import WorkerOutcome
 
 
 def _build_dag(tmp_path: Path, ids_with_deps: list[tuple[str, list[str]]]) -> DAG:
@@ -99,9 +100,7 @@ def test_yield_off_by_default(tmp_path):
 
 
 def test_yields_when_higher_priority_queued(tmp_path):
-    """With preempt on and a queued task scoring higher than self by more
-    than the threshold, yield. The task transitions to PENDING with the
-    resume marker set."""
+    """Strict FSM mode does not re-pend active work for preemptive yielding."""
     # R-001 has 3 dependents → score = 0 + 15 - 0 = 15
     # R-099 has 0 dependents → score = 0 + 0 - 9 = -9
     # delta = 15 - (-9) = 24. With threshold=10, yield triggers.
@@ -114,14 +113,10 @@ def test_yields_when_higher_priority_queued(tmp_path):
     ]
     worker = _build_worker(tmp_path, self_id="R-099", dag_edges=edges, preempt_on=True, threshold=10)
     outcome = worker._maybe_yield_at_boundary()
-    assert outcome is not None
-    assert outcome.final_state is State.PENDING
-    assert "yielded to" in outcome.note
-    assert "R-001" in outcome.note
-    # State transitioned + resume marker set.
+    assert outcome is None
     row = worker.store.get("R-099")
     assert row["state"] == State.PENDING.value
-    assert row["resume_from_existing_subtasks"] == 1
+    assert (row.get("resume_from_existing_subtasks") or 0) == 0
     worker.store.conn.close()
 
 
@@ -151,9 +146,7 @@ def test_no_yield_when_no_pending_candidates(tmp_path):
 
 
 def test_run_subtask_set_returns_yield_outcome(tmp_path):
-    """Integration: when `_maybe_yield_at_boundary` returns a yield outcome
-    inside `_run_subtask_set`, the subtask loop short-circuits and propagates
-    the outcome. The first un-DONE subtask is NOT executed."""
+    """If a boundary check returns an outcome, the subtask set propagates it."""
     edges = [
         ("R-001", []),
         ("R-099", []),
@@ -187,6 +180,9 @@ def test_run_subtask_set_returns_yield_outcome(tmp_path):
         patch.object(worker, "_do_subtask", side_effect=lambda *a, **k: do_called.append(1)),
         patch.object(worker, "_check_subtask"),
         patch.object(worker, "_handle_parent_rebase_if_needed", return_value=None),
+        patch.object(
+            worker, "_maybe_yield_at_boundary", return_value=WorkerOutcome(State.PENDING, "yielded")
+        ),
     ):
         outcome = worker._run_subtask_set([worker.plan.subtasks[0]])
     assert outcome is not None

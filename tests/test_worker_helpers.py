@@ -76,8 +76,8 @@ def test_h_helper_asserts_until_provisioned(tmp_path):
 
 def test_commit_push_clean_tree_with_branch_ahead_pushes(tmp_path, monkeypatch):
     """v3 regression: per-subtask commits make the working tree clean by the
-    time _commit_push runs. The legacy 'nothing to commit → no diff' branch
-    used to short-circuit to AWAITING_MERGE without pushing or opening a PR.
+    time _commit_push runs. The old 'nothing to commit → no diff' branch
+    used to short-circuit to PENDING_CI without pushing or opening a PR.
     Fix: when commit_all reports clean tree, check ahead_count first; only
     treat as no-op when both are zero."""
     w = _worker(tmp_path)
@@ -85,7 +85,7 @@ def test_commit_push_clean_tree_with_branch_ahead_pushes(tmp_path, monkeypatch):
     # Stub container handle so worker._h works.
     w.handle = MagicMock(container_name="qk-stub")
     # Move past PROVISIONING so _h assertion passes.
-    w.store.transition("T-1", State.PLANNING)
+    w.store.transition("T-1", State.CHECKING_SUBTASK)
     # Set a branch on the row so _commit_push can read it.
     w.store.set_field("T-1", branch="quikode/t-1-abc123")
 
@@ -116,12 +116,12 @@ def test_commit_push_clean_tree_with_branch_ahead_pushes(tmp_path, monkeypatch):
 
 
 def test_commit_push_clean_tree_no_commits_marks_no_diff(tmp_path, monkeypatch):
-    """When the tree is clean AND the branch has no commits ahead, the legacy
+    """When the tree is clean AND the branch has no commits ahead, the old
     'no diff — task already complete' shortcut still applies."""
     w = _worker(tmp_path)
     w.store.upsert_pending("T-1")
     w.handle = MagicMock(container_name="qk-stub")
-    w.store.transition("T-1", State.PLANNING)
+    w.store.transition("T-1", State.CHECKING_SUBTASK)
     w.store.set_field("T-1", branch="quikode/t-1-empty")
 
     monkeypatch.setattr(

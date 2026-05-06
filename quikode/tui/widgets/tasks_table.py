@@ -25,13 +25,9 @@ _STATE_STYLE = {
     "doing_subtask": "state-doing",
     "checking_subtask": "state-doing",
     "triaging_subtask": "state-rebasing",
-    "doing": "state-doing",
-    "checking": "state-doing",
-    "triaging": "state-rebasing",
-    "rebasing": "state-rebasing",
+    "rebasing_to_main": "state-rebasing",
     "conflict_resolving": "state-failed",
-    "intent_reviewing": "state-rebasing",
-    "replanning": "state-doing",
+    "fixup_planning": "state-doing",
     "blocked": "state-blocked",
     "failed": "state-failed",
     "aborted": "state-failed",
@@ -50,7 +46,6 @@ _STATE_STYLE = {
     # knows actual work is happening.
     "triaging_feedback": "state-responding",
     "addressing_feedback": "state-responding",
-    "rebasing_to_main": "state-rebasing",
 }
 
 

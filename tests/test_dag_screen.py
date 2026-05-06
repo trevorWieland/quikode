@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from quikode.config import DEFAULT_CONFIG_TOML
+from quikode.config_template import DEFAULT_CONFIG_TOML
 from quikode.state import State, Store
 from quikode.tui.app import QuikodeTUI
 from quikode.tui.dag_view.screen import DAGScreen
