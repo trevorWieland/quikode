@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from . import git_push_recovery
 from .docker_env import exec_in
 
 log = logging.getLogger("quikode.worktree")
@@ -131,82 +132,20 @@ def commit_subtask(
     accepted_files: list[str] = list(actually_touched)
 
     # 3. Advisory lane review — only when there's drift AND we have a reviewer.
-    # Pure subset of declared → skip the agent entirely (cheap path).
     if lane_review_fn is not None and actually_touched and not (set(actually_touched) <= set(declared)):
-        review = lane_review_fn(subtask, declared, actually_touched)
-        if not review.legitimate:
-            # Roll back the staged changes so the worktree returns to a
-            # clean re-runnable state. The doer's edits stay on disk
-            # (un-staged) — triage feedback in the next attempt will
-            # tell the doer to revert/scope-down before retrying.
-            _rc_reset, reset_out, reset_err = exec_in(
-                handle,
-                ["bash", "-lc", "cd /workspace && git reset HEAD -- ."],
-                log_path=log_path,
-                timeout=30,
-            )
-            return _commit_failure(
-                (
-                    f"scope review rejected commit as overreach: {review.reason}\n\n"
-                    f"declared lane: {declared!r}\n"
-                    f"actually touched: {actually_touched!r}\n"
-                    f"out-of-lane files: {sorted(set(actually_touched) - set(declared))!r}\n\n"
-                    f"git reset output:\n{reset_out}\n{reset_err}"
-                ),
-            )
-        accepted_files = list(review.accepted_files) or list(actually_touched)
-        if log_path is not None:
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with log_path.open("a") as f:
-                f.write(
-                    f"[commit_subtask] scope review accepted lane drift for "
-                    f"{subtask.id}: {review.reason}\n"
-                    f"  declared:  {declared!r}\n"
-                    f"  accepted:  {accepted_files!r}\n"
-                )
-
-    # 4. git commit -m <message>. If there's nothing staged it usually
-    # means the doer made no diff — but it can ALSO mean a prior attempt
-    # already committed this subtask's work and the worker re-entered.
-    # Detect the second case by checking whether HEAD has commits beyond
-    # the worktree's stored base_ref_sha or the latest non-HEAD subtask
-    # commit; if so, treat as already-done (idempotent re-entry) and
-    # return success with the existing HEAD sha. Otherwise it's a real
-    # no-diff failure that triage should see.
-    rc, out, err = exec_in(
-        handle,
-        [
-            "bash",
-            "-lc",
-            f"cd /workspace && git commit -m {shlex.quote(message)}",
-        ],
-        log_path=log_path,
-        timeout=timeout,
-    )
-    nothing_to_commit = rc != 0 and "nothing to commit" in ((out or "") + (err or ""))
-    if rc != 0 and not nothing_to_commit:
-        combined = (out or "") + "\n" + (err or "")
-        return _commit_failure(f"git commit failed (rc={rc}):\n{combined}")
-    if nothing_to_commit:
-        # Idempotent re-entry guard: if HEAD has at least one commit on
-        # this branch beyond `main` (the base), the prior attempt's work
-        # already landed locally. Treat as success and skip to push so
-        # remote stays aligned.
-        _rc_ahead, ahead_out, _ = exec_in(
-            handle,
-            ["bash", "-lc", "cd /workspace && git rev-list --count main..HEAD 2>/dev/null || echo 0"],
-            log_path=log_path,
-            timeout=30,
+        review_outcome = _apply_lane_review(
+            handle, subtask, declared, actually_touched, lane_review_fn, log_path
         )
-        ahead = 0
-        try:
-            ahead = int((ahead_out or "0").strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            ahead = 0
-        if ahead == 0:
-            combined = (out or "") + "\n" + (err or "")
-            return _commit_failure(f"git commit failed (rc={rc}):\n{combined}")
-        # Fall through with ahead > 0 — capture HEAD + push (idempotent).
+        if isinstance(review_outcome, CommitResult):
+            return review_outcome
+        accepted_files = review_outcome
+
+    # 4. git commit -m <message>. Helper handles the idempotent-re-entry
+    # case where the doer made no diff but a prior attempt already committed
+    # this subtask's work locally.
+    commit_outcome = _commit_or_idempotent(handle, message, log_path, timeout)
+    if isinstance(commit_outcome, CommitResult):
+        return commit_outcome
 
     # 5. capture the new HEAD sha.
     rc, sha_out, _sha_err = exec_in(
@@ -218,26 +157,94 @@ def commit_subtask(
     commit_sha = sha_out.strip() if rc == 0 else None
 
     # 6. git push (optional).
-    result = _commit_success(commit_sha, accepted_files)
     if push:
-        rc, out, err = exec_in(
+        return git_push_recovery.push_with_recovery(
             handle,
-            [
-                "bash",
-                "-lc",
-                f"cd /workspace && git push {shlex.quote(remote)} {shlex.quote(branch)}",
-            ],
+            branch,
+            remote,
+            exec_fn=exec_in,
             log_path=log_path,
             timeout=timeout,
+            is_transient=_is_transient_git_failure,
+            success=_commit_success(commit_sha, accepted_files),
+            failure=lambda msg, transient=False: _commit_failure(
+                msg, commit_sha=commit_sha, transient=transient
+            ),
         )
-        if rc != 0:
-            combined = (out or "") + "\n" + (err or "")
-            result = _commit_failure(
-                f"git push failed (rc={rc}):\n{combined}",
-                commit_sha=commit_sha,
-                transient=_is_transient_git_failure(rc, combined),
+    return _commit_success(commit_sha, accepted_files)
+
+
+def _commit_or_idempotent(
+    handle: TaskContainer, message: str, log_path: Path | None, timeout: int
+) -> CommitResult | None:
+    """Run `git commit`. Return None if the commit landed (or idempotent
+    re-entry detected — fall through to push); return a CommitResult on
+    real failure."""
+    rc, out, err = exec_in(
+        handle,
+        ["bash", "-lc", f"cd /workspace && git commit -m {shlex.quote(message)}"],
+        log_path=log_path,
+        timeout=timeout,
+    )
+    nothing_to_commit = rc != 0 and "nothing to commit" in ((out or "") + (err or ""))
+    combined = (out or "") + "\n" + (err or "")
+    if rc != 0 and not nothing_to_commit:
+        return _commit_failure(f"git commit failed (rc={rc}):\n{combined}")
+    if not nothing_to_commit:
+        return None
+    # Idempotent re-entry: nothing to commit but the branch may already
+    # carry the work from a prior attempt. Push if ahead of base.
+    _rc_ahead, ahead_out, _ = exec_in(
+        handle,
+        ["bash", "-lc", "cd /workspace && git rev-list --count main..HEAD 2>/dev/null || echo 0"],
+        log_path=log_path,
+        timeout=30,
+    )
+    try:
+        ahead = int((ahead_out or "0").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        ahead = 0
+    if ahead == 0:
+        return _commit_failure(f"git commit failed (rc={rc}):\n{combined}")
+    return None
+
+
+def _apply_lane_review(
+    handle: TaskContainer,
+    subtask: Subtask,
+    declared: list[str],
+    actually_touched: list[str],
+    lane_review_fn: LaneReviewFn,
+    log_path: Path | None,
+) -> CommitResult | list[str]:
+    """Run scope review. On reject: unstage and return CommitResult.
+    On accept: return the accepted files list."""
+    review = lane_review_fn(subtask, declared, actually_touched)
+    if not review.legitimate:
+        _rc_reset, reset_out, reset_err = exec_in(
+            handle,
+            ["bash", "-lc", "cd /workspace && git reset HEAD -- ."],
+            log_path=log_path,
+            timeout=30,
+        )
+        return _commit_failure(
+            f"scope review rejected commit as overreach: {review.reason}\n\n"
+            f"declared lane: {declared!r}\n"
+            f"actually touched: {actually_touched!r}\n"
+            f"out-of-lane files: {sorted(set(actually_touched) - set(declared))!r}\n\n"
+            f"git reset output:\n{reset_out}\n{reset_err}"
+        )
+    accepted_files = list(review.accepted_files) or list(actually_touched)
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a") as f:
+            f.write(
+                f"[commit_subtask] scope review accepted lane drift for "
+                f"{subtask.id}: {review.reason}\n"
+                f"  declared:  {declared!r}\n"
+                f"  accepted:  {accepted_files!r}\n"
             )
-    return result
+    return accepted_files
 
 
 def _commit_failure(output: str, *, commit_sha: str | None = None, transient: bool = False) -> CommitResult:

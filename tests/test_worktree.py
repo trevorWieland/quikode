@@ -172,6 +172,61 @@ def test_commit_subtask_real_push_failure_not_transient(tmp_path):
     assert result.transient is False
 
 
+def test_commit_subtask_non_fast_forward_auto_rebases_and_succeeds(tmp_path):
+    """When push is rejected non-fast-forward (typically because the doer
+    rewrote local history), the worker fetches origin, rebases on top, and
+    retries the push. R-0004's F-1-2 spent 8 attempts on this divergence
+    before the fix."""
+    push_calls: list[int] = []
+
+    def fake_exec(handle, cmd, log_path=None, stdin=None, timeout=None):
+        body = cmd[2]
+        if "git diff --cached --name-only" in body:
+            return 0, _diff_response(("foo.py",)), ""
+        if "rev-parse" in body:
+            return 0, "abc\n", ""
+        if "git push" in body:
+            push_calls.append(1)
+            if len(push_calls) == 1:
+                return 1, "", "! [rejected] foo -> foo (non-fast-forward)\nerror: failed to push some refs\n"
+            return 0, "", ""  # second push (post-rebase) succeeds
+        if "git fetch" in body and "git rebase" in body:
+            return 0, "", ""  # rebase clean
+        return 0, "", ""
+
+    with patch("quikode.worktree.exec_in", side_effect=fake_exec):
+        result = commit_subtask(_handle(), _stub_subtask(), "msg", branch="b")
+
+    assert result.success is True
+    assert len(push_calls) == 2, "should retry push after rebase"
+
+
+def test_commit_subtask_non_fast_forward_rebase_conflict_fails(tmp_path):
+    """If fetch+rebase fails (conflict), the worker aborts the rebase and
+    returns a failure with the rebase output — caller's triage sees it."""
+
+    def fake_exec(handle, cmd, log_path=None, stdin=None, timeout=None):
+        body = cmd[2]
+        if "git diff --cached --name-only" in body:
+            return 0, _diff_response(("foo.py",)), ""
+        if "rev-parse" in body and "HEAD" in body:
+            return 0, "abc\n", ""
+        if "git push" in body:
+            return 1, "", "! [rejected] foo -> foo (non-fast-forward)\nerror: failed to push some refs\n"
+        if "git fetch" in body and "git rebase" in body:
+            return 1, "", "CONFLICT (content): Merge conflict in foo.py\n"
+        if "git rebase --abort" in body:
+            return 0, "", ""
+        return 0, "", ""
+
+    with patch("quikode.worktree.exec_in", side_effect=fake_exec):
+        result = commit_subtask(_handle(), _stub_subtask(), "msg", branch="b")
+
+    assert result.success is False
+    assert "auto-rebase failed" in result.output
+    assert "CONFLICT" in result.output
+
+
 def test_commit_subtask_push_false_skips_push(tmp_path):
     seen_push = {"n": 0}
 
