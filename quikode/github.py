@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import net_retry
 from .docker_env import TaskContainer, exec_in
 
 
@@ -102,12 +102,9 @@ def pr_view(
     us merge/check/state but cannot distinguish open vs resolved review
     threads, which is what the v3 review-watcher needs.
     """
-    r = subprocess.run(
+    r = net_retry.run_with_backoff(
         ["gh", "pr", "view", str(pr_number), "--json", fields],
         cwd=repo,
-        capture_output=True,
-        text=True,
-        check=False,
     )
     if r.returncode != 0:
         return {}
@@ -161,12 +158,9 @@ def poll_pr(repo: Path, pr_number: int) -> PRStatus:
 def fetch_failed_check_logs(repo: Path, pr_number: int, max_lines: int = 200) -> str:
     """Best-effort: grab a snippet from the most recently failed check run."""
     # gh pr checks doesn't return logs directly; use gh run list + view
-    r = subprocess.run(
+    r = net_retry.run_with_backoff(
         ["gh", "pr", "checks", str(pr_number)],
         cwd=repo,
-        capture_output=True,
-        text=True,
-        check=False,
     )
     return r.stdout or ""
 

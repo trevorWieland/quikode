@@ -20,6 +20,8 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel
 
+from . import net_retry
+
 log = logging.getLogger("quikode.github_graphql")
 
 
@@ -171,7 +173,7 @@ def get_review_threads(repo: str, pr_number: int, *, gh_bin: str = "gh") -> list
         f"number={pr_number}",
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        r = net_retry.run_with_backoff(cmd, timeout=60)
     except (subprocess.TimeoutExpired, OSError) as e:
         log.warning("get_review_threads: subprocess error: %s", e)
         return []
@@ -253,7 +255,7 @@ def reply_to_review_thread(
         f"body={body}",
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        r = net_retry.run_with_backoff(cmd, timeout=60)
     except (subprocess.TimeoutExpired, OSError) as e:
         log.warning("reply_to_review_thread: subprocess error: %s", e)
         return False
@@ -285,7 +287,7 @@ def resolve_thread(thread_id: str, *, gh_bin: str = "gh") -> bool:
         f"threadId={thread_id}",
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        r = net_retry.run_with_backoff(cmd, timeout=60)
     except (subprocess.TimeoutExpired, OSError) as e:
         log.warning("resolve_thread: subprocess error: %s", e)
         return False
