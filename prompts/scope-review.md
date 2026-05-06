@@ -79,6 +79,15 @@ are heuristics; gate-greenness is the contract.
 {% if missing %}{% for f in missing %}- `{{ f }}`
 {% endfor %}{% else %}_(none)_{% endif %}
 
+{% if triage_notes %}### Triage notes from the prior attempt (authoritative evidence of gate-fix intent)
+
+The doer's previous attempt failed and a triage agent identified the root cause. If those notes name files outside `files_to_touch` and instruct the doer to fix them, the resulting cross-file edits in this attempt are by definition gate-keeping fixes — mark them legitimate. Do NOT second-guess the triage agent on whether the cause is "really" out-of-scope; the triage agent already considered scope and decided the gate-fix is the right move.
+
+```
+{{ triage_notes }}
+```
+{% endif %}
+
 ## Output
 
 Emit a single JSON object inside ```json ... ``` fences:

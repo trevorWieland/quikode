@@ -285,7 +285,7 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
             consecutive_transients = 0
             checker_text = outcome.checker_text
             if outcome.verdict is Verdict.PASS:
-                settled, retry, checker_text = self._handle_passed_subtask(subtask)
+                settled, retry, checker_text = self._handle_passed_subtask(subtask, triage_notes)
                 if settled:
                     return True, None
                 if retry:
@@ -297,8 +297,10 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
                 return False, progress_block
         return False, None
 
-    def _handle_passed_subtask(self: Any, subtask: Subtask) -> tuple[bool, bool, str]:
-        pass_outcome = self._handle_subtask_pass(subtask)
+    def _handle_passed_subtask(
+        self: Any, subtask: Subtask, triage_notes: str | None = None
+    ) -> tuple[bool, bool, str]:
+        pass_outcome = self._handle_subtask_pass(subtask, triage_notes=triage_notes)
         if pass_outcome.kind == "settled":
             fsm_runtime.enter_committing(self.store, self.node.id, note=f"{subtask.id} passed")
             fsm_runtime.enter_pushing(self.store, self.node.id, note=f"{subtask.id} committed and pushed")

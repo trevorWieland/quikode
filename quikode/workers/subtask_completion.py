@@ -22,7 +22,9 @@ class SubtaskCompletionMixin:
     def _mark_subtask_done(self: Any, subtask: Subtask) -> None:
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.DONE.value)
 
-    def _handle_subtask_pass(self: Any, subtask: Subtask) -> _SubtaskPassOutcome:
+    def _handle_subtask_pass(
+        self: Any, subtask: Subtask, triage_notes: str | None = None
+    ) -> _SubtaskPassOutcome:
         gate_ok, gate_output = self._pre_commit_gate(subtask)
         if not gate_ok:
             self.store.increment_subtask_pre_commit_failures(self.node.id, subtask.id)
@@ -44,6 +46,7 @@ class SubtaskCompletionMixin:
                 declared=declared,
                 actually_touched=actually_touched,
                 log_path=self.log_path,
+                triage_notes=triage_notes,
             )
 
         result = _tw.worktree.commit_subtask(

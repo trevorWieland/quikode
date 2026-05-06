@@ -67,6 +67,7 @@ def review_scope_drift(
     role: AgentRole | None = None,
     log_path: Path | None = None,
     timeout: int = 180,
+    triage_notes: str | None = None,
 ) -> ScopeReviewResult:
     """Decide whether the doer's commit drift is legitimate.
 
@@ -100,6 +101,7 @@ def review_scope_drift(
             actually_touched=list(actually_touched),
             out_of_lane=out_of_lane,
             missing=missing,
+            triage_notes=triage_notes,
         )
     except Exception as e:
         log.warning("scope-review prompt render failed: %s; defaulting to LEGITIMATE", e)
