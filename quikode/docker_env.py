@@ -316,7 +316,7 @@ def teardown_warm_cache_container(container_name: str) -> None:
     _run(["docker", "rm", "-f", container_name], check=False)
 
 
-def wait_dev_ready(handle: TaskContainer, timeout_s: int = 30) -> None:
+def wait_dev_ready(handle: TaskContainer, timeout_s: int = 120) -> None:
     """Wait for the dev container's entrypoint to finish copying auth files.
 
     The entrypoint touches /tmp/qk-ready as its last step before exec'ing the CMD.

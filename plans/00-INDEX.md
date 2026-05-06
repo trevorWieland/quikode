@@ -19,6 +19,8 @@ PR's worth of work; sequencing notes call out dependencies. Order = priority.
 | 12 | no-ci-leak-invariant | Prompt-level fix for R-0005 BLOCKED. Bakes "branch owns every commit" / "no pre-existing failure" into doer/triage/checker/planner/progress. Shipped. | — |
 | 13 | scope-review-gate-fix-rule | Follow-up to 12. Scope reviewer was nuking the cross-file fixes the new doer/triage prompts authorize, leaving the system in a churn loop. Added "gate-keeping cross-file fixes are ALWAYS legitimate" to `scope-review.md`. Shipped. | 12 |
 | 14 | checker-must-not-fabricate | Walked back plan 12's "synthetic FAIL bullet" guidance for the subtask checker. It was inventing criteria the doer couldn't satisfy (e.g. R-0021/S-08 spent 11 attempts because the checker fabricated a "surface startup" criterion the BDD scenario already mocked via in-process harnesses by tanren design). New rule: fail on observed gate failures only; never fabricate. Shipped. | 12 |
+| 15 | qk-show-markup-safety | `qk show` crashed with `MarkupError` whenever an artifact contained bracketed paths like `[/workspace/...]` (rustc, BDD, checker output). Operator/agent couldn't read triage at all. Fix: print artifact bodies with `markup=False, highlight=False`. Shipped. | — |
+| 16 | dev-container-readiness-timeout | 16-way parallel boot of dev containers exceeded the 60s `wait_dev_ready` ceiling under I/O contention; tasks marked FAILED while their containers actually finished entrypoint a moment later, then held the budget as zombies. Fix: bump call-site to 240s and default to 120s. Shipped. | — |
 
 ## Suggested ship order (no priorities crossing each other)
 

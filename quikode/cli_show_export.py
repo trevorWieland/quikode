@@ -517,6 +517,10 @@ def _print_show_artifacts(store: Store, task_id: str, *, full: bool) -> None:
         seen.add(kind)
         console.print(f"\n[bold]-- {kind} --[/]")
         body = a["content"] or ""
+        truncated_suffix = ""
         if not full and len(body) > 4000:
-            body = body[:4000] + f"\n\n[dim]... ({len(a['content']) - 4000} more chars; pass --full)[/]"
-        console.print(body)
+            truncated_suffix = f"... ({len(a['content']) - 4000} more chars; pass --full)"
+            body = body[:4000]
+        console.print(body, markup=False, highlight=False)
+        if truncated_suffix:
+            console.print(f"\n[dim]{truncated_suffix}[/]")

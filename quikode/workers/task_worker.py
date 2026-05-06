@@ -326,7 +326,13 @@ class TaskWorker(
         # Wait for the container's entrypoint to finish copying agent auth files
         # before any agent CLI is invoked. Without this, claude/codex see a
         # half-copied .claude.json and fail with cryptic errors.
-        docker_env.wait_dev_ready(handle, timeout_s=60)
+        # 240s, not 60s: when the orchestrator brings up many containers in
+        # parallel on a cold cluster, the entrypoint's auth-file copy contends
+        # for I/O and routinely takes 60–120s. The probe itself is a cheap
+        # `test -f /tmp/qk-ready` every 500ms, so waiting longer costs nothing
+        # when the entrypoint succeeds — but a too-tight ceiling marks live,
+        # working containers as FAILED and orphans them holding the budget.
+        docker_env.wait_dev_ready(handle, timeout_s=240)
 
         # Postgres is up; database setup inside the project is the doer's responsibility (tanren
         # ships them via tanren-cli migrate up; whether `just ci` needs them
