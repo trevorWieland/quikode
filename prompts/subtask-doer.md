@@ -78,9 +78,28 @@ A previous attempt failed. The triage agent's root-cause narrative is below. **I
 ```
 {% endif %}
 
+## Before stopping — inspect what will actually be committed
+
+Run these two commands and read the output:
+
+```
+git status -uall
+git diff HEAD --stat
+```
+
+The orchestrator commits **everything in the working tree** with `git add -A`. That includes files you did not consciously edit this attempt — out-of-lane edits and partial implementations from prior attempts of this same subtask **persist in the working tree** when a previous attempt's commit was rejected (the orchestrator unstages the index but does not revert files; nothing is lost, but nothing is reset either).
+
+For every file the diff shows, decide one of three things — and execute it before you stop:
+
+- **In-lane and correct** — keep as is.
+- **Out-of-lane but a legitimate gate-fix** — keep, and list it in your summary with the specific gate, test, or panic that requires it.
+- **Stale, wrong, or unjustified** — fix it in place. Open the file and write the correct content (do not blindly `git checkout` it without first checking whether reverting breaks a gate).
+
+**Never claim "no out-of-lane edits" or "no changes" when `git diff HEAD --stat` shows otherwise.** That contradiction is the most reliable way to get the commit rejected: the scope reviewer reads your summary as authoritative for intent, and a contradictory summary tells the reviewer you don't know what's in the diff. Reconcile your summary with the actual diff.
+
 ## Output — your summary is authoritative
 
-After implementing, emit a brief summary (≤ 200 words) covering:
+After implementing AND inspecting the diff, emit a brief summary (≤ 200 words) covering:
 
 - **Files changed** — one line per file, with the reason.
 - **Out-of-lane edits, if any** — list each file outside `files_to_touch` with the **specific gate, test, or panic** that requires it. The scope reviewer reads this verbatim and uses it to judge whether each cross-file edit is a legitimate gate-fix or overreach. "Required by `just web-test` migration panic at m20260504_…:42" → accepted. "Seemed needed" → rejected.
