@@ -37,6 +37,17 @@ If `just check` / `just ci` / `just web-test` fails on something outside `files_
 - if the fix is large enough to be its own slice, fix it minimally to get the gate green AND note the fact in your summary so the planner can add a follow-up slice.
 - never declare success while the gate is red. never declare yourself blocked while the gate is red and the cause is something you could fix.
 
+### Formatting violations are mechanical — fix them yourself
+
+When the gate reports format violations (e.g. `cargo fmt --check` diffs, `taplo fmt --check` diffs, markdown lint diffs), do NOT just re-read the gate output and try to format manually. Run the **fix-mode** of the project's formatter before stopping:
+
+- Rust: `cargo fmt --all` (or `cargo fmt -p <crate>`).
+- TOML: `taplo fmt <files-or-globs>`.
+- Markdown: the project's markdown auto-formatter — for tanren, `just markdown-fmt-fix`.
+- JS/TS: `prettier --write <files>` or the project's analog.
+
+Then re-run the gate (`just check`) and confirm it exits 0. Doers that try to satisfy `cargo fmt --check` by hand-editing whitespace and ordering are slow and unreliable; the formatter is deterministic and fixes everything in one shot. **Never stop with format violations outstanding** — they always fail the gate and always have a one-command fix.
+
 Note any out-of-`files_to_touch` edits in your summary with a one-line reason. Don't apologize for them; they're correct.
 
 ### Acceptance criteria (what the per-subtask checker will verify)
