@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from typing import Any
 
@@ -21,6 +22,21 @@ class _TaskWorkerGlobals:
 
 
 _tw = _TaskWorkerGlobals()
+
+
+def _subtask_from_row(row: dict) -> Subtask:
+    """Reconstruct a Subtask from a store row. Used for resuming leftover
+    fixup subtasks whose original FixupPlan object was not persisted."""
+    return Subtask(
+        id=row["subtask_id"],
+        title=row.get("title", "") or "",
+        depends_on=tuple(json.loads(row.get("depends_on") or "[]")),
+        files_to_touch=tuple(json.loads(row.get("files_to_touch") or "[]")),
+        boundary=row.get("boundary", "") or "",
+        acceptance=tuple(json.loads(row.get("acceptance") or "[]")) or ("(reconstructed)",),
+        notes=row.get("notes", "") or "",
+        kind=row.get("kind", "spec") or "spec",
+    )
 
 
 class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCompletionMixin):
@@ -156,7 +172,50 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
         resume from the failed subtask with the rest of the plan intact.
         """
         assert self.plan is not None, "_plan() must run before _subtask_loop()"
-        return self._run_subtask_set(self.plan.topo_order())
+        spec_outcome = self._run_subtask_set(self.plan.topo_order())
+        if spec_outcome is not None:
+            return spec_outcome
+        # Pick up any non-DONE fixup subtasks left over from a prior fixup
+        # round (e.g. resume mid-fixup). They live in the store but not in
+        # `self.plan.topo_order()` because the original planner didn't emit
+        # them — the audit-driven fixup planner did. Without this, resume
+        # silently skips pending fixups and the worker advances to
+        # LOCAL_CI_CHECKING with half-applied audit findings.
+        leftover = self._collect_leftover_fixup_subtasks()
+        if leftover:
+            _tw.log.info(
+                "subtask loop: driving %d leftover fixup subtask(s) from prior round: %s",
+                len(leftover),
+                ", ".join(s.id for s in leftover),
+            )
+            return self._run_subtask_set(leftover)
+        return None
+
+    def _collect_leftover_fixup_subtasks(self: Any) -> list[Subtask]:
+        """Reconstruct Subtask objects for any non-DONE rows in the store
+        that aren't part of `self.plan.topo_order()`. These are fixup slices
+        from a prior `_run_fixup_round` that didn't finish before a daemon
+        restart / orphan recovery."""
+        assert self.plan is not None
+        plan_ids = {s.id for s in self.plan.topo_order()}
+        out: list[Subtask] = []
+        for row in self.store.list_subtasks(self.node.id):
+            sid = row.get("subtask_id")
+            if not sid or sid in plan_ids:
+                continue
+            if row.get("state") in (SubtaskState.DONE.value, SubtaskState.SKIPPED.value):
+                continue
+            try:
+                sub = _subtask_from_row(row)
+            except Exception as e:
+                _tw.log.warning(
+                    "could not reconstruct leftover fixup subtask %s: %s; skipping",
+                    sid,
+                    e,
+                )
+                continue
+            out.append(sub)
+        return out
 
     def _run_subtask_set(self: Any, subtasks: list[Subtask]) -> WorkerOutcome | None:
         """Drive a sequence of subtasks through the doer/checker/triage loop.

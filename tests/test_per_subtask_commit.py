@@ -303,3 +303,82 @@ def test_pre_commit_gate_failure_synthesizes_checker_fail(tmp_path):
         assert "pre-commit hook failed" in txt
         assert "rustfmt failed" in txt
     worker.store.conn.close()
+
+
+def test_subtask_loop_picks_up_leftover_fixup_subtasks_on_resume(tmp_path):
+    """Resume mid-fixup: the daemon was running fixup subtasks (added by the
+    audit-driven fixup planner) when it died. Orphan recovery sends the task
+    back to PENDING with a resume marker. On the next worker run, _plan()
+    skips planning, _subtask_loop iterates self.plan.topo_order() — which
+    only includes the *original* spec subtasks, not the fixups — so all
+    spec subtasks short-circuit as DONE and the loop returns None. Without
+    the leftover-fixup pickup, _commit_push then fast-forwards to
+    LOCAL_CI_CHECKING with half-applied audit findings."""
+    plan = _build_plan(["S-01"])
+    worker = _build_worker(tmp_path, plan)
+
+    # Mark S-01 done — already committed before the simulated restart.
+    worker.store.update_subtask("R-001", "S-01", state=SubtaskState.DONE.value)
+
+    # Append two fixup subtasks (audit-driven) to the store. One is still
+    # in DOING (the doer was running when daemon died); one is fully
+    # PENDING. Neither is in self.plan.topo_order().
+    worker.store.append_subtasks(
+        "R-001",
+        [
+            {
+                "subtask_id": "F-1-1-fix-formatting",
+                "title": "Fix formatting issues found by rubric audit",
+                "depends_on": [],
+                "files_to_touch": ["src/foo.rs"],
+                "boundary": "",
+                "acceptance": ["cargo fmt --check passes"],
+                "notes": "",
+                "kind": "fixup-pre-pr-audit",
+            },
+            {
+                "subtask_id": "F-1-2-fix-types",
+                "title": "Fix type errors found by behavior audit",
+                "depends_on": [],
+                "files_to_touch": ["src/bar.rs"],
+                "boundary": "",
+                "acceptance": ["cargo check passes"],
+                "notes": "",
+                "kind": "fixup-pre-pr-audit",
+            },
+        ],
+    )
+    # Simulate the doer was mid-run on F-1-1 when the daemon died.
+    worker.store.update_subtask("R-001", "F-1-1-fix-formatting", state=SubtaskState.DOING.value)
+
+    fixup_ids_run: list[str] = []
+
+    def fake_commit(
+        handle, subtask, message, *, branch, remote, push, log_path, timeout=300, lane_review_fn=None
+    ):
+        fixup_ids_run.append(subtask.id)
+        return CommitResult(success=True, commit_sha="cafe" * 10, transient=False, output="ok")
+
+    with (
+        patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.PASS, checker_text="VERDICT: PASS", transient=False, rc=0, stderr=""
+            ),
+        ),
+        patch.object(worker, "_pre_commit_gate", return_value=(True, "skipped")),
+        patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit),
+    ):
+        outcome = worker._subtask_loop()
+
+    assert outcome is None, "all subtasks settled (spec + leftover fixups)"
+    assert "F-1-1-fix-formatting" in fixup_ids_run
+    assert "F-1-2-fix-types" in fixup_ids_run
+    # Both fixups should now be DONE.
+    f1 = worker.store.get_subtask("R-001", "F-1-1-fix-formatting")
+    f2 = worker.store.get_subtask("R-001", "F-1-2-fix-types")
+    assert f1["state"] == SubtaskState.DONE.value
+    assert f2["state"] == SubtaskState.DONE.value
+    worker.store.conn.close()
