@@ -22,9 +22,7 @@ class SubtaskCompletionMixin:
     def _mark_subtask_done(self: Any, subtask: Subtask) -> None:
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.DONE.value)
 
-    def _handle_subtask_pass(
-        self: Any, subtask: Subtask, triage_notes: str | None = None
-    ) -> _SubtaskPassOutcome:
+    def _handle_subtask_pass(self: Any, subtask: Subtask) -> _SubtaskPassOutcome:
         gate_ok, gate_output = self._pre_commit_gate(subtask)
         if not gate_ok:
             self.store.increment_subtask_pre_commit_failures(self.node.id, subtask.id)
@@ -35,6 +33,7 @@ class SubtaskCompletionMixin:
 
         branch = str(self._row()["branch"])
         commit_msg = f"subtask({subtask.id}): {subtask.title}"
+        doer_summary = self.last_doer_summary or None
 
         def _lane_review(
             sub: Subtask, declared: list[str], actually_touched: list[str]
@@ -46,7 +45,7 @@ class SubtaskCompletionMixin:
                 declared=declared,
                 actually_touched=actually_touched,
                 log_path=self.log_path,
-                triage_notes=triage_notes,
+                doer_summary=doer_summary,
             )
 
         result = _tw.worktree.commit_subtask(

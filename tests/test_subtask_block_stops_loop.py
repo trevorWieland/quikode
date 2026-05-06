@@ -195,7 +195,7 @@ def test_block_on_middle_subtask_skips_only_later(tmp_path):
             verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
         )
 
-    def fake_pass(subtask, triage_notes=None):
+    def fake_pass(subtask):
         # Stub the v3 commit gate: PASS branch always settles cleanly.
         worker.store.update_subtask("R-001", subtask.id, state=SubtaskState.DONE.value)
         return _SubtaskPassOutcome(kind="settled")
@@ -230,7 +230,7 @@ def test_all_pass_returns_none_so_final_check_runs(tmp_path):
     def fake_do(subtask, attempt, triage_notes):
         worker.store.update_subtask("R-001", subtask.id, state=SubtaskState.DOING.value)
 
-    def fake_pass(subtask, triage_notes=None):
+    def fake_pass(subtask):
         worker.store.update_subtask("R-001", subtask.id, state=SubtaskState.DONE.value)
         return _SubtaskPassOutcome(kind="settled")
 

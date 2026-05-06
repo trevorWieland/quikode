@@ -67,9 +67,15 @@ def review_scope_drift(
     role: AgentRole | None = None,
     log_path: Path | None = None,
     timeout: int = 180,
-    triage_notes: str | None = None,
+    doer_summary: str | None = None,
 ) -> ScopeReviewResult:
     """Decide whether the doer's commit drift is legitimate.
+
+    The reviewer reads `doer_summary` — the doer's contemporaneous summary of
+    THIS commit — as authoritative for intent. The doer summary is where
+    gate-fix justifications live ("file X edited because just web-test panics
+    without it"); a concrete cite there flips an out-of-lane file from
+    overreach to legitimate.
 
     Skip the agent call entirely when `actually_touched ⊆ declared`
     (no out-of-lane files) — that's strictly within the lane, no
@@ -101,7 +107,7 @@ def review_scope_drift(
             actually_touched=list(actually_touched),
             out_of_lane=out_of_lane,
             missing=missing,
-            triage_notes=triage_notes,
+            doer_summary=doer_summary,
         )
     except Exception as e:
         log.warning("scope-review prompt render failed: %s; defaulting to LEGITIMATE", e)
