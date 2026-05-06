@@ -6,7 +6,7 @@ PR's worth of work; sequencing notes call out dependencies. Order = priority.
 | # | Title | Why it matters | Depends on |
 |---|---|---|---|
 | 01 | retry-landscape | Landscape map. Read first. | — |
-| 02 | network-rate-limit-backoff | gh/git polls have no backoff; one 429 → infinite retries. | — |
+| 02 | network-rate-limit-backoff | gh/git polls have no backoff; one 429 → infinite retries. **Shipped** as `quikode/net_retry.py`; wired into github.py + github_graphql.py. | — |
 | 03 | conflict-cap-and-force-push | Hard-coded 6 ignores config; force-push has no retry. | 02 |
 | 04 | supervision-stall-event | Stall reset uses wrong FSM event, loses evidence. | — |
 | 05 | poisoned-worktree-wipe | "Wipe rather than carry forward" — the user's explicit ask. | 06 |
