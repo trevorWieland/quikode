@@ -101,6 +101,12 @@ And File Convention" if you're unsure about a rule.
 - `DATABASE_URL` is set.
 - Other subtasks of this same spec have NOT been started yet unless listed in `depends_on`. Don't assume their files exist.
 
+### Do NOT rewrite git history
+
+The orchestrator handles `git add`, `git commit`, and `git push` itself after you stop. **Do not run `git reset`, `git rebase`, `git commit --amend`, `git checkout <ref>`, `git cherry-pick`, or any command that rewrites or moves HEAD.** Each of those breaks the orchestrator's invariants about the branch state — the most common symptom is push being rejected as non-fast-forward when prior subtask commits get re-ordered or removed.
+
+If you need to undo your own in-progress edits, use `git checkout -- <file>` to discard unstaged changes, or just edit the file back to what you want. Never touch HEAD; never touch the index past `git add`/`git restore --staged`. If you find yourself wanting to "clean up the commit graph" before stopping, don't — the orchestrator's per-subtask flow expects exactly the commits it created, in the order it created them.
+
 ## Quality gate for this subtask — how your work will be judged
 
 The orchestrator runs a **two-layer gate** the moment you finish:
