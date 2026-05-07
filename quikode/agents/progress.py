@@ -35,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .. import prompts
 from ..config import AgentRole, Config
-from ..docker_env import TaskContainer
+from ..execution import ExecutionSandbox
 from ..subtask_schema import Subtask
 from . import build_agent
 
@@ -83,7 +83,7 @@ class ProgressAgent:
         subtask: Subtask,
         attempts: list[ProgressAttempt],
         acceptance: tuple[str, ...],
-        handle: TaskContainer,
+        handle: ExecutionSandbox,
         log_path: Path | None = None,
         timeout: int = 180,
     ) -> ProgressVerdict:

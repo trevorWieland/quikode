@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
 
 from quikode.cli import _compute_max_parallel
 from quikode.config import Config
-from quikode.docker_env import _parse_mem_string, workspace_label
+from quikode.docker_env import (
+    TaskContainer,
+    _parse_mem_string,
+    start_dev_container,
+    start_postgres,
+    workspace_label,
+)
 
 
 def _cfg(**kw):
-    return Config(repo_path=Path("/tmp"), dag_path=Path("/tmp"), **kw)
+    repo_path = kw.pop("repo_path", Path("/tmp"))
+    dag_path = kw.pop("dag_path", Path("/tmp"))
+    return Config(repo_path=repo_path, dag_path=dag_path, **kw)
 
 
 def test_cpu_bounded():
@@ -89,3 +98,50 @@ def test_workspace_label_differs_per_path(tmp_path):
     a = workspace_label(_cfg(state_dir=tmp_path / "a"))
     b = workspace_label(_cfg(state_dir=tmp_path / "b"))
     assert a != b
+
+
+def test_start_postgres_uses_configured_database(monkeypatch, tmp_path):
+    cfg = _cfg(postgres_db="zaimu", postgres_user="pguser", postgres_password="secret")
+    handle = TaskContainer("T-1", "qk-t-1", "t-1", "qk-t-1-dev", "qk-t-1-pg", "qk-t-1-net")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check=True, capture=True):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr("quikode.docker_env._run", fake_run)
+
+    start_postgres(handle, cfg, label="qk_workspace=abc123")
+
+    docker_run = calls[-1]
+    assert "POSTGRES_DB=zaimu" in docker_run
+    assert "POSTGRES_USER=pguser" in docker_run
+    assert "POSTGRES_PASSWORD=secret" in docker_run
+
+
+def test_start_dev_container_injects_configured_database_url(monkeypatch, tmp_path):
+    cfg = _cfg(
+        repo_path=tmp_path / "repo",
+        state_dir=tmp_path / ".quikode",
+        sccache_dir=tmp_path / ".quikode" / "sccache",
+        database_url="postgres://postgres:dev@postgres:5432/zaimu",
+    )
+    cfg.repo_path.mkdir()
+    (cfg.repo_path / ".git").mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    handle = TaskContainer("T-1", "qk-t-1", "t-1", "qk-t-1-dev", "qk-t-1-pg", "qk-t-1-net")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check=True, capture=True):
+        calls.append(cmd)
+        stdout = "token" if cmd[:3] == ["gh", "auth", "token"] else "container-id"
+        return SimpleNamespace(returncode=0, stdout=stdout)
+
+    monkeypatch.setattr("quikode.docker_env._run", fake_run)
+
+    start_dev_container(handle, cfg, worktree)
+
+    docker_run = calls[-1]
+    assert "-e" in docker_run
+    assert "DATABASE_URL=postgres://postgres:dev@postgres:5432/zaimu" in docker_run

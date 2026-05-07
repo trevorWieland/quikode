@@ -23,7 +23,7 @@ import secrets
 import time
 from pathlib import Path
 
-from ..docker_env import exec_in
+from ..execution import exec_in
 from . import ccusage
 from .base import AgentResult, _is_transient_container_failure, parse_tokens
 

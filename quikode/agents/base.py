@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..docker_env import exec_in
+from ..execution import exec_in
 from ..types import AgentResult
 
 # Re-export so existing `from .base import AgentResult` still works.

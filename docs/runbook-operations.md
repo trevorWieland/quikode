@@ -4,7 +4,7 @@
 
 ```bash
 quikode doctor
-quikode seed-from-main
+quikode seed-from-base
 quikode daemon start --detach --max-parallel 3
 quikode daemon status
 ```
@@ -47,4 +47,4 @@ quikode tail <task-id>
 
 ## Overnight Checklist
 
-Run the validation ladder, initialize a fresh workspace, run `seed-from-main`, confirm already-landed nodes are `merged`, then start the daemon with the intended parallelism.
+Run the validation ladder, initialize a fresh workspace, run `seed-from-base`, confirm already-landed nodes are `merged`, then start the daemon with the intended parallelism.

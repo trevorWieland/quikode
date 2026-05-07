@@ -101,6 +101,6 @@ Recovery: operator chooses one of: merge externally, post guidance, `resume`, or
 
 ## Seed Evidence Mismatch
 
-First look: DAG metadata, `origin/main` subjects, and any explicit evidence file used with `seed-from-main`.
+First look: DAG metadata, configured base-branch commit subjects, and any explicit evidence file used with `seed-from-base`.
 
 Recovery: correct the evidence source and rerun seeding in a fresh workspace.

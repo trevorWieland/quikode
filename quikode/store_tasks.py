@@ -98,7 +98,7 @@ class StoreTaskMixin:
                 raise ValueError(f"cannot seed {task_id}: task already exists in state {row['state']!r}")
             c.execute(
                 "INSERT INTO state_log (task_id, from_state, to_state, note, ts) VALUES (?, ?, ?, ?, ?)",
-                (task_id, from_state, State.MERGED.value, f"seed-from-main:{source}", now),
+                (task_id, from_state, State.MERGED.value, f"seed-from-base:{source}", now),
             )
 
     def get(self: Any, task_id: str) -> TaskRow:

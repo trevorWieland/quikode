@@ -89,10 +89,11 @@ def test_teardown_warm_cache_container_is_idempotent():
     assert run_mock.call_args.kwargs.get("check") is False
 
 
-def test_cli_warm_cache_runs_expected_steps(tmp_path):
+def test_cli_warm_cache_runs_expected_steps(tmp_path, monkeypatch):
     """End-to-end CLI invocation: container started, all four steps
     invoked in order, teardown called."""
     workspace = _write_config(tmp_path)
+    monkeypatch.chdir(workspace)
 
     with (
         patch.object(
@@ -126,8 +127,9 @@ def test_cli_warm_cache_runs_expected_steps(tmp_path):
     assert any("sccache --show-stats" in i for i in invocations), invocations
 
 
-def test_cli_warm_cache_no_fetch_skips_git_fetch(tmp_path):
+def test_cli_warm_cache_no_fetch_skips_git_fetch(tmp_path, monkeypatch):
     workspace = _write_config(tmp_path)
+    monkeypatch.chdir(workspace)
 
     with (
         patch.object(
@@ -151,8 +153,9 @@ def test_cli_warm_cache_no_fetch_skips_git_fetch(tmp_path):
     assert any("git checkout origin/main" in i for i in invocations), invocations
 
 
-def test_cli_warm_cache_custom_branch(tmp_path):
+def test_cli_warm_cache_custom_branch(tmp_path, monkeypatch):
     workspace = _write_config(tmp_path)
+    monkeypatch.chdir(workspace)
 
     with (
         patch.object(
@@ -180,9 +183,10 @@ def test_cli_warm_cache_custom_branch(tmp_path):
     assert any("git checkout origin/develop" in i for i in invocations), invocations
 
 
-def test_cli_warm_cache_tears_down_on_failure(tmp_path):
+def test_cli_warm_cache_tears_down_on_failure(tmp_path, monkeypatch):
     """Even when cargo build fails, the container is torn down."""
     workspace = _write_config(tmp_path)
+    monkeypatch.chdir(workspace)
 
     fail_step = subprocess.CompletedProcess(args=[], returncode=101, stdout="error: linker failed", stderr="")
     ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")

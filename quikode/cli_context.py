@@ -25,7 +25,7 @@ from . import notify as notify_mod
 from . import workspace as workspace_mod
 from .config import Config
 from .config_loader import find_config_root, load_config
-from .config_template import DEFAULT_CONFIG_TOML
+from .config_template import DEFAULT_CONFIG_TOML, render_config_toml
 from .dag import DAG
 from .orchestrator import Orchestrator
 from .profiles import BUILTIN_PROFILES, get_profile
@@ -68,6 +68,7 @@ __all__ = [
     "load_config",
     "notify_mod",
     "os",
+    "render_config_toml",
     "retry_classify",
     "run_tui",
     "shutil",

@@ -82,7 +82,7 @@ def test_demo_clones_when_target_does_not_exist(tmp_path, monkeypatch):
         result = CliRunner().invoke(app, ["demo", "R-001"])
     assert result.exit_code == 0, result.output
     expected_target = tmp_path / "myrepo-demo"
-    assert str(expected_target) in result.output
+    assert str(expected_target) in result.output.replace("\n", "")
     # Should have invoked git clone with the resolved url.
     clone_call = next((c for c in calls if c and c[0] == "git" and len(c) > 1 and c[1] == "clone"), None)
     assert clone_call is not None, f"expected git clone call; got {calls}"

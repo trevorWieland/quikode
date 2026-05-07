@@ -154,7 +154,7 @@ class FeedbackWorkerMixin:
             # Tear down container only — keep the worktree so subsequent
             # response cycles (or merge) can reuse it.
             if self.handle is not None:
-                _tw.docker_env.teardown(self._h)
+                self.execution_backend.teardown(self._h)
                 self.handle = None
 
     def run_ci_fix_response(self: Any, pr_status: _tw.github.PRStatus) -> WorkerOutcome:
@@ -238,7 +238,7 @@ class FeedbackWorkerMixin:
             return WorkerOutcome(State.PENDING_CI, f"ci-fix crashed: {e}")
         finally:
             if self.handle is not None:
-                _tw.docker_env.teardown(self._h)
+                self.execution_backend.teardown(self._h)
                 self.handle = None
 
     def _commit_and_push_response(self: Any) -> _tw.worktree.CommitResult:

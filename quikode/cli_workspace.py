@@ -76,6 +76,35 @@ def status(
     console.print(table)
 
 
+def _seed_from_base_impl(
+    merged_nodes_file: Path | None,
+    output_json: bool,
+) -> None:
+    cfg = load_config()
+    store = _open_store(cfg)
+    result = workspace_mod.seed_from_base(cfg, store, merged_nodes_file=merged_nodes_file)
+    if output_json:
+        print(json.dumps({"merged": result.merged, "pending": result.pending}, indent=2))
+        return
+    console.print(
+        f"[green]seeded {len(result.merged)} merged DAG node(s) from {cfg.pr_remote}/{cfg.base_branch}[/]"
+    )
+    console.print(f"[cyan]{len(result.pending)} node(s) remain pending[/]")
+
+
+@app.command("seed-from-base")
+def seed_from_base(
+    merged_nodes_file: Path | None = typer.Option(
+        None,
+        "--merged-nodes-file",
+        help="JSON object/list of explicit merged-node evidence.",
+    ),
+    output_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+):
+    """Seed a fresh workspace from deterministic DAG and configured base branch evidence."""
+    _seed_from_base_impl(merged_nodes_file=merged_nodes_file, output_json=output_json)
+
+
 @app.command("seed-from-main")
 def seed_from_main(
     merged_nodes_file: Path | None = typer.Option(
@@ -85,16 +114,8 @@ def seed_from_main(
     ),
     output_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ):
-    """Seed a fresh workspace from deterministic DAG and origin/main evidence."""
-
-    cfg = load_config()
-    store = _open_store(cfg)
-    result = workspace_mod.seed_from_main(cfg, store, merged_nodes_file=merged_nodes_file)
-    if output_json:
-        print(json.dumps({"merged": result.merged, "pending": result.pending}, indent=2))
-        return
-    console.print(f"[green]seeded {len(result.merged)} merged DAG node(s)[/]")
-    console.print(f"[cyan]{len(result.pending)} node(s) remain pending[/]")
+    """Compatibility alias for seed-from-base."""
+    _seed_from_base_impl(merged_nodes_file=merged_nodes_file, output_json=output_json)
 
 
 @app.command()

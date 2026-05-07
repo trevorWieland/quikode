@@ -13,8 +13,6 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from .docker_env import TaskContainer
-
 _NON_FAST_FORWARD_MARKERS = ("non-fast-forward", "rejected]", "fetch first")
 
 
@@ -23,7 +21,7 @@ def is_non_fast_forward(combined: str) -> bool:
 
 
 def push_with_recovery(
-    handle: TaskContainer,
+    handle: Any,
     branch: str,
     remote: str,
     *,

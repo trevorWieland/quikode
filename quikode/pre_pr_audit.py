@@ -46,7 +46,7 @@ from . import prompts as prompts_mod
 from . import triage as triage_mod
 from .agents import build_agent
 from .config import AgentRole, Config
-from .docker_env import TaskContainer, exec_in
+from .execution import ExecutionSandbox, exec_in
 
 log = logging.getLogger("quikode.pre_pr_audit")
 
@@ -89,7 +89,7 @@ class PipelineCycleResult:
 def run_local_ci_gate(
     *,
     cfg: Config,
-    handle: TaskContainer,
+    handle: ExecutionSandbox,
     log_path: Path | None = None,
 ) -> StageOutcome:
     """Run the configured local-CI command inside the dev container. Empty
@@ -160,7 +160,7 @@ _JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 def run_rubric_audit(
     *,
     cfg: Config,
-    handle: TaskContainer,
+    handle: ExecutionSandbox,
     diff_excerpt: str,
     plan_text: str,
     role: AgentRole | None = None,
@@ -281,7 +281,7 @@ def collect_standards_text(cfg: Config) -> str:
 def run_standards_audit(
     *,
     cfg: Config,
-    handle: TaskContainer,
+    handle: ExecutionSandbox,
     diff_excerpt: str,
     standards_text: str,
     role: AgentRole | None = None,
@@ -385,7 +385,7 @@ def _parse_findings_envelope(text: str) -> dict | None:
 def run_behavior_audit(
     *,
     cfg: Config,
-    handle: TaskContainer,
+    handle: ExecutionSandbox,
     expected_evidence: list[dict],
     diff_excerpt: str,
     plan_text: str,
