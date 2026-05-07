@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from quikode.subtask_schema import (
+    STABILIZATION_SUBTASK_ID,
     PlanValidationError,
     extract_json,
     parse_fixup_planner_output,
@@ -286,3 +289,87 @@ def test_fixup_plan_accepts_subtasks_without_addresses_findings():
     assert len(plan.subtasks) == 1
     assert plan.subtasks[0].addresses_findings == ()
     assert plan.findings_addressed == ()
+
+
+# ----------------------------- plan 24: stabilization subtask injection -----
+
+
+def _two_subtask_plan_dict() -> dict:
+    return {
+        "node_id": "R-001",
+        "summary": "test",
+        "subtasks": [
+            {
+                "id": "S-01-domain",
+                "title": "domain types",
+                "depends_on": [],
+                "files_to_touch": ["a.rs"],
+                "boundary": "",
+                "acceptance": ["compiles"],
+            },
+            {
+                "id": "S-02-services",
+                "title": "service layer",
+                "depends_on": ["S-01-domain"],
+                "files_to_touch": ["b.rs"],
+                "boundary": "",
+                "acceptance": ["passes tests"],
+            },
+        ],
+        "final_acceptance": ["just ci passes"],
+    }
+
+
+def test_stabilization_injection_appends_when_command_given():
+    raw = _two_subtask_plan_dict()
+    plan = validate_and_build_plan(raw, spec_gate_command="just check")
+    assert len(plan.subtasks) == 3
+    last = plan.subtasks[-1]
+    assert last.id == STABILIZATION_SUBTASK_ID
+    assert last.depends_on == ("S-01-domain", "S-02-services")
+    assert last.files_to_touch == ()
+    assert any("just check" in a for a in last.acceptance)
+    assert "gate-keeping cross-file fixes" in last.boundary or "scope review" in last.boundary
+    assert last.kind == "spec"
+
+
+def test_stabilization_injection_skipped_when_command_none():
+    raw = _two_subtask_plan_dict()
+    plan = validate_and_build_plan(raw, spec_gate_command=None)
+    assert len(plan.subtasks) == 2
+    assert all(s.id != STABILIZATION_SUBTASK_ID for s in plan.subtasks)
+
+
+def test_stabilization_injection_idempotent_if_already_present():
+    """Re-parsing the same plan_text on resume must not double-inject."""
+    raw = _two_subtask_plan_dict()
+    plan_v1 = validate_and_build_plan(raw, spec_gate_command="just check")
+    # Simulate persisting + re-parsing by serializing back to dict shape.
+    raw_v2 = {
+        "node_id": plan_v1.node_id,
+        "summary": plan_v1.summary,
+        "subtasks": [
+            {
+                "id": s.id,
+                "title": s.title,
+                "depends_on": list(s.depends_on),
+                "files_to_touch": list(s.files_to_touch),
+                "boundary": s.boundary,
+                "acceptance": list(s.acceptance),
+                "notes": s.notes,
+                "kind": s.kind,
+            }
+            for s in plan_v1.subtasks
+        ],
+        "final_acceptance": list(plan_v1.final_acceptance),
+    }
+    plan_v2 = validate_and_build_plan(raw_v2, spec_gate_command="just check")
+    assert len(plan_v2.subtasks) == len(plan_v1.subtasks)
+    assert sum(1 for s in plan_v2.subtasks if s.id == STABILIZATION_SUBTASK_ID) == 1
+
+
+def test_parse_planner_output_threads_command_through():
+    raw = _two_subtask_plan_dict()
+    text = "```json\n" + json.dumps(raw) + "\n```"
+    plan = parse_planner_output(text, expected_node_id="R-001", spec_gate_command="just check")
+    assert any(s.id == STABILIZATION_SUBTASK_ID for s in plan.subtasks)

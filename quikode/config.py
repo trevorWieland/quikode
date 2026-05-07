@@ -144,6 +144,18 @@ class Config(BaseModel):
         le=10,
         description="Consecutive FLATLINED progress verdicts before BLOCKING the subtask.",
     )
+    subtask_same_signature_block_count: int = Field(
+        default=5,
+        ge=2,
+        le=20,
+        description=(
+            "If the last N non-transient retry_reasons share the same "
+            "(category, signature) tuple, BLOCK the subtask. Independent of "
+            "the progress-check verdict — catches deadlocks where each "
+            "attempt produces different-but-equally-invalid output that "
+            "the progress-check agent rates 'progressing'. Plan 23."
+        ),
+    )
     subtask_transient_max_retries: int = Field(
         default=5,
         ge=0,

@@ -360,6 +360,60 @@ class StoreForensicsMixin:
         # Reverse so caller sees oldest-first (matches "attempt 1 ... attempt N").
         return [str(r["content"] or "") for r in reversed(rows)]
 
+    def last_n_retry_signatures(
+        self: Any, task_id: str, subtask_id: str, *, limit: int
+    ) -> list[tuple[str, str]]:
+        """Return the last N non-transient retry_reasons as
+        (category, signature) tuples, oldest first. Empty list when no
+        history yet. Used by plan 23's same-signature stop-loss.
+
+        Transient reasons (container vanished, infra glitches) are
+        intentionally excluded — they describe environmental noise, not
+        deadlock signal. Non-transient reasons describe what the doer
+        actually produced and what gate it tripped.
+        """
+        with self._tx_lock:
+            row = self.conn.execute(
+                "SELECT retry_reasons FROM subtasks WHERE task_id = ? AND subtask_id = ?",
+                (task_id, subtask_id),
+            ).fetchone()
+        if row is None:
+            return []
+        raw = row["retry_reasons"]
+        if not raw:
+            return []
+        try:
+            reasons = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        out: list[tuple[str, str]] = []
+        for r in reasons:
+            if not isinstance(r, dict):
+                continue
+            if r.get("transient"):
+                continue
+            cat = str(r.get("category") or "")
+            sig = str(r.get("signature") or "")
+            out.append((cat, sig))
+        return out[-limit:]
+
+    def latest_subtask_doer_output(self: Any, task_id: str, subtask_id: str) -> str | None:
+        """Return the most recent doer stdout artifact for a subtask, or
+        None if no prior attempt exists. Used by plan 22 to carry forward
+        the prior attempt's investigation/summary into the next doer
+        prompt — without this, every attempt restarts investigation from
+        scratch and progress stalls when a single 22-min doer turn isn't
+        enough (e.g. multi-file harness debugging on R-0005/S-10)."""
+        with self._tx_lock:
+            row = self.conn.execute(
+                "SELECT content FROM artifacts WHERE task_id = ? AND kind = ? ORDER BY ts DESC LIMIT 1",
+                (task_id, f"subtask_doer:{subtask_id}"),
+            ).fetchone()
+        if row is None:
+            return None
+        content = row["content"]
+        return str(content) if content else None
+
     def add_artifact(self: Any, task_id: str, kind: str, content: str, is_path: bool = False) -> None:
         with self.tx() as c:
             c.execute(

@@ -38,7 +38,7 @@ class SubtaskCompletionMixin:
         def _lane_review(
             sub: Subtask, declared: list[str], actually_touched: list[str]
         ) -> _tw.scope_review.ScopeReviewResult:
-            return _tw.scope_review.review_scope_drift(
+            review = _tw.scope_review.review_scope_drift(
                 cfg=self.cfg,
                 handle=self._h,
                 subtask=sub,
@@ -47,6 +47,8 @@ class SubtaskCompletionMixin:
                 log_path=self.log_path,
                 doer_summary=doer_summary,
             )
+            self._record_scope_review(sub, declared, actually_touched, review)
+            return review
 
         result = _tw.worktree.commit_subtask(
             self._h,
@@ -77,6 +79,55 @@ class SubtaskCompletionMixin:
         self.store.update_subtask(self.node.id, subtask.id, **update_fields)
         self._mark_subtask_done(subtask)
         return _SubtaskPassOutcome(kind="settled")
+
+    def _record_scope_review(
+        self: Any,
+        subtask: Subtask,
+        declared: list[str],
+        actually_touched: list[str],
+        review: Any,
+    ) -> None:
+        """Persist scope-review verdict to `agent_calls` + an artifact.
+
+        Plan 21: scope-review was the only agent invocation in the subtask
+        cycle without observability. Operator and triage agents could only
+        infer rejections from `commit_subtask` output prose. Now every
+        attempt that adjudicates out-of-lane drift produces a structured
+        record. Skipped on the cheap-path early return (subset of declared
+        lane) where no agent ran.
+        """
+        run = getattr(review, "agent_run", None)
+        role = getattr(review, "role_used", None)
+        if run is None or role is None:
+            return
+        self.store.record_agent_call(
+            self.node.id,
+            phase="subtask_scope_review",
+            cli=role.cli,
+            model=role.model,
+            rc=run.rc,
+            duration_s=run.duration_s or 0,
+            tokens_used=run.tokens_used,
+            tokens_input=run.tokens_input,
+            tokens_output=run.tokens_output,
+            tokens_cached_read=run.tokens_cached_read,
+            tokens_cached_creation=run.tokens_cached_creation,
+            cost_usd=run.cost_usd,
+            subtask_id=subtask.id,
+        )
+        out_of_lane = sorted(set(actually_touched) - set(declared))
+        verdict = "LEGITIMATE" if review.legitimate else "OVERREACH"
+        body = (
+            f"VERDICT: {verdict}\n"
+            f"REASON: {review.reason}\n\n"
+            f"declared lane: {sorted(declared)}\n"
+            f"actually touched: {sorted(actually_touched)}\n"
+            f"out-of-lane: {out_of_lane}\n"
+            f"accepted lane (post-review): {sorted(review.accepted_files)}\n\n"
+            f"---- agent rc={run.rc} duration={run.duration_s or 0:.1f}s ----\n"
+            f"{run.stdout}"
+        )
+        self.store.add_artifact(self.node.id, f"subtask_scope_review:{subtask.id}", body)
 
     def _pre_commit_gate(self: Any, subtask: Subtask) -> tuple[bool, str]:
         runner = self.cfg.pre_commit_runner

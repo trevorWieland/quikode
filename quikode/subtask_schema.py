@@ -198,8 +198,89 @@ def extract_json(text: str) -> dict[str, Any]:
         raise PlanValidationError(f"unfenced JSON not parseable: {e}") from e
 
 
-def validate_and_build_plan(raw: dict[str, Any], *, expected_node_id: str | None = None) -> Plan:
-    """Validate a parsed JSON object and return a Plan, or raise PlanValidationError."""
+STABILIZATION_SUBTASK_ID = "Z-99-stabilize-spec-gate"
+
+
+def _build_stabilization_subtask(*, prior_ids: list[str], spec_gate_command: str) -> dict[str, Any]:
+    """Plan 24: deterministic final subtask appended to every spec plan.
+
+    Sits after every planner-emitted subtask and depends on all of them.
+    Its job is to run the spec gate (`{cfg.subtask_check_command}`) and
+    fix any breakage the prior subtasks left. Without this, the first
+    pre-PR audit cycle nearly always burns a fixup-planner round on
+    cross-subtask integration failures the planner couldn't have
+    foreseen — wasting one cycle of every audit gauntlet.
+
+    `files_to_touch` is intentionally empty: this subtask's "lane" is
+    "anything required to make the gate green". Scope-review still
+    adjudicates each cross-file edit using the existing invariant
+    "gate-keeping cross-file fixes are always legitimate" (plan 13).
+    """
+    return {
+        "id": STABILIZATION_SUBTASK_ID,
+        "title": "Stabilize spec gate — ensure all gate checks pass cleanly",
+        "depends_on": list(prior_ids),
+        "files_to_touch": [],
+        "boundary": (
+            f"Make the spec gate (`{spec_gate_command}`) pass cleanly. May "
+            f"edit any file required to fix gate failures; cross-file edits "
+            f"are adjudicated by scope review under the standing invariant "
+            f"that gate-keeping cross-file fixes are always legitimate."
+        ),
+        "acceptance": [
+            f"Spec gate (`{spec_gate_command}`) passes with rc=0",
+            "All committed changes from prior subtasks remain functional",
+        ],
+        "notes": (
+            "System-injected stabilization subtask (plan 24). Every prior "
+            "subtask has already landed and been committed. Your job is to "
+            "run the gate, fix anything that fails, run it again, and "
+            "repeat until rc=0. If a fix requires editing files outside "
+            "any prior subtask's lane, do it and explain why in your "
+            "summary — the scope reviewer accepts gate-fix justifications."
+        ),
+        "kind": "spec",
+    }
+
+
+def _maybe_inject_stabilization(raw: dict[str, Any], *, spec_gate_command: str | None) -> dict[str, Any]:
+    """Append the stabilization subtask to a planner-emitted dict if not
+    already present and the caller supplied a gate command. Idempotent —
+    safe to re-call across resumes / re-parses (`plan_text` is persisted
+    once so this fires on the first parse and short-circuits on every
+    subsequent re-parse).
+    """
+    if not spec_gate_command:
+        return raw
+    subtasks = raw.get("subtasks") or []
+    if not isinstance(subtasks, list):
+        return raw
+    for s in subtasks:
+        if isinstance(s, dict) and s.get("id") == STABILIZATION_SUBTASK_ID:
+            return raw
+    prior_ids = [s.get("id", "") for s in subtasks if isinstance(s, dict) and s.get("id")]
+    new_raw = dict(raw)
+    new_raw["subtasks"] = [
+        *subtasks,
+        _build_stabilization_subtask(prior_ids=prior_ids, spec_gate_command=spec_gate_command),
+    ]
+    return new_raw
+
+
+def validate_and_build_plan(
+    raw: dict[str, Any],
+    *,
+    expected_node_id: str | None = None,
+    spec_gate_command: str | None = None,
+) -> Plan:
+    """Validate a parsed JSON object and return a Plan, or raise PlanValidationError.
+
+    When `spec_gate_command` is supplied, a system-injected stabilization
+    subtask (plan 24) is appended to the plan before validation. Pass
+    None to skip injection (used for tests of pre-injection planner
+    output).
+    """
+    raw = _maybe_inject_stabilization(raw, spec_gate_command=spec_gate_command)
     try:
         plan = Plan.model_validate(raw)
     except ValidationError as e:
@@ -213,9 +294,19 @@ def validate_and_build_plan(raw: dict[str, Any], *, expected_node_id: str | None
     return plan
 
 
-def parse_planner_output(text: str, *, expected_node_id: str | None = None) -> Plan:
-    """Convenience: extract + validate in one step."""
-    return validate_and_build_plan(extract_json(text), expected_node_id=expected_node_id)
+def parse_planner_output(
+    text: str,
+    *,
+    expected_node_id: str | None = None,
+    spec_gate_command: str | None = None,
+) -> Plan:
+    """Convenience: extract + validate in one step. Pass `spec_gate_command`
+    to enable plan 24's stabilization-subtask injection."""
+    return validate_and_build_plan(
+        extract_json(text),
+        expected_node_id=expected_node_id,
+        spec_gate_command=spec_gate_command,
+    )
 
 
 # ---------- v3 fixup decomposition ----------

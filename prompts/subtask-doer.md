@@ -49,7 +49,15 @@ If a gate fails on a file outside `files_to_touch`:
 
 There is no "out-of-scope" exemption, no "pre-existing" exemption, no "upstream owner who'll fix it later." Every commit on this branch is yours.
 
-### 2. Don't rewrite git history
+### 2. If you write or modify tests, run them yourself before stopping
+You are responsible for the green of any test you author or change. Run
+the tests through their actual runner (not just `cargo check`) and only
+stop when they pass. Handing off red tests for the next subtask, the
+spec-stabilization subtask, or the pre-PR audit to discover wastes
+retries and surfaces failures to layers that can't fix them as
+efficiently as you can right now. Test-author owns test green.
+
+### 3. Don't rewrite git history
 The orchestrator owns commits. **No `git reset`, `git rebase`, `git commit --amend`, `git checkout <ref>`, `git cherry-pick`** — these break invariants about branch state and most often surface as non-fast-forward push rejections. To discard unstaged edits use `git checkout -- <file>` or `git restore --staged <file>`. Never touch HEAD.
 
 ## Working environment
@@ -68,13 +76,25 @@ This must exit 0. The orchestrator runs it after you stop; if it fails, you'll b
 
 Run a focused `cargo check -p <crate>` or equivalent before stopping (full `just ci` is too slow per subtask).{% endif %}
 
-{% if triage_notes %}
+{% if triage_notes is defined and triage_notes %}
 ## Triage from prior attempt — context, not a fix recipe
 
 A previous attempt failed. The triage agent's root-cause narrative is below. **It describes what failed; it does not prescribe what to do.** Apply your own judgment guided by the invariants above: gate must be green, fix gate failures wherever they live, justify out-of-lane edits in your summary.
 
 ```
 {{ triage_notes }}
+```
+{% endif %}
+
+{% if prior_doer_output is defined and prior_doer_output %}
+## Your prior attempt's output — continue from where you left off
+
+This subtask has been attempted before. The trailing portion of your prior attempt's output is below. **Use it to avoid restarting investigation from scratch and to build on prior progress.** The worktree on disk also persists every file you edited — out-of-lane edits and partial implementations from prior attempts are still there (`git status -uall` will show them).
+
+If the prior output looks truncated (the previous attempt may have hit the doer timeout), that's expected — the agent was killed mid-stream but the worktree state was preserved. Pick up the same investigation thread, narrow toward a fix, and produce a complete summary this time.
+
+```
+{{ prior_doer_output }}
 ```
 {% endif %}
 

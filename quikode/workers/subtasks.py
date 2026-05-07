@@ -50,7 +50,11 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
             fsm_runtime.environment_ready(self.store, self.node.id, note="resume - skipping planner")
             self.plan_text = str(row["plan_text"] or "")
             try:
-                self.plan = _tw.parse_planner_output(self.plan_text, expected_node_id=self.node.id)
+                self.plan = _tw.parse_planner_output(
+                    self.plan_text,
+                    expected_node_id=self.node.id,
+                    spec_gate_command=self.cfg.subtask_check_command,
+                )
             except PlanValidationError as e:
                 # plan_text was malformed for some reason — fall through to
                 # re-plan with the agent rather than crash.
@@ -110,7 +114,11 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
 
     def _parse_or_retry_plan(self: Any, stdout: str) -> Plan:
         try:
-            return _tw.parse_planner_output(stdout, expected_node_id=self.node.id)
+            return _tw.parse_planner_output(
+                stdout,
+                expected_node_id=self.node.id,
+                spec_gate_command=self.cfg.subtask_check_command,
+            )
         except PlanValidationError as e:
             # One retry with the validation error fed back as user input
             _tw.log.warning("planner output failed validation (%s); re-prompting once", e)
@@ -140,7 +148,11 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
                 cost_usd=result.cost_usd,
             )
             self.store.add_artifact(self.node.id, "planner_output", result.stdout)
-            return _tw.parse_planner_output(result.stdout, expected_node_id=self.node.id)
+            return _tw.parse_planner_output(
+                result.stdout,
+                expected_node_id=self.node.id,
+                spec_gate_command=self.cfg.subtask_check_command,
+            )
 
     def _subtask_loop(self: Any) -> WorkerOutcome | None:
         """Iterate subtasks in topological order. Each subtask retries
@@ -324,6 +336,9 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
                     attempt -= 1
                     continue
             triage_notes = self._record_subtask_triage(subtask, attempt, hard_max, checker_text, outcome)
+            sig_block = self._maybe_signature_stop_loss(subtask)
+            if sig_block:
+                return False, sig_block
             progress_block = self._maybe_record_progress_block(subtask, attempt)
             if progress_block:
                 return False, progress_block
@@ -383,6 +398,32 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
         )
         self.store.append_retry_reason(
             self.node.id, subtask.id, attempt=attempt, category=cat, signature=sig, transient=transient
+        )
+
+    def _maybe_signature_stop_loss(self: Any, subtask: Subtask) -> str | None:
+        """Block when the last N non-transient retry_reasons share the
+        same `(category, signature)` tuple. Plan 23.
+
+        Independent of `_maybe_record_progress_block` — that one relies
+        on the progress-check agent's verdict, which can rate
+        different-but-equally-invalid output as 'progressing' and so
+        misses retry storms with stable failure signatures (e.g.
+        R-0005/S-10's `doer_output_invalid rc=0` loop).
+        """
+        n = self.cfg.subtask_same_signature_block_count
+        if n < 2:
+            return None
+        sigs = self.store.last_n_retry_signatures(self.node.id, subtask.id, limit=n)
+        if len(sigs) < n:
+            return None
+        first = sigs[0]
+        if not all(s == first for s in sigs):
+            return None
+        cat, sig = first
+        sig_short = sig[:120]
+        return (
+            f"same-signature stop-loss: last {n} non-transient retries all "
+            f"share category={cat!r} signature={sig_short!r}"
         )
 
     def _maybe_record_progress_block(self: Any, subtask: Subtask, attempt: int) -> str | None:

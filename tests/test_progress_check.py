@@ -101,6 +101,7 @@ def _build_worker(
     progress_after: int = 3,
     progress_every: int = 2,
     flatline_block: int = 2,
+    same_signature_block: int = 20,
 ) -> TaskWorker:
     cfg = Config(
         repo_path=tmp_path,
@@ -114,6 +115,11 @@ def _build_worker(
         subtask_progress_check_after=progress_after,
         subtask_progress_check_every=progress_every,
         subtask_flatline_block_count=flatline_block,
+        # Default to a high cap in test fixtures so the plan-23 stop-loss
+        # doesn't fire on these progress-check-focused tests, which set up
+        # uniform-signature retry storms by design. Tests of plan 23 itself
+        # set this to its real value explicitly.
+        subtask_same_signature_block_count=same_signature_block,
     )
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
@@ -685,4 +691,117 @@ def test_loop_blocks_immediately_when_first_check_already_flatlines_at_block_cou
     assert outcome.final_state is State.BLOCKED
     assert "flatlined 1 consecutive times" in outcome.note
     assert do_calls == [1, 2]
+    worker.store.conn.close()
+
+
+# ----- plan 23: same-signature stop-loss -----
+
+
+def test_same_signature_stop_loss_blocks_after_n_identical_failures(tmp_path):
+    """Plan 23: when the last N non-transient retry_reasons share the same
+    (category, signature), block regardless of progress-check verdict.
+
+    Setup: progress agent always says 'progressing' (would otherwise let
+    the loop run to hard_max), checker always FAILs with rc=0 → identical
+    `(doer_output_invalid, rc=0)` signatures. With the stop-loss set to 3,
+    the third retry's append should trigger the block.
+    """
+    plan = _build_plan(["S-01"])
+    worker = _build_worker(
+        tmp_path,
+        plan,
+        hard_max=20,
+        progress_after=2,
+        progress_every=2,
+        flatline_block=10,  # max — don't let flatline win the race
+        same_signature_block=3,
+    )
+
+    do_calls: list[int] = []
+
+    def fake_do(subtask, attempt, triage_notes):
+        do_calls.append(attempt)
+
+    fake_progress = MagicMock()
+    fake_progress.check.return_value = ProgressVerdict(verdict="progressing", rationale="x")
+
+    with (
+        patch.object(worker, "_do_subtask", side_effect=fake_do),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+            ),
+        ),
+        patch.object(worker, "_triage_subtask", return_value="fix it"),
+        patch("quikode.worker.build_progress_agent", return_value=fake_progress),
+    ):
+        outcome = worker._subtask_loop()
+
+    assert outcome is not None
+    assert outcome.final_state is State.BLOCKED
+    assert "same-signature stop-loss" in outcome.note
+    # Three doer attempts → three identical retry_reasons → block fires after the 3rd append.
+    assert do_calls == [1, 2, 3]
+    worker.store.conn.close()
+
+
+def test_same_signature_stop_loss_excludes_transient_reasons(tmp_path):
+    """Plan 23: only non-transient retry_reasons count toward the
+    same-signature stop-loss. Transient (container/infra) retries are
+    excluded — they describe environmental noise, not deadlock signal.
+
+    Setup: stop-loss=3, but the second attempt's checker is transient.
+    So after 4 attempts the non-transient signatures are 1, 3, 4 — three
+    identical → block fires only on the 4th attempt."""
+    plan = _build_plan(["S-01"])
+    worker = _build_worker(
+        tmp_path,
+        plan,
+        hard_max=20,
+        progress_after=10,
+        progress_every=10,  # never run progress check
+        flatline_block=10,
+        same_signature_block=3,
+    )
+
+    do_calls: list[int] = []
+
+    def fake_do(subtask, attempt, triage_notes):
+        do_calls.append(attempt)
+
+    transient_outcome = _CheckerOutcome(
+        verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=True, rc=124, stderr="container died"
+    )
+    real_outcome = _CheckerOutcome(
+        verdict=Verdict.FAIL, checker_text="VERDICT: FAIL", transient=False, rc=0, stderr=""
+    )
+    sequence = [real_outcome, transient_outcome, real_outcome, real_outcome, real_outcome]
+    counter = {"i": 0}
+
+    def fake_check(_subtask):
+        i = counter["i"]
+        counter["i"] += 1
+        return sequence[min(i, len(sequence) - 1)]
+
+    fake_progress = MagicMock()
+    fake_progress.check.return_value = ProgressVerdict(verdict="progressing", rationale="x")
+
+    with (
+        patch.object(worker, "_do_subtask", side_effect=fake_do),
+        patch.object(worker, "_check_subtask", side_effect=fake_check),
+        patch.object(worker, "_triage_subtask", return_value="fix it"),
+        patch("quikode.worker.build_progress_agent", return_value=fake_progress),
+    ):
+        outcome = worker._subtask_loop()
+
+    assert outcome is not None
+    assert outcome.final_state is State.BLOCKED
+    assert "same-signature stop-loss" in outcome.note
+    # Doer call sequence reflects the retry-with-decrement pattern for
+    # transients: do(1) real → do(2) transient → do(2) real (re-attempt) →
+    # do(3) real → block. Three non-transient identical signatures by the
+    # 4th doer call → the stop-loss fires.
+    assert do_calls == [1, 2, 2, 3]
     worker.store.conn.close()

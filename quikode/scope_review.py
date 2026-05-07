@@ -34,6 +34,7 @@ from .config import AgentRole, Config
 from .docker_env import TaskContainer
 from .json_extract import first_balanced_object
 from .subtask_schema import Subtask
+from .types import AgentResult
 
 log = logging.getLogger("quikode.scope_review")
 
@@ -50,11 +51,22 @@ class ScopeReviewResult:
     `accepted_files` records the effective lane for legitimacy cases —
     surfaced via `quikode show` so the operator can see how a subtask's
     scope evolved across attempts.
+
+    `agent_run` and `role_used` are populated whenever the underlying
+    agent CLI was actually invoked (i.e. when there were out-of-lane
+    files to adjudicate). They are None on the cheap-path early return
+    (`actual ⊆ declared`) and on prompt-render failure. The caller uses
+    them to record the call into `agent_calls` and persist a
+    `subtask_scope_review:<id>` artifact — without this, scope-review
+    decisions are invisible in `qk show` and the store, which makes
+    diagnosing "why is the commit not landing" impossible (plan 21).
     """
 
     legitimate: bool
     reason: str
     accepted_files: list[str] = field(default_factory=list)
+    agent_run: AgentResult | None = None
+    role_used: AgentRole | None = None
 
 
 def review_scope_drift(
@@ -129,6 +141,8 @@ def review_scope_drift(
             legitimate=True,
             reason=f"scope-review agent rc={result.rc}; defaulted LEGITIMATE",
             accepted_files=list(actually_touched),
+            agent_run=result,
+            role_used=role,
         )
 
     parsed = _parse_envelope(result.stdout)
@@ -141,6 +155,8 @@ def review_scope_drift(
             legitimate=True,
             reason="scope-review output unparseable; defaulted LEGITIMATE",
             accepted_files=list(actually_touched),
+            agent_run=result,
+            role_used=role,
         )
 
     legitimate = bool(parsed.get("legitimate", True))
@@ -153,6 +169,8 @@ def review_scope_drift(
         legitimate=legitimate,
         reason=reason,
         accepted_files=accepted if legitimate else list(declared),
+        agent_run=result,
+        role_used=role,
     )
 
 

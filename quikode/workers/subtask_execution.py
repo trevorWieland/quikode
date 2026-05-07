@@ -26,7 +26,14 @@ class SubtaskExecutionMixin:
         fsm_runtime.enter_doing_subtask(self.store, self.node.id, note=f"{subtask.id} attempt {attempt}")
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.DOING.value)
         agent = _tw.build_agent(self.cfg.doer)
-        prompt = _tw.prompts.subtask_doer_prompt(self.cfg, self.node, subtask, triage_notes=triage_notes)
+        prior_doer_output = self._fetch_prior_doer_output(subtask, attempt)
+        prompt = _tw.prompts.subtask_doer_prompt(
+            self.cfg,
+            self.node,
+            subtask,
+            triage_notes=triage_notes,
+            prior_doer_output=prior_doer_output,
+        )
         self._write_log_header(f"SUBTASK DOER {subtask.id} (attempt {attempt})", prompt)
         result = agent.run(
             prompt, handle=self._h, log_path=self.log_path, timeout=self.cfg.subtask_doer_timeout_s
@@ -48,6 +55,26 @@ class SubtaskExecutionMixin:
         )
         self.last_doer_summary = result.stdout[-2000:]
         self.store.add_artifact(self.node.id, f"subtask_doer:{subtask.id}", result.stdout)
+
+    def _fetch_prior_doer_output(self: Any, subtask: Subtask, attempt: int) -> str | None:
+        """Return a context-sized excerpt of the prior attempt's doer
+        stdout, or None when this is the first attempt or no prior
+        artifact exists. Plan 22.
+
+        Trimmed to the trailing ~6000 chars: the doer's "Summary" /
+        "Files changed" sections live at the end, and on timeout the
+        partial output's tail is the most recent investigation state —
+        both far more useful than the leading tool-call preamble.
+        """
+        if attempt <= 1:
+            return None
+        full = self.store.latest_subtask_doer_output(self.node.id, subtask.id)
+        if not full:
+            return None
+        max_chars = 6000
+        if len(full) <= max_chars:
+            return full
+        return "[...earlier output truncated...]\n" + full[-max_chars:]
 
     def _check_subtask(self: Any, subtask: Subtask) -> _CheckerOutcome:
         """Run objective and LLM subtask checks."""
