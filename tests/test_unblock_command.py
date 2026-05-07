@@ -75,7 +75,7 @@ def test_unblock_prints_context_for_blocked_task(tmp_path, monkeypatch):
     # Subtask context shown.
     assert "S-07-mcp-tools" in out
     # Worktree, branch, PR all surface.
-    assert str(tmp_path / "wt") in out
+    assert str(tmp_path / "wt") in out.replace("\n", "")
     assert "quikode/r-001-abc" in out
     assert "https://github.com/foo/bar/pull/42" in out
     # Reason text shown.

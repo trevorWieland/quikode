@@ -80,6 +80,18 @@ class Config(BaseModel):
         min_length=1,
         description="Docker image tag for the dev container.",
     )
+    postgres_enabled: bool = Field(
+        default=True,
+        description="Start a per-task Postgres sidecar for local docker execution.",
+    )
+    postgres_db: str = Field(default="tanren", min_length=1)
+    postgres_user: str = Field(default="postgres", min_length=1)
+    postgres_password: str = Field(default="dev", min_length=1)
+    postgres_image: str = Field(default="postgres:16-alpine", min_length=1)
+    database_url: str = Field(
+        default="postgres://postgres:dev@postgres:5432/tanren",
+        description="DATABASE_URL injected into task containers. Empty string disables injection.",
+    )
 
     # ----- orchestration -----
     max_parallel: int = Field(

@@ -155,11 +155,6 @@ def get_status(cfg: Config) -> DaemonStatus:
 
 
 def _backoff_for_attempt(schedule: list[int], attempt: int) -> int:
-    """Pick the backoff delay for the Nth consecutive crash (1-indexed).
-
-    For attempt > len(schedule), returns the last (cap) value.
-    Empty schedule falls back to a 60s cap so we never spin.
-    """
     if not schedule:
         return 60
     idx = max(0, min(attempt - 1, len(schedule) - 1))
@@ -180,11 +175,7 @@ def _quikode_run_argv(extra: list[str]) -> list[str]:
 
 def _spawn_child(cfg: Config, run_args: list[str], log_fp) -> subprocess.Popen:
     argv = _quikode_run_argv(run_args)
-    # Spawn the child with the WORKSPACE dir as cwd, not the target repo. The
-    # inner `quikode run` calls `load_config()` which walks up from cwd looking
-    # for `.quikode/config.toml`. `cfg.repo_path` is the target source repo
-    # (e.g. /home/.../tanren) — config.toml lives in the *workspace* (e.g.
-    # /home/.../tanren-runs/) which is always state_dir.parent.
+    # Spawn from the workspace dir, where `.quikode/config.toml` lives.
     workspace = cfg.state_dir.parent
     return subprocess.Popen(
         argv,
@@ -192,11 +183,6 @@ def _spawn_child(cfg: Config, run_args: list[str], log_fp) -> subprocess.Popen:
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         cwd=str(workspace),
-        # Don't `start_new_session=True` — we want the child to receive our
-        # signals normally if we choose to forward them. We forward SIGTERM
-        # explicitly anyway; the difference is mainly about Ctrl-C in an
-        # interactive terminal, which we DO want to swallow at the
-        # supervisor and forward intentionally.
     )
 
 
@@ -228,9 +214,6 @@ def _terminate_child(child: ChildProcess, *, timeout_s: int | float = CHILD_TERM
 
 
 class _SupervisorState:
-    """Mutable state for the supervisor loop. Module-level so signal
-    handlers can flip the flag without juggling closures."""
-
     def __init__(self) -> None:
         self.shutdown = False
         self.current_child: subprocess.Popen | None = None
@@ -239,12 +222,6 @@ class _SupervisorState:
 def _schedule_failsafe_kill(
     child: ChildProcess, timeout_s: int | float = CHILD_TERM_TIMEOUT_S
 ) -> threading.Timer:
-    """Schedule SIGKILL on `child` after `timeout_s` if it's still alive.
-
-    Module-level so tests can mock it. Returns the Timer (started) so callers
-    can cancel it on a clean exit.
-    """
-
     def _kill_if_still_alive() -> None:
         if child.poll() is None:
             log.warning(
@@ -273,13 +250,6 @@ def _install_signal_handlers(state: _SupervisorState) -> None:
                 ch.send_signal(signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            # Failsafe: if the inner orchestrator doesn't obey SIGTERM within
-            # CHILD_TERM_TIMEOUT_S (e.g. it's blocked on a long-running agent
-            # subprocess.run), fire SIGKILL from a background timer. Without
-            # this, child.wait() hangs forever; `stop_daemon` then SIGKILLs
-            # the supervisor — orphaning the child against a now cleaned-up
-            # workspace. The orphan keeps running and chews retry budget in
-            # 1-second cycles against a dead container.
             _schedule_failsafe_kill(ch)
 
     signal.signal(signal.SIGTERM, _handler)
@@ -294,20 +264,6 @@ def _write_pid_file(cfg: Config) -> Path:
 
 
 def detach_into_background(log_path: Path) -> int:
-    """Fork into a session-leader child writing to `log_path`. Parent returns child PID.
-
-    The child:
-      - calls `os.setsid()` so it survives SIGHUP from the controlling terminal,
-      - re-opens stdin from /dev/null,
-      - redirects stdout/stderr to `log_path` (append mode).
-
-    The parent returns the child's PID. The child returns 0 — the caller
-    distinguishes the two by checking the return value, like `os.fork()`.
-
-    Why not double-fork? `os.setsid` already detaches from the controlling
-    terminal; the second fork only matters if you're worried about reacquiring
-    one via opening a tty device, which we never do.
-    """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     child_pid = os.fork()
     if child_pid > 0:

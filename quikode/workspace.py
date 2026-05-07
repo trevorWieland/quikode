@@ -22,16 +22,16 @@ class SeedResult:
     pending: list[str]
 
 
-def seed_from_main(
+def seed_from_base(
     cfg: Config,
     store: Store,
     *,
     merged_nodes_file: Path | None = None,
 ) -> SeedResult:
-    """Seed a fresh store with DAG nodes deterministically known to be on main."""
+    """Seed a fresh store with DAG nodes deterministically known to be on the base branch."""
 
     dag = DAG.load(cfg.dag_path)
-    evidence = _collect_seed_evidence(cfg.repo_path, dag, merged_nodes_file=merged_nodes_file)
+    evidence = _collect_seed_evidence(cfg, dag, merged_nodes_file=merged_nodes_file)
     for node_id, detail in sorted(evidence.items()):
         if node_id in dag.nodes:
             source, _, value = detail.partition(":")
@@ -42,8 +42,18 @@ def seed_from_main(
     return SeedResult(merged=merged, pending=pending)
 
 
+def seed_from_main(
+    cfg: Config,
+    store: Store,
+    *,
+    merged_nodes_file: Path | None = None,
+) -> SeedResult:
+    """Compatibility alias for older callers; uses cfg.base_branch."""
+    return seed_from_base(cfg, store, merged_nodes_file=merged_nodes_file)
+
+
 def _collect_seed_evidence(
-    repo_path: Path,
+    cfg: Config,
     dag: DAG,
     *,
     merged_nodes_file: Path | None,
@@ -53,7 +63,7 @@ def _collect_seed_evidence(
         dag_evidence = _dag_node_evidence(node)
         if dag_evidence:
             evidence[node.id] = dag_evidence
-    for node_id, detail in _git_subject_evidence(repo_path).items():
+    for node_id, detail in _git_subject_evidence(cfg.repo_path, cfg.pr_remote, cfg.base_branch).items():
         evidence.setdefault(node_id, detail)
     if merged_nodes_file is not None:
         evidence.update(_explicit_file_evidence(merged_nodes_file))
@@ -68,9 +78,9 @@ def _dag_node_evidence(node: Node) -> str | None:
     return None
 
 
-def _git_subject_evidence(repo_path: Path) -> dict[str, str]:
+def _git_subject_evidence(repo_path: Path, remote: str, base_branch: str) -> dict[str, str]:
     result = subprocess.run(
-        ["git", "log", "--format=%s", "origin/main"],
+        ["git", "log", "--format=%s", f"{remote}/{base_branch}"],
         cwd=repo_path,
         capture_output=True,
         text=True,

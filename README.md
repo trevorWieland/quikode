@@ -16,16 +16,36 @@ quikode doctor
 quikode run --max-parallel 4
 ```
 
-For the Tanren profile, `init` seeds already-landed DAG nodes from deterministic evidence on `origin/main`. Test fixtures can pass `--no-seed-from-main`.
+Profiles provide project defaults for the base branch, dev image, local validation
+commands, resource sizing, and local Postgres settings. Built-ins include
+`tanren`, `zaimu`, `rust-just`, `generic-rust`, and `generic-python`.
 
-## Seed From Main
+For Zaimu:
 
 ```bash
-quikode seed-from-main
-quikode seed-from-main --merged-nodes-file merged.json
+quikode init --repo ../zaimu --dag ../zaimu/docs/roadmap/dag.json --profile zaimu
+quikode doctor
+quikode build-image --flavor rust
+quikode run --max-parallel 2
 ```
 
-Accepted evidence is exact and deterministic: DAG `merged_in_main: true`, DAG `status: "merged"`, a commit subject on `origin/main` matching `<node_id>:`, or an explicit JSON evidence file. Nodes without evidence remain unstarted and are scheduled only after their dependencies are complete.
+`init` seeds already-landed DAG nodes from deterministic evidence on the
+configured base branch (`origin/main` for Tanren, `origin/dev` for Zaimu). Test
+fixtures can pass `--no-seed-from-base`; `--no-seed-from-main` remains as a
+compatibility alias.
+
+## Seed From Base
+
+```bash
+quikode seed-from-base
+quikode seed-from-base --merged-nodes-file merged.json
+quikode seed-from-main
+```
+
+Accepted evidence is exact and deterministic: DAG `merged_in_main: true`, DAG
+`status: "merged"`, a commit subject on the configured base branch matching
+`<node_id>:`, or an explicit JSON evidence file. Nodes without evidence remain
+unstarted and are scheduled only after their dependencies are complete.
 
 ## Validation
 
@@ -44,6 +64,6 @@ uv run pytest tests/ -q
 
 Lifecycle: `run`, `plan`, `retry`, `resume`, `reset-retries`, `abort`.
 Inspection: `status`, `watch`, `briefing`, `show`, `subtasks`, `explain`, `tail`, `logs`.
-Workspace: `init`, `doctor`, `seed-from-main`, `reset`, `prune`, `disk-usage`.
+Workspace: `init`, `doctor`, `seed-from-base`, `seed-from-main`, `reset`, `prune`, `disk-usage`.
 Daemon: `daemon start`, `daemon stop`, `daemon status`.
 TUI: `tui`.

@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, cast
 
-ProfileName = Literal["generic-python", "generic-rust", "tanren"]
+ProfileName = Literal["generic-python", "generic-rust", "rust-just", "tanren", "zaimu"]
 
 
 @dataclass(frozen=True)
@@ -22,6 +22,12 @@ class ProjectProfile:
     subtask_check_command: str = ""
     pre_commit_runner: Literal["auto", "lefthook", "pre-commit", "none"] = "auto"
     resource_defaults: dict[str, int | bool] = field(default_factory=dict)
+    postgres_enabled: bool = True
+    postgres_db: str = "tanren"
+    postgres_user: str = "postgres"
+    postgres_password: str = "dev"
+    postgres_image: str = "postgres:16-alpine"
+    database_url: str = "postgres://postgres:dev@postgres:5432/tanren"
     merge_policy: str = "manual"
     manual_probe_credentials: str = ""
     domain_prompt_context: str = ""
@@ -42,6 +48,8 @@ BUILTIN_PROFILES: dict[ProfileName, ProjectProfile] = {
             "host_reserved_cpu": 2,
             "host_reserved_mem_gb": 4,
         },
+        postgres_enabled=False,
+        database_url="",
         validation_commands=("python -m pytest",),
     ),
     "generic-rust": ProjectProfile(
@@ -56,7 +64,26 @@ BUILTIN_PROFILES: dict[ProfileName, ProjectProfile] = {
             "host_reserved_cpu": 2,
             "host_reserved_mem_gb": 8,
         },
+        postgres_enabled=False,
+        database_url="",
         validation_commands=("cargo fmt --check", "cargo clippy --workspace", "cargo test --workspace"),
+    ),
+    "rust-just": ProjectProfile(
+        name="rust-just",
+        default_image="quikode-rust-just-dev:latest",
+        local_ci_command="just ci",
+        subtask_check_command="just check",
+        pre_commit_runner="auto",
+        resource_defaults={
+            "cpu_per_task": 3,
+            "mem_per_task_gb": 8,
+            "host_reserved_cpu": 2,
+            "host_reserved_mem_gb": 8,
+            "max_parallel_auto": True,
+        },
+        postgres_db="app",
+        database_url="postgres://postgres:dev@postgres:5432/app",
+        validation_commands=("just check", "just ci"),
     ),
     "tanren": ProjectProfile(
         name="tanren",
@@ -78,6 +105,33 @@ BUILTIN_PROFILES: dict[ProfileName, ProjectProfile] = {
         bdd_conventions=(
             "BDD features live under tests/bdd/features and must satisfy the "
             "project's behavior-proof tag checks."
+        ),
+        validation_commands=("just check", "just ci"),
+    ),
+    "zaimu": ProjectProfile(
+        name="zaimu",
+        default_image="quikode-zaimu-dev:latest",
+        base_branch="dev",
+        local_ci_command="just ci",
+        subtask_check_command="just check",
+        pre_commit_runner="auto",
+        resource_defaults={
+            "cpu_per_task": 3,
+            "mem_per_task_gb": 8,
+            "host_reserved_cpu": 2,
+            "host_reserved_mem_gb": 8,
+            "max_parallel_auto": True,
+        },
+        postgres_db="zaimu",
+        database_url="postgres://postgres:dev@postgres:5432/zaimu",
+        merge_policy="squash-delete-branch",
+        domain_prompt_context=(
+            "Zaimu work uses a Rust/Node/Postgres stack, BDD behavior-proof "
+            "features, just-based validation, and PRs targeting dev."
+        ),
+        bdd_conventions=(
+            "BDD features live under tests/bdd/features with closed tags "
+            "@positive, @falsification, @cli, @api, @tui, and @web."
         ),
         validation_commands=("just check", "just ci"),
     ),

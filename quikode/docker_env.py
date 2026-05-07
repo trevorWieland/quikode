@@ -92,7 +92,7 @@ def network_remove(name: str) -> None:
     _run(["docker", "network", "rm", name], check=False)
 
 
-def start_postgres(handle: TaskContainer, label: str | None = None) -> None:
+def start_postgres(handle: TaskContainer, cfg: Config, label: str | None = None) -> None:
     network_create(handle.network_name)
     cmd = [
         "docker",
@@ -105,13 +105,13 @@ def start_postgres(handle: TaskContainer, label: str | None = None) -> None:
         "--network-alias",
         "postgres",
         "-e",
-        "POSTGRES_PASSWORD=dev",
+        f"POSTGRES_PASSWORD={cfg.postgres_password}",
         "-e",
-        "POSTGRES_USER=postgres",
+        f"POSTGRES_USER={cfg.postgres_user}",
         "-e",
-        "POSTGRES_DB=tanren",
+        f"POSTGRES_DB={cfg.postgres_db}",
         "--health-cmd",
-        "pg_isready -U postgres",
+        f"pg_isready -U {shlex.quote(cfg.postgres_user)}",
         "--health-interval",
         "2s",
         "--health-timeout",
@@ -121,7 +121,7 @@ def start_postgres(handle: TaskContainer, label: str | None = None) -> None:
     ]
     if label:
         cmd += ["--label", label]
-    cmd.append("postgres:16-alpine")
+    cmd.append(cfg.postgres_image)
     _run(cmd)
 
 
@@ -175,7 +175,7 @@ def start_dev_container(handle: TaskContainer, cfg: Config, worktree_path: Path)
         "GITHUB_TOKEN": token,
         "GH_TOKEN": token,
         "HOME": "/home/dev",
-        "DATABASE_URL": "postgres://postgres:dev@postgres:5432/tanren",
+        "DATABASE_URL": cfg.database_url,
         "QK_TASK_ID": handle.task_id,
         # Identity for any commits the agent makes inside the container
         "QK_GIT_EMAIL": os.environ.get("QK_GIT_EMAIL", "wielandtrevor@gmail.com"),
@@ -378,8 +378,9 @@ def ensure_dev_container_running(
     _run(["docker", "rm", "-f", handle.pg_container_name], check=False)
     network_remove(handle.network_name)
     network_create(handle.network_name, label=ws_label)
-    start_postgres(handle, label=ws_label)
-    wait_postgres_healthy(handle)
+    if cfg.postgres_enabled:
+        start_postgres(handle, cfg, label=ws_label)
+        wait_postgres_healthy(handle)
     start_dev_container(handle, cfg, worktree_path)
     wait_dev_ready(handle, timeout_s=240)
     return True

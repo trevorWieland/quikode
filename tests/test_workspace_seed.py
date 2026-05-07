@@ -9,7 +9,7 @@ import pytest
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.state import State, Store
-from quikode.workspace import seed_from_main
+from quikode.workspace import seed_from_base, seed_from_main
 
 
 def _cfg(tmp_path: Path, dag_path: Path) -> Config:
@@ -36,7 +36,7 @@ def test_seed_from_main_marks_metadata_merged_nodes(tmp_path: Path):
     cfg = _cfg(tmp_path, _fixture_dag())
     store = _store(cfg)
 
-    result = seed_from_main(cfg, store)
+    result = seed_from_base(cfg, store)
 
     assert result.merged == {
         "F-0001": "dag:merged_in_main=true",
@@ -57,7 +57,7 @@ def test_seed_from_main_accepts_explicit_evidence_file(tmp_path: Path):
     evidence.write_text(json.dumps({"R-0002": "manual PR evidence"}))
     store = _store(cfg)
 
-    result = seed_from_main(cfg, store, merged_nodes_file=evidence)
+    result = seed_from_base(cfg, store, merged_nodes_file=evidence)
 
     assert result.merged["R-0002"] == "explicit-file:manual PR evidence"
     row = store.get("R-0002")
@@ -77,7 +77,7 @@ def test_seed_from_main_accepts_exact_git_subject_evidence(tmp_path: Path):
     subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=cfg.repo_path, check=True)
     store = _store(cfg)
 
-    result = seed_from_main(cfg, store)
+    result = seed_from_base(cfg, store)
 
     assert result.merged["R-0002"] == "git-subject:R-0002: land behavior"
     row = store.get("R-0002")
@@ -88,12 +88,41 @@ def test_seed_from_main_accepts_exact_git_subject_evidence(tmp_path: Path):
 def test_unseeded_nodes_obey_dependency_order(tmp_path: Path):
     cfg = _cfg(tmp_path, _fixture_dag())
     store = _store(cfg)
-    seed_from_main(cfg, store)
+    seed_from_base(cfg, store)
     dag = DAG.load(cfg.dag_path)
 
     ready = dag.ready_nodes(store.completed_ids(), store.active_ids())
 
     assert [node.id for node in ready] == ["R-0002", "R-0003"]
+
+
+def test_seed_from_base_accepts_configured_base_branch_git_subject(tmp_path: Path):
+    cfg = _cfg(tmp_path, _fixture_dag())
+    cfg.base_branch = "dev"
+    subprocess.run(["git", "init"], cwd=cfg.repo_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=cfg.repo_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=cfg.repo_path, check=True)
+    (cfg.repo_path / "file.txt").write_text("x")
+    subprocess.run(["git", "add", "file.txt"], cwd=cfg.repo_path, check=True)
+    subprocess.run(["git", "commit", "-m", "R-0002: land behavior"], cwd=cfg.repo_path, check=True)
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/dev", "HEAD"], cwd=cfg.repo_path, check=True)
+    store = _store(cfg)
+
+    result = seed_from_base(cfg, store)
+
+    assert result.merged["R-0002"] == "git-subject:R-0002: land behavior"
+
+
+def test_seed_from_main_alias_uses_configured_base_branch(tmp_path: Path):
+    cfg = _cfg(tmp_path, _fixture_dag())
+    cfg.base_branch = "dev"
+    evidence = tmp_path / "merged.json"
+    evidence.write_text(json.dumps({"R-0002": "manual PR evidence"}))
+    store = _store(cfg)
+
+    result = seed_from_main(cfg, store, merged_nodes_file=evidence)
+
+    assert result.merged["R-0002"] == "explicit-file:manual PR evidence"
 
 
 def test_unknown_state_at_startup_fails(tmp_path: Path):

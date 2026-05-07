@@ -7,7 +7,6 @@ import fcntl
 from .cli_context import (
     BUILTIN_PROFILES,
     DAG,
-    DEFAULT_CONFIG_TOML,
     Config,
     Orchestrator,
     Path,
@@ -24,6 +23,7 @@ from .cli_context import (
     get_profile,
     load_config,
     os,
+    render_config_toml,
     shutil,
     signal,
     subprocess,
@@ -40,10 +40,15 @@ def init(
     dag: Path = typer.Option(..., "--dag", help="Path to the dag.json file"),
     profile: str = typer.Option("tanren", "--profile", help="Project profile"),
     force: bool = typer.Option(False, "--force"),
+    no_seed_from_base: bool = typer.Option(
+        False,
+        "--no-seed-from-base",
+        help="Do not seed already-merged DAG nodes from the configured base branch.",
+    ),
     no_seed_from_main: bool = typer.Option(
         False,
         "--no-seed-from-main",
-        help="Test-fixture escape hatch: do not seed already-merged Tanren DAG nodes.",
+        help="Compatibility alias for --no-seed-from-base.",
     ),
 ):
     """Create .quikode/config.toml in the current directory."""
@@ -68,28 +73,19 @@ def init(
         console.print(f"valid profiles: {', '.join(sorted(BUILTIN_PROFILES))}")
         raise typer.Exit(2)
     profile_def = get_profile(profile)
-    content = (
-        DEFAULT_CONFIG_TOML.format(repo_path=repo_abs, dag_path=dag_abs)
-        .replace(
-            'profile = "tanren"',
-            f'profile = "{profile}"',
-            1,
-        )
-        .replace(
-            'image_tag = "quikode-tanren-dev:latest"',
-            f'image_tag = "{profile_def.default_image}"',
-            1,
-        )
-    )
+    content = render_config_toml(repo_path=repo_abs, dag_path=dag_abs, profile=profile_def)
     cfg_path.write_text(content)
     (cfg_dir / "logs").mkdir(exist_ok=True)
     (cfg_dir / "worktrees").mkdir(exist_ok=True)
     console.print(f"[green]wrote {cfg_path}[/]")
-    if profile == "tanren" and not no_seed_from_main:
+    should_seed = not (no_seed_from_base or no_seed_from_main)
+    if should_seed:
         cfg = load_config()
         store = _open_store(cfg)
-        result = workspace_mod.seed_from_main(cfg, store)
-        console.print(f"[green]seeded {len(result.merged)} merged DAG node(s) from main[/]")
+        result = workspace_mod.seed_from_base(cfg, store)
+        console.print(
+            f"[green]seeded {len(result.merged)} merged DAG node(s) from {cfg.pr_remote}/{cfg.base_branch}[/]"
+        )
     console.print(
         "Next: edit the config to set agent models, then `quikode doctor`, then `quikode build-image`."
     )
@@ -145,13 +141,14 @@ def doctor():
 
 
 @app.command("build-image")
-def build_image(flavor: str = typer.Option("tanren", "--flavor", help="tanren | python")):
+def build_image(flavor: str = typer.Option("tanren", "--flavor", help="tanren | rust | python")):
     """Build the dev container image. --flavor selects the Dockerfile."""
     _setup_logging()
     cfg = load_config()
     here = Path(__file__).resolve().parent.parent / "docker"
     dockerfile = {
         "tanren": here / "Dockerfile",
+        "rust": here / "Dockerfile",
         "python": here / "Dockerfile.python",
     }.get(flavor)
     if dockerfile is None or not dockerfile.exists():

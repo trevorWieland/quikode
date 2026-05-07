@@ -235,11 +235,11 @@ class TaskWorker(
         # When > 1 parent, build a synthetic merge-base branch
         # (`quikode/<id>-base-<6hex>`) off `git merge` of the parent tips
         # and fork the worktree from there. When == 1 parent, branch off
-        # that parent's branch directly. When 0, branch off main.
+        # that parent's branch directly. When 0, branch off the configured base.
         parent_branches = self.store.get_parent_branches(self.node.id)
         parent_branch: str | None = None
         if len(parent_branches) > 1:
-            # Build the merge-base branch off origin/main + every parent's tip.
+            # Build the merge-base branch off the configured base + every parent's tip.
             worktree.fetch_base(self.cfg.repo_path, self.cfg.pr_remote, self.cfg.base_branch)
             mb_name = stacking.compute_merge_base_branch_name(self.node.id, parent_branches)
             mb_sha = stacking.construct_merge_base(
@@ -260,7 +260,7 @@ class TaskWorker(
         elif len(parent_branches) == 1:
             parent_branch = parent_branches[0]
         worktree.fetch_base(self.cfg.repo_path, self.cfg.pr_remote, self.cfg.base_branch)
-        # Capture the main SHA at branch creation. Used by Phase A's
+        # Capture the base SHA at branch creation. Used by Phase A's
         # conflict resolver to compute "what landed since" and by Phase B's
         # intent reviewer to detect drift.
         base_sha_proc = subprocess.run(
@@ -271,7 +271,7 @@ class TaskWorker(
             check=False,
         )
         base_ref_sha = base_sha_proc.stdout.strip() if base_sha_proc.returncode == 0 else None
-        # If stacking, branch off parent_branch; else main.
+        # If stacking, branch off parent_branch; else the configured base.
         if parent_branch:
             worktree.add_worktree_off_branch(
                 self.cfg.repo_path,
@@ -343,8 +343,9 @@ class TaskWorker(
         handle = docker_env.make_handle(self.node.id)
         ws_label = docker_env.workspace_label(self.cfg)
         docker_env.network_create(handle.network_name, label=ws_label)
-        docker_env.start_postgres(handle, label=ws_label)
-        docker_env.wait_postgres_healthy(handle)
+        if self.cfg.postgres_enabled:
+            docker_env.start_postgres(handle, self.cfg, label=ws_label)
+            docker_env.wait_postgres_healthy(handle)
         cid = docker_env.start_dev_container(handle, self.cfg, wt_path)
         # Wait for the container's entrypoint to finish copying agent auth files
         # before any agent CLI is invoked. Without this, claude/codex see a
@@ -357,9 +358,8 @@ class TaskWorker(
         # working containers as FAILED and orphans them holding the budget.
         docker_env.wait_dev_ready(handle, timeout_s=240)
 
-        # Postgres is up; database setup inside the project is the doer's responsibility (tanren
-        # ships them via tanren-cli migrate up; whether `just ci` needs them
-        # depends on the task — leaving this to the doer keeps provisioning fast).
+        # Database setup inside the project is the doer's responsibility.
+        # Whether local CI needs migrations depends on the target repo.
 
         self.handle = handle
         self.store.set_field(self.node.id, container_id=cid)

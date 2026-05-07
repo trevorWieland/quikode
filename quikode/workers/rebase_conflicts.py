@@ -87,11 +87,14 @@ class RebaseConflictMixin:
             )
             return WorkerOutcome(State.BLOCKED, "conflict iteration cap")
 
+        verify_cmd = (self.cfg.local_ci_command or "").strip()
+        if not verify_cmd:
+            verify_cmd = "true"
         rc, out, err = _tw.exec_in(
             self._h,
-            ["bash", "-lc", "cd /workspace && just ci 2>&1"],
+            ["bash", "-lc", f"cd /workspace && {verify_cmd} 2>&1"],
             log_path=self.log_path,
-            timeout=1800,
+            timeout=self.cfg.local_ci_timeout_s,
         )
         if rc != 0:
             ci_log = (out or "") + "\n" + (err or "")
@@ -99,7 +102,7 @@ class RebaseConflictMixin:
             fsm_runtime.block_current(
                 self.store,
                 self.node.id,
-                note="post-rebase `just ci` FAILed; conflict resolution broke build",
+                note=f"post-rebase `{verify_cmd}` FAILed; conflict resolution broke build",
                 last_error=_tw._last_lines(ci_log, 30)[:1000],
             )
             return WorkerOutcome(State.BLOCKED, "rebase verify failed")
