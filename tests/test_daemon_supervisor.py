@@ -600,6 +600,35 @@ def test_watchdog_kills_child_when_heartbeat_stale(tmp_path, monkeypatch):
     assert len(spawned) == 2
 
 
+def test_supervisor_clears_stale_heartbeat_on_spawn(tmp_path, monkeypatch):
+    """A heartbeat file left behind by a prior daemon's unclean exit must be
+    deleted before the new child runs — otherwise the watchdog's first poll
+    reads the stale ts and kills the new child within ~14 s before it can
+    write its own heartbeat. Plan 20 supervisor follow-up."""
+    cfg = _make_cfg(tmp_path)
+    cfg = cfg.model_copy(update={"daemon_heartbeat_stale_kill_s": 60})
+
+    # Plant a stale heartbeat file (1 hour old) before the supervisor starts.
+    state = cfg.state_dir
+    stale_ts = time.time() - 3600
+    (state / "orchestrator.heartbeat").write_text(
+        f'{{"ts": {stale_ts}, "in_flight": 99, "pending_ci": 0, "addressing_feedback": 0}}\n'
+    )
+    assert (state / "orchestrator.heartbeat").exists()
+
+    child = _FakeChild(exit_codes=[0])
+    monkeypatch.setattr(daemon_mod, "_spawn_child", lambda *_: child)
+    monkeypatch.setattr(daemon_mod, "_install_signal_handlers", lambda s: None)
+
+    rc = daemon_mod.supervise(cfg, [], sleep_fn=_no_sleep)
+    assert rc == 0
+    # The fake child exits immediately, so the supervisor returns before the
+    # heartbeat file is recreated. The unlink at spawn-time is what we verify.
+    assert not (state / "orchestrator.heartbeat").exists(), (
+        "supervisor must delete stale heartbeat before spawning child"
+    )
+
+
 def test_watchdog_disabled_when_threshold_zero(tmp_path, monkeypatch):
     """daemon_heartbeat_stale_kill_s=0 falls back to the original wait-forever path."""
     cfg = _make_cfg(tmp_path)

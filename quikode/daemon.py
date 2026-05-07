@@ -376,16 +376,25 @@ def _wait_with_watchdog(
 
         hb = read_heartbeat(cfg)
         now = time.time()
+        child_start = _process_start_time(child.pid)
         if hb is None:
             # No heartbeat yet → orchestrator hasn't bootstrapped its writer.
             # Tolerate this until the child has been alive longer than the
             # staleness threshold; after that, treat absence as stale too.
-            ts_age = now - _process_start_time(child.pid)
+            ts_age = now - child_start
         else:
             try:
-                ts_age = max(0.0, now - float(hb.get("ts", 0.0)))
+                hb_ts = float(hb.get("ts", 0.0))
             except (TypeError, ValueError):
-                ts_age = float("inf")
+                hb_ts = 0.0
+            # A heartbeat written BEFORE this child spawned belongs to a
+            # prior daemon generation and is NOT evidence of THIS child's
+            # liveness. Treat it as if there were no heartbeat — fall back
+            # to the child-start-time-based grace. Without this guard, a
+            # crashed-unclean prior daemon's stale heartbeat kills every
+            # fresh spawn at uptime ~14 s before it can write its own
+            # heartbeat. See plan 20 supervisor follow-up.
+            ts_age = (now - child_start) if hb_ts < child_start else max(0.0, now - hb_ts)
 
         if ts_age > threshold:
             consecutive_stale += 1
@@ -513,6 +522,23 @@ def _supervisor_spawn_child(
     _supervisor_log(
         log_fp, f"\n--- [supervisor] spawn quikode run at {time.strftime('%Y-%m-%dT%H:%M:%S')} ---"
     )
+    # Clear any stale heartbeat file left by a prior child generation. Without
+    # this, the watchdog's first poll reads the OLD heartbeat (potentially
+    # hours old from a daemon that died unclean), trips the staleness
+    # threshold immediately, and SIGTERMs the fresh child within ~14 s before
+    # it can write its own heartbeat. The watchdog also has a defensive
+    # "ignore heartbeats older than child spawn time" check below, but
+    # clearing here is the primary path. See plan 20 supervisor follow-up.
+    hb_path = heartbeat_file(cfg)
+    try:
+        if hb_path.exists():
+            hb_path.unlink()
+    except OSError as exc:
+        _supervisor_log(
+            log_fp,
+            f"--- [supervisor] could not clear stale heartbeat {hb_path}: {exc}; "
+            f"watchdog defensive check will still apply ---",
+        )
     child = _spawn_child(cfg, run_args, log_fp)
     state.current_child = child
     log.info("supervisor spawned child pid=%d", child.pid)

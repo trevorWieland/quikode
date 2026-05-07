@@ -68,6 +68,26 @@ qk daemon start --detach --max-parallel <N>
 
 **Note.** Prompts (`prompts/*.md`) are loaded fresh per render via Jinja's `FileSystemLoader`, so a reinstall (which updates the bundled prompts at the wheel install path) is enough — no daemon restart needed for prompt-only changes. Python code changes do require a restart.
 
+## Daemon startup flow (read this if `qk daemon start` keeps re-killing the child)
+
+When `qk daemon start --detach` runs, the supervisor process forks and:
+
+1. **Spawns child orchestrator** (`quikode run`) and writes the supervisor pid to `<state_dir>/orchestrator.pid`.
+2. **Acquires `<state_dir>/orchestrator.lock`** via `fcntl.flock(LOCK_EX | LOCK_NB)`. Second concurrent invocation against the same workspace exits 2 with a friendly error rather than racing on container cleanup or orphan recovery (plan 20). The lock is advisory and kernel-released on FD close (incl. SIGKILL), so a hard-killed daemon doesn't leak it.
+3. **Cleans up the stale heartbeat** (`<state_dir>/orchestrator.heartbeat`) before the child runs. Without this, the watchdog's first poll reads the OLD heartbeat from a previously-killed daemon and SIGTERMs the fresh child within ~14s before it can write its own. The watchdog also has a defensive fallback: heartbeats with a `ts` older than the child's spawn time are ignored (treated as if no heartbeat existed).
+4. **Child startup** runs `cleanup_all_quikode` (kills any leftover `qk-*` containers in this workspace), then `recover_orphan_tasks` (resets every active task row to PENDING + a resume marker), then enters the orchestrator loop. The child writes its first heartbeat shortly after the loop starts.
+5. **Watchdog** polls `<state_dir>/orchestrator.heartbeat` every 5s. Two consecutive reads with `now - ts > daemon_heartbeat_stale_kill_s` (default 600s) → SIGTERM the child → backoff (60s, 300s, 1800s) → respawn.
+
+**If the daemon refuses to stay up** (immediate `--- [supervisor] heartbeat watchdog firing — SIGTERM child ---` lines in `daemon.log` at uptime ~14s):
+
+- Confirm the heartbeat fix is deployed: in `daemon.py:_supervisor_spawn_child` look for the `hb_path.unlink()` block. If absent, you're on a build older than plan 20 — reinstall.
+- Confirm the lock isn't held by a zombie process: `ls -la <state_dir>/orchestrator.lock` and check for an `orchestrator.pid` whose pid is dead. If so, `rm orchestrator.lock orchestrator.pid` and retry (clean shutdown should have done this already).
+- Confirm orphan recovery isn't taking longer than `daemon_heartbeat_stale_kill_s`. With many active tasks (>50) the recovery sweep can take a while; if needed bump `daemon_heartbeat_stale_kill_s` in `.quikode/config.toml`.
+
+**If `qk daemon stop` reports `no daemon running` but a daemon is alive**: the pid file may be missing. `ps -ef | grep "quikode run"` to find the actual pid; SIGTERM it directly.
+
+**If `qk daemon start` exits 2 with "another quikode daemon holds … orchestrator.lock"**: another `qk run` (or `qk daemon`) is already alive in this workspace. Find it via `ps -ef`; either `qk daemon stop` or kill the orphan pid. Do not `rm orchestrator.lock` while a live daemon holds it — that would defeat the singleton guarantee.
+
 ## Resource sizing
 
 Computed live by `qk resources`. The orchestrator math:
