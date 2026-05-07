@@ -180,6 +180,7 @@ class SupervisionMixin:
                 "pending_ci": pending_ci,
                 "addressing_feedback": responding,
                 "addressing_feedback_futures": addressing_feedback_futures,
+                "max_parallel": int(self.cfg.max_parallel),
             }
             (self.cfg.state_dir / "orchestrator.heartbeat").write_text(_rt.json.dumps(payload))
         except OSError as e:

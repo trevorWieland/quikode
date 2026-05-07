@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 from quikode.config import Config
 from quikode.config_loader import load_config
+from quikode.daemon import read_heartbeat
 from quikode.dag import DAG
 from quikode.state import State
 
@@ -282,7 +283,7 @@ class StorePoller:
             host_mem_gb=host_mem_gb,
             cpu_per_task=cfg.cpu_per_task,
             mem_per_task_gb=cfg.mem_per_task_gb,
-            max_parallel=cfg.max_parallel,
+            max_parallel=_runtime_max_parallel(cfg),
             containers=containers,
         )
 
@@ -316,7 +317,7 @@ class StorePoller:
         return HeaderSnapshot(
             workspace_path=str(self.workspace),
             stacking_strategy=cfg.stacking_strategy.value,
-            max_parallel=cfg.max_parallel,
+            max_parallel=_runtime_max_parallel(cfg),
             cpu_per_task=cfg.cpu_per_task,
             mem_per_task_gb=cfg.mem_per_task_gb,
             in_flight=counts["in_flight"],
@@ -548,6 +549,24 @@ def _read_host_caps() -> tuple[int | None, int | None]:
     except OSError:
         mem_gb = None
     return cpus, mem_gb
+
+
+def _runtime_max_parallel(cfg: Config) -> int:
+    """Live max_parallel from the daemon's heartbeat, falling back to config.
+
+    `qk daemon start --max-parallel N` overrides cfg in the daemon process
+    only — the on-disk config still says whatever's in config.toml. The
+    daemon writes its effective value into the heartbeat each tick; reading
+    it here keeps the TUI honest about what the running daemon is using.
+    Falls back to cfg.max_parallel when no heartbeat is present (daemon
+    stopped, fresh workspace).
+    """
+    hb = read_heartbeat(cfg)
+    if hb is not None:
+        value = hb.get("max_parallel")
+        if isinstance(value, int) and value > 0:
+            return value
+    return int(cfg.max_parallel)
 
 
 # Skip these path components when computing worktree mtime — they churn

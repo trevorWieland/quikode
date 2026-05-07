@@ -75,7 +75,16 @@ Screen {
 
 /* Phase status line at top of detail panel — surfaces what the agent is
    doing right now, especially during whole-spec phases when the subtasks
-   tab is frozen. */
+   tab is frozen. The wrapping VerticalScroll defaults to 1fr; cap it so
+   the subtasks table below claims the bulk of the panel and the scrollbar
+   lives on the table (its natural overflow target), not the title. The
+   phase content is typically 1-8 lines; max-height 10 covers the gauntlet
+   block in full and only engages a scrollbar in genuine overflow. */
+#detail-phase-scroll {
+    height: auto;
+    max-height: 10;
+}
+
 #detail-phase {
     height: auto;
     margin: 0 0 1 0;

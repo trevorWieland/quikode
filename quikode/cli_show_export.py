@@ -333,7 +333,7 @@ def _print_show_agent_calls(store: Store, task_id: str) -> None:
     console.print(table)
     total_tokens = sum(c["tokens_used"] or 0 for c in calls)
     total_secs = sum(c["duration_s"] or 0.0 for c in calls)
-    suffix = " (codex only - others don't surface tokens in text mode)" if total_tokens else ""
+    suffix = " (only the CLIs that emit token counts in text mode are summed)" if total_tokens else ""
     console.print(
         f"  total agent time: {_humanize_secs(total_secs)}, reported tokens: {total_tokens:,}{suffix}"
     )

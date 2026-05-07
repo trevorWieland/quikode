@@ -308,7 +308,7 @@ def _phase_line(snap: DetailSnapshot) -> str:
         if snap.review_round is not None and snap.review_threads_count is not None:
             parts.append(f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads")
     elif state in {"local_ci_checking", "pre_pr_auditing", "fixup_planning"} and note:
-        # Pipeline notes carry per-stage context ("rubric audit (codex)"); show.
+        # Pipeline notes carry per-stage context ("rubric audit"); show.
         parts.append(f"[dim]{note[:80]}[/]")
     elif note:
         parts.append(f"[dim]{note[:80]}[/]")
@@ -353,11 +353,15 @@ def _state_long_description(state: str) -> str | None:
 # Stage display order + human labels. The same four stages always render —
 # ones that haven't run yet in the current cycle show as "queued" so the
 # operator sees the full pipeline shape rather than just "what's done so far."
+# Labels describe the stage's purpose, not the implementation. The CLI/model
+# that actually ran each stage is visible per-call in the agent_calls tab,
+# and is configurable via `cfg.checker` / `cfg.triage`; baking concrete CLI
+# names into these labels lies whenever the operator overrides those roles.
 _GAUNTLET_STAGES = [
     ("local_ci", "local CI gate (just ci)"),
-    ("rubric", "rubric audit (codex, 6 categories)"),
-    ("standards", "standards audit (claude-opus + repo profile)"),
-    ("behavior", "behavior audit (codex verifies expected_evidence)"),
+    ("rubric", "rubric audit (6 categories)"),
+    ("standards", "standards audit (repo profile)"),
+    ("behavior", "behavior audit (verifies expected_evidence)"),
 ]
 
 

@@ -426,7 +426,7 @@ class PrePrWorkerMixin:
             standards_text = _tw.pre_pr_audit.collect_standards_text(self.cfg)
 
             fsm_runtime.enter_pre_pr_auditing(
-                self.store, self.node.id, note=f"pre-pr cycle {cycle}: rubric audit (codex)"
+                self.store, self.node.id, note=f"pre-pr cycle {cycle}: rubric audit"
             )
             rubric = _tw.pre_pr_audit.run_rubric_audit(
                 cfg=self.cfg,
@@ -446,7 +446,7 @@ class PrePrWorkerMixin:
             fsm_runtime.enter_pre_pr_auditing(
                 self.store,
                 self.node.id,
-                note=f"pre-pr cycle {cycle}: standards audit (claude-opus)",
+                note=f"pre-pr cycle {cycle}: standards audit",
             )
             standards = _tw.pre_pr_audit.run_standards_audit(
                 cfg=self.cfg,
@@ -464,7 +464,7 @@ class PrePrWorkerMixin:
             )
 
             fsm_runtime.enter_pre_pr_auditing(
-                self.store, self.node.id, note=f"pre-pr cycle {cycle}: behavior audit (codex)"
+                self.store, self.node.id, note=f"pre-pr cycle {cycle}: behavior audit"
             )
             behavior = _tw.pre_pr_audit.run_behavior_audit(
                 cfg=self.cfg,
