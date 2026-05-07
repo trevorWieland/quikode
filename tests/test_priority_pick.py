@@ -97,10 +97,13 @@ def test_id_tiebreak_when_no_other_signal(tmp_path):
     assert nxt == "R-001"
 
 
-def test_stacked_child_beats_fresh_root_with_no_dependents(tmp_path):
-    """A stacked R-002 (parent PENDING_CI) should be picked over a fresh
-    R-099 root. Stacking advances chain throughput; finishing a chain
-    unblocks more downstream work than starting a new one."""
+def test_primary_root_beats_stacked_child(tmp_path):
+    """Plan 30: primary tasks (no unmet deps) take precedence over stacked.
+    R-099 (fresh root) should be picked over R-002 (stacked on R-001's open
+    PR), even though R-002 would be eligible. Reverses the pre-plan-30
+    +50 stacked-boost behavior — primaries unblock more downstream work,
+    and stacked children that DO get scheduled have the strongest
+    foundation by waiting for the parent's review-ready-settled signal."""
     edges = [
         ("R-001", []),
         ("R-002", ["R-001"]),
@@ -114,34 +117,27 @@ def test_stacked_child_beats_fresh_root_with_no_dependents(tmp_path):
     o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
 
     nxt = o._pick_next({"R-001", "R-002", "R-099"}, set())
-    assert nxt == "R-002"
+    assert nxt == "R-099"
 
 
-def test_high_fan_out_root_beats_stacked_with_no_unblock(tmp_path):
-    """If a fresh root unblocks far more downstream work than a stacked
-    child, fan-out beats stacking. The +50 stacking_boost is meaningful
-    but not so dominant that it overrides large fan-out signals (1 stacked
-    boost = ~10 dependents)."""
+def test_stacked_picked_when_no_primary_available(tmp_path):
+    """Plan 30: stacked candidates are picked only when no primary is
+    pickable. If R-099 (the only primary) is in flight, R-002 (stacked)
+    becomes eligible."""
     edges = [
-        # Big-fan-out root: R-100 with 25 dependents in scope.
-        ("R-100", []),
-        # Stacked R-002 → no further dependents.
         ("R-001", []),
         ("R-002", ["R-001"]),
+        ("R-099", []),
     ]
-    # Add 25 dependents on R-100.
-    for i in range(200, 225):
-        edges.append((f"R-{i:03d}", ["R-100"]))
     dag = _make_dag(tmp_path, edges)
     o = _orch(tmp_path, dag, stacking_strategy=StackingStrategy.WITHIN_MILESTONE)
-    for nid, _ in edges:
-        o.store.upsert_pending(nid)
+    o.store.upsert_pending("R-001")
+    o.store.upsert_pending("R-002")
+    o.store.upsert_pending("R-099")
     o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
-    scope = {nid for nid, _ in edges}
-
-    nxt = o._pick_next(scope, set())
-    # 25 deps × 5 = 125 unblock_boost vs. 50 stacking_boost. R-100 wins.
-    assert nxt == "R-100"
+    # R-099 is "in flight" — emulate scheduler having already picked it.
+    nxt = o._pick_next({"R-001", "R-002", "R-099"}, in_flight={"R-099"})
+    assert nxt == "R-002"
 
 
 def test_returns_none_when_no_eligible(tmp_path):
@@ -289,10 +285,10 @@ def test_settled_readiness_skips_addressing_feedback_parent(tmp_path):
     assert nxt is None  # neither eligible: R-001 active, R-002 has un-settled parent
 
 
-def test_settled_readiness_picks_when_parent_is_awaiting_review(tmp_path):
-    """Plan 28: settled mode picks when parent reaches AWAITING_REVIEW (the
-    streamlined replacement for MERGE_READY — settle window retired with the
-    per-thread classifier)."""
+def test_settled_readiness_picks_when_parent_settled_past_threshold(tmp_path):
+    """Plan 30: in settled mode, parent must be in AWAITING_REVIEW for ≥
+    cfg.review_ready_settle_s. With threshold=0 the gate is just "in
+    AWAITING_REVIEW", which is the bare-minimum case."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
     dag = _make_dag(tmp_path, edges)
     o = _orch(
@@ -300,6 +296,7 @@ def test_settled_readiness_picks_when_parent_is_awaiting_review(tmp_path):
         dag,
         stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
         stacking_readiness="settled",
+        review_ready_settle_s=0,
     )
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
@@ -307,6 +304,28 @@ def test_settled_readiness_picks_when_parent_is_awaiting_review(tmp_path):
     o.store.transition("R-001", State.AWAITING_REVIEW)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt == "R-002"
+
+
+def test_settled_readiness_skips_when_parent_in_awaiting_review_too_briefly(tmp_path):
+    """Plan 30: with threshold=900s default, a parent that JUST entered
+    AWAITING_REVIEW is not yet stack-ready. Children stay unpicked until
+    the 15-min settle window elapses — same threshold that gates the
+    ntfy notification."""
+    edges = [("R-001", []), ("R-002", ["R-001"])]
+    dag = _make_dag(tmp_path, edges)
+    o = _orch(
+        tmp_path,
+        dag,
+        stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
+        stacking_readiness="settled",
+        review_ready_settle_s=900,
+    )
+    o.store.upsert_pending("R-001")
+    o.store.upsert_pending("R-002")
+    o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
+    o.store.transition("R-001", State.AWAITING_REVIEW)
+    nxt = o._pick_next({"R-001", "R-002"}, set())
+    assert nxt is None
 
 
 def test_settled_readiness_skips_pending_ci_parent(tmp_path):

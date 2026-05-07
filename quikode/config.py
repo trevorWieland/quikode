@@ -243,6 +243,29 @@ class Config(BaseModel):
         description="Squash-merge automatically when a non-bot APPROVED review lands and the PR is clean.",
     )
 
+    # ----- plan 30: unified review-ready signal -----
+    # Threshold serves two purposes: (1) ntfy notification fires once per
+    # settled period; (2) stacked-diff dependents become eligible (in
+    # `stacking_readiness="settled"` mode). One threshold, two consumers.
+    review_ready_settle_s: int = Field(
+        default=900,
+        ge=0,
+        le=14400,
+        description=(
+            "Seconds in AWAITING_REVIEW before the review-ready-settled signal fires. "
+            "Triggers ntfy notification AND unblocks stacked-diff dependents in "
+            "stacking_readiness='settled' mode."
+        ),
+    )
+    notify_ntfy_url: str = Field(
+        default="https://ntfy.sh",
+        description="ntfy server base URL.",
+    )
+    notify_ntfy_topic: str = Field(
+        default="",
+        description="ntfy topic. Empty = no review-ready notifications fire.",
+    )
+
     # ----- v2 Resources -----
     cpu_per_task: int = Field(
         default=4,

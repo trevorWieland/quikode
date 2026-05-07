@@ -32,7 +32,7 @@ import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
-from quikode import fsm_runtime
+from quikode import fsm_runtime, notify
 from quikode.fsm import Event
 from quikode.github_graphql import Review
 from quikode.state import State, TaskRow
@@ -95,9 +95,47 @@ class ReviewWatchMixin:
             return
         if str(task_row.get("state")) != State.AWAITING_REVIEW.value:
             return
+        # Plan 30: review-ready-settled signal fires once per settled period
+        # (AWAITING_REVIEW for ≥ cfg.review_ready_settle_s, ntfy not yet fired
+        # since most recent entry into AWAITING_REVIEW). Same threshold gates
+        # stacked-diff dependent kickoff via scheduler.is_parent_stack_ready.
+        self._maybe_notify_review_ready(task_row)
         self._handle_awaiting_review_reviews(
             repo, pr_number, task_row, pr_status, pool, futures, review_response_futures
         )
+
+    def _maybe_notify_review_ready(self: Any, task_row: TaskRow) -> None:
+        topic = (self.cfg.notify_ntfy_topic or "").strip()
+        if not topic:
+            return
+        task_id = task_row["id"]
+        entered_ts = self.store.most_recent_awaiting_review_entry_ts(task_id)
+        if entered_ts is None:
+            return
+        now = _rt.time.time()
+        if now - entered_ts < self.cfg.review_ready_settle_s:
+            return
+        last_notified = self.store.get_last_review_ready_notified_ts(task_id)
+        if last_notified is not None and last_notified >= entered_ts:
+            return  # already pinged for this settled period
+        node = self.dag.nodes.get(task_id)
+        title = node.title if node else task_id
+        round_no = int(task_row.get("review_round") or 0)
+        settled_min = int((now - entered_ts) // 60)
+        round_str = f" · {round_no} review round(s)" if round_no else ""
+        msg = notify.ReviewReadyMessage(
+            task_id=task_id,
+            title=title,
+            pr_url=str(task_row.get("pr_url") or ""),
+            summary=f"settled {settled_min}min{round_str} · CI green",
+        )
+        ok = notify.notify_review_ready(
+            ntfy_url=self.cfg.notify_ntfy_url,
+            ntfy_topic=topic,
+            msg=msg,
+        )
+        if ok:
+            self.store.set_last_review_ready_notified_ts(task_id, now)
 
     def _review_pr_info(self: Any, task_row: TaskRow, now: float) -> tuple[int, str] | None:
         task_id = task_row["id"]

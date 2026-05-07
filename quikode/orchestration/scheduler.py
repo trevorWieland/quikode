@@ -11,6 +11,7 @@ orchestrator instance — they communicate through `store` + `dag` only.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from quikode.fsm import STACK_READY_STATES as FSM_STACK_READY_STATES
@@ -53,24 +54,28 @@ def is_parent_stack_ready(
 
     - `"speculative"` (default): any state in `STACK_READY_STATES` — children
       fork the moment a PR exists on origin.
-    - `"settled"`: parent must be in AWAITING_REVIEW. Plan 28 retired
-      MERGE_READY (the settle window died with the per-thread classifier);
-      AWAITING_REVIEW is now the closest "CI green, ready for human
-      attention" signal.
-
-    `parent_state` is the cached state we already read for the candidate's
-    deps — passed in to avoid an extra Store.get per evaluation. The
-    `parent_id` / `store` / `now` arguments are kept on the signature for
-    callers that already passed them; with the simplified settled gate they
-    are no longer used internally.
+    - `"settled"` (plan 30): parent must be in `AWAITING_REVIEW` continuously
+      for ≥ `cfg.review_ready_settle_s` (default 15 min). The same threshold
+      that gates the ntfy notification gates dependent kickoff — children
+      always start from a CI-green base the operator could have reviewed.
     """
-    del parent_id, store, now  # accepted for signature parity; unused now
     if parent_state is None:
         return False
     mode = getattr(cfg, "stacking_readiness", "speculative")
     if mode == "speculative":
         return parent_state in STACK_READY_STATES
-    return parent_state == State.AWAITING_REVIEW.value
+    # "settled" mode: must be AWAITING_REVIEW AND have been there long enough.
+    if parent_state != State.AWAITING_REVIEW.value:
+        return False
+    threshold = getattr(cfg, "review_ready_settle_s", 0)
+    if threshold <= 0:
+        return True
+    entered_ts = store.most_recent_awaiting_review_entry_ts(parent_id)
+    if entered_ts is None:
+        return False
+    if now is None:
+        now = time.time()
+    return (now - entered_ts) >= threshold
 
 
 # Resume-boost weights. Keep these visible at module top so the score
@@ -91,23 +96,21 @@ def score_candidate(
 ) -> int:
     """Priority score for a pickable task. Higher wins.
 
+    Plan 30: primary vs stacked is now a HARD TIER decided by the caller
+    (see `prefer_primary_candidates`), not a soft +50 boost in the scorer.
+    `is_stacked` is retained on the signature for back-compat but no longer
+    affects the score — both tiers use the same intra-tier ranking below.
+
     Components:
-    - `stacked_boost`: +50 for stacked children (Phase 3+ chain throughput).
     - `unblock_boost`: +5 per direct dependent in scope. High-fan-out tasks
       unblock more downstream parallelism.
-    - `resume_boost`: +15 if the task already has an open PR (orphan
-      recovery / explicit resume put it back in PENDING but we shouldn't
-      re-pick a fresh root over it). Plus up to +25 scaled by completed
-      subtask fraction. Keeps progressed tasks ahead of cold roots without
-      dominating high-fan-out roots (max +40).
-    Ties are left to candidate ordering, which is deterministic and does not
-    apply project-specific numeric penalties.
-
-    NOT scored here: review/CI-fix priorities — those are dispatched on
-    separate code paths (`_poll_review_threads`, `_poll_pr_loop` ci-branch)
-    and do not compete for slots through this scorer.
+    - `pr_boost`: +15 if the task already has an open PR (orphan recovery /
+      explicit resume put it back in PENDING but we shouldn't re-pick a
+      fresh root over it). Plus up to +25 scaled by completed subtask
+      fraction. Keeps progressed tasks ahead of cold roots without
+      dominating high-fan-out roots.
     """
-    stacked_boost = 50 if is_stacked else 0
+    del is_stacked  # plan 30: tiering is the caller's job, not the scorer's
     dependents = sum(
         1 for other_id, other in dag.nodes.items() if other_id in scope and task_id in other.depends_on
     )
@@ -118,7 +121,24 @@ def score_candidate(
         progress_boost = round(_RESUME_SUBTASK_FRACTION_MAX * fraction)
     else:
         progress_boost = 0
-    return stacked_boost + unblock_boost + pr_boost + progress_boost
+    return unblock_boost + pr_boost + progress_boost
+
+
+def prefer_primary_candidates(candidates: list[dict]) -> list[dict]:
+    """Plan 30: primary tasks (no unmet deps) take precedence over stacked.
+
+    If any primary candidate is pickable, return only the primary ones.
+    Stacked candidates are deferred until the primary pool empties — the
+    user's stated preference: "stacked-diff issues only get picked up when
+    all available primary nodes are done or awaiting review." Primaries
+    unblock more downstream work per slot than stacked children, and a
+    stacked child that starts after the parent is review-ready-settled has
+    the strongest possible foundation (CI-green, post-settle).
+    """
+    primaries = [c for c in candidates if not c.get("is_stacked")]
+    if primaries:
+        return primaries
+    return candidates
 
 
 def _resume_signals(row: TaskRow | None, store: Store) -> tuple[bool, int, int]:
@@ -309,6 +329,8 @@ def best_queued_priority(
         )
     if not candidates:
         return (None, None)
+    # Plan 30: hard-tier filter — primaries first, stacked only as fallback.
+    candidates = prefer_primary_candidates(candidates)
     scored = [
         (
             score_candidate(

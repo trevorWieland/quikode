@@ -318,3 +318,45 @@ class StoreReviewMixin:
             )
             r = c.execute("SELECT review_round FROM tasks WHERE id = ?", (task_id,)).fetchone()
             return int(r["review_round"]) if r else 0
+
+    def most_recent_awaiting_review_entry_ts(self: Any, task_id: str) -> float | None:
+        """Plan 30: ts at which the task most recently entered AWAITING_REVIEW.
+
+        Reads `state_log` (no new column). Returns None if the task has never
+        entered AWAITING_REVIEW. Used by both the ntfy gate and the
+        stacking-readiness gate to compute "has been settled for ≥ N
+        seconds" without persistent per-row bookkeeping.
+        """
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT MAX(ts) AS ts FROM state_log WHERE task_id = ? AND to_state = ?",
+                (task_id, fsm.State.AWAITING_REVIEW.value),
+            ).fetchone()
+        if r is None:
+            return None
+        v = r["ts"]
+        return float(v) if v is not None else None
+
+    def get_last_review_ready_notified_ts(self: Any, task_id: str) -> float | None:
+        """Plan 30: ts of the most recent review-ready ntfy fire for a task.
+
+        Repurposes `last_notified_settled_ts` (column retained by plan 28
+        because SQLite column-drop requires a table rebuild). NULL until the
+        first review-ready notification posts successfully.
+        """
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT last_notified_settled_ts FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        if r is None:
+            return None
+        v = r["last_notified_settled_ts"]
+        return float(v) if v is not None else None
+
+    def set_last_review_ready_notified_ts(self: Any, task_id: str, ts: float) -> None:
+        """Stamp the most recent review-ready ntfy fire ts. Idempotent."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET last_notified_settled_ts = ?, updated_at = ? WHERE id = ?",
+                (ts, time.time(), task_id),
+            )

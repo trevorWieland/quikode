@@ -213,6 +213,12 @@ class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWa
         candidates = self._collect_pick_candidates(scope, in_flight)
         if not candidates:
             return None
+        # Plan 30: hard-tier filter — only fall through to stacked candidates
+        # when no primary (no unmet deps) is pickable. Stacked work waits for
+        # primaries to drain so the orchestrator never starves the high-fan-out
+        # work, and stacked children that DO get scheduled have the strongest
+        # possible foundation (parent in AWAITING_REVIEW + settled).
+        candidates = scheduler.prefer_primary_candidates(candidates)
         # Sort: highest score first, lower task_id breaks score ties (so a
         # tied R-001 wins over R-005, preserving milestone-order intuition).
         candidates.sort(key=lambda c: (-self._score_candidate(c, scope), c["task_id"]))
