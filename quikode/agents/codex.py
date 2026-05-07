@@ -20,6 +20,7 @@ CRITICAL FLAGS:
 from __future__ import annotations
 
 import secrets
+import subprocess
 import time
 from pathlib import Path
 
@@ -63,9 +64,40 @@ class CodexAgent:
         # this call's contribution. Codex's stderr regex still runs as a
         # belt-and-suspenders fallback when ccusage is unavailable.
         before = ccusage.fetch_session_stats("codex", handle=handle)
-        rc, out, err = exec_in(
-            handle, ["bash", "-lc", shell_cmd], log_path=log_path, stdin=prompt, timeout=timeout
-        )
+        try:
+            rc, out, err = exec_in(
+                handle, ["bash", "-lc", shell_cmd], log_path=log_path, stdin=prompt, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as e:
+            # Mirror `_exec`'s timeout handling so codex's checker / triage /
+            # planner calls don't crash the worker on a hung subprocess
+            # (e.g. quota wait, model API hang). Without this the
+            # `TimeoutExpired` propagates uncaught through subtask_execution
+            # → task_worker.run → FSM CRASH event → task FAILED. Caller
+            # treats `transient=True` as a free retry (no attempt-counter bump).
+            partial_out = (
+                (e.stdout.decode("utf-8", errors="replace") if e.stdout else "")
+                if isinstance(e.stdout, bytes)
+                else (e.stdout or "")
+            )
+            partial_err = (
+                (e.stderr.decode("utf-8", errors="replace") if e.stderr else "")
+                if isinstance(e.stderr, bytes)
+                else (e.stderr or "")
+            )
+            msg = f"\n[quikode] codex timed out after {timeout}s; treating as transient retry"
+            if log_path is not None:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a") as f:
+                    f.write(msg + "\n")
+            return AgentResult(
+                rc=124,
+                stdout=partial_out,
+                stderr=(partial_err + msg).strip(),
+                tokens_used=parse_tokens(partial_out, partial_err),
+                duration_s=time.time() - t0,
+                transient=True,
+            )
         # Mirror _exec's transient-failure detection so codex doesn't bypass
         # the free-retry path just because it constructs its AgentResult
         # locally (it captures `--output-last-message` and dumps it post-run).

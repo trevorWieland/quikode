@@ -1,9 +1,12 @@
 """v3.6 pre-PR pipeline: 4-stage gate before opening a PR.
 
 Stage 0  Local CI gate  — run `cfg.local_ci_command` (default `just ci`)
-                          inside the dev container. Output parsed via
-                          `triage.parse_ci_failure` into structured
-                          findings.
+                          inside the dev container. The full raw output is
+                          passed through to downstream consumers (triage +
+                          fixup planner) without regex-based extraction —
+                          structured-failure parsing was lossy on outputs
+                          the patterns didn't match (e.g. R-0021's "0
+                          structured failure(s) extracted").
 Stage 1  Rubric audit   — codex agent rates the diff on
                           `cfg.pre_pr_rubric_categories` from 1-10. Any
                           category < `cfg.pre_pr_rubric_min_score` fails.
@@ -43,7 +46,6 @@ from pathlib import Path
 from typing import Literal
 
 from . import prompts as prompts_mod
-from . import triage as triage_mod
 from .agents import build_agent
 from .config import AgentRole, Config
 from .execution import ExecutionSandbox, exec_in
@@ -130,24 +132,20 @@ def run_local_ci_gate(
             summary=f"local CI passed: `{cmd_str}` rc=0",
             raw_output=_tail(blob, 80),
         )
-    failures = triage_mod.parse_ci_failure(blob)
-    findings = [
-        {
-            "kind": f.kind,
-            "file": f.file,
-            "line": f.line,
-            "message": f.message,
-            "excerpt": f.excerpt[:1000],
-        }
-        for f in failures
-    ]
-    summary = f"local CI failed: rc={rc} ({len(failures)} structured failure(s) extracted)"
+    # Pass the full raw output through to the fixup planner. Pre-plan-29 we
+    # ran `triage.parse_ci_failure` to extract structured findings via regex,
+    # but on outputs the patterns didn't match (custom test runners, BDD
+    # scenario blocks, just-recipe wrappers) the extraction returned 0
+    # findings AND we tailed the output to 200 lines — leaving the planner
+    # blind. Hand over the unfiltered context and let the planner decide what
+    # to fix. Cap is generous (16k chars / ~250 lines) to fit the prompt
+    # budget without truncating typical multi-failure runs.
+    summary = f"local CI failed: rc={rc} (full output below)"
     return StageOutcome(
         name="local_ci",
         passed=False,
         summary=summary,
-        raw_output=_tail(blob, 200),
-        findings=findings,
+        raw_output=_tail(blob, 600),
     )
 
 
