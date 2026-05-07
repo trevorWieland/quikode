@@ -31,7 +31,7 @@ from pathlib import Path
 from . import prompts as prompts_mod
 from .agents import build_agent
 from .config import AgentRole, Config
-from .docker_env import TaskContainer
+from .execution import ExecutionSandbox
 from .json_extract import first_balanced_object
 from .subtask_schema import Subtask
 from .types import AgentResult
@@ -72,7 +72,7 @@ class ScopeReviewResult:
 def review_scope_drift(
     *,
     cfg: Config,
-    handle: TaskContainer,
+    handle: ExecutionSandbox,
     subtask: Subtask,
     declared: list[str],
     actually_touched: list[str],

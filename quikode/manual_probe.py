@@ -25,8 +25,8 @@ Contract between `expected_evidence` items and `ManualProbe`:
   substring (e.g. `"ok"`) using regex heuristics. If extraction fails
   the probe is skipped with a logged warning — never crashes.
 
-The runner always operates inside the existing dev container via
-`docker_env.exec_in`, so no new mounts/networks are needed. Services
+The runner always operates inside the existing execution sandbox via the
+backend exec interface, so no new mounts/networks are needed. Services
 are background-started with `nohup` and a per-service health check
 loop; `teardown_services()` `kill`s them via the captured pids.
 """
@@ -184,7 +184,7 @@ def parse_evidence_to_probe(item: object) -> ManualProbe | None:
 
 class ContainerExec(Protocol):
     """Anything that can `exec_in(handle, cmd, ..., timeout=...)` — i.e.
-    `quikode.docker_env.exec_in` in production, a stub in tests."""
+    `quikode.execution.exec_in` in production, a stub in tests."""
 
     def __call__(
         self,
@@ -218,7 +218,7 @@ class ManualProbeRunner:
     context manager).
     """
 
-    handle: Any  # the TaskContainer; opaque to the runner
+    handle: Any  # the execution sandbox; opaque to the runner
     exec_in: ContainerExec
     log_path: Any = None
     credentials: dict[str, str] = field(default_factory=dict)

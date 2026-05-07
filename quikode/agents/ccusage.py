@@ -45,7 +45,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
-from ..docker_env import exec_in
+from ..execution import exec_in
 from ..types import AgentResult
 
 log = logging.getLogger("quikode.ccusage")

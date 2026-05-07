@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import net_retry
-from .docker_env import TaskContainer, exec_in
+from .execution import ExecutionSandbox, exec_in
 
 
 @dataclass
@@ -24,12 +24,12 @@ class PRStatus:
 
 
 def _exec_gh(
-    handle: TaskContainer, args: list[str], log_path: Path | None = None, timeout: int = 60
+    handle: ExecutionSandbox, args: list[str], log_path: Path | None = None, timeout: int = 60
 ) -> tuple[int, str, str]:
     return exec_in(handle, ["bash", "-lc", "gh " + " ".join(args)], log_path=log_path, timeout=timeout)
 
 
-def commit_all(handle: TaskContainer, message: str, log_path: Path | None = None) -> tuple[int, str]:
+def commit_all(handle: ExecutionSandbox, message: str, log_path: Path | None = None) -> tuple[int, str]:
     """Stage everything, commit. Returns (rc, output)."""
     cmd = f"git add -A && git commit -m {_sh_quote(message)}"
     rc, out, err = exec_in(handle, ["bash", "-lc", cmd], log_path=log_path)
@@ -37,7 +37,7 @@ def commit_all(handle: TaskContainer, message: str, log_path: Path | None = None
 
 
 def push(
-    handle: TaskContainer, branch: str, remote: str = "origin", log_path: Path | None = None
+    handle: ExecutionSandbox, branch: str, remote: str = "origin", log_path: Path | None = None
 ) -> tuple[int, str]:
     rc, out, err = exec_in(
         handle,
@@ -48,7 +48,9 @@ def push(
     return rc, out + err
 
 
-def ahead_count(handle: TaskContainer, branch: str, base: str = "main", log_path: Path | None = None) -> int:
+def ahead_count(
+    handle: ExecutionSandbox, branch: str, base: str = "main", log_path: Path | None = None
+) -> int:
     """How many commits is `branch` ahead of `origin/base`? 0 if base ref unknown.
 
     Used post-v3 to detect "branch already has work via per-subtask commits"
@@ -69,7 +71,7 @@ def ahead_count(handle: TaskContainer, branch: str, base: str = "main", log_path
 
 
 def open_pr(
-    handle: TaskContainer, title: str, body: str, base: str = "main", log_path: Path | None = None
+    handle: ExecutionSandbox, title: str, body: str, base: str = "main", log_path: Path | None = None
 ) -> tuple[int, str, str]:
     """Returns (rc, pr_url, raw_output)."""
     # Write body to a tempfile inside the container to avoid quoting hell

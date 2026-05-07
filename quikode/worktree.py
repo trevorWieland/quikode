@@ -23,12 +23,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import git_push_recovery
-from .docker_env import exec_in
+from .execution import exec_in
 
 log = logging.getLogger("quikode.worktree")
 
 if TYPE_CHECKING:
-    from .docker_env import TaskContainer
+    from .execution import ExecutionSandbox
     from .scope_review import ScopeReviewResult
     from .subtask_schema import Subtask
 
@@ -95,7 +95,7 @@ def _is_transient_git_failure(rc: int, output: str) -> bool:
 
 
 def commit_subtask(
-    handle: TaskContainer,
+    handle: ExecutionSandbox,
     subtask: Subtask,
     message: str,
     *,
@@ -175,7 +175,7 @@ def commit_subtask(
 
 
 def _commit_or_idempotent(
-    handle: TaskContainer, message: str, log_path: Path | None, timeout: int
+    handle: ExecutionSandbox, message: str, log_path: Path | None, timeout: int
 ) -> CommitResult | None:
     """Run `git commit`. Return None if the commit landed (or idempotent
     re-entry detected — fall through to push); return a CommitResult on
@@ -210,7 +210,7 @@ def _commit_or_idempotent(
 
 
 def _apply_lane_review(
-    handle: TaskContainer,
+    handle: ExecutionSandbox,
     subtask: Subtask,
     declared: list[str],
     actually_touched: list[str],
@@ -262,7 +262,7 @@ def _commit_success(commit_sha: str | None, accepted_files: list[str]) -> Commit
 
 
 def commit_response(
-    handle: TaskContainer,
+    handle: ExecutionSandbox,
     message: str,
     *,
     branch: str,

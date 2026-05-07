@@ -82,7 +82,7 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
         finally:
             # Tear down the container only — keep the _tw.worktree.
             if self.handle is not None:
-                _tw.docker_env.teardown(self._h)
+                self.execution_backend.teardown(self._h)
                 self.handle = None
 
     def _pre_rebase_state(self: Any, row: dict[str, Any]) -> State:

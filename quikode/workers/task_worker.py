@@ -33,7 +33,7 @@ from quikode.agents.progress import (
 )
 from quikode.config import Config
 from quikode.dag import Node
-from quikode.docker_env import TaskContainer, exec_in
+from quikode.execution import ExecutionBackend, build_execution_backend, exec_in
 from quikode.fsm import TERMINAL_STATES
 from quikode.orchestration import scheduler
 from quikode.state import State, Store, TaskRow
@@ -82,6 +82,7 @@ _PATCH_EXPORTS = (
     ProgressVerdict,
     build_progress_agent,
     exec_in,
+    build_execution_backend,
     scheduler,
     parse_fixup_planner_output,
     parse_planner_output,
@@ -97,10 +98,11 @@ class TaskWorker(
 ):
     def __init__(self, cfg: Config, dag: Any, store: Store, node: Node):
         self.cfg = cfg
+        self.execution_backend: ExecutionBackend = build_execution_backend(cfg)
         self.dag = dag
         self.store = store
         self.node = node
-        self.handle: TaskContainer | None = None
+        self.handle: Any | None = None
         self.log_path = cfg.log_dir / f"{node.id}.log"
         self.plan_text: str = ""  # raw planner stdout (kept for artifact + PR body)
         self.plan: Plan | None = None  # parsed structured plan
@@ -108,7 +110,7 @@ class TaskWorker(
         self.last_triage_notes: str = ""
 
     @property
-    def _h(self) -> TaskContainer:
+    def _h(self) -> Any:
         """Narrow `self.handle` for type-checker happiness; asserts at call.
         Once provision runs, self.handle is set and stays set for the worker's
         lifetime. Methods called after _provision can use self._h instead of
@@ -340,29 +342,14 @@ class TaskWorker(
     def _provision_container(self, wt_path: Path) -> None:
         """Spin a fresh dev container against `wt_path`. Used both by the
         full provision path and by review-response re-provisioning."""
-        handle = docker_env.make_handle(self.node.id)
-        ws_label = docker_env.workspace_label(self.cfg)
-        docker_env.network_create(handle.network_name, label=ws_label)
-        if self.cfg.postgres_enabled:
-            docker_env.start_postgres(handle, self.cfg, label=ws_label)
-            docker_env.wait_postgres_healthy(handle)
-        cid = docker_env.start_dev_container(handle, self.cfg, wt_path)
-        # Wait for the container's entrypoint to finish copying agent auth files
-        # before any agent CLI is invoked. Without this, claude/codex see a
-        # half-copied .claude.json and fail with cryptic errors.
-        # 240s, not 60s: when the orchestrator brings up many containers in
-        # parallel on a cold cluster, the entrypoint's auth-file copy contends
-        # for I/O and routinely takes 60–120s. The probe itself is a cheap
-        # `test -f /tmp/qk-ready` every 500ms, so waiting longer costs nothing
-        # when the entrypoint succeeds — but a too-tight ceiling marks live,
-        # working containers as FAILED and orphans them holding the budget.
-        docker_env.wait_dev_ready(handle, timeout_s=240)
-
+        sandbox = self.execution_backend.provision(self.node.id, wt_path)
         # Database setup inside the project is the doer's responsibility.
         # Whether local CI needs migrations depends on the target repo.
 
-        self.handle = handle
-        self.store.set_field(self.node.id, container_id=cid)
+        self.handle = sandbox
+        self.store.set_field(
+            self.node.id, container_id=str(sandbox.metadata.get("container_id") or sandbox.unit_id)
+        )
 
     # ----- phase: plan -----
 
@@ -390,7 +377,7 @@ class TaskWorker(
 
     def _teardown(self) -> None:
         if self.handle is not None:
-            docker_env.teardown(self._h)
+            self.execution_backend.teardown(self._h)
         wt = self.store.get(self.node.id)
         if wt and wt.get("worktree_path"):
             row = self._row()

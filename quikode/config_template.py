@@ -16,10 +16,14 @@ postgres_user = "postgres"
 postgres_password = "dev"
 postgres_image = "postgres:16-alpine"
 database_url = "postgres://postgres:dev@postgres:5432/tanren"
+execution_backend = "docker"
 max_parallel = 3
 base_branch = "main"
 pr_remote = "origin"
 triage_budget_per_phase = 3
+
+[execution]
+# Reserved for future remote backends ("ssh-docker", "vm-sandbox").
 
 [agents.planner]
 cli = "codex"
@@ -65,6 +69,7 @@ postgres_user = "{profile_def.postgres_user}"
 postgres_password = "{profile_def.postgres_password}"
 postgres_image = "{profile_def.postgres_image}"
 database_url = "{profile_def.database_url}"
+execution_backend = "docker"
 max_parallel = 3
 base_branch = "{profile_def.base_branch}"
 pr_remote = "origin"
@@ -72,6 +77,9 @@ triage_budget_per_phase = 3
 local_ci_command = "{profile_def.local_ci_command}"
 subtask_check_command = "{profile_def.subtask_check_command}"
 pre_commit_runner = "{profile_def.pre_commit_runner}"
+
+[execution]
+# Reserved for future remote backends ("ssh-docker", "vm-sandbox").
 
 [resources]
 cpu_per_task = {int(resources.get("cpu_per_task", 4))}

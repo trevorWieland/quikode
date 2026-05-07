@@ -287,9 +287,7 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
             # so a permanently-broken provisioning path (bad image, missing
             # mount, etc.) doesn't pin the worker indefinitely.
             try:
-                recreated = _tw.docker_env.ensure_dev_container_running(
-                    self._h, self.cfg, self._existing_worktree_path()
-                )
+                recreated = self.execution_backend.ensure_running(self._h, self._existing_worktree_path())
             except Exception as exc:
                 _tw.log.warning(
                     "subtask %s/%s: ensure_dev_container_running raised %s; proceeding",

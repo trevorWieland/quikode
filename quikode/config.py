@@ -92,6 +92,18 @@ class Config(BaseModel):
         default="postgres://postgres:dev@postgres:5432/tanren",
         description="DATABASE_URL injected into task containers. Empty string disables injection.",
     )
+    execution_backend: Literal["docker", "fake"] = Field(
+        default="docker",
+        description=(
+            "Execution backend for task sandboxes. Phase 2 supports 'docker' "
+            "and test-only 'fake'; future documented values are 'ssh-docker' "
+            "and 'vm-sandbox'."
+        ),
+    )
+    execution: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Reserved execution-backend settings for future remote backends.",
+    )
 
     # ----- orchestration -----
     max_parallel: int = Field(

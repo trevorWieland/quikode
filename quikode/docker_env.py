@@ -67,9 +67,11 @@ def _run(cmd: list[str], check: bool = True, capture: bool = True) -> subprocess
     return subprocess.run(cmd, check=check, capture_output=capture, text=True)
 
 
-def gh_token() -> str:
+def gh_token(env_name: str = "GITHUB_TOKEN") -> str:
     """Resolve GITHUB_TOKEN from env or `gh auth token`."""
-    if t := os.environ.get("GITHUB_TOKEN"):
+    if t := os.environ.get(env_name):
+        return t
+    if env_name != "GITHUB_TOKEN" and (t := os.environ.get("GITHUB_TOKEN")):
         return t
     try:
         r = _run(["gh", "auth", "token"])
@@ -138,9 +140,40 @@ def wait_postgres_healthy(handle: TaskContainer, timeout_s: int = 60) -> None:
     raise TimeoutError(f"postgres did not become healthy within {timeout_s}s")
 
 
-def start_dev_container(handle: TaskContainer, cfg: Config, worktree_path: Path) -> str:
+def _credential_mounts(cfg: Config, credential_bundle: Any | None = None) -> list[tuple[str, ...]]:
+    if credential_bundle is None:
+        mounts: list[tuple[str, ...]] = [
+            ("type=bind", f"src={cfg.claude_auth_dir}", "dst=/host-auth/claude", "ro=true"),
+            ("type=bind", f"src={cfg.codex_auth_dir}", "dst=/host-auth/codex", "ro=true"),
+            ("type=bind", f"src={cfg.opencode_auth_dir}", "dst=/host-auth/opencode-data", "ro=true"),
+            ("type=bind", f"src={cfg.opencode_config_dir}", "dst=/host-auth/opencode-config", "ro=true"),
+        ]
+        if cfg.claude_json_path.exists():
+            mounts.append(
+                ("type=bind", f"src={cfg.claude_json_path}", "dst=/host-auth/claude.json", "ro=true")
+            )
+        return mounts
+
+    mounts = []
+    for source in credential_bundle.path_sources():
+        src = Path(source.source)
+        parts = ["type=bind", f"src={src}", f"dst={source.install_path}"]
+        if source.read_only:
+            parts.append("ro=true")
+        mounts.append(tuple(parts))
+    return mounts
+
+
+def start_dev_container(
+    handle: TaskContainer,
+    cfg: Config,
+    worktree_path: Path,
+    *,
+    credential_bundle: Any | None = None,
+) -> str:
     """Start the dev container detached. Returns container ID."""
-    token = gh_token()
+    token_env = credential_bundle.github_env_name() if credential_bundle is not None else cfg.github_token_env
+    token = gh_token(token_env)
     # Ensure the sccache dir exists on the host
     cfg.sccache_dir.mkdir(parents=True, exist_ok=True)
     # Mount host auth dirs at /host-auth/* read-only; the entrypoint copies them
@@ -154,19 +187,13 @@ def start_dev_container(handle: TaskContainer, cfg: Config, worktree_path: Path)
     # whole repo) to keep the surface area small and avoid mounting unrelated
     # working-tree state.
     repo_git_dir = cfg.repo_path / ".git"
-    mounts = [
+    mounts: list[tuple[str, ...]] = [
         ("type=bind", f"src={worktree_path}", "dst=/workspace"),
         ("type=bind", f"src={repo_git_dir}", f"dst={repo_git_dir}"),
-        ("type=bind", f"src={cfg.claude_auth_dir}", "dst=/host-auth/claude", "ro=true"),
-        ("type=bind", f"src={cfg.codex_auth_dir}", "dst=/host-auth/codex", "ro=true"),
-        ("type=bind", f"src={cfg.opencode_auth_dir}", "dst=/host-auth/opencode-data", "ro=true"),
-        ("type=bind", f"src={cfg.opencode_config_dir}", "dst=/host-auth/opencode-config", "ro=true"),
         # Shared sccache across all tasks — sccache handles concurrent access safely.
         ("type=bind", f"src={cfg.sccache_dir}", "dst=/sccache"),
     ]
-    # claude.json is a file (not a dir); mount it only if it exists on host
-    if cfg.claude_json_path.exists():
-        mounts.append(("type=bind", f"src={cfg.claude_json_path}", "dst=/host-auth/claude.json", "ro=true"))
+    mounts.extend(_credential_mounts(cfg, credential_bundle))
     mount_args: list[str] = []
     for m in mounts:
         mount_args += ["--mount", ",".join(m)]
@@ -349,7 +376,12 @@ def is_dev_container_running(handle: TaskContainer) -> bool:
 
 
 def ensure_dev_container_running(
-    handle: TaskContainer, cfg: Config, worktree_path: Path, label: str | None = None
+    handle: TaskContainer,
+    cfg: Config,
+    worktree_path: Path,
+    label: str | None = None,
+    *,
+    credential_bundle: Any | None = None,
 ) -> bool:
     """Idempotent: if the dev container is missing or not running, recreate
     it (postgres + network + dev container + wait_dev_ready). Returns True
@@ -381,7 +413,10 @@ def ensure_dev_container_running(
     if cfg.postgres_enabled:
         start_postgres(handle, cfg, label=ws_label)
         wait_postgres_healthy(handle)
-    start_dev_container(handle, cfg, worktree_path)
+    if credential_bundle is None:
+        start_dev_container(handle, cfg, worktree_path)
+    else:
+        start_dev_container(handle, cfg, worktree_path, credential_bundle=credential_bundle)
     wait_dev_ready(handle, timeout_s=240)
     return True
 
