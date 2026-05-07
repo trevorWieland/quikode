@@ -98,6 +98,10 @@ def test_gauntlet_block_returns_none_when_no_summary():
 def test_gauntlet_block_renders_pass_fail_queued_icons():
     snap = DetailSnapshot(
         task_id="R-001",
+        # plan 26: gauntlet only renders when current state is in the
+        # pipeline-relevant set; pre_pr_auditing is the canonical "render"
+        # state.
+        task_state="pre_pr_auditing",
         pre_pr_audit_cycle=2,
         pre_pr_audit_stages=[
             {"name": "local_ci", "passed": True, "summary": "rc=0"},
@@ -126,6 +130,7 @@ def test_gauntlet_block_handles_missing_stage_gracefully():
     still render without raising — missing stages are simply skipped."""
     snap = DetailSnapshot(
         task_id="R-001",
+        task_state="pre_pr_auditing",  # plan 26: pipeline-relevant state
         pre_pr_audit_cycle=1,
         pre_pr_audit_stages=[
             {"name": "local_ci", "passed": True, "summary": "rc=0"},
@@ -137,6 +142,47 @@ def test_gauntlet_block_handles_missing_stage_gracefully():
     assert "local_ci" not in block  # we render the human label, not the raw name
     assert "local CI gate" in block
     assert "rubric audit" in block
+
+
+def test_gauntlet_block_hides_when_state_is_not_pipeline_relevant():
+    """Plan 26: when the task is back in spec/fixup-subtask work after a
+    prior cycle ran, the persisted audit summary represents history, not
+    current state. The gauntlet panel should hide rather than mislead the
+    operator with stale data."""
+    common_kwargs = {
+        "task_id": "R-001",
+        "pre_pr_audit_cycle": 1,
+        "pre_pr_audit_stages": [
+            {"name": "local_ci", "passed": False, "summary": "rc=1"},
+            {"name": "rubric", "passed": False, "summary": "security<7"},
+            {"name": "standards", "passed": None, "summary": "queued"},
+            {"name": "behavior", "passed": None, "summary": "queued"},
+        ],
+    }
+    # Subtask phase states — should hide.
+    for hide_state in (
+        "doing_subtask",
+        "checking_subtask",
+        "triaging_subtask",
+        "planning",
+        "pending",
+        "provisioning",
+    ):
+        snap = DetailSnapshot(task_state=hide_state, **common_kwargs)
+        assert _gauntlet_block(snap) is None, f"expected None for state {hide_state!r}"
+
+    # Pipeline / terminal states — should render.
+    for show_state in (
+        "pre_pr_auditing",
+        "local_ci_checking",
+        "fixup_planning",
+        "pending_ci",
+        "merged",
+        "blocked",
+        "failed",
+    ):
+        snap = DetailSnapshot(task_state=show_state, **common_kwargs)
+        assert _gauntlet_block(snap) is not None, f"expected block for state {show_state!r}"
 
 
 def test_block_transition_does_not_clobber_audit_summary(tmp_path):

@@ -16,7 +16,7 @@ import os
 from dataclasses import dataclass, field
 
 from textual.app import ComposeResult
-from textual.containers import Container
+from textual.containers import Container, VerticalScroll
 from textual.widgets import DataTable, RichLog, Static, TabbedContent, TabPane
 
 # Diagnostic logger for the 2026-05-04 missing-rows bug. Enabled by setting
@@ -100,7 +100,13 @@ class DetailPanel(Container):
         self._user_moved_subtask_cursor = False
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="detail-phase")
+        # Plan 26: wrap the phase Static in VerticalScroll so multi-line
+        # content (gauntlet block + phase description + container stats +
+        # state-long-description) doesn't get clipped at the panel
+        # boundary. Without this, the operator sees a truncated phase
+        # readout once the content exceeds the panel's allocated height.
+        with VerticalScroll(id="detail-phase-scroll"):
+            yield Static("", id="detail-phase")
         with TabbedContent(initial="subtasks-tab", id="detail-tabs"):
             with TabPane("Subtasks", id="subtasks-tab"):
                 yield DataTable(id="subtasks-table", zebra_stripes=True, cursor_type="row")
@@ -355,6 +361,29 @@ _GAUNTLET_STAGES = [
 ]
 
 
+# Plan 26: states where the persisted `pre_pr_audit_summary` represents
+# either the in-flight cycle, the cycle just queued, or the post-pipeline
+# disposition that the operator wants to see. In every other state the
+# summary is stale (last completed cycle that's no longer the current
+# concern) and rendering it alongside e.g. `doing_subtask Z-99-stabilize…`
+# misleads the operator into thinking the audit is the active phase.
+_GAUNTLET_RELEVANT_STATES = frozenset(
+    {
+        "pre_pr_auditing",
+        "local_ci_checking",
+        "fixup_planning",
+        "committing",
+        "pushing",
+        "pending_ci",
+        "awaiting_review",
+        "merge_ready",
+        "merged",
+        "blocked",
+        "failed",
+    }
+)
+
+
 def _gauntlet_block(snap: DetailSnapshot) -> str | None:
     """Render the 4-stage pre-PR audit gauntlet as a pass/fail/queued block.
 
@@ -365,9 +394,12 @@ def _gauntlet_block(snap: DetailSnapshot) -> str | None:
       · behavior    — queued
 
     Returns None when the task has never entered the pipeline (no summary
-    on the row). The cycle number is shown so multi-cycle runs are
-    distinguishable: cycle 1 fails → fixup → cycle 2 passes."""
+    on the row), OR when the task's current state is not pipeline-related
+    (plan 26: avoids showing a stale prior-cycle summary while the task
+    is back in spec/fixup subtask work)."""
     if not snap.pre_pr_audit_stages or snap.pre_pr_audit_cycle is None:
+        return None
+    if snap.task_state not in _GAUNTLET_RELEVANT_STATES:
         return None
     by_name = {s.get("name"): s for s in snap.pre_pr_audit_stages}
     lines = [f"[bold]Pre-PR audit gauntlet[/] — cycle {snap.pre_pr_audit_cycle}"]

@@ -49,11 +49,22 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
         if row.get("resume_from_existing_subtasks") and row.get("plan_text"):
             fsm_runtime.environment_ready(self.store, self.node.id, note="resume - skipping planner")
             self.plan_text = str(row["plan_text"] or "")
+            # Plan 26: skip Z-99 stabilization injection on resume when the
+            # task already has fixup subtasks. The presence of `kind="fixup-…"`
+            # rows means cycle 1 of the pre-PR audit has already run and
+            # produced findings; re-injecting Z-99 mid-fixup creates a
+            # parallel-but-unsequenced spec subtask that competes with the
+            # in-flight fixups and burns retries on a gate that can't pass
+            # until the fixups land. (Observed on R-0021 after the plan-24
+            # ship: Z-99 attempt 2 ran while F-1-11 was still doing.)
+            spec_gate_command = self.cfg.subtask_check_command
+            if self._has_existing_fixup_subtasks():
+                spec_gate_command = None
             try:
                 self.plan = _tw.parse_planner_output(
                     self.plan_text,
                     expected_node_id=self.node.id,
-                    spec_gate_command=self.cfg.subtask_check_command,
+                    spec_gate_command=spec_gate_command,
                 )
             except PlanValidationError as e:
                 # plan_text was malformed for some reason — fall through to
@@ -111,6 +122,18 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
                 for s in plan.subtasks
             ],
         )
+
+    def _has_existing_fixup_subtasks(self: Any) -> bool:
+        """True if the task already has any `kind="fixup-…"` subtask rows.
+        Used by plan 26 to skip Z-99 stabilization injection on resume —
+        once the pre-PR audit has produced fixups, re-injecting Z-99
+        mid-fixup creates a competing spec subtask that can't pass until
+        the fixups land, wasting retries."""
+        for row in self.store.list_subtasks(self.node.id):
+            kind = row.get("kind") or "spec"
+            if kind.startswith("fixup-"):
+                return True
+        return False
 
     def _parse_or_retry_plan(self: Any, stdout: str) -> Plan:
         try:
