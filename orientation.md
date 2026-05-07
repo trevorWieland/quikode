@@ -100,6 +100,8 @@ For dedicated cloud (e.g. Hetzner CCX63, 48c/192GB): same `max_parallel=16` is s
 | Container OOM (rc=137) | `docker stats` for the container | Bump `mem_per_task_gb` and reinstall; transient retries already free-retry |
 | Rate limit (429) on gh polls | Daemon log "transient subprocess failure" | `quikode/net_retry.py` already handles with exponential backoff; if it persists, check API tier |
 | 7+ tasks all failing on same root cause within minutes | `qk briefing`'s "Recent transitions" | Cluster bug — fix the shared cause (e.g. missing prompts, broken bundled file) and reinstall once for all |
+| Multiple tasks BLOCK at 50/50 retries simultaneously, with `qk show` retry histogram dominated by `container_vanished=N` | per-attempt duration <2s across last 30 attempts; daemon log spam: `objective check FAILED (rc=1, 119 bytes)` body = `No such container: …` | Container-vanished cascade. Plan 20's `ensure_dev_container_running` + transient-stderr classification on the gate path is now active; for already-blocked tasks: stop daemon, `qk reset-retries <id>` + `qk resume <id>` per task, restart. See `docs/runbook-incident-response.md` and `docs/incident-2026-05-07-recovery.md`. |
+| `InvalidTransition` cascade (multiple tasks FAILED with `event 'crash' is not valid from state 'failed'`) | daemon log tracebacks | Two `qk run` invocations raced on the same workspace. Plan 20's flock on `<state_dir>/orchestrator.lock` prevents recurrence. Recover affected tasks via `qk reset-retries` + `qk resume`. |
 
 When the diagnosis is unclear, prefer wiping a worktree and starting that subtask over (`qk retry <id>`) rather than carrying poisoned state forward. Per the user's standing direction: "It is truly better to wipe a worktree and start over, rather than carry forward poisoned work sometimes."
 
@@ -123,6 +125,8 @@ These live in the bundled prompts and are the contract every agent role honors. 
 - **Doer never rewrites git history.** No `git reset`, `git rebase`, `git commit --amend`, `git checkout <ref>`, `git cherry-pick`. The orchestrator owns commits. (`subtask-doer.md`.)
 - **Format violations get the formatter, not hand-edits.** `cargo fmt --all`, `taplo fmt`, `just markdown-fmt-fix`, `prettier --write`. (`subtask-doer.md`.)
 - **Checker fails on observed failures, never fabricated ones.** No synthetic acceptance criteria the planner didn't write. The audit gauntlet is the right place for thorough invariants. (`subtask-checker.md`.)
+- **One orchestrator per workspace.** `cli_core` acquires an exclusive `fcntl.flock` on `<state_dir>/orchestrator.lock` before container cleanup or orphan recovery; a second `qk run` against the same workspace exits 2 rather than racing. The lock auto-releases on FD close (incl. SIGKILL) so a hard-killed daemon never leaks it. (Plan 20.)
+- **Vanished-container failures are free retries, not attempt-counter increments.** Both the agent path and the objective gate path classify rc=137 / "No such container" / "container is not running" / "Error response from daemon" as transient. Each subtask attempt's pre-flight calls `docker_env.ensure_dev_container_running` so a dead container is recreated before the next agent invocation. (Plan 20.)
 
 ## Memory system hooks
 
@@ -142,6 +146,7 @@ Update memory as you learn things that should outlive the current conversation (
 - `qk tail <task>` — task log tail. Currently captures everything in memory until the agent exits (plan 11 will fix the streaming gap).
 - `qk resume <id>` — drop a BLOCKED/FAILED task back to PENDING with a resume marker. Worker picks up from the nearest non-DONE subtask, including leftover audit-driven fixups.
 - `qk retry <id>` — fresh restart: clears worktree + branch + subtask rows. Use only when the slate genuinely needs to be clean.
+- `qk reset-retries <id> [<subtask>]` — zero retry counters on BLOCKED subtasks of a BLOCKED/FAILED task without discarding committed work. Pair with `qk resume <id>` afterwards. Refuses on actively-running tasks. Designed for the container-vanished cascade scenario where 50 attempts were burned on infrastructure noise rather than real doer work — see plan 20.
 
 ## Quick state-of-the-world (as of the most recent commit on `optimizations`)
 

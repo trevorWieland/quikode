@@ -6,6 +6,7 @@ import sys
 from typing import Any
 
 from quikode import fsm_runtime
+from quikode.agents.base import _is_transient_container_failure
 from quikode.state import SubtaskState
 from quikode.subtask_schema import Subtask
 from quikode.types import Verdict
@@ -130,17 +131,35 @@ class SubtaskExecutionMixin:
             f"DETAILS:\n{head}"
         )
         self.store.add_artifact(self.node.id, f"subtask_objective_check:{subtask.id}", blob[:20000])
-        _tw.log.info(
-            "subtask %s/%s: objective check FAILED (rc=%d, %d bytes of output)",
-            self.node.id,
-            subtask.id,
-            rc,
-            len(blob),
+        # If the objective check failed because the dev container vanished
+        # (rc=137 OOM kill, "No such container", "Error response from daemon",
+        # etc.), classify as TRANSIENT so the existing free-retry path runs
+        # instead of charging the attempt counter. The doer / triage agent
+        # paths in agents/base.py:_exec already do this; this matches them
+        # for the gate-runner so a corpse container can't burn the 50-attempt
+        # hard ceiling in 60 seconds (plan 20 / 2026-05-07 incident).
+        is_transient = _is_transient_container_failure(rc, stderr or "") or _is_transient_container_failure(
+            rc, blob
         )
+        if is_transient:
+            _tw.log.warning(
+                "subtask %s/%s: objective check transient failure (rc=%d); container likely vanished",
+                self.node.id,
+                subtask.id,
+                rc,
+            )
+        else:
+            _tw.log.info(
+                "subtask %s/%s: objective check FAILED (rc=%d, %d bytes of output)",
+                self.node.id,
+                subtask.id,
+                rc,
+                len(blob),
+            )
         return _CheckerOutcome(
             verdict=Verdict.FAIL,
             checker_text=synthesized,
-            transient=False,
+            transient=is_transient,
             rc=rc,
             stderr=stderr or "",
         )

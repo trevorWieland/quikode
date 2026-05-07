@@ -34,6 +34,7 @@ from quikode.agents.progress import (
 from quikode.config import Config
 from quikode.dag import Node
 from quikode.docker_env import TaskContainer, exec_in
+from quikode.fsm import TERMINAL_STATES
 from quikode.orchestration import scheduler
 from quikode.state import State, Store, TaskRow
 from quikode.subtask_schema import (
@@ -146,10 +147,37 @@ class TaskWorker(
             return self._poll_pr_loop()
         except Exception as e:
             log.exception("task %s crashed", self.node.id)
-            fsm_runtime.crash_current(self.store, self.node.id, note=str(e), last_error=str(e)[:1000])
+            self._safe_crash_current(str(e))
             return WorkerOutcome(State.FAILED, str(e))
         finally:
             self._teardown()
+
+    def _safe_crash_current(self, err: str) -> None:
+        """Fire CRASH event ONLY if the task is still in an active state.
+
+        Without this guard, an exception during cleanup or after an earlier
+        failure path already moved the task to FAILED would re-fire CRASH from
+        FAILED — there's no (FAILED, CRASH) transition, so apply_event would
+        raise InvalidTransition, masking the original error and leaving the
+        task in a confusing state. See plan 20 / 2026-05-07 incident.
+        """
+        try:
+            cur = fsm_runtime.current_state(self.store, self.node.id)
+        except Exception as exc:
+            log.warning("task %s: cannot read current_state in crash guard: %s", self.node.id, exc)
+            cur = None
+        if cur in TERMINAL_STATES:
+            log.warning(
+                "task %s already in terminal %s; skipping crash_current (orig err: %s)",
+                self.node.id,
+                cur,
+                err[:200],
+            )
+            return
+        try:
+            fsm_runtime.crash_current(self.store, self.node.id, note=err, last_error=err[:1000])
+        except Exception as exc:
+            log.warning("task %s: crash_current itself raised %s; suppressing", self.node.id, exc)
 
     # ----- phase: provision -----
 
@@ -225,12 +253,7 @@ class TaskWorker(
                     f"multi-parent merge-base construction failed for "
                     f"{parent_branches}; cannot provision worktree"
                 )
-                fsm_runtime.crash_current(
-                    self.store,
-                    self.node.id,
-                    note=note,
-                    last_error=note[:1000],
-                )
+                self._safe_crash_current(note)
                 raise RuntimeError(note)
             self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
             parent_branch = mb_name

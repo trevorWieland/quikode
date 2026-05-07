@@ -167,6 +167,78 @@ def resume(
     )
 
 
+@app.command("reset-retries")
+def reset_retries(
+    task_id: str,
+    subtask_id: str | None = typer.Argument(
+        None,
+        help="Specific subtask id; if omitted, all blocked subtasks of the task are reset.",
+    ),
+) -> None:
+    """Zero retry counters on BLOCKED subtasks of a BLOCKED/FAILED task.
+
+    Designed for the container-vanished cascade scenario (plan 20 /
+    2026-05-07 incident): when infrastructure noise (a SIGKILL'd dev
+    container, an out-of-band cleanup, etc.) burned the per-subtask
+    50-attempt hard ceiling without any real doer/checker work, this
+    command rolls the counters back to zero so a follow-up `qk resume`
+    gives the subtask a clean budget.
+
+    Behavior:
+    - Refuses (exit 2) on any task not currently in BLOCKED or FAILED.
+    - Without `subtask_id`: targets every subtask whose state is `blocked`.
+    - With `subtask_id`: targets that subtask exactly (must exist).
+    - Per target, zeroes `retries`, `transient_retries`, `flatline_count`,
+      clears `last_error`, and (if previously `blocked`) flips the subtask
+      state back to `pending`.
+    - Does NOT fire FSM events on the task row itself; follow up with
+      `qk resume <task_id>` to drive the task back to PENDING.
+    """
+    cfg = load_config()
+    store = _open_store(cfg)
+    row = store.get(task_id)
+    if not row:
+        console.print(f"[red]no such task: {task_id}[/]")
+        raise typer.Exit(1)
+    state = row.get("state")
+    allowed = {State.BLOCKED.value, State.FAILED.value}
+    if state not in allowed:
+        console.print(
+            f"[red]task {task_id} is in state {state!r}; reset-retries only allowed "
+            f"on BLOCKED or FAILED tasks. use `qk abort` first if needed.[/]"
+        )
+        raise typer.Exit(2)
+    subs = store.list_subtasks(task_id)
+    if subtask_id is not None:
+        targets = [s for s in subs if s["subtask_id"] == subtask_id]
+        if not targets:
+            console.print(f"[red]no subtask {subtask_id!r} on task {task_id}[/]")
+            raise typer.Exit(1)
+    else:
+        targets = [s for s in subs if s["state"] == "blocked"]
+        if not targets:
+            console.print(f"[yellow]no blocked subtasks on {task_id}; nothing to reset[/]")
+            raise typer.Exit(0)
+    for s in targets:
+        was_blocked = s["state"] == "blocked"
+        new_state = "pending" if was_blocked else s["state"]
+        store.update_subtask(
+            task_id,
+            s["subtask_id"],
+            retries=0,
+            transient_retries=0,
+            flatline_count=0,
+            last_error=None,
+            state=new_state,
+        )
+        prior_retries = s.get("retries") or 0
+        console.print(
+            f"[green]reset {task_id}/{s['subtask_id']}[/]  "
+            f"[dim](retries {prior_retries} → 0; state {s['state']} → {new_state})[/]"
+        )
+    console.print(f"[cyan]done. follow up with `qk resume {task_id}` to put the task back in queue.[/]")
+
+
 @app.command("unblock")
 def unblock(
     task_id: str,

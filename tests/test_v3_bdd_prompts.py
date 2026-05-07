@@ -201,6 +201,12 @@ def test_planner_json_round_trips_with_interfaces():
 
 
 def test_subtask_doer_renders_interfaces_block_when_set(tmp_path):
+    """Plan 17 compressed the BDD slice rules to a single paragraph that
+    cites `just check-bdd-tags` as the authoritative validator and points
+    at `docs/architecture/subsystems/behavior-proof.md` for the convention
+    reference. The full mechanical rule list lives in the convention doc,
+    not in the prompt — the prompt only needs to surface the interfaces
+    plus the validator + ref doc."""
     dag = _make_dag_with_behaviors(tmp_path, ["B-0001"])
     cfg = _cfg(tmp_path)
     sub = Subtask(
@@ -214,13 +220,9 @@ def test_subtask_doer_renders_interfaces_block_when_set(tmp_path):
         notes="",
     )
     out = subtask_doer_prompt(cfg, dag.nodes["R-001"], sub)
-    # Header + the interfaces themselves
-    assert "Interfaces this subtask must cover" in out
+    # BDD slice section is rendered with the interfaces in the header.
+    assert "BDD slice" in out
     assert "web" in out and "api" in out
-    # The mechanical rules block kicks in
-    assert "@positive" in out
-    assert "@falsification" in out
-    assert "Scenario Outline" in out
     assert "just check-bdd-tags" in out
     assert "behavior-proof.md" in out
 

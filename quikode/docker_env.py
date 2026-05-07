@@ -333,6 +333,58 @@ def wait_dev_ready(handle: TaskContainer, timeout_s: int = 120) -> None:
     raise TimeoutError(f"dev container {handle.container_name} not ready within {timeout_s}s")
 
 
+def is_dev_container_running(handle: TaskContainer) -> bool:
+    """True iff `handle.container_name` exists AND its `.State.Running` is true.
+
+    Uses `docker inspect` once. Cheap (~50ms). Returns False on missing
+    container, exited container, or any inspect error — caller should treat
+    False as "needs recreation".
+    """
+    r = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", handle.container_name],
+        capture_output=True,
+        text=True,
+    )
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def ensure_dev_container_running(
+    handle: TaskContainer, cfg: Config, worktree_path: Path, label: str | None = None
+) -> bool:
+    """Idempotent: if the dev container is missing or not running, recreate
+    it (postgres + network + dev container + wait_dev_ready). Returns True
+    iff a recreation actually happened.
+
+    Recovery from the 2026-05-07 container-vanished cascade: when a worker's
+    dev container is OOM-killed mid-task or destroyed by an out-of-band
+    cleanup, the next subtask attempt's pre-flight calls this helper, which
+    re-provisions before the agent runs. Without this, every retry re-issues
+    `docker exec` against the corpse container, returns rc=1 / 119-byte
+    "No such container" stderr, and burns the 50-attempt hard ceiling in
+    ~60 seconds.
+
+    The cheap path: `is_dev_container_running` returns True immediately
+    when the container is healthy (one inspect call, ~50ms). Steady-state
+    cost is negligible. Caller (worker) is responsible for capping
+    consecutive recreations to detect a permanently broken provisioning
+    path; see `quikode/workers/subtasks.py`.
+    """
+    if is_dev_container_running(handle):
+        return False
+    ws_label = label or workspace_label(cfg)
+    # Tear down any partial state so the recreate path is clean. _run with
+    # check=False makes the calls idempotent — missing entities are silent.
+    _run(["docker", "rm", "-f", handle.container_name], check=False)
+    _run(["docker", "rm", "-f", handle.pg_container_name], check=False)
+    network_remove(handle.network_name)
+    network_create(handle.network_name, label=ws_label)
+    start_postgres(handle, label=ws_label)
+    wait_postgres_healthy(handle)
+    start_dev_container(handle, cfg, worktree_path)
+    wait_dev_ready(handle, timeout_s=240)
+    return True
+
+
 def exec_in(
     handle: Any,
     cmd: list[str],

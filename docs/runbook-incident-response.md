@@ -26,6 +26,45 @@ quikode unblock <task-id>
 
 Recovery: inspect block forensics, latest checker output, retry categories, progress checks, and worktree state. Fix locally and `resume`, or intentionally `retry`.
 
+## Container-Vanished Retry Cascade
+
+**Detection signature.** Multiple tasks blocking near-simultaneously with
+all of the following:
+
+- Identical retry-cause histogram fingerprint in `qk show <task>`:
+  `container_vanished=N` (typically 30–44) for the blocking subtask.
+- Per-attempt durations of <2 seconds across the last 30+ attempts.
+- Daemon log shows repeated `objective check FAILED (rc=1, 119 bytes of output)`
+  or `(rc=1, 69 bytes of output)`, where the body is `Error response from
+  daemon: No such container: ...` or `... is not running`.
+- Hitting the 50-attempt hard ceiling in 60–90 seconds of wall-clock.
+
+**Root cause** is documented in plan 20: `agents/base.py:_TRANSIENT_STDERR_MARKERS`
+already classifies these patterns as transient on the doer/triage path,
+but the objective gate runner (`workers/subtask_execution.py:_run_subtask_check_command`)
+historically did not — so vanished-container gate failures were charged
+against the per-subtask attempt counter. Plan 20 ships the fix:
+container recreation per attempt (`docker_env.ensure_dev_container_running`)
+and stderr-marker classification on the gate path.
+
+**Recovery template** (post-fix-deploy):
+
+1. Confirm the four plan-20 patches are deployed: `bash scripts/reinstall.sh --skip-tests`.
+2. Stop the daemon: `qk daemon stop`.
+3. For each affected task:
+   ```bash
+   qk unblock <task-id>          # forensics: confirm container_vanished histogram
+   qk reset-retries <task-id>    # zero retries on every blocked subtask
+   qk resume <task-id>           # → PENDING with resume marker
+   ```
+4. Restart daemon: `qk daemon start --detach --max-parallel <N> --retry-failed`.
+5. Soak ≥30 minutes; watch `qk briefing` for new `container_vanished` patterns.
+
+For batch incidents where a single root-cause docker event takes out many
+tasks at once, write a per-incident recovery doc under `docs/incident-<date>-*.md`
+listing each task + any task-specific worktree intervention needed before
+the resume (per plan 20's checklist for the 2026-05-07 incident).
+
 ## Failed Invariant
 
 First look: task log, artifact stream, and the state transition immediately before failure.

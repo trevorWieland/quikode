@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import fcntl
+
 from .cli_context import (
     BUILTIN_PROFILES,
     DAG,
@@ -191,6 +193,7 @@ def run(
 
     def cleanup_pid() -> None:
         _cleanup_pid(pid_file)
+        _release_orchestrator_lock()
 
     atexit.register(cleanup_pid)
     orch = Orchestrator(cfg, dag, store, task_filter=scope)
@@ -213,9 +216,58 @@ def _resolve_run_scope(dag: DAG, only: list[str] | None, milestone: str | None) 
     return None
 
 
+_orchestrator_lock_fd: int | None = None
+
+
+def _acquire_orchestrator_lock(cfg: Config) -> None:
+    """Acquire an exclusive flock on `<state_dir>/orchestrator.lock` BEFORE
+    any destructive workspace prep (container cleanup, orphan recovery).
+
+    Without this lock, two `qk run` invocations against the same workspace
+    race: the second's `cleanup_all_quikode` kills the first's live worker
+    containers, and `recover_orphan_tasks` flips rows to PENDING while the
+    first's worker threads are still firing FSM events against them — which
+    then crash with InvalidTransition. See plan 20 / 2026-05-07 incident.
+
+    flock is advisory and kernel-released on FD close (incl. SIGKILL), so a
+    crashed daemon never leaks the lock. The file descriptor is held in
+    module state for the daemon's lifetime — released by `cleanup_pid` via
+    the existing atexit hook. We use raw os.open / os.close rather than the
+    `open` builtin because the FD's lifetime intentionally exceeds any
+    function scope; a `with` would release the lock instantly.
+    """
+    global _orchestrator_lock_fd
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = cfg.state_dir / "orchestrator.lock"
+    fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        console.print(
+            f"[red]another quikode daemon holds {lock_path} — refusing to clean up "
+            f"containers; stop the other daemon first.[/]"
+        )
+        raise typer.Exit(2) from exc
+    _orchestrator_lock_fd = fd
+
+
+def _release_orchestrator_lock() -> None:
+    """Idempotent. Called from cleanup_pid atexit hook."""
+    global _orchestrator_lock_fd
+    if _orchestrator_lock_fd is not None:
+        try:
+            fcntl.flock(_orchestrator_lock_fd, fcntl.LOCK_UN)
+            os.close(_orchestrator_lock_fd)
+        except Exception:
+            pass
+        _orchestrator_lock_fd = None
+
+
 def _prepare_run_workspace(cfg: Config, *, max_parallel: int | None) -> None:
     for path in (cfg.log_dir, cfg.worktree_root, cfg.state_dir, cfg.sccache_dir):
         path.mkdir(parents=True, exist_ok=True)
+    _acquire_orchestrator_lock(cfg)
     if cfg.max_parallel_auto and max_parallel is None:
         host = docker_env.host_resources()
         cap, expl = _compute_max_parallel(cfg, host)

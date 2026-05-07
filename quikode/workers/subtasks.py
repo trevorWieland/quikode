@@ -268,7 +268,39 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
         triage_notes: str | None = None
         attempt = int((existing or {}).get("retries") or 0)
         consecutive_transients = 0
+        consecutive_reprovisions = 0
         while attempt < hard_max:
+            # Pre-flight: ensure the dev container is alive before each attempt.
+            # If it isn't, recreate cleanly. Caps consecutive recreations at 3
+            # so a permanently-broken provisioning path (bad image, missing
+            # mount, etc.) doesn't pin the worker indefinitely.
+            try:
+                recreated = _tw.docker_env.ensure_dev_container_running(
+                    self._h, self.cfg, self._existing_worktree_path()
+                )
+            except Exception as exc:
+                _tw.log.warning(
+                    "subtask %s/%s: ensure_dev_container_running raised %s; proceeding",
+                    self.node.id,
+                    subtask.id,
+                    exc,
+                )
+                recreated = False
+            if recreated:
+                consecutive_reprovisions += 1
+                _tw.log.warning(
+                    "subtask %s/%s: dev container recreated (consecutive=%d/3)",
+                    self.node.id,
+                    subtask.id,
+                    consecutive_reprovisions,
+                )
+                if consecutive_reprovisions > 3:
+                    return False, (
+                        f"subtask {subtask.id}: dev container recreation failed "
+                        f"3 consecutive times; aborting attempt loop"
+                    )
+            else:
+                consecutive_reprovisions = 0
             attempt += 1
             fsm_runtime.enter_doing_subtask(self.store, self.node.id, note=f"{subtask.id} attempt {attempt}")
             self._do_subtask(subtask, attempt, triage_notes)

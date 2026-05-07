@@ -157,7 +157,10 @@ def test_subtask_doer_prompt_includes_acceptance_and_files(tmp_path):
     assert "Triage feedback" not in out
 
 
-def test_subtask_doer_renders_triage_authoritatively(tmp_path):
+def test_subtask_doer_renders_triage_as_context(tmp_path):
+    """Plan 17 reframed triage feedback as context (not authoritative
+    fix-recipe) so the doer applies its own judgment guided by the
+    invariants. The prompt must still surface the triage body verbatim."""
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
     out = subtask_doer_prompt(
@@ -166,8 +169,8 @@ def test_subtask_doer_renders_triage_authoritatively(tmp_path):
         _subtask(),
         triage_notes="ROOT_CAUSE: missing field. WHAT_TO_DO_DIFFERENTLY: add foo.",
     )
-    assert "Triage feedback from prior attempt" in out
-    assert "authoritative" in out
+    assert "Triage from prior attempt" in out
+    assert "context, not a fix recipe" in out
     assert "missing field" in out
 
 
@@ -200,7 +203,11 @@ def test_conflict_resolver_prompt_renders_diffs(tmp_path):
     assert "GIVE_UP" in out
 
 
-def test_subtask_triage_prompt_scoped(tmp_path):
+def test_subtask_triage_prompt_root_cause_only(tmp_path):
+    """Plan 17 redesigned triage as a pure root-cause investigator. The
+    prompt must surface subtask id + checker output + doer summary, declare
+    the ROOT_CAUSE/CONFIDENCE schema, and explicitly forbid prescription
+    (the WHAT_TO_DO_DIFFERENTLY section is removed)."""
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
     out = subtask_triage_prompt(
@@ -216,4 +223,7 @@ def test_subtask_triage_prompt_scoped(tmp_path):
     assert "VERDICT: FAIL" in out
     assert "Tried but missed X" in out
     assert "ROOT_CAUSE:" in out
-    assert "scoped to this subtask" in out
+    assert "CONFIDENCE:" in out
+    # WHAT_TO_DO_DIFFERENTLY is intentionally absent (forbidden by plan 17).
+    assert "WHAT_TO_DO_DIFFERENTLY" in out  # mentioned only in the "Forbidden" block
+    assert "Forbidden in your output" in out

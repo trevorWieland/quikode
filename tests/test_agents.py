@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import inspect
 
+from quikode.agents.base import _is_quota_exhausted
 from quikode.agents.claude import ClaudeAgent
 from quikode.agents.codex import CodexAgent
 from quikode.agents.opencode import OpencodeAgent
@@ -51,8 +52,6 @@ def test_opencode_invocation_skips_permissions_and_sets_dir():
 
 
 # ----- quota-exhausted detection (plan 19A) -----
-
-from quikode.agents.base import _is_quota_exhausted  # noqa: E402
 
 
 def test_quota_exhausted_zero_rc_never_matches():
