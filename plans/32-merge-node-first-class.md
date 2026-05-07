@@ -160,11 +160,15 @@ Two PRs to keep the review surface manageable:
 
 Daemon restart on each PR. Validation ladder must stay green at every step.
 
-## Open question (one)
+## Audit gauntlet for merge-nodes (resolved)
 
-The merge-node's audit gauntlet runs rubric + standards + behavior audits. The behavior audit is keyed to `node.expected_evidence` per-task. **Merge-nodes don't have expected_evidence** — they have no DAG seed. Two ways:
+The full pre-PR gauntlet (rubric + standards + behavior + local-CI) is calibrated for spec tasks shipping new feature work. For a merge-node, only two stages carry real signal — and skipping the others avoids redundant work:
 
-- (a) Skip the behavior audit for merge-nodes; rubric + standards + local-CI suffice.
-- (b) Synthesize merge-node expected_evidence from the union of its parents' expected_evidence (the merged branch should still satisfy what each parent's behaviors witness).
+- **Local CI gate (`just ci`)** — required. Compile, lint, fast tests must pass on the integrated branch.
+- **Behavior audit** — required. `expected_evidence` is the **union of all source parents'** `expected_evidence`. The audit verifies every BDD scenario / witness from each parent still passes after integration. This is the "true risk surface of merging two branches autonomously" — A's behaviors might rely on a method B renamed; B's behaviors might rely on a contract A re-shaped; the integration may compile (CI passes) but break either parent's behavioral promise. The behavior audit catches this.
+- **Rubric audit** — skipped for merge-nodes. The integration's diff is the union of parents' diffs (modulo any merge-doer additions for semantic resolution); both parents already passed rubric scoring individually. Re-scoring the union is redundant.
+- **Standards audit** — skipped for the same reason. Standards drift is per-file; if neither parent introduced drift, the union doesn't either.
 
-(b) is more rigorous; (a) is simpler. Default to (b). Worth confirming before PR-B writes the prompt.
+**Exception**: when the merge-doer subloop runs (i.e., octopus/sequential merge had unresolvable textual conflicts and the planner emitted integration subtasks), the doer's commits ARE genuinely new content not present in either parent. For those cycles, rubric + standards audits ALSO run on the merge-doer's diff (against the parents' merge-base, not against main), to catch new code that bypasses the parent-level audits. The `pre_pr_audit` pipeline gains a `merge_node_mode` flag that skips rubric/standards by default but re-enables them when the cycle's commits include subtasks with `kind="merge-integration"`.
+
+Stage labels in the TUI reflect this: a merge-node row shows "local_ci · behavior" for the trivial-merge case, "local_ci · rubric · standards · behavior" for the conflict-resolution case.
