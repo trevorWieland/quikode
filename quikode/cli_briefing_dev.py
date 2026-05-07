@@ -73,9 +73,7 @@ def briefing(
     _print_agent_cost(store, merged_rows)
     total = len(dag.nodes)
     merged = sum(1 for r in rows if r["state"] == State.MERGED.value)
-    awaiting_count = len(
-        post_pr_groups["pending_ci"] + post_pr_groups["awaiting_review"] + post_pr_groups["merge_ready"]
-    )
+    awaiting_count = len(post_pr_groups["pending_ci"] + post_pr_groups["awaiting_review"])
     pct = (100 * merged // total) if total else 0
     console.print(
         f"\n[bold]DAG[/]  {merged}/{total} merged ({pct}%)  +{awaiting_count} awaiting merge  +{len(actives)} active  +{len(blocked)} blocked"
@@ -106,7 +104,6 @@ def _briefing_active_states() -> tuple[State, ...]:
         State.PENDING_CI,
         State.REBASING_TO_MAIN,
         State.CONFLICT_RESOLVING,
-        State.TRIAGING_FEEDBACK,
         State.FIXUP_PLANNING,
     )
 
@@ -138,10 +135,6 @@ def _briefing_json_payload(
         "pending_ci": [_briefing_row_summary(r) for r in rows if r["state"] == State.PENDING_CI.value],
         "awaiting_review": [
             _briefing_row_summary(r) for r in rows if r["state"] == State.AWAITING_REVIEW.value
-        ],
-        "merge_ready": [_briefing_row_summary(r) for r in rows if r["state"] == State.MERGE_READY.value],
-        "triaging_feedback": [
-            _briefing_row_summary(r) for r in rows if r["state"] == State.TRIAGING_FEEDBACK.value
         ],
         "addressing_feedback": [
             _briefing_row_summary(r) for r in rows if r["state"] == State.ADDRESSING_FEEDBACK.value
@@ -184,8 +177,6 @@ def _post_pr_groups(store: Store) -> dict[str, list]:
     return {
         "pending_ci": store.in_state(State.PENDING_CI),
         "awaiting_review": store.in_state(State.AWAITING_REVIEW),
-        "merge_ready": store.in_state(State.MERGE_READY),
-        "triaging_feedback": store.in_state(State.TRIAGING_FEEDBACK),
         "addressing_feedback": store.in_state(State.ADDRESSING_FEEDBACK),
         "rebasing": store.in_state(State.REBASING_TO_MAIN),
         "blocked": store.in_state(State.BLOCKED),
@@ -225,10 +216,8 @@ def _print_active_tasks(store: Store, actives: Sequence[Mapping[str, Any]], now:
 
 
 def _print_post_pr_groups(store: Store, groups: dict[str, list]) -> None:
-    _print_group(store, "Merge ready", "bright_green", groups["merge_ready"])
     _print_group(store, "Awaiting review (CI green)", "blue", groups["awaiting_review"])
     _print_group(store, "Pending CI", "yellow", groups["pending_ci"])
-    _print_group(store, "Triaging feedback (Python)", "cyan", groups["triaging_feedback"])
     _print_group(
         store, "Addressing feedback", "cyan", groups["addressing_feedback"], suffix_fn=_review_round_suffix
     )

@@ -13,21 +13,14 @@ class StoreReviewMixin:
         never polled). Used by the daemon's review-watcher pass to throttle
         GraphQL traffic.
 
-        Includes:
-        - PENDING_CI / AWAITING_REVIEW / MERGE_READY: the normal case — the
-          PR is open and waiting on something; poll for new threads + merge.
-          The poll itself drives transitions between these three sub-states
-          based on CI + review-approval signals.
-        - BLOCKED with a `pr_number`: the BLOCKED PR comment lists "reply
-          with guidance as a review comment" as an intervention path; for
-          that to actually work, the watcher keeps polling these PRs.
-          On a new non-bot thread, the response cycle fires and (on
-          success) transitions the task back to PENDING_CI.
+        Plan 28: post-PR set is now {PENDING_CI, AWAITING_REVIEW} —
+        MERGE_READY retired with the settle window. BLOCKED-with-PR rows
+        still poll so a human-driven CHANGES_REQUESTED review can reach the
+        worker after manual intervention.
         """
         post_pr_states = (
             State.PENDING_CI.value,
             State.AWAITING_REVIEW.value,
-            State.MERGE_READY.value,
         )
         placeholders = ",".join("?" * len(post_pr_states))
         with self._tx_lock:
@@ -39,6 +32,28 @@ class StoreReviewMixin:
                 (*post_pr_states, State.BLOCKED.value, cutoff),
             ).fetchall()
         return [cast(TaskRow, dict(r)) for r in rows]
+
+    def get_last_processed_review_id(self: Any, task_id: str) -> str | None:
+        """Plan 28: most recent GitHub Review id we've already routed to
+        ADDRESSING_FEEDBACK, or None if no review has fired yet.
+        """
+        with self._tx_lock:
+            r = self.conn.execute(
+                "SELECT last_processed_review_id FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        if r is None:
+            return None
+        v = r["last_processed_review_id"]
+        return str(v) if v else None
+
+    def mark_review_processed(self: Any, task_id: str, review_id: str) -> None:
+        """Stamp the most recent CHANGES_REQUESTED review id we've routed.
+        Idempotent — re-stamping the same id is a no-op."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE tasks SET last_processed_review_id = ?, updated_at = ? WHERE id = ?",
+                (review_id, time.time(), task_id),
+            )
 
     def get_stored_review_threads(self: Any, task_id: str) -> list[ReviewThreadRow]:
         with self._tx_lock:

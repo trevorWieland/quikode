@@ -1,6 +1,14 @@
-"""SQLite schema DDL."""
+"""SQLite schema DDL + plan-28 idempotent migrations.
+
+Fresh-install columns live in `SCHEMA`; existing-DB column adds + state
+renames live in `apply_migrations`, which is called once during `Store.__init__`
+right after `executescript(SCHEMA)`. Migrations are idempotent — re-running on
+an already-migrated DB is a no-op.
+"""
 
 from __future__ import annotations
+
+import sqlite3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -61,6 +69,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- MERGE_READY since the last notify (e.g. responded to a thread)
     -- so we don't spam on every poll tick.
     last_notified_settled_ts REAL,
+    -- Plan 28: most recent GitHub Review id we've already routed into
+    -- ADDRESSING_FEEDBACK. Prevents re-trigger on the same CHANGES_REQUESTED
+    -- after a daemon restart. NULL until first non-bot review observed.
+    last_processed_review_id TEXT,
     parent_task_ids TEXT,
     parent_branches TEXT,
     parent_pr_branches TEXT,
@@ -227,3 +239,24 @@ CREATE INDEX IF NOT EXISTS idx_progress_checks_subtask ON progress_checks(task_i
 CREATE INDEX IF NOT EXISTS idx_state_log_task ON state_log(task_id, ts);
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, kind, ts);
 """
+
+
+def apply_migrations(conn: sqlite3.Connection) -> None:
+    """Idempotent migrations for existing DBs.
+
+    Plan 28: add `tasks.last_processed_review_id` if missing, and rename the
+    two retired post-PR states (`merge_ready`, `triaging_feedback`) to their
+    streamlined replacements. Both UPDATEs are no-ops on fresh installs and on
+    re-runs.
+    """
+    try:
+        conn.execute("ALTER TABLE tasks ADD COLUMN last_processed_review_id TEXT")
+    except sqlite3.OperationalError:
+        # Column already present (fresh install via SCHEMA, or re-run).
+        pass
+    # Plan 28 state migration. `merge_ready` re-evaluates on next poll;
+    # `triaging_feedback` was always a transient classifier state — recovering
+    # rows there land in PENDING_CI which is what the daemon would do anyway
+    # via `recover_after_crash`.
+    conn.execute("UPDATE tasks SET state='awaiting_review' WHERE state='merge_ready'")
+    conn.execute("UPDATE tasks SET state='pending_ci' WHERE state='triaging_feedback'")

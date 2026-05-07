@@ -110,7 +110,6 @@ def load_config(root: Path | None = None) -> Config:
         pre_commit_runner=raw.get("pre_commit_runner", defaults.pre_commit_runner),
         pre_commit_timeout_s=int(raw.get("pre_commit_timeout_s", defaults.pre_commit_timeout_s)),
         review_poll_interval_s=int(raw.get("review_poll_interval_s", defaults.review_poll_interval_s)),
-        respond_to_bot_reviews=bool(raw.get("respond_to_bot_reviews", defaults.respond_to_bot_reviews)),
         review_response_extra_slots=int(
             raw.get("review_response_extra_slots", defaults.review_response_extra_slots)
         ),
@@ -121,12 +120,6 @@ def load_config(root: Path | None = None) -> Config:
         ),
         preempt_yield_threshold=int(raw.get("preempt_yield_threshold", defaults.preempt_yield_threshold)),
         auto_merge_when_clean=bool(raw.get("auto_merge_when_clean", defaults.auto_merge_when_clean)),
-        auto_merge_min_age_s=int(raw.get("auto_merge_min_age_s", defaults.auto_merge_min_age_s)),
-        notify_settled_channel=raw.get("notify_settled_channel", defaults.notify_settled_channel),
-        notify_settled_after_s=int(raw.get("notify_settled_after_s", defaults.notify_settled_after_s)),
-        notify_ntfy_url=raw.get("notify_ntfy_url", defaults.notify_ntfy_url),
-        notify_ntfy_topic=raw.get("notify_ntfy_topic", defaults.notify_ntfy_topic),
-        notify_slack_webhook_url=raw.get("notify_slack_webhook_url", defaults.notify_slack_webhook_url),
         cpu_per_task=int(resources.get("cpu_per_task", defaults.cpu_per_task)),
         mem_per_task_gb=int(resources.get("mem_per_task_gb", defaults.mem_per_task_gb)),
         host_reserved_cpu=int(resources.get("host_reserved_cpu", defaults.host_reserved_cpu)),
@@ -155,7 +148,6 @@ def load_config(root: Path | None = None) -> Config:
             Literal["speculative", "settled"],
             str(stacking.get("readiness", defaults.stacking_readiness)),
         ),
-        stack_settle_quiet_s=int(stacking.get("settle_quiet_s", defaults.stack_settle_quiet_s)),
         rebase_coalesce_window_s=int(
             stacking.get("rebase_coalesce_window_s", defaults.rebase_coalesce_window_s)
         ),

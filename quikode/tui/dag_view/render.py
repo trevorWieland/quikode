@@ -30,7 +30,6 @@ from .layout import Edge
 # State -> markup style. Edge variants are computed in `_edge_style`.
 _STATE_STYLE: dict[str, str] = {
     "merged": "green",
-    "merge_ready": "green",
     "awaiting_review": "yellow",
     "pending_ci": "yellow",
     "blocked": "red",
@@ -54,7 +53,6 @@ _IN_FLIGHT_STATES = {
     "pending_ci",
     "rebasing_to_main",
     "conflict_resolving",
-    "triaging_feedback",
     "fixup_planning",
     "addressing_feedback",
 }
@@ -62,7 +60,6 @@ _IN_FLIGHT_STATES = {
 # State -> single-character glyph painted at the start of the node cell.
 _STATE_GLYPH: dict[str, str] = {
     "merged": "✓",
-    "merge_ready": "✓",
     "awaiting_review": "⏸",
     "pending_ci": "⏵",
     "blocked": "✗",

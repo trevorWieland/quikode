@@ -228,7 +228,9 @@ class PrLifecycleWorkerMixin:
         row = self._row()
         if self._intent_review_budget_exhausted(row):
             return None
-        fsm_runtime.enter_triaging_feedback(self.store, self.node.id, note="dep merged; checking intent gap")
+        # Plan 28: TRIAGING_FEEDBACK retired. Intent review runs host-side and
+        # is bounded; the task stays in its current post-PR state during the
+        # check. The outcome handler transitions to PENDING_CI / FIXUP / etc.
         window = self._intent_review_window(row)
         if window is None:
             return None

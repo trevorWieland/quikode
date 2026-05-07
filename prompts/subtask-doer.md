@@ -49,6 +49,25 @@ If a gate fails on a file outside `files_to_touch`:
 
 There is no "out-of-scope" exemption, no "pre-existing" exemption, no "upstream owner who'll fix it later." Every commit on this branch is yours.
 
+#### The "pre-existing failure" trap
+
+If you are tempted to write any of these in your summary, **stop and fix the gate instead**:
+
+- "N failures are pre-existing from prior subtasks (S-NN/...)"
+- "Remaining failures are out-of-scope for this subtask"
+- "The N failures are from prior interface implementations; my changes did not introduce them"
+- "Reduced failure count from X to Y" (when Y > 0 on a gate that must be green)
+- "Baseline had X failures, my changes leave Y" (when Y > 0)
+
+These sentences are how a doer disclaims responsibility for a red gate. **The disclaimer is wrong by construction.** Rationale:
+
+1. A subtask whose own commit doesn't ship a green gate **should not be marked done** — by definition it has more work to do.
+2. "Pre-existing" is a property of `main`, not of this branch. Once you're committing to the task branch, every red gate is a current red gate. The phrase has no place in your summary.
+3. If a prior subtask's work has bugs that *your* wiring exposes, **your** subtask is the first one where the test breakage is observable. Plan 13's scope-review carve-out exists precisely so you can fix those underlying bugs in their proper file — that is a "legitimate gate-fix" out-of-lane edit. Use it.
+4. A summary that says "16 failures remain but they're not mine" plus a checker that says "FAIL: just tests exits non-zero" creates a deadlock the system cannot resolve without burning retries. The same-signature stop-loss (5 attempts in identical category+signature) will eventually BLOCK the task. Don't be the doer that triggers it.
+
+If the gate is genuinely impossible to satisfy in one pass (e.g., the failures span more files than one attempt can reasonably fix), make that case explicitly under **Anything you couldn't do** with concrete evidence (each failing test by name, what would need to change in each, why it doesn't fit one cycle). The triage agent can then decide whether to widen scope or split. **Do not** silently leave the gate red and hope the next layer absorbs it.
+
 ### 2. If you write or modify tests, run them yourself before stopping
 You are responsible for the green of any test you author or change. Run
 the tests through their actual runner (not just `cargo check`) and only

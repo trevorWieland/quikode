@@ -1,4 +1,30 @@
-"""Post-PR review and CI watcher mixin."""
+"""Post-PR review and CI watcher mixin (plan 28).
+
+Two polling phases per task:
+
+1. PENDING_CI: poll `gh pr view` for CI rollup. On `success` → AWAITING_REVIEW
+   via `CI_PASSED`. On `failure` → ADDRESSING_FEEDBACK with bundled CI excerpt
+   via `CI_FAILED` (no per-thread classifier in the loop).
+
+2. AWAITING_REVIEW: poll `gh pr view` (CI flake / merge / close detection)
+   plus formal Reviews via `_PR_REVIEWS_QUERY`. Trigger on the first non-bot
+   review whose id ≠ `last_processed_review_id`:
+   - `CHANGES_REQUESTED` → bundle every unresolved thread + every PR comment
+     + recent reviews, dispatch ADDRESSING_FEEDBACK worker.
+   - `APPROVED` (when `auto_merge_when_clean=True` AND CI clean) → fire
+     `gh pr merge --squash --delete-branch`. Next poll observes the remote
+     MERGED state and fires the FSM `MERGED` event.
+   - `COMMENTED` / `DISMISSED` / bot reviews → ignored. Comments + bots are
+     bundled CONTEXT only; resolved threads are excluded (= human-dismissed).
+
+Pre-plan-28 polluted code paths now retired:
+- per-thread classifier (`triage.classify_review_thread`)
+- `_classify_threads`, `_triage_review_threads`, `_resolve_auto_classified_threads`
+- thread-bookkeeping (`upsert_review_thread`, `mark_thread_addressed`)
+- `_classify_post_pr_target_state` 3-way truth table
+- `_block_if_review_rounds_exhausted` thread-batch counter
+- `_maybe_notify_settled` and the entire settled-task notification surface
+"""
 
 from __future__ import annotations
 
@@ -7,7 +33,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from quikode import fsm_runtime
-from quikode.github_graphql import ReviewThread
+from quikode.fsm import Event
+from quikode.github_graphql import Review
 from quikode.state import State, TaskRow
 
 
@@ -26,22 +53,12 @@ class ReviewWatchMixin:
         futures: dict[str, Future],
         review_response_futures: set[str],
     ) -> None:
-        """One review-watcher tick.
+        """One review-watcher tick (plan 28).
 
-        For every post-PR task whose last poll was older than
-        `cfg.review_poll_interval_s`:
-
-        1. Check the PR state via `gh pr view`. MERGED → transition to
-           MERGED. CLOSED → transition to ABORTED. Skip review-thread
-           polling for either terminal state.
-        2. Fetch live review threads via GraphQL. Diff against the stored
-           `review_threads` table to determine which threads need
-           addressing.
-        3. Bump `last_review_poll_ts` so the throttle window is honored.
-        4. If any threads need addressing AND the worker pool has slack,
-           submit a `run_review_response` future. The task transitions to
-           ADDRESSING_FEEDBACK synchronously before submit so the TUI /
-           pick-next loop see the new state immediately.
+        Throttled per-task by `cfg.review_poll_interval_s`. For each eligible
+        candidate, drives the post-PR FSM directly from CI + formal Review
+        signals. Method name retained for callsite stability; behavior is
+        the streamlined two-phase model.
         """
         now = _rt.time.time()
         cutoff = now - self.cfg.review_poll_interval_s
@@ -66,19 +83,21 @@ class ReviewWatchMixin:
         pr_number, repo = pr_info
         pr_status = _rt.github.poll_pr(self.cfg.repo_path, int(pr_number))
         self._maybe_schedule_cascade_for_push(task_row, pr_status, pool, futures, review_response_futures)
-        if self._handle_pre_thread_pr_signal(
+        if self._handle_pre_review_pr_signal(
             task_row, pr_status, now, pool, futures, review_response_futures
         ):
             return
-        threads = self._fetch_review_threads(repo, pr_number)
-        to_address = self._classify_threads(task_id, threads)
-        task_row = self._apply_post_pr_poll_state(task_row, pr_status, threads)
+        # Plan 28: only AWAITING_REVIEW rows poll formal reviews. PENDING_CI
+        # rows are CI-only on this tick (CI pass/fail handled in
+        # _handle_pre_review_pr_signal above and in _maybe_handle_ci_pass below).
         self.store.set_field(task_id, last_review_poll_ts=now)
-        if self._handle_review_threads(
-            repo, pr_number, task_row, to_address, now, pool, futures, review_response_futures
-        ):
+        if self._maybe_handle_ci_pass(task_row, pr_status):
             return
-        self._post_clean_review_followups(task_row, pr_status, threads)
+        if str(task_row.get("state")) != State.AWAITING_REVIEW.value:
+            return
+        self._handle_awaiting_review_reviews(
+            repo, pr_number, task_row, pr_status, pool, futures, review_response_futures
+        )
 
     def _review_pr_info(self: Any, task_row: TaskRow, now: float) -> tuple[int, str] | None:
         task_id = task_row["id"]
@@ -93,7 +112,7 @@ class ReviewWatchMixin:
         self.store.set_field(task_id, last_review_poll_ts=now)
         return None
 
-    def _handle_pre_thread_pr_signal(
+    def _handle_pre_review_pr_signal(
         self: Any,
         task_row: TaskRow,
         pr_status: _rt.github.PRStatus,
@@ -112,21 +131,142 @@ class ReviewWatchMixin:
             )
         )
 
-    def _handle_review_threads(
+    def _maybe_handle_ci_pass(self: Any, task_row: TaskRow, pr_status: _rt.github.PRStatus) -> bool:
+        """Drive PENDING_CI → AWAITING_REVIEW on observed CI success.
+
+        Returns True if a transition fired (caller should bail). On any other
+        state (including AWAITING_REVIEW already), returns False.
+        """
+        if str(task_row.get("state")) != State.PENDING_CI.value:
+            return False
+        if pr_status.checks_status not in ("success", "none"):
+            return False
+        task_id = task_row["id"]
+        fsm_runtime.enter_awaiting_review(self.store, task_id, note="CI green — awaiting formal review")
+        return True
+
+    def _handle_awaiting_review_reviews(
         self: Any,
         repo: str,
         pr_number: int,
         task_row: TaskRow,
-        to_address: list[ReviewThread],
-        now: float,
+        pr_status: _rt.github.PRStatus,
         pool: ThreadPoolExecutor,
         futures: dict[str, Future],
         review_response_futures: set[str],
-    ) -> bool:
-        if self._block_if_review_rounds_exhausted(task_row, to_address, now):
-            return True
-        to_address, task_row = self._triage_review_threads(repo, pr_number, task_row, to_address)
-        return self._dispatch_review_response(task_row, to_address, pool, futures, review_response_futures)
+    ) -> None:
+        """Plan 28: fetch formal reviews and dispatch on the latest novel one.
+
+        We process at most one review per tick — the most recent non-bot
+        submitted review whose id ≠ `last_processed_review_id`. This naturally
+        de-dupes across daemon restarts and across multiple bot reviews
+        landing between ticks.
+        """
+        task_id = task_row["id"]
+        try:
+            reviews = _rt.github_graphql.get_latest_reviews(repo, pr_number)
+        except Exception as e:
+            _rt.log.warning("get_latest_reviews(%s, %s) raised: %s", repo, pr_number, e)
+            return
+        last_processed = self.store.get_last_processed_review_id(task_id)
+        novel = self._novel_reviews(reviews, last_processed)
+        if not novel:
+            return
+        # Process the most recent novel non-bot submitted review.
+        target = novel[-1]
+        if target.state == "CHANGES_REQUESTED":
+            self._handle_changes_requested(
+                repo, pr_number, task_row, target, pool, futures, review_response_futures
+            )
+            return
+        if target.state == "APPROVED":
+            self._handle_approval(task_row, pr_status, target)
+            return
+        # COMMENTED, DISMISSED, PENDING — context-only; advance the cursor so
+        # we don't keep re-checking the same review.
+        self.store.mark_review_processed(task_id, target.review_id)
+
+    def _novel_reviews(self: Any, reviews: list[Review], last_processed: str | None) -> list[Review]:
+        """Return submitted, non-bot reviews newer than `last_processed`,
+        sorted oldest-first (caller takes [-1] for most recent)."""
+        non_bot = [r for r in reviews if not r.is_bot and r.state != "PENDING"]
+        if not last_processed:
+            return non_bot
+        seen = False
+        out: list[Review] = []
+        for r in non_bot:  # already sorted oldest-first by get_latest_reviews
+            if seen:
+                out.append(r)
+            elif r.review_id == last_processed:
+                seen = True
+        return out if seen else non_bot
+
+    def _handle_changes_requested(
+        self: Any,
+        repo: str,
+        pr_number: int,
+        task_row: TaskRow,
+        review: Review,
+        pool: ThreadPoolExecutor,
+        futures: dict[str, Future],
+        review_response_futures: set[str],
+    ) -> None:
+        task_id = task_row["id"]
+        review_cap = self.cfg.max_parallel + self.cfg.review_response_extra_slots
+        if len(futures) >= review_cap:
+            _rt.log.info(
+                "task %s: CHANGES_REQUESTED received but pool full (%d/%d); will retry next tick",
+                task_id,
+                len(futures),
+                review_cap,
+            )
+            return
+        current_round = int(task_row.get("review_round") or 0)
+        if current_round >= self.cfg.review_rounds_max:
+            note = (
+                f"review_rounds_max ({self.cfg.review_rounds_max}) exhausted; manual merge or close required."
+            )
+            _rt.log.warning("task %s: review rounds exhausted — BLOCKING", task_id)
+            fsm_runtime.block_current(
+                self.store,
+                task_id,
+                note=note,
+                last_error=note,
+            )
+            self.store.mark_review_processed(task_id, review.review_id)
+            return
+        try:
+            bundled_context = _rt.github_graphql.bundle_pr_context(repo, pr_number)
+        except Exception as e:
+            _rt.log.warning(
+                "bundle_pr_context(%s, %s) raised: %s — using review body only", repo, pr_number, e
+            )
+            bundled_context = ""
+        if not bundled_context.strip():
+            bundled_context = f"CHANGES_REQUESTED review by {review.author}:\n{review.body or '(no body)'}"
+        fsm_runtime.enter_addressing_feedback(
+            self.store,
+            task_id,
+            note=f"CHANGES_REQUESTED by {review.author}",
+            event=Event.CHANGES_REQUESTED_RECEIVED,
+        )
+        self.store.mark_review_processed(task_id, review.review_id)
+        _rt.log.info(
+            "scheduling changes-requested response for task %s (review by %s)",
+            task_id,
+            review.author,
+        )
+        fut = pool.submit(self._run_changes_requested_response_one, task_id, bundled_context)
+        futures[task_id] = fut
+        review_response_futures.add(task_id)
+
+    def _handle_approval(
+        self: Any, task_row: TaskRow, pr_status: _rt.github.PRStatus, review: Review
+    ) -> None:
+        task_id = task_row["id"]
+        # Stamp processed so we don't re-trigger on the same approval.
+        self.store.mark_review_processed(task_id, review.review_id)
+        self._attempt_auto_merge(task_row, pr_status, review.review_id)
 
     def _maybe_schedule_cascade_for_push(
         self: Any,
@@ -270,255 +410,6 @@ class ReviewWatchMixin:
         self._schedule_ci_fix_response(task_row["id"], pr_status, pool, futures, review_response_futures)
         return True
 
-    def _fetch_review_threads(self: Any, repo: str, pr_number: int) -> list[ReviewThread]:
-        try:
-            return _rt.github_graphql.get_review_threads(repo, pr_number)
-        except Exception as e:
-            _rt.log.warning("get_review_threads(%s, %s) raised: %s", repo, pr_number, e)
-            return []
-
-    def _apply_post_pr_poll_state(
-        self: Any,
-        task_row: TaskRow,
-        pr_status: _rt.github.PRStatus,
-        threads: list[ReviewThread],
-    ) -> TaskRow:
-        task_id = task_row["id"]
-        target = self._classify_post_pr_target_state(task_row, pr_status, threads)
-        if target is None or target.value == task_row.get("state"):
-            return task_row
-        if target is State.PENDING_CI:
-            if task_row.get("state") in {State.AWAITING_REVIEW.value, State.MERGE_READY.value}:
-                fsm_runtime.enter_triaging_feedback(
-                    self.store, task_id, note=f"poll classified state -> {target.value}"
-                )
-                if any(not thread.is_resolved for thread in threads):
-                    return _rt.cast(TaskRow, {**dict(task_row), "state": State.TRIAGING_FEEDBACK.value})
-            fsm_runtime.enter_pending_ci(self.store, task_id, note=f"poll classified state -> {target.value}")
-        elif target is State.AWAITING_REVIEW:
-            fsm_runtime.enter_awaiting_review(
-                self.store, task_id, note=f"poll classified state -> {target.value}"
-            )
-        elif target is State.MERGE_READY:
-            fsm_runtime.enter_merge_ready(
-                self.store, task_id, note=f"poll classified state -> {target.value}"
-            )
-        return _rt.cast(TaskRow, {**dict(task_row), "state": target.value})
-
-    def _block_if_review_rounds_exhausted(
-        self: Any,
-        task_row: TaskRow,
-        to_address: list[ReviewThread],
-        now: float,
-    ) -> bool:
-        current_round = int(task_row.get("review_round") or 0)
-        if not to_address or current_round < self.cfg.review_rounds_max:
-            return False
-        task_id = task_row["id"]
-        note = (
-            f"review_rounds_max ({self.cfg.review_rounds_max}) exhausted; "
-            f"{len(to_address)} thread(s) still unresolved. Manual merge or close required."
-        )
-        _rt.log.warning(
-            "task %s: review_rounds_max (%d) exhausted with %d unresolved thread(s); BLOCKING for manual merge/close",
-            task_id,
-            self.cfg.review_rounds_max,
-            len(to_address),
-        )
-        fsm_runtime.enter_triaging_feedback(self.store, task_id, note=note)
-        fsm_runtime.block_current(
-            self.store,
-            task_id,
-            note=note,
-            last_error=f"review_rounds_max={self.cfg.review_rounds_max} exhausted; {len(to_address)} unresolved threads remaining",
-        )
-        self.store.set_field(task_id, last_review_poll_ts=now)
-        return True
-
-    def _triage_review_threads(
-        self: Any,
-        repo: str,
-        pr_number: int,
-        task_row: TaskRow,
-        to_address: list[ReviewThread],
-    ) -> tuple[list[ReviewThread], TaskRow]:
-        if not to_address:
-            return to_address, task_row
-        task_id = task_row["id"]
-        fsm_runtime.enter_triaging_feedback(
-            self.store, task_id, note=f"classifying {len(to_address)} thread(s)"
-        )
-        updated = _rt.cast(TaskRow, {**dict(task_row), "state": State.TRIAGING_FEEDBACK.value})
-        outcome = _rt.triage.triage_review_threads(
-            cfg=self.cfg,
-            plan_text=str(updated.get("plan_text") or ""),
-            threads=list(to_address),
-        )
-        self._resolve_auto_classified_threads(repo, pr_number, task_id, outcome.auto_resolved)
-        if outcome.deferred:
-            _rt.log.info(
-                "task %s: %d thread(s) deferred to human review (needs_discussion)",
-                task_id,
-                len(outcome.deferred),
-            )
-        if outcome.classifier_errors:
-            _rt.log.warning(
-                "task %s: %d classifier error(s) — those thread(s) fall through to ADDRESSING_FEEDBACK",
-                task_id,
-                outcome.classifier_errors,
-            )
-        if outcome.actionable_threads:
-            return outcome.actionable_threads, updated
-        fsm_runtime.enter_pending_ci(
-            self.store, task_id, note="triage handled all threads in-process; nothing to dispatch"
-        )
-        return [], _rt.cast(TaskRow, {**dict(updated), "state": State.PENDING_CI.value})
-
-    def _resolve_auto_classified_threads(
-        self: Any,
-        repo: str,
-        pr_number: int,
-        task_id: str,
-        auto_resolved: list[Any],
-    ) -> None:
-        for thread, verdict in auto_resolved:
-            self._reply_to_auto_resolved_thread(repo, pr_number, thread, verdict)
-            try:
-                _rt.github_graphql.resolve_thread(thread.thread_id)
-            except Exception as e:
-                _rt.log.warning("auto-resolve of thread %s failed: %s", thread.thread_id, e)
-            self.store.mark_thread_addressed(
-                task_id,
-                thread.thread_id,
-                f"auto-classifier-incorrect: {verdict.rationale[:80]}",
-            )
-
-    def _reply_to_auto_resolved_thread(
-        self: Any, repo: str, pr_number: int, thread: Any, verdict: Any
-    ) -> None:
-        if not verdict.reply or thread.last_comment_database_id is None:
-            return
-        try:
-            _rt.github_graphql.reply_to_review_thread(
-                repo=repo,
-                pr_number=pr_number,
-                last_comment_database_id=thread.last_comment_database_id,
-                body=verdict.reply,
-            )
-        except Exception as e:
-            _rt.log.warning("auto-reply to thread %s failed: %s", thread.thread_id, e)
-
-    def _dispatch_review_response(
-        self: Any,
-        task_row: TaskRow,
-        to_address: list[ReviewThread],
-        pool: ThreadPoolExecutor,
-        futures: dict[str, Future],
-        review_response_futures: set[str],
-    ) -> bool:
-        if not to_address:
-            return False
-        task_id = task_row["id"]
-        review_cap = self.cfg.max_parallel + self.cfg.review_response_extra_slots
-        if len(futures) < review_cap:
-            self._schedule_review_response(task_id, to_address, pool, futures, review_response_futures)
-            return True
-        _rt.log.info(
-            "task %s has %d unresolved review threads but pool is full (%d/%d); will retry next tick",
-            task_id,
-            len(to_address),
-            len(futures),
-            review_cap,
-        )
-        if task_row.get("state") == State.TRIAGING_FEEDBACK.value:
-            fsm_runtime.enter_pending_ci(self.store, task_id, note="pool full - re-deferring to next poll")
-        return True
-
-    def _post_clean_review_followups(
-        self: Any,
-        task_row: TaskRow,
-        pr_status: _rt.github.PRStatus,
-        threads: list[ReviewThread],
-    ) -> None:
-        if self.cfg.auto_merge_when_clean and task_row.get("state") == State.MERGE_READY.value:
-            self._attempt_auto_merge(task_row, pr_status, threads)
-        if task_row.get("state") == State.MERGE_READY.value:
-            self._maybe_notify_settled(task_row, pr_status, threads)
-
-    def _classify_threads(self: Any, task_id: str, threads: list[ReviewThread]) -> list[ReviewThread]:
-        """Decide which threads warrant a response cycle and upsert all of
-        them into the `review_threads` table.
-
-        Address rules (all must be satisfied):
-          - thread.is_resolved is False
-          - last_comment_is_bot is False, OR cfg.respond_to_bot_reviews is True
-          - thread is "new" relative to what we last addressed: either no
-            stored row exists, OR the stored row was never marked addressed,
-            OR the latest comment is newer than what we stored last time we
-            addressed the thread.
-        """
-        to_address: list[ReviewThread] = []
-        for t in threads:
-            stored = self.store.get_review_thread(task_id, t.thread_id)
-            # Upsert first so the table tracks current state regardless of action.
-            self.store.upsert_review_thread(
-                task_id,
-                thread_id=t.thread_id,
-                is_resolved=t.is_resolved,
-                last_comment_ts=t.last_comment_created_at,
-                last_comment_author=t.last_comment_author,
-                last_comment_is_bot=t.last_comment_is_bot,
-            )
-            if t.is_resolved:
-                continue
-            if t.last_comment_is_bot and not self.cfg.respond_to_bot_reviews:
-                continue
-            # Thread is new (no stored row) → address.
-            if stored is None:
-                to_address.append(t)
-                continue
-            addressed_sha = stored.get("addressed_in_commit_sha")
-            if not addressed_sha:
-                # Never addressed; the stored row is from a prior poll-only
-                # observation. Address it.
-                to_address.append(t)
-                continue
-            # Already addressed at some point. Address again iff the latest
-            # comment is newer than what we last saw at address _rt.time. We
-            # approximate by comparing the incoming `last_comment_created_at`
-            # to the previously-stored `last_comment_ts` — the upsert above
-            # already overwrote that field, so we fall back to stored value
-            # before the upsert. For a conservative approach: if the times
-            # differ, treat it as a new comment.
-            stored_ts = float(stored.get("last_comment_ts") or 0.0)
-            if t.last_comment_created_at > stored_ts:
-                to_address.append(t)
-        return to_address
-
-    def _schedule_review_response(
-        self: Any,
-        task_id: str,
-        threads: list[ReviewThread],
-        pool: ThreadPoolExecutor,
-        futures: dict[str, Future],
-        review_response_futures: set[str],
-    ) -> None:
-        """Mark the task ADDRESSING_FEEDBACK and submit a worker future."""
-        fsm_runtime.enter_addressing_feedback(
-            self.store,
-            task_id,
-            note=f"daemon scheduled response to {len(threads)} thread(s)",
-        )
-        _rt.log.info("scheduling review response for task %s (%d threads)", task_id, len(threads))
-        fut = pool.submit(self._run_review_response_one, task_id, threads)
-        futures[task_id] = fut
-        review_response_futures.add(task_id)
-
-    def _run_review_response_one(self: Any, task_id: str, threads: list[ReviewThread]):
-        node = self.dag.nodes[task_id]
-        worker = _rt.TaskWorker(self.cfg, self.dag, self.store, node)
-        return worker.run_review_response(threads)
-
     def _schedule_ci_fix_response(
         self: Any,
         task_id: str,
@@ -527,20 +418,26 @@ class ReviewWatchMixin:
         futures: dict[str, Future],
         review_response_futures: set[str],
     ) -> None:
-        """Dispatch a CI-fix cycle when GitHub CI fails *after* the worker
-        has handed off to PENDING_CI. Re-uses the review-response
-        worker entry mode (which fixup-decomposes into per-slice subtasks)
-        with a CI-failure trigger context."""
-        fsm_runtime.enter_triaging_feedback(
-            self.store,
-            task_id,
-            note=f"CI failed with {len(pr_status.failed_checks)} failed check(s)",
-        )
-        fsm_runtime.enter_addressing_feedback(
-            self.store,
-            task_id,
-            note=f"daemon scheduled CI-fix for {len(pr_status.failed_checks)} failed check(s)",
-        )
+        """Plan 28: route CI failure straight to ADDRESSING_FEEDBACK via
+        either CI_FAILED (from PENDING_CI) or CI_FAILED (from AWAITING_REVIEW
+        — CI flake after pass). No TRIAGING_FEEDBACK intermediate.
+        """
+        # Use the right event depending on current state.
+        row = self.store.get(task_id)
+        current = State(str(row["state"])) if row else None
+        if current is State.AWAITING_REVIEW:
+            fsm_runtime.enter_addressing_feedback(
+                self.store,
+                task_id,
+                note=f"daemon scheduled CI-fix for {len(pr_status.failed_checks)} failed check(s)",
+                event=Event.CI_FAILED,
+            )
+        else:
+            fsm_runtime.enter_addressing_feedback(
+                self.store,
+                task_id,
+                note=f"daemon scheduled CI-fix for {len(pr_status.failed_checks)} failed check(s)",
+            )
         _rt.log.info(
             "scheduling CI-fix for task %s (%d failed checks)",
             task_id,
@@ -550,14 +447,13 @@ class ReviewWatchMixin:
         futures[task_id] = fut
         review_response_futures.add(task_id)
 
-    def _run_ci_fix_response_one(self: Any, task_id: str, pr_status: _rt.github.PRStatus):
-        """Worker entry for daemon-detected CI failure on a post-PR task.
+    def _run_changes_requested_response_one(self: Any, task_id: str, bundled_context: str):
+        """Worker entry for daemon-detected CHANGES_REQUESTED review (plan 28)."""
+        node = self.dag.nodes[task_id]
+        worker = _rt.TaskWorker(self.cfg, self.dag, self.store, node)
+        return worker.run_changes_requested_response(bundled_context)
 
-        Fetches the failed-check logs, builds a synthetic ReviewThread-shaped
-        payload describing the CI failure, and routes through the same
-        `run_review_response` path. The worker's fixup planner sees the
-        failure context and emits CI-fix subtasks.
-        """
+    def _run_ci_fix_response_one(self: Any, task_id: str, pr_status: _rt.github.PRStatus):
         node = self.dag.nodes[task_id]
         worker = _rt.TaskWorker(self.cfg, self.dag, self.store, node)
         return worker.run_ci_fix_response(pr_status)

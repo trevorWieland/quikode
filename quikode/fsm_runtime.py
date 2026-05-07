@@ -94,12 +94,16 @@ def enter_pr_opening(store: Any, task_id: str, *, note: str | None = None, **fie
 
 
 def enter_pending_ci(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+    """Plan 28: PENDING_CI is reached from PR_OPENING (PR_OPENED), from
+    ADDRESSING_FEEDBACK after fixup-push (FEEDBACK_PUSHED), or from
+    REBASING_TO_MAIN after rebase-push (REBASE_PUSHED). The pre-plan-28
+    `NO_ACTIONABLE_FEEDBACK` path retired with `TRIAGING_FEEDBACK`.
+    """
     state = current_state(store, task_id)
     if state is State.PENDING_CI:
         return state
     event_by_state = {
         State.PR_OPENING: Event.PR_OPENED,
-        State.TRIAGING_FEEDBACK: Event.NO_ACTIONABLE_FEEDBACK,
         State.ADDRESSING_FEEDBACK: Event.FEEDBACK_PUSHED,
         State.REBASING_TO_MAIN: Event.REBASE_PUSHED,
     }
@@ -110,46 +114,44 @@ def enter_pending_ci(store: Any, task_id: str, *, note: str | None = None, **fie
 
 
 def enter_awaiting_review(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+    """Plan 28: AWAITING_REVIEW is reached from PENDING_CI on CI_PASSED. The
+    pre-plan-28 MERGE_READY → AWAITING_REVIEW idempotency arm retired with
+    the settle window."""
     state = current_state(store, task_id)
-    if state in {State.AWAITING_REVIEW, State.MERGE_READY}:
+    if state is State.AWAITING_REVIEW:
         return state
-    return store.apply_event(task_id, Event.CI_GREEN_THREADS_CLEAN, note=note, **fields)
+    return store.apply_event(task_id, Event.CI_PASSED, note=note, **fields)
 
 
-def enter_merge_ready(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_addressing_feedback(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+    """Plan 28: ADDRESSING_FEEDBACK reached directly from PENDING_CI (CI fail)
+    or AWAITING_REVIEW (CI flake or CHANGES_REQUESTED). No intermediate
+    classifier state — the bundled context (CI excerpt, threads, PR comments,
+    review bodies) is the input to the fixup planner."""
     state = current_state(store, task_id)
-    if state is State.MERGE_READY:
+    if state is State.ADDRESSING_FEEDBACK:
         return state
-    return store.apply_event(task_id, Event.SETTLE_WINDOW_ELAPSED, note=note, **fields)
+    if state is State.PENDING_CI:
+        return store.apply_event(task_id, Event.CI_FAILED, note=note, **fields)
+    if state is State.AWAITING_REVIEW:
+        # Caller picks the trigger by passing event=… — default to
+        # CHANGES_REQUESTED since CI flake is the rarer case.
+        event = fields.pop("event", None) or Event.CHANGES_REQUESTED_RECEIVED
+        return store.apply_event(task_id, event, note=note, **fields)
+    raise InvalidTransition(f"cannot enter addressing_feedback from {state.value}")
 
 
 def mark_merged(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+    """Plan 28: MERGED reached from PENDING (seed-from-base via MARK_MERGED),
+    PENDING_CI (CI_PASSED → AWAITING_REVIEW → MERGED), or AWAITING_REVIEW
+    directly. The pre-plan-28 SETTLE_WINDOW_ELAPSED hop retired."""
     state = current_state(store, task_id)
     if state is State.PENDING:
         return store.apply_event(task_id, Event.MARK_MERGED, note=note, **fields)
     if state is State.PENDING_CI:
-        store.apply_event(task_id, Event.CI_GREEN_THREADS_CLEAN, note=note)
+        store.apply_event(task_id, Event.CI_PASSED, note=note)
         state = State.AWAITING_REVIEW
-    if state is State.AWAITING_REVIEW:
-        store.apply_event(task_id, Event.SETTLE_WINDOW_ELAPSED, note=note)
     return store.apply_event(task_id, Event.MERGED, note=note, **fields)
-
-
-def enter_triaging_feedback(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
-    state = current_state(store, task_id)
-    if state is State.TRIAGING_FEEDBACK:
-        return state
-    if state is State.PENDING_CI:
-        return store.apply_event(task_id, Event.CI_FAILED_OR_THREADS_FOUND, note=note, **fields)
-    if state in {State.AWAITING_REVIEW, State.MERGE_READY}:
-        return store.apply_event(task_id, Event.THREADS_FOUND, note=note, **fields)
-    raise InvalidTransition(f"cannot enter triaging_feedback from {state.value}")
-
-
-def enter_addressing_feedback(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
-    if current_state(store, task_id) is State.PENDING_CI:
-        store.apply_event(task_id, Event.CI_FAILED_OR_THREADS_FOUND, note=note)
-    return store.apply_event(task_id, Event.ACTIONABLE_FEEDBACK, note=note, **fields)
 
 
 def enter_rebasing_to_main(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
@@ -166,10 +168,9 @@ def enter_conflict_resolving(store: Any, task_id: str, *, note: str | None = Non
 
 
 def block_current(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+    """Plan 28: TRIAGING_FEEDBACK retired. ADDRESSING_FEEDBACK can still
+    block via FEEDBACK_EXHAUSTED."""
     state = current_state(store, task_id)
-    if state is State.TRIAGING_FEEDBACK:
-        store.apply_event(task_id, Event.ACTIONABLE_FEEDBACK, note=note)
-        state = State.ADDRESSING_FEEDBACK
     event_by_state = {
         State.TRIAGING_SUBTASK: Event.RETRY_EXHAUSTED,
         State.FIXUP_PLANNING: Event.FIXUP_EXHAUSTED,

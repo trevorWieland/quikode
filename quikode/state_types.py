@@ -53,7 +53,10 @@ class TaskRow(TypedDict):
     # `cfg.auto_merge_when_clean`. Audit-only — does not change state-machine
     # behavior.
     auto_merged: NotRequired[int | None]
-    last_notified_settled_ts: NotRequired[float | None]
+    # Plan 28: tracks the most recent GitHub Review id we've already routed to
+    # ADDRESSING_FEEDBACK so we don't re-trigger on the same CHANGES_REQUESTED
+    # after a daemon restart. NULL until the first non-bot review arrives.
+    last_processed_review_id: NotRequired[str | None]
     # rebase coalescing: timestamp of the most recent rebase trigger for
     # this task, used by `_schedule_rebase_to_main` to dedupe rapid-fire
     # triggers within `cfg.rebase_coalesce_window_s`.
@@ -146,7 +149,6 @@ TERMINAL = {
     State.MERGED,
     State.PENDING_CI,
     State.AWAITING_REVIEW,
-    State.MERGE_READY,
     State.BLOCKED,
     State.FAILED,
     State.ABORTED,
@@ -163,21 +165,17 @@ ACTIVE = {
     State.PENDING_CI,
     State.REBASING_TO_MAIN,
     State.CONFLICT_RESOLVING,
-    State.TRIAGING_FEEDBACK,
     State.FIXUP_PLANNING,
-    State.FIXUP_PLANNING,
-    State.TRIAGING_FEEDBACK,
     State.ADDRESSING_FEEDBACK,
     State.LOCAL_CI_CHECKING,
     State.PRE_PR_AUDITING,
-    State.FIXUP_PLANNING,
-    State.REBASING_TO_MAIN,
 }
 
 # Convenience set: any state where the PR is open and waiting on something
-# outside the worker (CI run, human/bot review, settle window). PENDING_CI
-# is the most common — the worker just opened the PR and CI is running.
-POST_PR_STATES = {State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_READY}
+# outside the worker (CI run, human/bot review). PENDING_CI is the most common
+# — the worker just opened the PR and CI is running. Plan 28 retired
+# MERGE_READY (the settle window died with the per-thread classifier).
+POST_PR_STATES = {State.PENDING_CI, State.AWAITING_REVIEW}
 
 
 class SubtaskState(StrEnum):

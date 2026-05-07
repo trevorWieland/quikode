@@ -126,7 +126,7 @@ def test_addressing_feedback_goes_to_pending_ci(tmp_path):
 
 @pytest.mark.parametrize(
     "from_state",
-    [State.REBASING_TO_MAIN, State.CONFLICT_RESOLVING, State.TRIAGING_FEEDBACK, State.REBASING_TO_MAIN],
+    [State.REBASING_TO_MAIN, State.CONFLICT_RESOLVING, State.PR_OPENING, State.REBASING_TO_MAIN],
 )
 def test_pr_aware_states_with_pr_go_to_pending_ci(tmp_path, from_state):
     s = _store(tmp_path)
@@ -138,7 +138,7 @@ def test_pr_aware_states_with_pr_go_to_pending_ci(tmp_path, from_state):
 
 @pytest.mark.parametrize(
     "from_state",
-    [State.REBASING_TO_MAIN, State.CONFLICT_RESOLVING, State.TRIAGING_FEEDBACK, State.REBASING_TO_MAIN],
+    [State.REBASING_TO_MAIN, State.CONFLICT_RESOLVING, State.PR_OPENING, State.REBASING_TO_MAIN],
 )
 def test_pr_aware_states_without_pr_resume_to_pending(tmp_path, from_state):
     s = _store(tmp_path)

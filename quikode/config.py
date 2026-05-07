@@ -199,15 +199,13 @@ class Config(BaseModel):
         default=60,
         ge=10,
         le=3600,
-        description="How often the daemon polls open PRs for new review threads.",
-    )
-    respond_to_bot_reviews: bool = Field(
-        default=True,
+        description="How often the daemon polls open PRs for CI status + formal Reviews.",
     )
     review_rounds_max: int = Field(
         default=15,
         ge=1,
         le=100,
+        description="Plan 28: counts CHANGES_REQUESTED rounds. Block when exhausted.",
     )
     review_response_extra_slots: int = Field(
         default=1,
@@ -239,33 +237,10 @@ class Config(BaseModel):
         ge=0,
         le=1000,
     )
-    # ----- v3 polish: auto-merge -----
+    # ----- v3 polish: auto-merge (plan 28: triggered by APPROVED review) -----
     auto_merge_when_clean: bool = Field(
         default=False,
-    )
-    auto_merge_min_age_s: int = Field(
-        default=60,
-        ge=0,
-        le=3600,
-    )
-
-    # ----- v3 settled-task notifications -----
-    notify_settled_channel: Literal["none", "ntfy", "slack", "both"] = Field(
-        default="none",
-    )
-    notify_settled_after_s: int = Field(
-        default=1800,
-        ge=60,
-        le=14400,
-    )
-    notify_ntfy_url: str = Field(
-        default="https://ntfy.sh",
-    )
-    notify_ntfy_topic: str = Field(
-        default="",
-    )
-    notify_slack_webhook_url: str = Field(
-        default="",
+        description="Squash-merge automatically when a non-bot APPROVED review lands and the PR is clean.",
     )
 
     # ----- v2 Resources -----
@@ -351,11 +326,6 @@ class Config(BaseModel):
     )
     stacking_readiness: Literal["speculative", "settled"] = Field(
         default="speculative",
-    )
-    stack_settle_quiet_s: int = Field(
-        default=600,
-        ge=0,
-        le=3600,
     )
     rebase_coalesce_window_s: int = Field(
         default=30,

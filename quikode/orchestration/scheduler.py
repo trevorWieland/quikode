@@ -32,7 +32,6 @@ STACK_READY_STATES = frozenset(
         *(s.value for s in FSM_STACK_READY_STATES),
         State.PENDING_CI.value,
         State.PR_OPENING.value,
-        State.TRIAGING_FEEDBACK.value,
         State.ADDRESSING_FEEDBACK.value,
         State.PROVISIONING.value,
         State.FIXUP_PLANNING.value,
@@ -54,11 +53,10 @@ def is_parent_stack_ready(
 
     - `"speculative"` (default): any state in `STACK_READY_STATES` — children
       fork the moment a PR exists on origin.
-    - `"settled"`: parent must be in MERGE_READY. The MERGE_READY state itself
-      already encodes "CI green, no unresolved threads, settled past the quiet
-      window" — no extra timer check needed at this layer. The
-      `cfg.stack_settle_quiet_s` knob remains as the threshold the daemon
-      uses to *enter* MERGE_READY.
+    - `"settled"`: parent must be in AWAITING_REVIEW. Plan 28 retired
+      MERGE_READY (the settle window died with the per-thread classifier);
+      AWAITING_REVIEW is now the closest "CI green, ready for human
+      attention" signal.
 
     `parent_state` is the cached state we already read for the candidate's
     deps — passed in to avoid an extra Store.get per evaluation. The
@@ -72,7 +70,7 @@ def is_parent_stack_ready(
     mode = getattr(cfg, "stacking_readiness", "speculative")
     if mode == "speculative":
         return parent_state in STACK_READY_STATES
-    return parent_state == State.MERGE_READY.value
+    return parent_state == State.AWAITING_REVIEW.value
 
 
 # Resume-boost weights. Keep these visible at module top so the score

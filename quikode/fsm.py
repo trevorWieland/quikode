@@ -2,6 +2,12 @@
 
 This module is the source of truth for the supported task states and
 event-driven transitions.
+
+Plan 28 cutover (2026-05-07): the post-PR slice is streamlined to two polling
+phases. `MERGE_READY` and `TRIAGING_FEEDBACK` retire; the settle window
+retires; the per-thread classifier retires. Only formal GitHub Reviews trigger
+state changes — bot/AI-reviewer line comments become bundled CONTEXT for the
+fixup planner, not polling triggers. See plans/28-streamlined-post-pr-fsm.md.
 """
 
 from __future__ import annotations
@@ -28,8 +34,6 @@ class State(StrEnum):
     PR_OPENING = "pr_opening"
     PENDING_CI = "pending_ci"
     AWAITING_REVIEW = "awaiting_review"
-    MERGE_READY = "merge_ready"
-    TRIAGING_FEEDBACK = "triaging_feedback"
     ADDRESSING_FEEDBACK = "addressing_feedback"
     REBASING_TO_MAIN = "rebasing_to_main"
     CONFLICT_RESOLVING = "conflict_resolving"
@@ -58,13 +62,18 @@ class Event(StrEnum):
     FIXUP_PLAN_VALID = "fixup_plan_valid"
     FIXUP_EXHAUSTED = "fixup_exhausted"
     PR_OPENED = "pr_opened"
-    CI_GREEN_THREADS_CLEAN = "ci_green_threads_clean"
-    SETTLE_WINDOW_ELAPSED = "settle_window_elapsed"
+    # Plan 28: post-PR events. CI_PASSED takes the row from PENDING_CI to
+    # AWAITING_REVIEW (no thread polling). CI_FAILED routes the row directly
+    # to ADDRESSING_FEEDBACK with the bundled CI excerpt as fixup context —
+    # no per-thread classifier in the loop. CHANGES_REQUESTED_RECEIVED is the
+    # only review-driven trigger (formal GitHub Review with state =
+    # CHANGES_REQUESTED). MERGED is fired by the daemon when it observes the
+    # PR's remote state flip to MERGED (human-merged externally OR the daemon's
+    # own auto-merge call after observing APPROVED).
+    CI_PASSED = "ci_passed"
+    CI_FAILED = "ci_failed"
+    CHANGES_REQUESTED_RECEIVED = "changes_requested_received"
     MERGED = "merged"
-    CI_FAILED_OR_THREADS_FOUND = "ci_failed_or_threads_found"
-    THREADS_FOUND = "threads_found"
-    ACTIONABLE_FEEDBACK = "actionable_feedback"
-    NO_ACTIONABLE_FEEDBACK = "no_actionable_feedback"
     FEEDBACK_PUSHED = "feedback_pushed"
     FEEDBACK_EXHAUSTED = "feedback_exhausted"
     PARENT_MERGED_OR_CONFLICT = "parent_merged_or_conflict"
@@ -100,19 +109,20 @@ TRANSITIONS: dict[tuple[State, Event], State] = {
     (State.FIXUP_PLANNING, Event.FIXUP_PLAN_VALID): State.DOING_SUBTASK,
     (State.FIXUP_PLANNING, Event.FIXUP_EXHAUSTED): State.BLOCKED,
     (State.PR_OPENING, Event.PR_OPENED): State.PENDING_CI,
-    (State.PENDING_CI, Event.CI_GREEN_THREADS_CLEAN): State.AWAITING_REVIEW,
-    (State.AWAITING_REVIEW, Event.SETTLE_WINDOW_ELAPSED): State.MERGE_READY,
-    (State.MERGE_READY, Event.MERGED): State.MERGED,
-    (State.PENDING_CI, Event.CI_FAILED_OR_THREADS_FOUND): State.TRIAGING_FEEDBACK,
-    (State.AWAITING_REVIEW, Event.THREADS_FOUND): State.TRIAGING_FEEDBACK,
-    (State.MERGE_READY, Event.THREADS_FOUND): State.TRIAGING_FEEDBACK,
-    (State.TRIAGING_FEEDBACK, Event.ACTIONABLE_FEEDBACK): State.ADDRESSING_FEEDBACK,
-    (State.TRIAGING_FEEDBACK, Event.NO_ACTIONABLE_FEEDBACK): State.PENDING_CI,
+    # Plan 28 post-PR slice: PENDING_CI → AWAITING_REVIEW on CI_PASSED;
+    # PENDING_CI → ADDRESSING_FEEDBACK on CI_FAILED; AWAITING_REVIEW →
+    # ADDRESSING_FEEDBACK on either CHANGES_REQUESTED_RECEIVED (real review)
+    # or CI_FAILED (CI flaked red after passing); AWAITING_REVIEW → MERGED on
+    # observed remote merge.
+    (State.PENDING_CI, Event.CI_PASSED): State.AWAITING_REVIEW,
+    (State.PENDING_CI, Event.CI_FAILED): State.ADDRESSING_FEEDBACK,
+    (State.AWAITING_REVIEW, Event.CHANGES_REQUESTED_RECEIVED): State.ADDRESSING_FEEDBACK,
+    (State.AWAITING_REVIEW, Event.CI_FAILED): State.ADDRESSING_FEEDBACK,
+    (State.AWAITING_REVIEW, Event.MERGED): State.MERGED,
     (State.ADDRESSING_FEEDBACK, Event.FEEDBACK_PUSHED): State.PENDING_CI,
     (State.ADDRESSING_FEEDBACK, Event.FEEDBACK_EXHAUSTED): State.BLOCKED,
     (State.PENDING_CI, Event.PARENT_MERGED_OR_CONFLICT): State.REBASING_TO_MAIN,
     (State.AWAITING_REVIEW, Event.PARENT_MERGED_OR_CONFLICT): State.REBASING_TO_MAIN,
-    (State.MERGE_READY, Event.PARENT_MERGED_OR_CONFLICT): State.REBASING_TO_MAIN,
     (State.REBASING_TO_MAIN, Event.REBASE_PUSHED): State.PENDING_CI,
     (State.REBASING_TO_MAIN, Event.CONFLICT): State.CONFLICT_RESOLVING,
     (State.CONFLICT_RESOLVING, Event.RESOLVED): State.REBASING_TO_MAIN,
@@ -129,7 +139,6 @@ TRANSITIONS: dict[tuple[State, Event], State] = {
     (State.PRE_PR_AUDITING, Event.CRASH): State.FAILED,
     (State.FIXUP_PLANNING, Event.CRASH): State.FAILED,
     (State.PR_OPENING, Event.CRASH): State.FAILED,
-    (State.TRIAGING_FEEDBACK, Event.CRASH): State.FAILED,
     (State.ADDRESSING_FEEDBACK, Event.CRASH): State.FAILED,
     (State.REBASING_TO_MAIN, Event.CRASH): State.FAILED,
     (State.CONFLICT_RESOLVING, Event.CRASH): State.FAILED,
@@ -141,7 +150,6 @@ TRANSITIONS: dict[tuple[State, Event], State] = {
     (State.PENDING, Event.MARK_MERGED): State.MERGED,
     (State.PENDING_CI, Event.PR_CLOSED): State.ABORTED,
     (State.AWAITING_REVIEW, Event.PR_CLOSED): State.ABORTED,
-    (State.MERGE_READY, Event.PR_CLOSED): State.ABORTED,
 }
 
 ACTIVE_STATES = frozenset(
@@ -157,7 +165,6 @@ ACTIVE_STATES = frozenset(
         State.PRE_PR_AUDITING,
         State.FIXUP_PLANNING,
         State.PR_OPENING,
-        State.TRIAGING_FEEDBACK,
         State.ADDRESSING_FEEDBACK,
         State.REBASING_TO_MAIN,
         State.CONFLICT_RESOLVING,
@@ -173,14 +180,14 @@ TRANSITIONS.update(
 TRANSITIONS.update(
     {
         (state, Event.PARENT_MERGED_OR_CONFLICT): State.REBASING_TO_MAIN
-        for state in ACTIVE_STATES | {State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_READY}
+        for state in ACTIVE_STATES | {State.PENDING_CI, State.AWAITING_REVIEW}
         if state is not State.REBASING_TO_MAIN and (state, Event.PARENT_MERGED_OR_CONFLICT) not in TRANSITIONS
     }
 )
 TERMINAL_STATES = frozenset({State.MERGED, State.BLOCKED, State.FAILED, State.ABORTED})
-POST_PR_STATES = frozenset({State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_READY})
+POST_PR_STATES = frozenset({State.PENDING_CI, State.AWAITING_REVIEW})
 RETRYABLE_STATES = frozenset({State.BLOCKED, State.FAILED, State.ABORTED})
-STACK_READY_STATES = frozenset({State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_READY})
+STACK_READY_STATES = frozenset({State.PENDING_CI, State.AWAITING_REVIEW})
 
 
 def _coerce_state(state: State | str) -> State:
@@ -222,7 +229,6 @@ def recover_after_crash(state: State | str, *, has_pr: bool) -> tuple[State, dic
         return (State.PENDING, {"branch": None, "worktree_path": None, "container_id": None})
     if current in {
         State.PR_OPENING,
-        State.TRIAGING_FEEDBACK,
         State.ADDRESSING_FEEDBACK,
         State.REBASING_TO_MAIN,
         State.CONFLICT_RESOLVING,

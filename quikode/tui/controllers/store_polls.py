@@ -38,11 +38,9 @@ _SHORT_STATE = {
     "checking_subtask": "subtask_check",
     "triaging_subtask": "subtask_triage",
     "conflict_resolving": "conflict_res",
-    "triaging_feedback": "triaging_fb",
     "addressing_feedback": "addressing_fb",
     "pending_ci": "pending_ci",
     "awaiting_review": "awaiting_rev",
-    "merge_ready": "merge_ready",
     "local_ci_checking": "local_ci",
     "pre_pr_auditing": "pre_pr_audit",
     "fixup_planning": "fixup_plan",
@@ -56,13 +54,11 @@ _LONG_STATE_DESCRIPTION = {
     "local_ci_checking": "local CI gate (just ci)",
     "pre_pr_auditing": "pre-PR audit gauntlet",
     "fixup_planning": "planning fixup subtasks",
-    "triaging_feedback": "Python triage of review threads",
-    "addressing_feedback": "fixup planner + per-subtask doer",
+    "addressing_feedback": "fixup planner + per-subtask doer (CI fail or CHANGES_REQUESTED)",
     "conflict_resolving": "spawned conflict-resolver agent",
     "rebasing_to_main": "rebasing onto main (parent merged)",
     "pending_ci": "PR open · CI running",
-    "awaiting_review": "CI green · awaiting human/bot review",
-    "merge_ready": "ready to merge",
+    "awaiting_review": "CI green · awaiting formal GitHub review",
     "doing_subtask": "running per-subtask doer",
 }
 
@@ -78,14 +74,12 @@ _NON_TERMINAL_AGGREGATES = {
         State.PR_OPENING.value,
         State.REBASING_TO_MAIN.value,
         State.CONFLICT_RESOLVING.value,
-        State.TRIAGING_FEEDBACK.value,
         State.FIXUP_PLANNING.value,
         State.ADDRESSING_FEEDBACK.value,
     },
     "awaiting": {
         State.PENDING_CI.value,
         State.AWAITING_REVIEW.value,
-        State.MERGE_READY.value,
     },
     "blocked": {State.BLOCKED.value, State.FAILED.value},
     "merged": {State.MERGED.value},
@@ -196,7 +190,6 @@ class StorePoller:
             "FROM tasks ORDER BY "
             "  CASE state "
             "    WHEN 'blocked' THEN 0 WHEN 'failed' THEN 0 "
-            "    WHEN 'merge_ready' THEN 1 "
             "    WHEN 'awaiting_review' THEN 1 "
             "    WHEN 'pending_ci' THEN 1 "
             "    WHEN 'merged' THEN 4 "

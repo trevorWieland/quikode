@@ -21,7 +21,6 @@ from rich.table import Table
 
 from . import daemon as daemon_mod
 from . import docker_env, fsm_runtime, retry_classify, sound, worktree
-from . import notify as notify_mod
 from . import workspace as workspace_mod
 from .config import Config
 from .config_loader import find_config_root, load_config
@@ -66,7 +65,6 @@ __all__ = [
     "get_profile",
     "json",
     "load_config",
-    "notify_mod",
     "os",
     "render_config_toml",
     "retry_classify",

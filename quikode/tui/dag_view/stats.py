@@ -54,7 +54,6 @@ _IN_FLIGHT = {
     State.PENDING_CI.value,
     State.REBASING_TO_MAIN.value,
     State.CONFLICT_RESOLVING.value,
-    State.TRIAGING_FEEDBACK.value,
     State.FIXUP_PLANNING.value,
     State.ADDRESSING_FEEDBACK.value,
     State.REBASING_TO_MAIN.value,

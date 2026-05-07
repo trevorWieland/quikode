@@ -14,7 +14,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, cast
 
-from quikode import docker_env, github, github_graphql, notify, triage
+from quikode import docker_env, github, github_graphql, triage
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.github_graphql import ReviewThread
@@ -38,7 +38,6 @@ __all__ = [
     "docker_env",
     "github",
     "github_graphql",
-    "notify",
     "subprocess",
     "time",
     "triage",

@@ -9,6 +9,8 @@ def test_fake_project_full_lifecycle_without_docker_or_github(tmp_path):
     task_id = "F-LOOP"
     store.upsert_pending(task_id)
 
+    # Plan 28: PR_OPENED → PENDING_CI → AWAITING_REVIEW (CI_PASSED) → MERGED.
+    # MERGE_READY + the settle-window hop retired with the per-thread classifier.
     sequence = [
         Event.START_TASK,
         Event.ENVIRONMENT_READY,
@@ -20,8 +22,7 @@ def test_fake_project_full_lifecycle_without_docker_or_github(tmp_path):
         Event.LOCAL_CI_PASSED,
         Event.AUDIT_PASSED,
         Event.PR_OPENED,
-        Event.CI_GREEN_THREADS_CLEAN,
-        Event.SETTLE_WINDOW_ELAPSED,
+        Event.CI_PASSED,
         Event.MERGED,
     ]
 
@@ -48,8 +49,9 @@ def test_fake_project_feedback_and_rebase_branches_without_providers(tmp_path):
         Event.LOCAL_CI_PASSED,
         Event.AUDIT_PASSED,
         Event.PR_OPENED,
-        Event.CI_FAILED_OR_THREADS_FOUND,
-        Event.ACTIONABLE_FEEDBACK,
+        # Plan 28: CI_FAILED routes PENDING_CI → ADDRESSING_FEEDBACK directly,
+        # bypassing the retired TRIAGING_FEEDBACK / ACTIONABLE_FEEDBACK pair.
+        Event.CI_FAILED,
         Event.FEEDBACK_PUSHED,
         Event.PARENT_MERGED_OR_CONFLICT,
         Event.REBASE_PUSHED,

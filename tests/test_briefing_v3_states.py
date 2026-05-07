@@ -123,11 +123,10 @@ def test_briefing_json_groups_v3_states(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, ["briefing", "--json"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    # v3.5 split — pending_ci replaces the old pending_ci bucket.
+    # Plan 28: post-PR slice is {pending_ci, awaiting_review, addressing_feedback}.
+    # MERGE_READY + TRIAGING_FEEDBACK retired with the per-thread classifier.
     assert "pending_ci" in payload
     assert "awaiting_review" in payload
-    assert "merge_ready" in payload
-    assert "triaging_feedback" in payload
     assert "addressing_feedback" in payload
     assert "rebasing_to_main" in payload
     assert "blocked_needs_intervention" in payload

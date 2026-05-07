@@ -11,7 +11,6 @@ from .cli_context import (
     console,
     json,
     load_config,
-    notify_mod,
     subprocess,
     typer,
     workspace_mod,
@@ -137,39 +136,3 @@ def logs(task_id: str):
     if not p.exists():
         raise typer.Exit(1)
     print(p)
-
-
-@app.command("notify-test")
-def notify_test():
-    """Send a test settled-task notification via the configured channel(s).
-
-    Verifies your `notify_settled_channel` / `notify_ntfy_topic` /
-    `notify_slack_webhook_url` settings are correct and that the
-    operator can actually receive the ping. Run this once after
-    setup, then again any time you suspect delivery is broken.
-    """
-    cfg = load_config()
-    if cfg.notify_settled_channel == "none":
-        console.print(
-            "[yellow]notify_settled_channel = 'none' — no channel configured.[/]\n"
-            'Set `notify_settled_channel = "ntfy"` (or `slack` / `both`) '
-            "in `.quikode/config.toml`."
-        )
-        raise typer.Exit(1)
-    msg = notify_mod.SettledMessage(
-        task_id="TEST-0001",
-        title="quikode notify-test",
-        pr_url="https://github.com/example/repo/pull/0",
-        summary="this is a test notification — if you got this, delivery works",
-        cost_usd=0.00,
-    )
-    console.print(f"[cyan]sending test notification via channel='{cfg.notify_settled_channel}'...[/]")
-    ok = notify_mod.notify_settled(cfg, msg)
-    if ok:
-        console.print("[green]✓ delivered[/] — check your phone / Slack workspace")
-    else:
-        console.print(
-            "[red]✗ no channel succeeded[/] — see daemon log or run with "
-            "`PYTHONLOGLEVEL=DEBUG` for the HTTP details."
-        )
-        raise typer.Exit(2)

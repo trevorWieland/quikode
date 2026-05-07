@@ -320,7 +320,7 @@ def _phase_line(snap: DetailSnapshot) -> str:
     # Trailing notes — explain "why does the subtasks tab look frozen?" for
     # the operator. The post-PR states get their own copy: the worker has
     # fully released this task, the daemon is the one polling.
-    if state in {"pending_ci", "awaiting_review", "merge_ready"}:
+    if state in {"pending_ci", "awaiting_review"}:
         line += "\n[dim italic](no action required — auto-polling for CI + reviews)[/]"
     elif state in _WHOLE_TASK_STATES:
         line += "\n[dim italic](task-level phase — subtask states below are frozen until this returns)[/]"
@@ -333,13 +333,11 @@ _STATE_LONG_DESCRIPTION = {
     "local_ci_checking": "local CI gate (just ci)",
     "pre_pr_auditing": "pre-PR audit gauntlet",
     "fixup_planning": "planning fixup subtasks",
-    "triaging_feedback": "Python triage of review threads",
-    "addressing_feedback": "fixup planner + per-subtask doer",
+    "addressing_feedback": "fixup planner + per-subtask doer (CI fail or CHANGES_REQUESTED)",
     "conflict_resolving": "spawned conflict-resolver agent",
     "rebasing_to_main": "rebasing onto main (parent merged)",
     "pending_ci": "PR open · CI running",
-    "awaiting_review": "CI green · awaiting review",
-    "merge_ready": "ready to merge",
+    "awaiting_review": "CI green · awaiting formal GitHub review",
     "doing_subtask": "running per-subtask doer",
 }
 
@@ -380,7 +378,6 @@ _GAUNTLET_RELEVANT_STATES = frozenset(
         "pushing",
         "pending_ci",
         "awaiting_review",
-        "merge_ready",
         "merged",
         "blocked",
         "failed",
@@ -433,13 +430,13 @@ def _gauntlet_block(snap: DetailSnapshot) -> str | None:
 
 def _phase_color(state: str) -> str:
     color_sets = (
-        ("green", {"merge_ready", "merged"}),
+        ("green", {"merged"}),
         ("blue", {"awaiting_review"}),
         ("red", {"blocked", "failed", "aborted"}),
         ("cyan", {"addressing_feedback"} | _WHOLE_TASK_STATES | {"doing_subtask", "checking_subtask"}),
         (
             "yellow",
-            {"pending_ci", "rebasing_to_main", "triaging_subtask", "triaging_feedback", "conflict_resolving"},
+            {"pending_ci", "rebasing_to_main", "triaging_subtask", "conflict_resolving"},
         ),
     )
     return next((color for color, states in color_sets if state in states), "white")

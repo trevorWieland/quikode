@@ -25,7 +25,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from quikode.state_schema import SCHEMA
+from quikode.state_schema import SCHEMA, apply_migrations
 from quikode.state_types import (
     ACTIVE,
     POST_PR_STATES,
@@ -76,6 +76,7 @@ class Store(StoreTaskMixin, StoreSubtaskMixin, StoreForensicsMixin, StoreReviewM
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.executescript(SCHEMA)
+            apply_migrations(self.conn)
         self.validate_runtime_states()
 
     def validate_runtime_states(self) -> None:

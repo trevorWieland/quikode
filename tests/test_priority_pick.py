@@ -280,7 +280,6 @@ def test_settled_readiness_skips_addressing_feedback_parent(tmp_path):
         dag,
         stacking_strategy=StackingStrategy.WITHIN_MILESTONE,
         stacking_readiness="settled",
-        stack_settle_quiet_s=0,  # remove time gate; only state matters here.
     )
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
@@ -290,11 +289,10 @@ def test_settled_readiness_skips_addressing_feedback_parent(tmp_path):
     assert nxt is None  # neither eligible: R-001 active, R-002 has un-settled parent
 
 
-def test_settled_readiness_picks_when_parent_is_merge_ready(tmp_path):
-    """v3.5: settled mode picks when parent is in MERGE_READY. The new state
-    itself encodes "CI green, no unresolved threads, settled past quiet
-    window" — the daemon's poll is what *enters* MERGE_READY (using
-    stack_settle_quiet_s as one input)."""
+def test_settled_readiness_picks_when_parent_is_awaiting_review(tmp_path):
+    """Plan 28: settled mode picks when parent reaches AWAITING_REVIEW (the
+    streamlined replacement for MERGE_READY — settle window retired with the
+    per-thread classifier)."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
     dag = _make_dag(tmp_path, edges)
     o = _orch(
@@ -307,14 +305,13 @@ def test_settled_readiness_picks_when_parent_is_merge_ready(tmp_path):
     o.store.upsert_pending("R-002")
     o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
     o.store.transition("R-001", State.AWAITING_REVIEW)
-    o.store.transition("R-001", State.MERGE_READY)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt == "R-002"
 
 
 def test_settled_readiness_skips_pending_ci_parent(tmp_path):
-    """Settled mode: PENDING_CI / AWAITING_REVIEW parents are ineligible —
-    only MERGE_READY qualifies."""
+    """Plan 28: in settled mode, PENDING_CI parents are ineligible — only
+    AWAITING_REVIEW qualifies (CI green is the gate)."""
     edges = [("R-001", []), ("R-002", ["R-001"])]
     dag = _make_dag(tmp_path, edges)
     o = _orch(
@@ -326,9 +323,5 @@ def test_settled_readiness_skips_pending_ci_parent(tmp_path):
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
     o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
-    nxt = o._pick_next({"R-001", "R-002"}, set())
-    assert nxt is None
-    # AWAITING_REVIEW also doesn't qualify under settled.
-    o.store.transition("R-001", State.AWAITING_REVIEW)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt is None

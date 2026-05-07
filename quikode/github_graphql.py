@@ -64,6 +64,34 @@ def is_bot_author(login: str) -> bool:
     return login in _extra_bots()
 
 
+class Review(BaseModel):
+    """One formal GitHub PR review (the `pullRequest.reviews` slice).
+
+    The post-plan-28 polling surface only acts on `state == "CHANGES_REQUESTED"`
+    from a non-bot author; APPROVED triggers auto-merge (when configured); and
+    COMMENTED is bundled as context but never as a transition trigger.
+    """
+
+    review_id: str  # GraphQL node id (used as `last_processed_review_id`)
+    database_id: int | None
+    state: str  # APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | PENDING
+    submitted_at: float  # unix timestamp; 0.0 if missing/parse-failure
+    body: str
+    author: str
+    is_bot: bool
+
+
+class PRComment(BaseModel):
+    """One PR-level issue comment (general PR conversation, not inline)."""
+
+    comment_id: str
+    database_id: int | None
+    body: str
+    created_at: float
+    author: str
+    is_bot: bool
+
+
 class ReviewThread(BaseModel):
     """One GitHub PR review thread (a comment chain anchored to a file/line)."""
 
@@ -114,6 +142,39 @@ _RESOLVE_THREAD_MUTATION = """
 mutation($threadId: ID!) {
   resolveReviewThread(input: {threadId: $threadId}) {
     thread { id isResolved }
+  }
+}
+""".strip()
+
+
+# Plan 28: only formal Reviews (with `state` ∈ {APPROVED, CHANGES_REQUESTED,
+# COMMENTED}) drive post-PR state transitions. Inline review-thread comments
+# (handled by `_REVIEW_THREADS_QUERY` above) and PR-level issue comments
+# become bundled CONTEXT for the fixup planner — never polling triggers.
+_PR_REVIEWS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(last: 50) {
+        nodes {
+          id
+          databaseId
+          state
+          submittedAt
+          body
+          author { login }
+        }
+      }
+      comments(last: 50) {
+        nodes {
+          id
+          databaseId
+          body
+          createdAt
+          author { login }
+        }
+      }
+    }
   }
 }
 """.strip()
@@ -267,6 +328,195 @@ def reply_to_review_thread(
         )
         return False
     return True
+
+
+def _fetch_pr_reviews_payload(repo: str, pr_number: int, *, gh_bin: str = "gh") -> dict | None:
+    """Run `_PR_REVIEWS_QUERY` and return the parsed payload, or None on error.
+
+    Used by both `get_latest_reviews` and `bundle_pr_context` so we hit GitHub
+    once for the same data (plan 28's polling tick fetches reviews + comments
+    in one round trip).
+    """
+    try:
+        owner, name = _split_repo(repo)
+    except ValueError as e:
+        log.warning("get_latest_reviews: %s", e)
+        return None
+    cmd = [
+        gh_bin,
+        "api",
+        "graphql",
+        "-f",
+        f"query={_PR_REVIEWS_QUERY}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-F",
+        f"number={pr_number}",
+    ]
+    try:
+        r = net_retry.run_with_backoff(cmd, timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.warning("_fetch_pr_reviews_payload: subprocess error: %s", e)
+        return None
+    if r.returncode != 0:
+        log.warning(
+            "_fetch_pr_reviews_payload: gh exited %d; stderr=%s", r.returncode, (r.stderr or "")[:300]
+        )
+        return None
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        log.warning("_fetch_pr_reviews_payload: bad json from gh: %s", e)
+        return None
+
+
+def _parse_reviews(payload: dict) -> list[Review]:
+    nodes = (
+        payload.get("data", {})
+        .get("repository", {})
+        .get("pullRequest", {})
+        .get("reviews", {})
+        .get("nodes", [])
+    )
+    if not isinstance(nodes, list):
+        return []
+    out: list[Review] = []
+    for node in nodes:
+        try:
+            author_login = ((node.get("author") or {}).get("login")) or ""
+            db_id = node.get("databaseId")
+            out.append(
+                Review(
+                    review_id=node.get("id") or "",
+                    database_id=int(db_id) if db_id is not None else None,
+                    state=str(node.get("state") or ""),
+                    submitted_at=_parse_iso8601(node.get("submittedAt") or ""),
+                    body=str(node.get("body") or ""),
+                    author=author_login,
+                    is_bot=is_bot_author(author_login),
+                )
+            )
+        except (TypeError, ValueError, KeyError) as e:
+            log.warning("_parse_reviews: bad node, skipping: %s", e)
+            continue
+    out.sort(key=lambda r: r.submitted_at)
+    return out
+
+
+def _parse_comments(payload: dict) -> list[PRComment]:
+    nodes = (
+        payload.get("data", {})
+        .get("repository", {})
+        .get("pullRequest", {})
+        .get("comments", {})
+        .get("nodes", [])
+    )
+    if not isinstance(nodes, list):
+        return []
+    out: list[PRComment] = []
+    for node in nodes:
+        try:
+            author_login = ((node.get("author") or {}).get("login")) or ""
+            db_id = node.get("databaseId")
+            out.append(
+                PRComment(
+                    comment_id=node.get("id") or "",
+                    database_id=int(db_id) if db_id is not None else None,
+                    body=str(node.get("body") or ""),
+                    created_at=_parse_iso8601(node.get("createdAt") or ""),
+                    author=author_login,
+                    is_bot=is_bot_author(author_login),
+                )
+            )
+        except (TypeError, ValueError, KeyError) as e:
+            log.warning("_parse_comments: bad node, skipping: %s", e)
+            continue
+    out.sort(key=lambda c: c.created_at)
+    return out
+
+
+def get_latest_reviews(repo: str, pr_number: int, *, gh_bin: str = "gh") -> list[Review]:
+    """Fetch formal GitHub Reviews for a PR via GraphQL.
+
+    Best-effort: returns empty list on any failure. Reviews are sorted by
+    submission time ascending, so the caller can `[-1]` for "most recent" or
+    iterate from the last processed id.
+    """
+    payload = _fetch_pr_reviews_payload(repo, pr_number, gh_bin=gh_bin)
+    if payload is None:
+        return []
+    return _parse_reviews(payload)
+
+
+def bundle_pr_context(
+    repo: str,
+    pr_number: int,
+    *,
+    gh_bin: str = "gh",
+    max_chars: int = 12000,
+) -> str:
+    """Render every contextual signal on a PR into one prompt-ready block.
+
+    Plan 28 model: when a CHANGES_REQUESTED review fires (or CI fails), the
+    fixup planner needs the full context — every PR-level comment, every
+    *unresolved* inline thread, every formal Review's body — bundled so the
+    planner can decide what to fix. **Resolved threads are excluded** by
+    design (resolved = a human dismissed the AI/bot suggestion → ignore).
+
+    Returns a string suitable for `fixup-planner.md`'s context section, capped
+    at `max_chars` so we never blow the agent's prompt budget. On fetch
+    failure returns an empty string — the planner falls back to the base
+    instructions without external context.
+    """
+    payload = _fetch_pr_reviews_payload(repo, pr_number, gh_bin=gh_bin)
+    reviews = _parse_reviews(payload) if payload else []
+    comments = _parse_comments(payload) if payload else []
+    threads = get_review_threads(repo, pr_number, gh_bin=gh_bin)
+    unresolved = [t for t in threads if not t.is_resolved]
+
+    sections: list[str] = []
+    if reviews:
+        rendered: list[str] = []
+        for r in reviews[-10:]:
+            body = (r.body or "").strip().replace("\n", "\n    ")
+            if len(body) > 1200:
+                body = body[:1200] + "…"
+            tag = f"[{r.state}]" + (" [bot]" if r.is_bot else "")
+            head = f"  - {tag} by {r.author or '(unknown)'}: "
+            rendered.append(head + (body or "(no body)"))
+        sections.append("Recent reviews:\n" + "\n".join(rendered))
+    if unresolved:
+        rendered = []
+        for i, t in enumerate(unresolved, 1):
+            path_line = f"{t.path or '(no path)'}:{t.line or '?'}"
+            body = (t.last_comment_body or "").strip().replace("\n", " ")
+            if len(body) > 600:
+                body = body[:600] + "…"
+            bot_tag = " [bot]" if t.last_comment_is_bot else ""
+            rendered.append(
+                f"  {i}. [{path_line}] by {t.last_comment_author or '(unknown)'}{bot_tag}: {body}"
+            )
+        sections.append(
+            "Unresolved inline threads (resolved threads omitted by design):\n" + "\n".join(rendered)
+        )
+    if comments:
+        rendered = []
+        for c in comments[-10:]:
+            body = (c.body or "").strip().replace("\n", "\n    ")
+            if len(body) > 800:
+                body = body[:800] + "…"
+            bot_tag = " [bot]" if c.is_bot else ""
+            rendered.append(f"  - by {c.author or '(unknown)'}{bot_tag}: {body}")
+        sections.append("PR-level comments:\n" + "\n".join(rendered))
+
+    if not sections:
+        return ""
+    bundle = "\n\n".join(sections)
+    if len(bundle) > max_chars:
+        bundle = bundle[: max_chars - 80] + "\n…(truncated; bundle exceeded budget)"
+    return bundle
 
 
 def resolve_thread(thread_id: str, *, gh_bin: str = "gh") -> bool:
