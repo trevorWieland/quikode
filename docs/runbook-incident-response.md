@@ -104,3 +104,63 @@ Recovery: operator chooses one of: merge externally, post guidance, `resume`, or
 First look: DAG metadata, configured base-branch commit subjects, and any explicit evidence file used with `seed-from-base`.
 
 Recovery: correct the evidence source and rerun seeding in a fresh workspace.
+
+## Fruit-of-rotten-tree wipe
+
+Triggered after **any change that tightens the stacking gate** — flipping `cfg.stacking_readiness` from `"speculative"` to `"settled"`, raising `cfg.review_ready_settle_s`, or shipping a plan that adds a new readiness predicate.
+
+The new gate only governs FUTURE picks. Tasks already on disk with worktrees + branches were forked under the OLD looser gate, often off parents that were:
+
+- Still in PROVISIONING / PLANNING / DOING_SUBTASK (no real branch yet)
+- In PENDING_CI but with CI not yet green
+- In ADDRESSING_FEEDBACK with the parent's behavior actively churning
+
+Children that built atop those foundations were building on broken, half-formed, or actively-shifting bases. Every behavior they wired up against the parent's incomplete contract may need to be redone once the parent settles. Symptoms include doer attempts that struggle with "the type/method I need doesn't exist" or "this trait shape contradicts what I'm assembling" — patterns that no amount of doer-prompt strengthening can fix, because the foundation is wrong.
+
+**The canonical follow-up to a stacking-gate tightening: identify and wipe every PENDING task that has a worktree but whose parent isn't merged.**
+
+### Identifying the wipe set
+
+```python
+import json, sqlite3
+dag = json.load(open('<repo>/docs/roadmap/dag.json'))
+nodes = {n['id']: n for n in dag['nodes']}
+merged = {<the merged-set, from `qk status` or store.in_state(MERGED)>}
+con = sqlite3.connect('file:<state_dir>/quikode.db?mode=ro', uri=True)
+con.row_factory = sqlite3.Row
+running_states = {
+    'doing_subtask', 'checking_subtask', 'triaging_subtask', 'committing',
+    'pushing', 'pr_opening', 'planning', 'provisioning', 'fixup_planning',
+    'addressing_feedback', 'pre_pr_auditing', 'local_ci_checking',
+    'rebasing_to_main', 'conflict_resolving', 'pending_ci', 'awaiting_review',
+}
+for r in con.execute("SELECT id, state, branch FROM tasks").fetchall():
+    if r['state'] in running_states or r['state'] != 'pending' or not r['branch']:
+        continue
+    deps = nodes.get(r['id'], {}).get('depends_on') or []
+    unmet = [d for d in deps if d in nodes and d not in merged]
+    if unmet:
+        print(r['id'], 'forked on un-merged:', unmet)
+```
+
+### Wipe sequence
+
+`qk retry` requires BLOCKED/FAILED/ABORTED. PENDING tasks need `qk abort && qk retry` to apply the worktree + branch + subtask cleanup:
+
+```bash
+for t in R-0004 R-0005 R-0006 ...; do
+  qk abort "$t"
+  qk retry "$t" --reason "fruit-of-rotten-tree wipe: forked off non-merged parent under prior gate"
+done
+```
+
+`qk briefing` should show the in-flight count unchanged (active tasks aren't touched) and the pending-with-branch count drop to zero. The wiped tasks now have no branch / worktree / subtask rows; they will be re-planned from scratch the next time the scheduler picks them — which under the tightened gate will happen only after their parent reaches the new readiness signal.
+
+### Don't wipe
+
+- Tasks currently in flight (interrupts active work).
+- Tasks whose parent is now merged (their foundation is sound; let them keep their progress).
+
+### Why doing the wipe matters
+
+Without it, the daemon keeps re-running stacked tasks with `qk resume` semantics — the doer's prior-output carry-forward (plan 22) and the worktree state both reference the rotten foundation. Doer attempts will keep producing the same shape of failure no matter how strong the prompts are. Only `qk retry` clears the carry-forward + worktree state cleanly.

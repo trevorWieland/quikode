@@ -51,6 +51,7 @@ This is the highest-leverage section of this document. The four recovery primiti
 | You shipped a **doer-prompt edit** that prevents long-term debt (forbids a class of bad reasoning, tightens summary rules, etc.) and the affected tasks have already accumulated worktree state under the old prompt | **`qk retry <task>`** on those tasks | Plan 22's prior-output carry-forward will otherwise feed OLD doer thinking into the next attempt and re-prime the same bad pattern. |
 | You shipped a **doer-prompt edit** that's small / corrective and likely to auto-heal under the next attempt | **Let it ride.** Rewind on the next block. | Cheaper than retry; you only pay rewind cost when the heal didn't take. |
 | Soft cap (>5 retries on a subtask) tripping repeatedly **across multiple tasks** with the same root cause | **First diagnose root cause; ship a system fix in plans/; THEN retry the affected tasks.** | Mass intervention without a system fix is wasted effort — they'll re-block. But ship the fix in parallel, don't queue tasks behind it. |
+| You **tightened the stacking gate** (e.g. flipped `stacking_readiness` to `"settled"`, raised `review_ready_settle_s`, shipped a new readiness predicate) | **Wipe every PENDING task whose worktree was forked off a non-merged parent** — `qk abort && qk retry` per task | The new gate only governs FUTURE picks. Pre-tightening worktrees were forked under the looser gate, often off parents in PROVISIONING / DOING_SUBTASK / PENDING_CI-not-yet-green. Children built atop those foundations have rotten bases — no doer-prompt fix can save them. See `docs/runbook-incident-response.md` § "Fruit-of-rotten-tree wipe" for the full sequence. |
 
 ### 3.3 The cardinal rule
 
@@ -78,6 +79,7 @@ When a block is the second instance of a known failure mode in this run, the use
 - **"12 tasks BLOCKED at 50/50 retries simultaneously, container_vanished histogram."** Plan 20 cascade → **`qk reset-retries` + `qk resume` per task**, batch.
 - **"Just shipped a planner edit that decomposes audit-fixup more aggressively."** Running tasks were planned under the OLD prompt → **`qk retry`** on the affected ones.
 - **"Just shipped a doer-prompt edit forbidding a disclaim pattern. R-0011 has been running fine without that pattern; R-0012 has accumulated worktree state where the pattern was active."** R-0011: let it ride. R-0012: **retry** (carry-forward will re-prime the bad pattern).
+- **"Just shipped plan 30 (settled stacking gate). 13 PENDING tasks have worktrees from the prior speculative gate."** Fruit-of-rotten-tree → **`qk abort && qk retry`** each — they were forked off non-merged parents and the new gate ensures the next attempt starts from a CI-green base.
 
 ---
 
@@ -158,6 +160,10 @@ Operator-mediated worktree fixes (open the file, write the correct content, `qk 
 
 **State-log monitor pattern.** When you need a long-running watch for state transitions of interest, **poll the SQLite `state_log` directly**, not `tail -F daemon.log | grep`. The latter is flaky (log rotation, ANSI escapes, pipe buffering all conspire). A small Python poller against `<state_dir>/quikode.db` reading rows where `ts > last_seen` and emitting one line per relevant transition is robust to daemon restarts and works across WSL filesystem quirks. See `/tmp/qk-monitor.py` from the current session for a reference implementation.
 
+**Review-ready ntfy signal (plan 30).** When a task crosses `cfg.review_ready_settle_s` continuously in `awaiting_review`, the daemon fires an ntfy push to `cfg.notify_ntfy_topic`: title `"R-NNNN: ready for review"`, body with task title + settled minutes + review-round count + PR URL, click → PR. The same threshold gates stacked-diff dependents: from this moment, children whose only un-met dep is this task become eligible to start. One signal, two purposes. Idempotent re-fires only happen if the task leaves and re-enters `awaiting_review` (e.g. CI flake → fixup → re-AWAITING_REVIEW).
+
+**Stacking-gate startup ramp.** With `stacking_readiness="settled"`, the first wave of in-flight tasks is the depth-1 primary tier (deps all merged); everything below the first ring stays gated until parents settle. Expect partial slot fill for the first ~15-30 min after a fresh seed. This is by design — every stacked child starts from a CI-green base. If you find yourself looking at "8 of 12 slots running, why aren't more picked?" the answer is usually "no eligible candidate" not "scheduler bug" — check the primary-vs-stacked candidate split before investigating further. See §3 fruit-of-rotten-tree row for what to do after a gate change.
+
 ---
 
 ## 7. Key invariants the prompts encode
@@ -213,9 +219,12 @@ Persistent memory at `/home/trevor/.claude/projects/-home-trevor-github-quikode/
 
 ---
 
-## 9. Quick state-of-the-world (as of plan 28 ship)
+## 9. Quick state-of-the-world (as of plan 30 ship)
 
-- **Plan 28 shipped** (`5000f46` + `7baa951` on `optimizations`): post-PR FSM streamlined to three states (`PENDING_CI`, `AWAITING_REVIEW`, `ADDRESSING_FEEDBACK`); `MERGE_READY` and `TRIAGING_FEEDBACK` retired; settle window retired; per-thread review classifier deleted (~250 LoC removed). Bot/AI comments now bundle as fixup-planner context only. Auto-merge triggers on observed `APPROVED` review when `auto_merge_when_clean=True`.
+- **Plan 28 shipped** (post-PR FSM streamlined): three post-PR states (`PENDING_CI`, `AWAITING_REVIEW`, `ADDRESSING_FEEDBACK`); `MERGE_READY` and `TRIAGING_FEEDBACK` retired; settle window retired; per-thread review classifier deleted. Bot/AI comments bundle as fixup-planner context only. Auto-merge triggers on observed `APPROVED` review when `auto_merge_when_clean=True`.
+- **Plan 30 shipped** (review-ready unified signal): `cfg.review_ready_settle_s` (default 900s = 15min) gates two things: ntfy push to operator's phone AND stacked-diff dependent kickoff. ntfy.sh delivery resurrected (ntfy-only, no slack). Scheduler bumped to **primary-first hard tier** — stacked candidates only pick up when no primary is pickable. Tanren workspace flipped to `stacking_strategy="aggressive"` + `stacking_readiness="settled"` for cross-milestone chaining with the new safety property.
 - **Doer prompt** has explicit "pre-existing failure trap" anti-disclaim section (plan 28 driveby; R-0010 / S-07 incident).
-- **Validation ladder** stays green (819 tests). Tanren workspace runs `max_parallel=12, mem_per_task_gb=10`.
-- **Active failure mode under investigation**: planner over-scoping in subtasks that span > 1 interface surface (api/cli/mcp/web). When this drives a same-signature stop-loss BLOCK, the right move is `qk retry` (per §3.2). A planner-prompt fix to forbid cross-surface subtasks is a candidate plan 29.
+- **Codex agent** catches `TimeoutExpired` and returns `transient=True` instead of crashing the worker (R-0007 / R-0024 incident). Local CI gate (`run_local_ci_gate`) passes the full raw `just ci` output to the fixup planner instead of regex-extracted findings (R-0021 incident).
+- **Validation ladder** stays green (825 tests). Tanren workspace runs `max_parallel=12, mem_per_task_gb=10`.
+- **Active failure mode under investigation**: planner over-scoping in subtasks that span > 1 interface surface (api/cli/mcp/web). When this drives a same-signature stop-loss BLOCK, the right move is `qk retry` (per §3.2). A planner-prompt fix to forbid cross-surface subtasks is a candidate follow-up plan.
+- **First-wave ramp**: under plan 30's settle gate, expect ~8-of-12 slots filled until the first parent reaches review-ready-settled (~15-30 min cold start), then the funnel widens as dependents unlock.
