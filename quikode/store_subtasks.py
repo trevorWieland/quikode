@@ -102,6 +102,28 @@ class StoreSubtaskMixin:
                 vals,
             )
 
+    def reset_subtask_for_rewind(self: Any, task_id: str, subtask_id: str) -> None:
+        """Reset a subtask to a fresh PENDING state for plan-27 rewind.
+
+        Wipes everything that accrued during the subtask's run: retries,
+        transient retries, flatline counter, triage notes, last error,
+        commit sha, retry-reason history, accepted-files override,
+        pre-commit failures, and progress-check counter. Leaves the
+        immutable fields (id, title, depends_on, files_to_touch,
+        boundary, acceptance, notes, kind, addresses_findings) intact
+        so the worker re-runs the same subtask shape on resume.
+        """
+        with self.tx() as c:
+            c.execute(
+                "UPDATE subtasks SET state = ?, retries = 0, transient_retries = 0, "
+                "flatline_count = 0, triage_notes = NULL, last_error = NULL, "
+                "commit_sha = NULL, retry_reasons = NULL, accepted_files = NULL, "
+                "pre_commit_failures = 0, progress_check_count = 0, "
+                "updated_at = ? "
+                "WHERE task_id = ? AND subtask_id = ?",
+                ("pending", time.time(), task_id, subtask_id),
+            )
+
     def record_container_stats(
         self: Any,
         task_id: str,

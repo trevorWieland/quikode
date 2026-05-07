@@ -149,16 +149,12 @@ def test_gauntlet_block_hides_when_state_is_not_pipeline_relevant():
     prior cycle ran, the persisted audit summary represents history, not
     current state. The gauntlet panel should hide rather than mislead the
     operator with stale data."""
-    common_kwargs = {
-        "task_id": "R-001",
-        "pre_pr_audit_cycle": 1,
-        "pre_pr_audit_stages": [
-            {"name": "local_ci", "passed": False, "summary": "rc=1"},
-            {"name": "rubric", "passed": False, "summary": "security<7"},
-            {"name": "standards", "passed": None, "summary": "queued"},
-            {"name": "behavior", "passed": None, "summary": "queued"},
-        ],
-    }
+    stages = [
+        {"name": "local_ci", "passed": False, "summary": "rc=1"},
+        {"name": "rubric", "passed": False, "summary": "security<7"},
+        {"name": "standards", "passed": None, "summary": "queued"},
+        {"name": "behavior", "passed": None, "summary": "queued"},
+    ]
     # Subtask phase states — should hide.
     for hide_state in (
         "doing_subtask",
@@ -168,7 +164,12 @@ def test_gauntlet_block_hides_when_state_is_not_pipeline_relevant():
         "pending",
         "provisioning",
     ):
-        snap = DetailSnapshot(task_state=hide_state, **common_kwargs)
+        snap = DetailSnapshot(
+            task_id="R-001",
+            task_state=hide_state,
+            pre_pr_audit_cycle=1,
+            pre_pr_audit_stages=stages,
+        )
         assert _gauntlet_block(snap) is None, f"expected None for state {hide_state!r}"
 
     # Pipeline / terminal states — should render.
@@ -181,7 +182,12 @@ def test_gauntlet_block_hides_when_state_is_not_pipeline_relevant():
         "blocked",
         "failed",
     ):
-        snap = DetailSnapshot(task_state=show_state, **common_kwargs)
+        snap = DetailSnapshot(
+            task_id="R-001",
+            task_state=show_state,
+            pre_pr_audit_cycle=1,
+            pre_pr_audit_stages=stages,
+        )
         assert _gauntlet_block(snap) is not None, f"expected block for state {show_state!r}"
 
 
