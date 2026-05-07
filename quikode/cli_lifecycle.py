@@ -239,6 +239,230 @@ def reset_retries(
     console.print(f"[cyan]done. follow up with `qk resume {task_id}` to put the task back in queue.[/]")
 
 
+@app.command()
+def rewind(
+    task_id: str,
+    subtask_id: str = typer.Argument(
+        ...,
+        help="Subtask to rewind to. This subtask + every subtask topologically/chronologically after it is reset to PENDING; the worktree is reset to the commit immediately before this subtask.",
+    ),
+    keep_remote: bool = typer.Option(
+        False,
+        "--keep-remote",
+        help="Skip force-pushing the local rewind to the remote branch. The next subtask commit will then need to handle non-fast-forward divergence (auto-rebase).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the rewind plan without changing any state.",
+    ),
+) -> None:
+    """Surgical recovery: rewind a BLOCKED/FAILED task to the state before a
+    specific subtask started, preserving every prior subtask's commits.
+
+    Plan 27. Replaces the older "wipe the worktree and start over" pattern
+    for the toxic-subtask scenario: when one subtask's retries got burned
+    on a fundamentally unrecoverable state but earlier subtasks landed
+    cleanly, rewind reverts the toxic subtask only and lets the worker
+    try fresh from the last known healthy commit.
+
+    Behavior:
+    - Refuses (exit 2) on tasks not in BLOCKED or FAILED. Use `qk abort`
+      first if needed.
+    - Refuses (exit 2) on tasks with no worktree_path on disk.
+    - Reset target = the named subtask. Reset set = target plus every
+      subtask whose `created_at` is at or after target's (covers spec
+      successors AND any fixup subtasks added after target).
+    - Worktree is reset to the commit-sha of the predecessor subtask in
+      DONE state. If target itself was DONE/committed, target.commit_sha~1
+      is used. If target never committed, HEAD is already the
+      predecessor (uncommitted edits exist in the worktree from failed
+      attempts; `git reset --hard` clears them — this is the explicit
+      operator-invoked revert that the standing "never silently revert
+      agent work" rule still permits).
+    - `pre_pr_audit_summary` is cleared since prior cycle's findings
+      were against a branch state that no longer exists.
+    - Branch is force-pushed (`--force-with-lease`) unless --keep-remote.
+    - Task state transitions to PENDING with `resume_from_existing_subtasks=1`
+      so the worker resumes without re-running the planner.
+
+    Examples:
+      qk rewind R-0005 S-10-bdd-B-0044
+      qk rewind R-0005 S-10-bdd-B-0044 --dry-run
+      qk rewind R-0005 S-10-bdd-B-0044 --keep-remote
+    """
+    cfg = load_config()
+    store = _open_store(cfg)
+    plan = _validate_rewind_inputs(store, task_id, subtask_id)
+    _print_rewind_plan(task_id, subtask_id, plan)
+    if dry_run:
+        console.print("[dim]--dry-run: no changes made[/]")
+        return
+    _apply_rewind(store, task_id, subtask_id, plan, keep_remote=keep_remote)
+
+
+def _validate_rewind_inputs(store: Store, task_id: str, subtask_id: str) -> dict[str, Any]:
+    """Resolve all the inputs `rewind` needs, raising typer.Exit on any
+    pre-condition that prevents the operation. Returns a dict with keys:
+    worktree_path (Path), branch (str), target (Mapping), target_sha (str),
+    to_reset (list[Mapping])."""
+    row = store.get(task_id)
+    if not row:
+        console.print(f"[red]no such task: {task_id}[/]")
+        raise typer.Exit(1)
+    state = row.get("state")
+    allowed = {State.BLOCKED.value, State.FAILED.value}
+    if state not in allowed:
+        console.print(
+            f"[red]task {task_id} is in state {state!r}; rewind only allowed on "
+            f"BLOCKED or FAILED tasks. use `qk abort` first if needed.[/]"
+        )
+        raise typer.Exit(2)
+    worktree_path_str = row.get("worktree_path")
+    if not worktree_path_str:
+        console.print(f"[red]task {task_id} has no worktree_path; cannot rewind[/]")
+        raise typer.Exit(2)
+    worktree_path = Path(str(worktree_path_str))
+    if not worktree_path.exists():
+        console.print(f"[red]worktree path {worktree_path} doesn't exist on disk[/]")
+        raise typer.Exit(2)
+    branch = row.get("branch")
+    if not branch:
+        console.print(f"[red]task {task_id} has no branch recorded; cannot rewind[/]")
+        raise typer.Exit(2)
+    subs = store.list_subtasks(task_id)
+    target = next((s for s in subs if s["subtask_id"] == subtask_id), None)
+    if target is None:
+        console.print(f"[red]no subtask {subtask_id!r} on task {task_id}[/]")
+        raise typer.Exit(1)
+    target_sha = _resolve_rewind_target_sha(worktree_path, target)
+    if target_sha is None:
+        console.print(
+            f"[red]could not resolve a rewind target sha for {task_id}/{subtask_id}: "
+            f"no predecessor commit available[/]"
+        )
+        raise typer.Exit(2)
+    # Use SQL row `id` (auto-increment PK) for ordering rather than
+    # `created_at`: a planner emits its full subtask list in one batch
+    # upsert, and all rows in the batch get effectively-identical
+    # created_at timestamps (microsecond precision but truncated to
+    # whatever the clock returns at insert time). Row id is monotonic
+    # per-insert and reflects the planner's emission order, so
+    # `id >= target.id` cleanly partitions "target + everything after"
+    # from "everything before". Fixup subtasks added on top of the
+    # original plan also get higher ids than any spec subtask, so
+    # rewinding to a spec subtask correctly resets all subsequently-
+    # injected fixups too.
+    target_id = int(target.get("id") or 0)
+    to_reset = [s for s in subs if int(s.get("id") or 0) >= target_id]
+    return {
+        "worktree_path": worktree_path,
+        "branch": str(branch),
+        "target": target,
+        "target_sha": target_sha,
+        "to_reset": to_reset,
+    }
+
+
+def _print_rewind_plan(task_id: str, subtask_id: str, plan: Mapping[str, Any]) -> None:
+    console.print(f"[bold]Rewind plan for {task_id}[/]")
+    console.print(f"  target subtask: [cyan]{subtask_id}[/]")
+    console.print(f"  rewind to commit: [yellow]{plan['target_sha'][:12]}[/]")
+    console.print(f"  worktree: {plan['worktree_path']}")
+    console.print(f"  branch: {plan['branch']}")
+    console.print(f"  subtasks to reset to PENDING ({len(plan['to_reset'])}):")
+    for s in plan["to_reset"]:
+        retries = s.get("retries") or 0
+        cur_state = s.get("state")
+        console.print(f"    [cyan]{s['subtask_id']}[/]  [dim]state={cur_state} retries={retries}[/]")
+
+
+def _apply_rewind(
+    store: Store,
+    task_id: str,
+    subtask_id: str,
+    plan: Mapping[str, Any],
+    *,
+    keep_remote: bool,
+) -> None:
+    """Execute the rewind: git reset, optional force-push, DB resets, FSM
+    transition. Each step prints a one-line progress note. The caller has
+    already validated inputs and printed the plan."""
+    worktree_path: Path = plan["worktree_path"]
+    branch: str = plan["branch"]
+    target_sha: str = plan["target_sha"]
+    console.print(f"[cyan]→ git reset --hard {target_sha[:12]}[/]")
+    rc = subprocess.run(
+        ["git", "-C", str(worktree_path), "reset", "--hard", target_sha],
+        capture_output=True,
+        text=True,
+    )
+    if rc.returncode != 0:
+        console.print(f"[red]git reset failed:[/]\n{rc.stderr.strip()}")
+        raise typer.Exit(3)
+    if not keep_remote:
+        console.print(f"[cyan]→ git push --force-with-lease origin {branch}[/]")
+        push_rc = subprocess.run(
+            ["git", "-C", str(worktree_path), "push", "--force-with-lease", "origin", branch],
+            capture_output=True,
+            text=True,
+        )
+        if push_rc.returncode != 0:
+            console.print(
+                f"[yellow]force-push failed (continuing; the next subtask commit "
+                f"will hit non-fast-forward and trigger auto-rebase):[/]\n"
+                f"{push_rc.stderr.strip()}"
+            )
+    for s in plan["to_reset"]:
+        store.reset_subtask_for_rewind(task_id, s["subtask_id"])
+        console.print(f"  reset {task_id}/{s['subtask_id']}")
+    store.set_field(task_id, pre_pr_audit_summary=None)
+    store.set_field(
+        task_id,
+        state=State.PENDING.value,
+        last_error=None,
+        container_id=None,
+        resume_from_existing_subtasks=1,
+        block_forensics=None,
+    )
+    console.print(
+        f"[green]✓ rewound {task_id} to before {subtask_id}; resumed[/]\n"
+        f"[dim]worker will re-pick up at {subtask_id} on the next scheduling tick[/]"
+    )
+
+
+def _resolve_rewind_target_sha(worktree_path: Path, target: Mapping[str, Any]) -> str | None:
+    """Resolve the commit-sha that the worktree should be reset to in
+    order to land "just before this subtask started".
+
+    Two cases:
+    - Target was never committed (target.commit_sha is None / empty).
+      The current HEAD already represents the predecessor's last commit;
+      the rewind only needs to wipe uncommitted toxic edits via reset
+      --hard HEAD. We resolve and return the literal HEAD sha.
+    - Target was DONE/committed. We need its parent commit (HEAD~1
+      relative to target.commit_sha). Use `git rev-parse <sha>~1`.
+    """
+    target_commit = (target.get("commit_sha") or "").strip()
+    if not target_commit:
+        rc = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        if rc.returncode != 0:
+            return None
+        return rc.stdout.strip() or None
+    rc = subprocess.run(
+        ["git", "-C", str(worktree_path), "rev-parse", f"{target_commit}~1"],
+        capture_output=True,
+        text=True,
+    )
+    if rc.returncode != 0:
+        return None
+    return rc.stdout.strip() or None
+
+
 @app.command("unblock")
 def unblock(
     task_id: str,

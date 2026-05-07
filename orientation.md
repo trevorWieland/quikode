@@ -113,7 +113,7 @@ For dedicated cloud (e.g. Hetzner CCX63, 48c/192GB): same `max_parallel=16` is s
 |---|---|---|
 | `qk daemon status` says STALE for >5 min | `tail` daemon.log for crashes | Stop + restart daemon |
 | Task FAILED with `InvalidTransition` | daemon log Traceback | FSM bug — find the helper that fired the wrong event |
-| Task BLOCKED at subtask | `qk unblock <id>` for forensics | Read latest triage; if root cause is structural, fix prompt/FSM, then `qk resume <id>` |
+| Task BLOCKED at subtask | `qk unblock <id>` for forensics | Read latest triage; if root cause is structural, fix prompt/FSM. Then either `qk resume <id>` (preserve all worktree state) or `qk rewind <id> <subtask_id>` (rewind branch + worktree to before the toxic subtask, keeping every prior subtask's commits). Rewind is the right choice when the subtask's accumulated state is itself the problem — see "Recovery primitives" below. |
 | Subtask retries > 5 | `qk show <id>` | See "Soft-cap audit" above — categorize, then fix |
 | Audit cycle 4 reached | `qk show <id>` | Audit is over-flagging or fixup planner is too aggressive — strengthen audit acceptance or tighten fixup boundaries |
 | `git push` rejected non-fast-forward | `git reflog` in worktree | Doer rewrote history (forbidden) — `git_push_recovery.py` auto-rebases on next attempt; if not, manual rebase + resume |
@@ -123,7 +123,17 @@ For dedicated cloud (e.g. Hetzner CCX63, 48c/192GB): same `max_parallel=16` is s
 | Multiple tasks BLOCK at 50/50 retries simultaneously, with `qk show` retry histogram dominated by `container_vanished=N` | per-attempt duration <2s across last 30 attempts; daemon log spam: `objective check FAILED (rc=1, 119 bytes)` body = `No such container: …` | Container-vanished cascade. Plan 20's `ensure_dev_container_running` + transient-stderr classification on the gate path is now active; for already-blocked tasks: stop daemon, `qk reset-retries <id>` + `qk resume <id>` per task, restart. See `docs/runbook-incident-response.md` and `docs/incident-2026-05-07-recovery.md`. |
 | `InvalidTransition` cascade (multiple tasks FAILED with `event 'crash' is not valid from state 'failed'`) | daemon log tracebacks | Two `qk run` invocations raced on the same workspace. Plan 20's flock on `<state_dir>/orchestrator.lock` prevents recurrence. Recover affected tasks via `qk reset-retries` + `qk resume`. |
 
-When the diagnosis is unclear, prefer wiping a worktree and starting that subtask over (`qk retry <id>`) rather than carrying poisoned state forward. Per the user's standing direction: "It is truly better to wipe a worktree and start over, rather than carry forward poisoned work sometimes."
+## Recovery primitives — choose surgically, not by reflex
+
+Three escape hatches in increasing order of work-discarded; default to the *least* destructive one that resolves the problem. The user's earlier standing direction "it is truly better to wipe a worktree and start over rather than carry forward poisoned work" is **superseded by plan 27's `qk rewind`**: there is now a middle-ground option that throws away only the toxic subtask's accumulated state, not every prior subtask's commits.
+
+| When | Command | What it touches |
+|---|---|---|
+| Container/infra noise burned the retry budget but no real doer work poisoned the worktree | `qk reset-retries <task> [<subtask>]` then `qk resume <task>` | Zeroes retry counters; worktree, commits, branch, plan all preserved. |
+| One subtask's accumulated state is itself the problem (toxic loop, hopelessly broken cross-file edits sitting uncommitted) but earlier subtasks landed cleanly | `qk rewind <task> <subtask>` | Rewinds branch + worktree to the predecessor's commit (`git reset --hard`, force-pushes), resets target subtask + every topo-after subtask to PENDING, clears triage / retries / commit_sha, clears `pre_pr_audit_summary`, keeps every prior subtask's commits. Preferred for any "this subtask is hopeless" diagnosis. |
+| Plan itself is wrong, scope changed, doer model needs swapping, or we want a fully clean slate | `qk retry <task>` | Wipes worktree, branch, all subtask rows. Re-plans from scratch. Last resort. |
+
+Per-task examples in `plans/27-targeted-rewind-recovery.md`. The rule of thumb: **rewind discards work, but only the work that's already known to be poisoned.** The doer's prior-output artifacts (`subtask_doer:<id>`) survive rewind, so plan-22's carry-forward continues to give the next attempt the prior investigation thread.
 
 ## Mode of influence
 
@@ -165,7 +175,8 @@ Update memory as you learn things that should outlive the current conversation (
 - `qk subtasks <task> --json` — machine-readable subtask listing; pipe into Python for filtering by retry count.
 - `qk tail <task>` — task log tail. Currently captures everything in memory until the agent exits (plan 11 will fix the streaming gap).
 - `qk resume <id>` — drop a BLOCKED/FAILED task back to PENDING with a resume marker. Worker picks up from the nearest non-DONE subtask, including leftover audit-driven fixups.
-- `qk retry <id>` — fresh restart: clears worktree + branch + subtask rows. Use only when the slate genuinely needs to be clean.
+- `qk rewind <id> <subtask_id>` — **plan 27**, surgical recovery primitive. Rewinds a BLOCKED/FAILED task's branch + worktree to the predecessor's commit, resets target subtask + every topo-after subtask to PENDING, force-pushes (or `--keep-remote` to skip), clears `pre_pr_audit_summary`, transitions to PENDING with the resume marker. Preferred over `qk retry` whenever earlier subtasks landed cleanly and only the target subtask is poisoned. Supports `--dry-run` — always run that first to inspect the plan. Doer prior-output artifacts survive the rewind so plan 22's carry-forward still feeds the next attempt the prior investigation thread.
+- `qk retry <id>` — fresh restart: clears worktree + branch + subtask rows. Use only when the slate genuinely needs to be clean (plan changed, doer model swap, etc.). Prefer `qk rewind` for the toxic-subtask case.
 - `qk reset-retries <id> [<subtask>]` — zero retry counters on BLOCKED subtasks of a BLOCKED/FAILED task without discarding committed work. Pair with `qk resume <id>` afterwards. Refuses on actively-running tasks. Designed for the container-vanished cascade scenario where 50 attempts were burned on infrastructure noise rather than real doer work — see plan 20.
 
 ## Quick state-of-the-world (as of the most recent commit on `optimizations`)
