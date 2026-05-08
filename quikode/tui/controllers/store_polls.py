@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
-import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -18,7 +17,6 @@ from zoneinfo import ZoneInfo
 
 from quikode.config import Config
 from quikode.config_loader import load_config
-from quikode.daemon import read_heartbeat
 from quikode.dag import DAG
 from quikode.state import State
 
@@ -27,6 +25,7 @@ from ..widgets.detail_panel import DetailSnapshot, SubtaskRowSnapshot
 from ..widgets.header import HeaderSnapshot
 from ..widgets.resources_panel import ContainerSample, ResourcesSnapshot
 from ..widgets.tasks_table import TaskRowSnapshot
+from .host_metrics import _read_host_caps, _runtime_max_parallel, _worktree_recent_mtime
 
 # State -> short label that fits the table column without truncation.
 _SHORT_STATE = {
@@ -48,18 +47,21 @@ _SHORT_STATE = {
 
 # Long-form descriptions used by the detail-panel phase line + briefing.
 # The state column in tables is too narrow for these.
+# Plan 38 PR-C: never synthesize "running ..." labels from FSM state.
+# In-flight liveness is observed reality from `agent_calls` (the
+# start-marker / finish-update pair) — see `Store.agent_in_flight_status`.
 _LONG_STATE_DESCRIPTION = {
-    "checking_subtask": "per-subtask checker",
-    "triaging_subtask": "per-subtask triage (root-causing FAIL)",
+    "checking_subtask": "per-subtask checker phase",
+    "triaging_subtask": "per-subtask triage phase (root-causing FAIL)",
     "local_ci_checking": "local CI gate (just ci)",
     "pre_pr_auditing": "pre-PR audit gauntlet",
     "fixup_planning": "planning fixup subtasks",
     "addressing_feedback": "fixup planner + per-subtask doer (CI fail or CHANGES_REQUESTED)",
-    "conflict_resolving": "spawned conflict-resolver agent",
+    "conflict_resolving": "conflict-resolver phase",
     "rebasing_to_main": "rebasing onto main (parent merged)",
     "pending_ci": "PR open · CI running",
     "awaiting_review": "CI green · awaiting formal GitHub review",
-    "doing_subtask": "running per-subtask doer",
+    "doing_subtask": "per-subtask doer phase",
 }
 
 _NON_TERMINAL_AGGREGATES = {
@@ -352,6 +354,9 @@ class StorePoller:
         sub_rows, active_idx = self._detail_subtasks(c, selected_task_id)
         review_round, review_threads_count = _detail_review_context(match)
         pre_pr_audit_cycle, pre_pr_audit_stages = _detail_pre_pr_audit(match)
+        in_flight_status, in_flight_phase, in_flight_age_s, in_flight_last_rc = _detail_agent_in_flight(
+            c, selected_task_id
+        )
 
         return DetailSnapshot(
             task_id=selected_task_id,
@@ -367,6 +372,10 @@ class StorePoller:
             review_threads_count=review_threads_count,
             pre_pr_audit_cycle=pre_pr_audit_cycle,
             pre_pr_audit_stages=pre_pr_audit_stages,
+            agent_in_flight_status=in_flight_status,
+            agent_in_flight_phase=in_flight_phase,
+            agent_in_flight_age_s=in_flight_age_s,
+            agent_in_flight_last_rc=in_flight_last_rc,
         )
 
     def _detail_phase(self, task_id: str, row: sqlite3.Row) -> tuple[str, str, str]:
@@ -451,6 +460,28 @@ def _detail_review_context(row: sqlite3.Row) -> tuple[int | None, int | None]:
     return review_round, review_threads_count
 
 
+def _detail_agent_in_flight(
+    conn: sqlite3.Connection, task_id: str, *, now: float | None = None
+) -> tuple[str, str | None, float | None, int | None]:
+    """Plan 38 PR-C: read the latest `agent_calls` row to derive the
+    structured in-flight status. Mirrors `Store.agent_in_flight_status`
+    but operates on the TUI's read-only SQLite connection (the TUI does
+    not import Store)."""
+    row = conn.execute(
+        "SELECT phase, rc, started_at, ts FROM agent_calls WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return ("never", None, None, None)
+    wall = time.time() if now is None else now
+    phase = str(row["phase"]) if row["phase"] is not None else None
+    if row["rc"] is None:
+        started = float(row["started_at"]) if row["started_at"] is not None else float(row["ts"])
+        return ("running", phase, max(0.0, wall - started), None)
+    finished = float(row["ts"])
+    return ("idle", phase, max(0.0, wall - finished), int(row["rc"]))
+
+
 def _detail_pre_pr_audit(row: sqlite3.Row) -> tuple[int | None, list[dict]]:
     try:
         blob = row["pre_pr_audit_summary"]
@@ -525,69 +556,3 @@ def _humanize_seconds(s: float) -> str:
         return f"{int(s // 60)}m{int(s % 60):02d}s"
     h = int(s // 3600)
     return f"{h}h{int((s % 3600) // 60):02d}m"
-
-
-def _read_host_caps() -> tuple[int | None, int | None]:
-    """Best-effort: read host CPU + memory from /proc."""
-    cpus: int | None
-    cpus = os.cpu_count()
-    mem_gb: int | None = None
-    try:
-        with Path("/proc/meminfo").open() as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    kb = int(line.split()[1])
-                    mem_gb = round(kb / 1024 / 1024)
-                    break
-    except OSError:
-        mem_gb = None
-    return cpus, mem_gb
-
-
-def _runtime_max_parallel(cfg: Config) -> int:
-    """Live max_parallel from the daemon's heartbeat, falling back to config.
-
-    `qk daemon start --max-parallel N` overrides cfg in the daemon process
-    only — the on-disk config still says whatever's in config.toml. The
-    daemon writes its effective value into the heartbeat each tick; reading
-    it here keeps the TUI honest about what the running daemon is using.
-    Falls back to cfg.max_parallel when no heartbeat is present (daemon
-    stopped, fresh workspace).
-    """
-    hb = read_heartbeat(cfg)
-    if hb is not None:
-        value = hb.get("max_parallel")
-        if isinstance(value, int) and value > 0:
-            return value
-    return int(cfg.max_parallel)
-
-
-# Skip these path components when computing worktree mtime — they churn
-# constantly even when the agent isn't actually working (cache lookups,
-# build-tool metadata) and would mask real idleness.
-_WORKTREE_MTIME_SKIP = (".git", "target", ".rumdl_cache", "node_modules", ".next", "__pycache__")
-
-
-def _worktree_recent_mtime(worktree: Path) -> float | None:
-    """Most recent file mtime under the worktree, ignoring caches/build dirs.
-
-    Cheap-ish: walks once. The TUI polls every 1s; for a 200-file worktree
-    this is ~10ms. For pathological worktrees we'd want a watchman-style
-    delta but it's not the bottleneck right now.
-    """
-    if not worktree.exists():
-        return None
-    latest = 0.0
-    try:
-        for root, dirs, files in os.walk(worktree):
-            # In-place prune: skip churning dirs.
-            dirs[:] = [d for d in dirs if d not in _WORKTREE_MTIME_SKIP]
-            for f in files:
-                try:
-                    m = (Path(root) / f).stat().st_mtime
-                except OSError:
-                    continue
-                latest = max(latest, m)
-    except OSError:
-        return None
-    return latest if latest > 0 else None

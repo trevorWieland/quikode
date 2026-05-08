@@ -2,12 +2,104 @@
 
 from __future__ import annotations
 
+import logging
 import tomllib
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from quikode.config import Config, StackingStrategy
 from quikode.profiles import get_profile
+
+log = logging.getLogger("quikode.config_loader")
+
+# Plan 38 PR-C audit-log support: TOML sub-section → list of int knobs
+# that ride under it. Used by `_log_int_overrides` so the audit-log
+# walks every int field, not just the top-level ones. Keys are keys
+# inside the sub-section dict (NOT prefixed); values are the matching
+# `Config.model_fields` names.
+_TOML_SECTION_INT_KNOBS: dict[str, dict[str, str]] = {
+    "resources": {
+        "cpu_per_task": "cpu_per_task",
+        "mem_per_task_gb": "mem_per_task_gb",
+        "host_reserved_cpu": "host_reserved_cpu",
+        "host_reserved_mem_gb": "host_reserved_mem_gb",
+        "container_stats_sample_seconds": "container_stats_sample_seconds",
+    },
+    "conflicts": {
+        "resolver_max_iterations": "conflict_resolver_max_iterations",
+        "rebase_max_attempts": "rebase_max_attempts",
+    },
+    "intent": {
+        "max_reviews_per_task": "intent_max_reviews_per_task",
+        "max_replans": "intent_max_replans",
+    },
+    "stacking": {
+        "max_depth": "stacking_max_depth",
+        "max_breadth_per_root": "stacking_max_breadth_per_root",
+        "rebase_coalesce_window_s": "rebase_coalesce_window_s",
+    },
+    "daemon": {
+        "heartbeat_staleness_s": "daemon_heartbeat_staleness_s",
+        "min_run_for_backoff_reset_s": "daemon_min_run_for_backoff_reset_s",
+        "heartbeat_stale_kill_s": "daemon_heartbeat_stale_kill_s",
+    },
+}
+
+
+def _log_int_overrides(raw: dict[str, Any], defaults: Config) -> None:
+    """Plan 38 PR-C audit log: emit one INFO line per int knob the toml
+    overrides relative to the Field default.
+
+    The trigger for this audit log is the `subtask_doer_timeout_s`
+    drift incident (commit d06cdcd bumped Field default 1200 → 1800,
+    but live workspace config.toml's still pinned 1200, capping doer
+    calls at the prior ceiling). The drift was invisible because no
+    daemon-start log surfaced "your toml is overriding the Field
+    default of 1800 with 1200." This loop closes that gap: every
+    daemon-start, the operator sees a definitive list of which knobs
+    their toml is overriding and what the Field default is — so the
+    NEXT bump is visible immediately on a stale-toml workspace.
+
+    Iterates `Config.model_fields` instead of a hand-maintained list
+    so new int Fields get the audit treatment automatically.
+    """
+    for field_name, field_info in Config.model_fields.items():
+        if field_info.annotation is not int:
+            continue
+        # Discover the toml location for this knob.
+        raw_value: Any = None
+        toml_key: str | None = None
+        if field_name in raw:
+            raw_value = raw.get(field_name)
+            toml_key = field_name
+        else:
+            for section_name, section_map in _TOML_SECTION_INT_KNOBS.items():
+                if field_name in section_map.values():
+                    section_dict = raw.get(section_name) or {}
+                    if not isinstance(section_dict, dict):
+                        continue
+                    inner_key = next((k for k, v in section_map.items() if v == field_name), None)
+                    if inner_key is not None and inner_key in section_dict:
+                        raw_value = section_dict.get(inner_key)
+                        toml_key = f"{section_name}.{inner_key}"
+                        break
+        if raw_value is None or toml_key is None:
+            continue
+        try:
+            override = int(raw_value)
+        except (TypeError, ValueError):
+            continue
+        default_value = getattr(defaults, field_name)
+        if not isinstance(default_value, int):  # pragma: no cover — model_fields filtered to int
+            continue
+        if override == default_value:
+            continue
+        log.info(
+            "config[%s] = %d (overrides Field default %d)",
+            toml_key,
+            override,
+            default_value,
+        )
 
 
 def find_config_root(start: Path | None = None) -> Path:
@@ -91,6 +183,7 @@ def load_config(root: Path | None = None) -> Config:
         host_reserved_mem_gb=int(profile.resource_defaults.get("host_reserved_mem_gb", 16)),
         max_parallel_auto=bool(profile.resource_defaults.get("max_parallel_auto", False)),
     )
+    _log_int_overrides(raw, defaults)
     return Config(
         profile=profile.name,
         repo_path=_path(raw["repo_path"], root),

@@ -71,6 +71,18 @@ class DetailSnapshot:
     # entered the pipeline.
     pre_pr_audit_cycle: int | None = None
     pre_pr_audit_stages: list[dict] = field(default_factory=list)
+    # Plan 38 PR-C: structured "agent in-flight" status for the selected
+    # task, derived from the latest `agent_calls` row. Replaces the prior
+    # FSM-state-derived synthesis ("running per-subtask doer") which lied
+    # whenever the doer call had returned but the FSM was still in
+    # `doing_subtask`. Tuple shape: (status, last_phase, age_seconds, last_rc).
+    #   status="running"  → agent invocation in flight (start-marker, no rc yet)
+    #   status="idle"     → agent has returned; orchestrator post-processing
+    #   status="never"    → no agent_call rows for the task yet
+    agent_in_flight_status: str = "never"
+    agent_in_flight_phase: str | None = None
+    agent_in_flight_age_s: float | None = None
+    agent_in_flight_last_rc: int | None = None
 
 
 class DetailPanel(Container):
@@ -150,6 +162,14 @@ class DetailPanel(Container):
             snap.in_state_for,
             snap.last_worktree_edit,
             gauntlet_fp,
+            # Plan 38 PR-C: in-flight signal must trigger re-render so
+            # "agent in-flight (12s)" actually ticks; bucket the age to
+            # whole seconds so we don't repaint every poll-tick on
+            # sub-second drift.
+            snap.agent_in_flight_status,
+            snap.agent_in_flight_phase,
+            int(snap.agent_in_flight_age_s) if snap.agent_in_flight_age_s is not None else None,
+            snap.agent_in_flight_last_rc,
         )
         if phase_fp != self._phase_fp:
             phase_text = _phase_line(snap)
@@ -285,38 +305,16 @@ def _phase_line(snap: DetailSnapshot) -> str:
     if not snap.task_id or snap.task_id == "(none)":
         return "[dim]No task selected — highlight a row above and press Enter.[/]"
     state = snap.task_state or "?"
-    note = snap.last_state_note
-    in_state = snap.in_state_for
-    edit = snap.last_worktree_edit
-
-    color = _phase_color(state)
-    parts = [f"[b]{snap.task_id}[/]"]
-    if snap.title:
-        parts.append(f"[dim]{snap.title[:60]}[/]")
-    # State display: short label with bracketed long description so the
-    # operator never has to remember what the compact state label means.
-    long_desc = _state_long_description(state)
-    if long_desc:
-        parts.append(f"[{color}]{state}[/] [dim]({long_desc})[/]")
-    else:
-        parts.append(f"[{color}]{state}[/]")
-    # State-specific extras: review-loop context (round / threads) takes
-    # priority over the generic state_log note when addressing_feedback,
-    # since "round 3 · 2 threads" is more useful at-a-glance than a
-    # truncated transition note.
-    if state == "addressing_feedback":
-        if snap.review_round is not None and snap.review_threads_count is not None:
-            parts.append(f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads")
-    elif state in {"local_ci_checking", "pre_pr_auditing", "fixup_planning"} and note:
-        # Pipeline notes carry per-stage context ("rubric audit"); show.
-        parts.append(f"[dim]{note[:80]}[/]")
-    elif note:
-        parts.append(f"[dim]{note[:80]}[/]")
-    if in_state:
-        parts.append(f"in-state [b]{in_state}[/]")
-    if edit and state in _WHOLE_TASK_STATES | {"doing_subtask", "checking_subtask", "triaging_subtask"}:
-        parts.append(f"edit [b]{edit}[/]")
+    parts = _phase_line_parts(snap, state)
     line = "  ·  ".join(parts)
+    # Plan 38 PR-C: structured "agent in-flight" line. Reflects observed
+    # reality from `agent_calls` (start-marker + finish UPDATE), NOT
+    # synthesized from FSM state. Replaces the old "running per-subtask
+    # doer" string that lied whenever the call had returned but the FSM
+    # was still in `doing_subtask`.
+    in_flight_line = _agent_in_flight_line(snap)
+    if in_flight_line:
+        line += f"\n{in_flight_line}"
     # Trailing notes — explain "why does the subtasks tab look frozen?" for
     # the operator. The post-PR states get their own copy: the worker has
     # fully released this task, the daemon is the one polling.
@@ -327,18 +325,99 @@ def _phase_line(snap: DetailSnapshot) -> str:
     return line
 
 
+def _phase_line_parts(snap: DetailSnapshot, state: str) -> list[str]:
+    """Build the `·`-joined chunks for the top phase line. Pulled out of
+    `_phase_line` to keep the branch count under the project's lint cap."""
+    color = _phase_color(state)
+    parts = [f"[b]{snap.task_id}[/]"]
+    if snap.title:
+        parts.append(f"[dim]{snap.title[:60]}[/]")
+    long_desc = _state_long_description(state)
+    if long_desc:
+        parts.append(f"[{color}]{state}[/] [dim]({long_desc})[/]")
+    else:
+        parts.append(f"[{color}]{state}[/]")
+    note_chunk = _phase_state_extra(snap, state)
+    if note_chunk:
+        parts.append(note_chunk)
+    if snap.in_state_for:
+        parts.append(f"in-state [b]{snap.in_state_for}[/]")
+    if snap.last_worktree_edit and state in _WHOLE_TASK_STATES | {
+        "doing_subtask",
+        "checking_subtask",
+        "triaging_subtask",
+    }:
+        parts.append(f"edit [b]{snap.last_worktree_edit}[/]")
+    return parts
+
+
+def _phase_state_extra(snap: DetailSnapshot, state: str) -> str | None:
+    """State-specific extras: review-loop context (round / threads) takes
+    priority over the generic state_log note when addressing_feedback,
+    since "round 3 · 2 threads" is more useful at-a-glance than a
+    truncated transition note."""
+    note = snap.last_state_note
+    if state == "addressing_feedback":
+        if snap.review_round is not None and snap.review_threads_count is not None:
+            return f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads"
+        return None
+    if not note:
+        return None
+    return f"[dim]{note[:80]}[/]"
+
+
+def _humanize_age_seconds(s: float | None) -> str:
+    if s is None or s < 0:
+        return "—"
+    if s < 60:
+        return f"{int(s)}s"
+    if s < 3600:
+        return f"{int(s // 60)}m{int(s % 60):02d}s"
+    h = int(s // 3600)
+    return f"{h}h{int((s % 3600) // 60):02d}m"
+
+
+def _agent_in_flight_line(snap: DetailSnapshot) -> str | None:
+    """Render the structured in-flight status line.
+
+    Three shapes (matching `Store.agent_in_flight_status`):
+
+      agent in-flight: subtask_doer (12s)
+      agent idle (last subtask_doer returned 30s ago, rc=124)
+      no agent call yet
+    """
+    status = snap.agent_in_flight_status
+    phase = snap.agent_in_flight_phase or "?"
+    age = _humanize_age_seconds(snap.agent_in_flight_age_s)
+    if status == "running":
+        return f"[cyan]agent in-flight[/]: [b]{phase}[/] ({age})"
+    if status == "idle":
+        rc = snap.agent_in_flight_last_rc
+        rc_label = f"rc={rc}" if rc is not None else "rc=?"
+        rc_color = "green" if rc == 0 else "red"
+        return f"[dim]agent idle[/] (last [b]{phase}[/] returned {age} ago, [{rc_color}]{rc_label}[/])"
+    if status == "never":
+        return "[dim]no agent call yet[/]"
+    return None
+
+
 _STATE_LONG_DESCRIPTION = {
-    "checking_subtask": "per-subtask checker",
-    "triaging_subtask": "per-subtask triage",
+    # Plan 38 PR-C: "running per-subtask doer" (and similar synthesized
+    # "running ..." labels) are gone from the FSM-state map. The doer
+    # being in flight vs returned is observed reality, surfaced by the
+    # structured `agent_in_flight_status` line below — never synthesized
+    # from FSM state alone.
+    "checking_subtask": "per-subtask checker phase",
+    "triaging_subtask": "per-subtask triage phase",
     "local_ci_checking": "local CI gate (just ci)",
     "pre_pr_auditing": "pre-PR audit gauntlet",
     "fixup_planning": "planning fixup subtasks",
     "addressing_feedback": "fixup planner + per-subtask doer (CI fail or CHANGES_REQUESTED)",
-    "conflict_resolving": "spawned conflict-resolver agent",
+    "conflict_resolving": "conflict-resolver phase",
     "rebasing_to_main": "rebasing onto main (parent merged)",
     "pending_ci": "PR open · CI running",
     "awaiting_review": "CI green · awaiting formal GitHub review",
-    "doing_subtask": "running per-subtask doer",
+    "doing_subtask": "per-subtask doer phase",
 }
 
 

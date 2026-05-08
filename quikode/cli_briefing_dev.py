@@ -163,6 +163,9 @@ def _briefing_json_payload(
 
 
 def _briefing_in_flight_row(store: Store, r: Mapping[str, Any], now: float) -> dict:
+    in_flight_status, in_flight_phase, in_flight_age_s, in_flight_last_rc = store.agent_in_flight_status(
+        r["id"], now=now
+    )
     return {
         "id": r["id"],
         "state": r["state"],
@@ -170,6 +173,15 @@ def _briefing_in_flight_row(store: Store, r: Mapping[str, Any], now: float) -> d
         "worktree_mtime_age_seconds": _worktree_age_seconds(now, r.get("worktree_path")),
         "max_rss_bytes": store.task_max_rss(r["id"]),
         "pr_number": r.get("pr_number"),
+        # Plan 38 PR-C: agent in-flight observed reality (start-marker
+        # vs finish-update on `agent_calls`). Replaces the prior
+        # FSM-derived "running ..." synthesis.
+        "agent_in_flight": {
+            "status": in_flight_status,
+            "phase": in_flight_phase,
+            "age_seconds": in_flight_age_s,
+            "last_rc": in_flight_last_rc,
+        },
     }
 
 
@@ -213,6 +225,22 @@ def _print_active_tasks(store: Store, actives: Sequence[Mapping[str, Any]], now:
             + (f"  max_rss={mx / (1024**3):.1f}GB" if mx else "")
             + (f"  · ${cost:.2f}" if cost else "")
         )
+        # Plan 38 PR-C: structured "agent in-flight" line per task.
+        # Reflects what the agent_calls table actually records; never
+        # synthesizes "running" from FSM state.
+        console.print(f"    {_briefing_agent_in_flight_line(store, r['id'], now)}")
+
+
+def _briefing_agent_in_flight_line(store: Store, task_id: str, now: float) -> str:
+    status, phase, age_s, last_rc = store.agent_in_flight_status(task_id, now=now)
+    age = _humanize_secs(age_s)
+    if status == "running":
+        return f"[cyan]agent in-flight[/]: [b]{phase or '?'}[/] ({age})"
+    if status == "idle":
+        rc_label = f"rc={last_rc}" if last_rc is not None else "rc=?"
+        rc_color = "green" if last_rc == 0 else "red"
+        return f"[dim]agent idle[/] (last [b]{phase or '?'}[/] returned {age} ago, [{rc_color}]{rc_label}[/])"
+    return "[dim]no agent call yet[/]"
 
 
 def _print_post_pr_groups(store: Store, groups: dict[str, list]) -> None:

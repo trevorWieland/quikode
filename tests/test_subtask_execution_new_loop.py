@@ -413,6 +413,12 @@ def test_diff_capture_handles_empty_diff(tmp_path) -> None:
 
 
 def test_run_doer_agent_records_call_with_subtask_id(tmp_path) -> None:
+    """Plan 38 PR-C: per-call recording is split into a start-marker
+    `record_agent_call_started` (phase / cli / model / subtask_id) and a
+    finish UPDATE `record_agent_call_finished` (rc / duration_s / tokens
+    / cost). The TUI's "agent in-flight" detector keys off `rc IS NULL`
+    on the start-marker row, so this split has to land at the worker
+    layer for the in-flight signal to be honest."""
     cfg = _cfg(tmp_path)
     w = _build_worker(cfg)
     envelope = DoerEnvelope(summary="x")
@@ -428,13 +434,15 @@ def test_run_doer_agent_records_call_with_subtask_id(tmp_path) -> None:
     )
     with patch("quikode.workers.subtask_execution.make_agent", return_value=stub):
         w._run_doer_agent(_S04_WEB_SUBTASK, "prompt", attempt=1)
-    call = w.store.record_agent_call.call_args
-    assert call.kwargs["phase"] == "subtask_doer"
-    assert call.kwargs["subtask_id"] == "S-04-web"
-    assert call.kwargs["model"] == cfg.subtask_doer_model
-    assert call.kwargs["duration_s"] == 12.5
-    assert call.kwargs["tokens_input"] == 1000
-    assert call.kwargs["cost_usd"] == 0.05
+    started = w.store.record_agent_call_started.call_args
+    assert started.kwargs["phase"] == "subtask_doer"
+    assert started.kwargs["subtask_id"] == "S-04-web"
+    assert started.kwargs["model"] == cfg.subtask_doer_model
+    finished = w.store.record_agent_call_finished.call_args
+    assert finished.kwargs["rc"] == 0
+    assert finished.kwargs["duration_s"] == 12.5
+    assert finished.kwargs["tokens_input"] == 1000
+    assert finished.kwargs["cost_usd"] == 0.05
 
 
 # Suppress unused-import warning for `Path`.

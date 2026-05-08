@@ -109,26 +109,26 @@ class SubtaskExecutionMixin:
 
     def _run_doer_agent(self: Any, subtask: Subtask, prompt: str, attempt: int) -> _DoerCallResult:
         agent = make_agent("subtask_doer", self.cfg)
+        call_id = self.store.record_agent_call_started(
+            self.node.id,
+            phase="subtask_doer",
+            cli="json_agent",
+            model=self.cfg.subtask_doer_model,
+            subtask_id=subtask.id,
+        )
         result = agent.invoke(
             prompt,
             handle=self._h,
             log_path=self.log_path,
             timeout=self.cfg.subtask_doer_timeout_s,
         )
-        self.store.record_agent_call(
-            self.node.id,
-            phase="subtask_doer",
-            cli="json_agent",
-            model=self.cfg.subtask_doer_model,
+        self.store.record_agent_call_finished(
+            call_id,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=None,
-            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
-            subtask_id=subtask.id,
         )
         envelope: DoerEnvelope | None = None
         if isinstance(result.structured, DoerEnvelope):
@@ -303,26 +303,26 @@ class SubtaskExecutionMixin:
             witness_results=self._last_witness_results,
         )
         self._write_log_header(f"SUBTASK CHECKER {subtask.id}", prompt)
+        call_id = self.store.record_agent_call_started(
+            self.node.id,
+            phase="subtask_checker",
+            cli="json_agent",
+            model=self.cfg.subtask_checker_model,
+            subtask_id=subtask.id,
+        )
         result = agent.invoke(
             prompt,
             handle=self._h,
             log_path=self.log_path,
             timeout=self.cfg.subtask_checker_timeout_s,
         )
-        self.store.record_agent_call(
-            self.node.id,
-            phase="subtask_checker",
-            cli="json_agent",
-            model=self.cfg.subtask_checker_model,
+        self.store.record_agent_call_finished(
+            call_id,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=None,
-            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
-            subtask_id=subtask.id,
         )
         if result.parse_errors or not isinstance(result.structured, SubtaskCheckerOutput):
             return self._checker_parse_failure(subtask, result)
@@ -448,26 +448,26 @@ class SubtaskExecutionMixin:
             diff_text=self._last_diff_text,
         )
         self._write_log_header(f"SUBTASK TRIAGE {subtask.id} (attempt {attempt})", prompt)
+        call_id = self.store.record_agent_call_started(
+            self.node.id,
+            phase="subtask_triage",
+            cli="json_agent",
+            model=self.cfg.subtask_triage_model,
+            subtask_id=subtask.id,
+        )
         result = agent.invoke(
             prompt,
             handle=self._h,
             log_path=self.log_path,
             timeout=self.cfg.subtask_triage_timeout_s,
         )
-        self.store.record_agent_call(
-            self.node.id,
-            phase="subtask_triage",
-            cli="json_agent",
-            model=self.cfg.subtask_triage_model,
+        self.store.record_agent_call_finished(
+            call_id,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=None,
-            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
-            subtask_id=subtask.id,
         )
         if result.parse_errors or not isinstance(result.structured, SubtaskTriageOutput):
             errs = list(result.parse_errors or ())

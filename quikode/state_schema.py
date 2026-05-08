@@ -130,6 +130,14 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     tokens_cached_creation INTEGER,
     cost_usd REAL,
     subtask_id TEXT,                 -- v2: scope to a specific subtask if applicable
+    -- Plan 38 PR-C: when the worker invokes an agent it FIRST inserts a
+    -- start-marker row with `started_at = now`, leaving rc/duration_s
+    -- NULL. On return the worker UPDATEs the same row with rc/duration_s
+    -- + token/cost detail. The TUI distinguishes "agent in-flight" from
+    -- "agent idle" by `rc IS NULL AND duration_s IS NULL` on the
+    -- newest row per task. Single-call inserts (no start-marker) set
+    -- started_at = ts so the rollup queries stay unaffected.
+    started_at REAL,
     ts REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_calls_task ON agent_calls(task_id, ts);
@@ -273,3 +281,12 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     # via `recover_after_crash`.
     conn.execute("UPDATE tasks SET state='awaiting_review' WHERE state='merge_ready'")
     conn.execute("UPDATE tasks SET state='pending_ci' WHERE state='triaging_feedback'")
+    # Plan 38 PR-C: start-marker for in-flight agent_call detection.
+    # Existing rows backfill to started_at = ts (call finished instantly
+    # in our prior single-INSERT semantics) so historical queries are
+    # unaffected.
+    try:
+        conn.execute("ALTER TABLE agent_calls ADD COLUMN started_at REAL")
+    except sqlite3.OperationalError:
+        pass
+    conn.execute("UPDATE agent_calls SET started_at = ts WHERE started_at IS NULL")

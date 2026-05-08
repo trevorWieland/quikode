@@ -298,24 +298,24 @@ def run_fixup_planner_loop(
     cur_prompt = base_prompt
     while True:
         attempt_no += 1
+        call_id = worker.store.record_agent_call_started(
+            worker.node.id,
+            phase=f"fixup_planner:{kind}",
+            cli="json_agent",
+            model=cfg.fixup_planner_model,
+        )
         result = agent.invoke(
             cur_prompt,
             handle=worker._h,
             log_path=worker.log_path,
             timeout=cfg.fixup_planner_timeout_s,
         )
-        worker.store.record_agent_call(
-            worker.node.id,
-            phase=f"fixup_planner:{kind}",
-            cli="json_agent",
-            model=cfg.fixup_planner_model,
+        worker.store.record_agent_call_finished(
+            call_id,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=None,
-            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
         artifact_text = result.raw_text or (

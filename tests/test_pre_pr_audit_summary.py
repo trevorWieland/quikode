@@ -82,8 +82,12 @@ def test_new_cycle_clears_prior_results(tmp_path):
 
 
 def test_state_long_description_known():
+    # Plan 38 PR-C: state long-descriptions describe the FSM phase
+    # ("per-subtask checker phase"), NOT a synthesized agent-running
+    # status ("running per-subtask checker"). Live agent in-flight vs
+    # idle is rendered separately from `agent_calls` observed reality.
     assert _state_long_description("local_ci_checking") == "local CI gate (just ci)"
-    assert _state_long_description("checking_subtask") == "per-subtask checker"
+    assert _state_long_description("checking_subtask") == "per-subtask checker phase"
     assert _state_long_description("fixup_planning") == "planning fixup subtasks"
     # Self-explanatory states return None.
     assert _state_long_description("pending") is None

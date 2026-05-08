@@ -194,13 +194,14 @@ class StoreTaskMixin:
         tokens_cached_creation: int | None = None,
         cost_usd: float | None = None,
     ) -> None:
+        now = time.time()
         with self.tx() as c:
             c.execute(
                 "INSERT INTO agent_calls "
                 "(task_id, phase, cli, model, rc, duration_s, tokens_used, "
                 " tokens_input, tokens_output, tokens_cached_read, tokens_cached_creation, "
-                " cost_usd, subtask_id, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " cost_usd, subtask_id, started_at, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     task_id,
                     phase,
@@ -215,6 +216,118 @@ class StoreTaskMixin:
                     tokens_cached_creation,
                     cost_usd,
                     subtask_id,
-                    time.time(),
+                    now,
+                    now,
                 ),
             )
+
+    def record_agent_call_started(
+        self: Any,
+        task_id: str,
+        *,
+        phase: str,
+        cli: str,
+        model: str | None,
+        subtask_id: str | None = None,
+    ) -> int:
+        """Plan 38 PR-C: insert a start-marker row before invoking the agent.
+
+        Returns the new row's `id`; the caller passes it to
+        `record_agent_call_finished` once the agent returns. While `rc`
+        and `duration_s` are NULL the TUI's "agent in-flight" detector
+        treats this row as live work. Crash-safe: a worker that exits
+        before calling `_finished` leaves the row as "stuck in-flight"
+        — operators (or the daemon supervisor) can spot the staleness
+        from `started_at` age.
+        """
+        now = time.time()
+        with self.tx() as c:
+            cur = c.execute(
+                "INSERT INTO agent_calls "
+                "(task_id, phase, cli, model, subtask_id, started_at, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, phase, cli, model, subtask_id, now, now),
+            )
+            row_id = cur.lastrowid
+        if row_id is None:  # pragma: no cover — sqlite3 always returns an id
+            raise RuntimeError("INSERT INTO agent_calls returned no lastrowid")
+        return int(row_id)
+
+    def record_agent_call_finished(
+        self: Any,
+        call_id: int,
+        *,
+        rc: int,
+        duration_s: float,
+        tokens_used: int | None = None,
+        tokens_input: int | None = None,
+        tokens_output: int | None = None,
+        tokens_cached_read: int | None = None,
+        tokens_cached_creation: int | None = None,
+        cost_usd: float | None = None,
+    ) -> None:
+        """Plan 38 PR-C: complete the start-marker row inserted by
+        `record_agent_call_started`. Updates rc/duration_s/tokens/cost
+        and bumps `ts` to the finish moment so chronological ordering
+        by ts still reflects call completion."""
+        now = time.time()
+        with self.tx() as c:
+            c.execute(
+                "UPDATE agent_calls SET "
+                "  rc = ?, duration_s = ?, tokens_used = ?, "
+                "  tokens_input = ?, tokens_output = ?, "
+                "  tokens_cached_read = ?, tokens_cached_creation = ?, "
+                "  cost_usd = ?, ts = ? "
+                "WHERE id = ?",
+                (
+                    rc,
+                    duration_s,
+                    tokens_used,
+                    tokens_input,
+                    tokens_output,
+                    tokens_cached_read,
+                    tokens_cached_creation,
+                    cost_usd,
+                    now,
+                    call_id,
+                ),
+            )
+
+    def agent_in_flight_status(
+        self: Any, task_id: str, *, now: float | None = None
+    ) -> tuple[str, str | None, float | None, int | None]:
+        """Plan 38 PR-C: 'agent in-flight' status for the TUI / briefing.
+
+        Reads the LATEST `agent_calls` row for `task_id` and returns one
+        of:
+
+        * `("running", phase, started_at_ago_seconds, None)` —
+          the most recent row has `rc IS NULL` (agent invocation in
+          flight; the start-marker hasn't been finished yet).
+        * `("idle", last_phase, last_returned_ago_seconds, last_rc)` —
+          the most recent row has `rc` set (agent has returned;
+          orchestrator is post-processing or stalled). `last_rc`
+          surfaces a non-zero return code so operators see "rc=124"
+          on a recent timeout.
+        * `("never", None, None, None)` — no agent_call rows for the
+          task yet.
+
+        This is the structured signal that replaces the old TUI
+        synthesis "running per-subtask doer" derived purely from FSM
+        state. The display reads observed reality: when the latest
+        call returned, the agent is NOT running (the FSM hasn't
+        advanced yet, but the agent is done).
+        """
+        wall = time.time() if now is None else now
+        row = self.conn.execute(
+            "SELECT phase, rc, started_at, ts FROM agent_calls WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return ("never", None, None, None)
+        phase = str(row["phase"]) if row["phase"] is not None else None
+        if row["rc"] is None:
+            started = float(row["started_at"]) if row["started_at"] is not None else float(row["ts"])
+            return ("running", phase, max(0.0, wall - started), None)
+        finished = float(row["ts"])
+        return ("idle", phase, max(0.0, wall - finished), int(row["rc"]))

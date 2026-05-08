@@ -221,24 +221,24 @@ class RebaseConflictMixin:
             parent_contexts=parent_contexts or [],
         )
         self._write_log_header(f"CONFLICT RESOLVER (iter {iteration})", prompt)
+        call_id = self.store.record_agent_call_started(
+            self.node.id,
+            phase="conflict_resolver",
+            cli="json_agent",
+            model=self.cfg.conflict_resolver_model,
+        )
         result = agent.invoke(
             prompt,
             handle=self._h,
             log_path=self.log_path,
             timeout=self.cfg.conflict_resolver_timeout_s,
         )
-        self.store.record_agent_call(
-            self.node.id,
-            phase="conflict_resolver",
-            cli="json_agent",
-            model=self.cfg.conflict_resolver_model,
+        self.store.record_agent_call_finished(
+            call_id,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=None,
-            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
         envelope_text = (

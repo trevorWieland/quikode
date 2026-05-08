@@ -288,24 +288,24 @@ class PrLifecycleWorkerMixin:
             main_diff_excerpt=main_diff,
         )
         self._write_log_header("INTENT REVIEW", prompt)
+        call_id = self.store.record_agent_call_started(
+            self.node.id,
+            phase="intent_reviewer",
+            cli="json_agent",
+            model=self.cfg.intent_reviewer_model,
+        )
         result = agent.invoke(
             prompt,
             handle=self._h,
             log_path=self.log_path,
             timeout=self.cfg.intent_reviewer_timeout_s,
         )
-        self.store.record_agent_call(
-            self.node.id,
-            phase="intent_reviewer",
-            cli="json_agent",
-            model=self.cfg.intent_reviewer_model,
+        self.store.record_agent_call_finished(
+            call_id,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=None,
-            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
         if result.rc != 0 or result.parse_errors or not isinstance(result.structured, IntentReviewVerdict):
@@ -414,24 +414,24 @@ class PrLifecycleWorkerMixin:
             "Emit the SAME structured JSON schema as the spec planner."
         )
         self._write_log_header("PLANNER (replan)", prompt)
+        call_id = self.store.record_agent_call_started(
+            self.node.id,
+            phase="planner_replan",
+            cli="json_agent",
+            model=self.cfg.replan_planner_model,
+        )
         result = agent.invoke(
             prompt,
             handle=self._h,
             log_path=self.log_path,
             timeout=self.cfg.replan_planner_timeout_s,
         )
-        self.store.record_agent_call(
-            self.node.id,
-            phase="planner_replan",
-            cli="json_agent",
-            model=self.cfg.replan_planner_model,
+        self.store.record_agent_call_finished(
+            call_id,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=None,
-            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
         plan_text = result.raw_text or (

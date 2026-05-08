@@ -424,24 +424,24 @@ class MergeNodeWorker(TaskWorker):
         prompt = prompts.merge_planner_prompt(self.cfg, self.node, parent_contexts, contract)
         self._write_log_header("MERGE PLANNER", prompt)
         agent = make_agent("merge_planner", self.cfg)
+        call_id = self.store.record_agent_call_started(
+            self.node.id,
+            phase="merge_planner",
+            cli="json_agent",
+            model=self.cfg.merge_planner_model,
+        )
         result = agent.invoke(
             prompt,
             handle=self._h,
             log_path=self.log_path,
             timeout=self.cfg.merge_planner_timeout_s,
         )
-        self.store.record_agent_call(
-            self.node.id,
-            phase="merge_planner",
-            cli="json_agent",
-            model=self.cfg.merge_planner_model,
+        self.store.record_agent_call_finished(
+            call_id,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=None,
-            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
         artifact_text = result.raw_text or (
