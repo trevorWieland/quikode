@@ -70,10 +70,14 @@ added a caller of the old shape). Your subtasks must resolve BOTH:
 ## 4. What each subtask must declare
 
 Same shape as the standard planner contract: id, title, depends_on,
-acceptance, files_to_touch, plus the three Plan 33 stage-typed fields:
+acceptance, files_to_touch, plus the four stage-typed fields:
 
 - `rubric_targets: [{ "category": "...", "predicted_score": <int 1-10> }, ...]`
-- `standards_referenced: [{ "doc_path": "...", "section": "..." }, ...]`
+- `standards_referenced: [{ "doc_path": "...", "section": "..." }, ...]` —
+  cites must resolve under a configured standards-profile doc.
+- `architecture_referenced: [{ "doc_path": "...", "section": "..." }, ...]` —
+  cites must resolve under `cfg.architecture_docs_dir`. Same shape as
+  `standards_referenced` but a different bucket; do not mix them.
 - `behavior_evidence_advanced: ["..."]` — for merge nodes this is
   typically empty (the parents already delivered their witnesses);
   populate only if the integration *adds* new behavior coverage.
@@ -118,6 +122,7 @@ Emit your output as a single JSON object **inside a fenced ```json ...
   "node_id": "{{ merge_node.id }}",
   "summary": "1-3 sentence overview of the integration approach",
   "gauntlet_strategy": "200-2000 char prose section explaining how the merge preserves each parent's rubric/standards/behavior on cycle 1...",
+  "merge_context_summary": "REQUIRED. 1-3 sentences capturing the cross-parent conflict context as you saw it: what each parent contributed, where the textual conflicts are, and where the semantic conflicts hide. The orchestrator persists this for forensics; an empty string is rejected as a missing field.",
   "subtasks": [
     {
       "id": "S-01-resolve-foo",
@@ -134,6 +139,7 @@ Emit your output as a single JSON object **inside a fenced ```json ...
         { "category": "<one of the contract's rubric categories>", "predicted_score": 8 }
       ],
       "standards_referenced": [],
+      "architecture_referenced": [],
       "behavior_evidence_advanced": [],
       "interfaces": [],
       "notes": "parent A renamed `process_event` → `handle_event`; parent B added a new caller; keep B's caller, update it to the new name."
@@ -152,6 +158,7 @@ Emit your output as a single JSON object **inside a fenced ```json ...
         { "category": "<a category appropriate for verification>", "predicted_score": 8 }
       ],
       "standards_referenced": [],
+      "architecture_referenced": [],
       "behavior_evidence_advanced": [],
       "interfaces": [],
       "notes": "Final integration gate."

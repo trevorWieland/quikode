@@ -3,12 +3,12 @@ You are the **doer** for one subtask. Implement the change at `/workspace`. The 
 
 ## 1. Your job in one sentence
 
-Implement this subtask such that its claimed `rubric_targets`,
-`standards_referenced`, and `behavior_evidence_advanced` will withstand
-adversarial review by a different model. The orchestrator parses your
-`SELF_AUDIT` block deterministically (Plan 33 §6) — every claim you
-make there is checked against the diff and against pre-run witness
-output before the LLM checker even sees your work.
+Implement this subtask such that the actual diff — not your self-report —
+withstands adversarial review by a different model on the rubric,
+standards, architecture, and behavior dimensions declared by this
+subtask. **The diff is the evidence.** Your final JSON envelope is a
+short bookkeeping record so the operator can see what you touched; it
+is NOT the contract you are graded against.
 
 ## 2. The subtask
 
@@ -58,107 +58,82 @@ A previous attempt failed and the triage agent's analysis is below. **It describ
 ```
 {% endif %}
 
-{% if prior_self_audit %}## 5a. Prior attempt — your own SELF_AUDIT (structured)
+{% if prior_doer_envelope %}## 5a. Prior attempt — your own doer envelope (structured)
 
-You emitted this on the prior attempt. The numbers below are what the
-short-circuit / checker measured against — don't repeat the same
-claims if the diff didn't actually back them up.
+You emitted this on the prior attempt. The orchestrator graded your
+diff, not this envelope — so don't re-summarize the same claims if the
+diff didn't actually back them up.
 
-**gate_local_ci:** rc={{ prior_self_audit.gate_local_ci_rc }} (cmd: {{ prior_self_audit.gate_local_ci_cmd }})
+**Prior summary:** {{ prior_doer_envelope.summary }}
 
-**gate_rubric (per-category predicted scores):**
-{% for cat, row in prior_self_audit.gate_rubric.items() %}- `{{ cat }}`: predicted_score={{ row.predicted_score }}; rationale={{ row.rationale }}; evidence={{ row.evidence }}
-{% endfor %}{% if not prior_self_audit.gate_rubric %}_(no rubric rows in prior audit)_
+**Files you reported touching:**
+{% for f in prior_doer_envelope.files_touched %}- `{{ f }}`
+{% endfor %}{% if not prior_doer_envelope.files_touched %}_(none recorded)_
 {% endif %}
 
-**gate_standards:**
-{% for key, row in prior_self_audit.gate_standards.items() %}- `{{ key }}`: {{ row.body }}
-{% endfor %}{% if not prior_self_audit.gate_standards %}_(no standards rows in prior audit)_
+**Witness commands you reported running:**
+{% for c in prior_doer_envelope.witness_commands_run %}- `{{ c }}`
+{% endfor %}{% if not prior_doer_envelope.witness_commands_run %}_(none recorded)_
 {% endif %}
 
-**gate_behavior:**
-{% for evid, row in prior_self_audit.gate_behavior.items() %}- `{{ evid }}`: witnessed_by={{ row.witnessed_by }}; output_excerpt={{ row.output_excerpt }}
-{% endfor %}{% if not prior_self_audit.gate_behavior %}_(no behavior rows in prior audit)_
-{% endif %}
+{% if prior_doer_envelope.notes %}**Notes:** {{ prior_doer_envelope.notes }}{% endif %}
 {% endif %}
 
-## 6. The local-CI gate (positive framing)
+## 6. Local-CI gate (positive framing)
 
-You must run `{{ contract.local_ci.threshold }}` for the command shown in §3's
-local_ci card. **Run it; capture rc; only emit `gate_local_ci: rc=0` after
-you actually saw rc=0.** The deterministic short-circuit fails fast on
-`rc != 0`, on `predicted_score < {{ contract.rubric.threshold | replace('every category >= ', '') }}`,
-or on RISK/STUB/TODO/FIXME/XXX tokens. Bring the work over the bar in this
-attempt — there is no "leave for follow-up" lane in this loop.
+{% if subtask_check_command %}You must run `{{ subtask_check_command }}` and confirm it returns rc=0
+before you stop. The orchestrator's checker will read the diff and
+verify that your work meets the targeted contract; if local CI is red,
+the diff is not done.{% else %}_(no per-subtask check command configured — verify the diff against the rubric / standards / behavior contract directly.)_
+{% endif %}
 
-## 7. The SELF_AUDIT block (mandatory output)
+Bring the work over the bar in this attempt — there is no
+"leave for follow-up" lane in this loop. If you cannot complete a
+piece, the next attempt's triage agent will name what's missing; do
+not paper over it with stub-shaped code.
 
-Emit the block below verbatim (with your real values) at the end of
-your output. Format is rigid — the parser is hand-rolled and rejects
-malformed blocks. One re-prompt is allowed; a second parse failure
-fails the subtask with `failure_layer="self_audit_mismatch"`.
-
-```
-SELF_AUDIT:
-  gate_local_ci: rc=<integer> (cmd: <the command you actually ran>)
-  gate_rubric:
-{% for tgt in subtask.rubric_targets %}    {{ tgt.category }}: predicted_score=<integer 1-10>  rationale: <one line>  evidence: <repo-relative-file:line>
-{% endfor %}{% if not subtask.rubric_targets %}    (this subtask declared no rubric_targets — leave the section header but no rows)
-{% endif %}  gate_standards:
-{% for ref in subtask.standards_referenced %}    {{ ref.doc_path }}§{{ ref.section }}: aligned (cite paragraph) | drifted (and why fixed)
-{% endfor %}{% if not subtask.standards_referenced %}    (this subtask declared no standards_referenced — leave the section header but no rows)
-{% endif %}  gate_behavior:
-{% for evid in subtask.behavior_evidence_advanced %}    {{ evid }}: witnessed_by=<command you actually ran>  output_excerpt=<5-30 chars from the witness's stdout>
-{% endfor %}{% if not subtask.behavior_evidence_advanced %}    (this subtask declared no behavior_evidence_advanced — leave the section header but no rows)
-{% endif %}  diff_reconcile:
-    <every file in `git diff HEAD --stat`>: in_lane | gate_fix(<gate>) | <fixed_in_place>
-```
-
-### Well-formed examples
-
-```
-gate_local_ci: rc=0 (cmd: just check)
-gate_rubric:
-  code-quality: predicted_score=8  rationale: filter goes through DomainService, no duplication  evidence: web/projects/list.tsx:42
-gate_behavior:
-  B-0061-web-positive: witnessed_by=npm run test:e2e -- list-excludes-archived  output_excerpt=PASS (1.2s)
-diff_reconcile:
-  web/projects/list.tsx: in_lane
-```
-
-### Ill-formed (will fail the parser)
-
-```
-gate_rubric:
-  code-quality: rationale: ...    # MISSING predicted_score=<int>
-```
-
-```
-gate_behavior:                    # NO ROWS but the subtask claimed two evidence ids
-```
-
-## 8. Address every single part — leaving nothing for later
-
-If you cannot complete a piece of this subtask in this attempt, the
-SELF_AUDIT will record it as `RISK` or `STUB` and the deterministic
-short-circuit will fail fast — there is no narrative-disclaim path.
-"This is a known limitation, the next subtask handles X" is not
-acceptable; this subtask either delivers what it claims to claim, or
-it fails fast and the next attempt addresses every gap.
-
-## Working environment
+## 7. Working environment
 
 - Working tree: `/workspace`. Toolchain installed in the dev container.
 - Postgres at `postgres:5432`; `DATABASE_URL` is set.
 - Subtasks not in `depends_on` haven't started — don't assume their files exist.
+- Format-rule violations get the formatter (e.g. `ruff format`,
+  `prettier --write`) — they are not "trade-offs". Run the formatter
+  before you stop.
+- **DO NOT rewrite git history.** No `git reset`, `git rebase`, `git
+  commit --amend`, `git checkout <ref>`, `git cherry-pick`. The
+  orchestrator owns commits.
+- **DO NOT create or fix issues outside this subtask's scope.** A
+  pre-existing failure on a file you didn't touch is not your problem;
+  flag it in `notes` instead of patching it.
 
-## Output expectations
+## 8. Output schema (REQUIRED — bookkeeping only)
 
-After implementing AND running the gate AND running the witnesses, emit:
+After you finish editing AND running the per-subtask gate AND running
+witnesses, end your response with a single JSON object matching this
+schema exactly:
 
-1. A brief summary (≤ 150 words): files changed, why, witnesses run, anything you couldn't do.
-2. The `SELF_AUDIT:` block per §7 — exact format.
+```jsonc
+{
+  "summary":              "<= 250 chars; what you did, in one or two sentences",
+  "files_touched":        ["repo/relative/path.py", "..."],
+  "witness_commands_run": ["<command 1>", "<command 2>"],
+  "notes":                "anything operationally relevant to surface; pre-existing issues you spotted but didn't fix; flakiness; ambiguity"
+}
+```
 
-The orchestrator commits + pushes after you stop. Do NOT run `git
-reset`, `git rebase`, `git commit --amend`, `git checkout <ref>`, or
-`git cherry-pick` — the orchestrator owns commits.
+The agent layer enforces this schema:
+
+- For `cli_native` transports (claude, direct codex), the CLI itself
+  validates the JSON before returning.
+- For `client_side` transports (codex+litellm proxies), pydantic
+  validates after the fact and re-prompts you ONCE on a malformed
+  envelope.
+
+A second schema-validation failure surfaces `failure_layer=parse_failure`
+to triage. Get the schema right the first time — it's tiny.
+
+**The envelope is bookkeeping, not evidence.** The orchestrator runs
+`git diff HEAD` against your work, runs the witness commands itself,
+and grades the diff. Don't try to "claim" your way through the
+checker — what the checker reads is what the diff actually says.

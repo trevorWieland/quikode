@@ -6,10 +6,10 @@ from pathlib import Path
 
 from jinja2 import ChoiceLoader, Environment, FileSystemLoader, StrictUndefined
 
+from .agent_schemas import DoerEnvelope
 from .config import Config
 from .dag import DAG, Node
 from .evaluation_contract import EvaluationContract
-from .self_audit import ParsedSelfAudit
 from .subtask_schema import STABILIZATION_SUBTASK_ID, Plan
 
 # Bundled prompts ship inside the quikode package itself (../prompts at the repo root,
@@ -119,14 +119,15 @@ def subtask_doer_prompt(
     *,
     plan: Plan | None = None,
     triage_notes: str | None = None,
-    prior_self_audit: ParsedSelfAudit | None = None,
+    prior_doer_envelope: DoerEnvelope | None = None,
 ) -> str:
-    """Plan 33 PR-B: subtask-doer prompt now takes the full
+    """Plan 38 PR-B.5: subtask-doer prompt takes the full
     `EvaluationContract` (rendered into §3 via `ec_targeted`) plus an
-    optional structured `prior_self_audit` (replaces the loose
-    `prior_doer_output: str` from PR-A). Z-99 still runs the full
-    local-CI gate; per-subtask gating uses `cfg.subtask_check_command`.
-    """
+    optional structured `prior_doer_envelope` carrying the prior
+    attempt's bookkeeping (files_touched / witnesses_run / summary).
+    The doer emits a `DoerEnvelope` JSON object — bookkeeping only;
+    the diff is what's graded. Z-99 still runs the full local-CI gate;
+    per-subtask gating uses `cfg.subtask_check_command`."""
     gate_command = (
         cfg.local_ci_command if subtask.id == STABILIZATION_SUBTASK_ID else cfg.subtask_check_command
     )
@@ -138,7 +139,7 @@ def subtask_doer_prompt(
         subtask=subtask,
         contract=contract,
         triage_notes=triage_notes,
-        prior_self_audit=prior_self_audit,
+        prior_doer_envelope=prior_doer_envelope,
         subtask_check_command=gate_command,
     )
 
@@ -149,19 +150,21 @@ def subtask_checker_prompt(
     subtask,
     contract: EvaluationContract,
     *,
-    self_audit: ParsedSelfAudit,
+    doer_envelope: DoerEnvelope | None,
     diff_text: str,
     witness_results: dict[str, dict],
 ) -> str:
-    """Plan 33 PR-B: checker now consumes the structured `ParsedSelfAudit`,
-    the unified diff, and the per-subtask scoped witness results."""
+    """Plan 38 PR-B.5: checker grades the unified diff against the
+    targeted contract. Receives the doer's `DoerEnvelope` as
+    informational context (NOT the contract being graded), the diff,
+    and the per-subtask scoped witness results."""
     return render(
         cfg,
         "subtask-checker.md",
         node=node,
         subtask=subtask,
         contract=contract,
-        self_audit=self_audit,
+        doer_envelope=doer_envelope,
         diff_text=diff_text[:20000],
         witness_results=witness_results,
     )
@@ -173,20 +176,21 @@ def subtask_triage_prompt(
     subtask,
     contract: EvaluationContract,
     *,
-    self_audit: ParsedSelfAudit,
+    doer_envelope: DoerEnvelope | None,
     checker_verdict: str,
     diff_text: str,
 ) -> str:
-    """Plan 33 PR-B: senior-engineer-tutoring-junior triage. Inputs are
-    the targeted contract slice, the structured SELF_AUDIT, the
-    checker's verdict, and the unified diff."""
+    """Plan 38 PR-B.5: senior-engineer-tutoring-junior triage. Inputs
+    are the targeted contract slice, the doer envelope (informational),
+    the checker's text output, and the unified diff. Output is a
+    `SubtaskTriageOutput` JSON instance."""
     return render(
         cfg,
         "subtask-triage.md",
         node=node,
         subtask=subtask,
         contract=contract,
-        self_audit=self_audit,
+        doer_envelope=doer_envelope,
         checker_verdict=checker_verdict,
         diff_text=diff_text[:20000],
     )

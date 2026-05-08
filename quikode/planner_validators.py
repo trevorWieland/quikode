@@ -356,6 +356,20 @@ def validate_architecture_refs(plan: Plan | FixupPlan, contract: EvaluationContr
         )
 
 
+def _is_parse_failure_finding(finding_id: str) -> bool:
+    """True iff the audit-finding id has the `<stage>:parse_failure`
+    shape produced by `pre_pr_audit._parse_failure_outcome`.
+
+    Plan 38 PR-B.5: parse_failure findings are auditor-side
+    schema-validation failures (the JsonAgent layer's two-strikes
+    pydantic re-prompt path). They are structural, carry no content for
+    a fixup subtask to address, and are filtered out of
+    `validate_finding_coverage`'s expected set.
+    """
+    _, _, tail = finding_id.partition(":")
+    return tail == "parse_failure"
+
+
 def _classify_finding_coverage(
     plan: FixupPlan, expected: list[str]
 ) -> tuple[list[str], list[tuple[str, list[str]]], list[tuple[str, str]]]:
@@ -421,13 +435,21 @@ def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> Non
     Every id in `audit_findings` must be addressed by EXACTLY ONE
     subtask via the stage-typed field matching the finding's namespace
     (`rubric:` → `rubric_targets`; `standards:` → `standards_referenced`;
-    `behavior:` → `behavior_evidence_advanced`). Mirrors the partition
-    discipline of `validate_evidence_partition` but scoped to the audit
-    bundle.
+    `architecture:` → `architecture_referenced`; `behavior:` →
+    `behavior_evidence_advanced`). Mirrors the partition discipline of
+    `validate_evidence_partition` but scoped to the audit bundle.
 
     No-op when `audit_findings` is empty (e.g. `fixup-final` /
     `fixup-ci` / `fixup-review` triggers that don't carry a typed
     finding bundle — the trigger context is the failure context).
+
+    Plan 38 PR-B.5 carve-out: `<stage>:parse_failure` findings are
+    auditor-side schema-validation failures (the JsonAgent layer
+    re-prompted, the second response also failed pydantic). They have
+    no content to address — the fixup re-runs the audit, which either
+    parses cleanly or fails the same way. We filter them out of the
+    expected set so they don't appear as `missing`. The fixup planner
+    is told (via prompt) not to allocate subtasks for them.
 
     Why this exists (vs. `validate_rubric_coverage`):
     `validate_rubric_coverage` insists every rubric **category** be
@@ -439,7 +461,10 @@ def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> Non
     """
     if not audit_findings:
         return
-    missing, duplicated, unknown = _classify_finding_coverage(plan, audit_findings)
+    expected = [fid for fid in audit_findings if not _is_parse_failure_finding(fid)]
+    if not expected:
+        return
+    missing, duplicated, unknown = _classify_finding_coverage(plan, expected)
     if not missing and not duplicated and not unknown:
         return
 
@@ -471,7 +496,7 @@ def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> Non
             "rubric/behavior coverage that doesn't match any audit "
             "finding):\n"
             + "\n".join(f"- subtask {sid!r}: {fid!r}" for sid, fid in unknown)
-            + f"\nValid finding ids from this audit: {audit_findings!r}"
+            + f"\nValid finding ids from this audit: {expected!r}"
         )
     raise PlannerValidationError(
         "finding_coverage",

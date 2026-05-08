@@ -88,12 +88,20 @@ For an audit-driven round (`kind="fixup-pre-pr-audit"`):
   same rubric category in `rubric_targets`.
 - A `standards:<finding-id>` finding → the subtask lists the relevant
   doc + section in `standards_referenced`.
+- An `architecture:<finding-id>` finding → the subtask lists the
+  relevant project-architecture doc + section in
+  `architecture_referenced`.
 - A `behavior:<id>` finding → the subtask lists the evidence id in
   `behavior_evidence_advanced`.
+- A `parse_failure:` finding (auditor's own response failed schema
+  validation) is structural — it has no content to address; it is
+  always considered covered. Re-running the audit on the next cycle
+  resolves it.
 
 The orchestrator unions `rubric_targets[].category`,
-`standards_referenced[]`, and `behavior_evidence_advanced[]` across
-your subtasks and verifies every finding-id is covered. Top-level
+`standards_referenced[]`, `architecture_referenced[]`, and
+`behavior_evidence_advanced[]` across your subtasks and verifies every
+content-bearing finding-id is covered. Top-level
 `findings_addressed` MUST list every finding id you've covered (audit
 completeness check).
 
@@ -103,16 +111,22 @@ Emit your output as a single JSON object **inside a fenced ```json ... ``` block
 
 ### Stage-typed field shapes (MUST match exactly)
 
-The three stage-typed fields are typed Pydantic models — emitting them as
+The four stage-typed fields are typed Pydantic models — emitting them as
 plain strings will fail schema validation and burn a re-prompt:
 
 - `rubric_targets[]` is an array of `{"category": "<rubric-category-name>",
   "predicted_score": <int 1-10>}` objects.
 - `standards_referenced[]` is an array of `{"doc_path": "<repo-relative
   path>", "section": "<heading or anchor>"}` objects — **NOT** an array
-  of strings. `"docs/architecture/operations.md#Section"` is wrong;
-  `{"doc_path": "docs/architecture/operations.md", "section": "Section"}`
-  is right.
+  of strings. `"profiles/rust-cargo/rust/error-handling.md#Section"` is
+  wrong; `{"doc_path": "profiles/.../error-handling.md", "section":
+  "Section"}` is right. Cites must resolve under a configured
+  standards-profile doc.
+- `architecture_referenced[]` is an array of `{"doc_path": "<repo-relative
+  path>", "section": "<heading or anchor>"}` objects — same shape as
+  `standards_referenced`. Cites must resolve under
+  `cfg.architecture_docs_dir` (project-architecture docs, distinct from
+  standards profiles).
 - `behavior_evidence_advanced[]` is an array of evidence-id strings (each
   must appear in `node.expected_evidence`).
 
@@ -145,8 +159,9 @@ finding-id to be matched by SOME subtask via the namespace dispatch.
         { "category": "edge-case-handling", "predicted_score": 8 }
       ],
       "standards_referenced": [
-        { "doc_path": "docs/architecture/operations.md", "section": "Input validation" }
+        { "doc_path": "profiles/typescript-node/security.md", "section": "Input validation" }
       ],
+      "architecture_referenced": [],
       "behavior_evidence_advanced": [],
       "interfaces": [],
       "notes": "closes rubric:add-input-validation-on-org-name",

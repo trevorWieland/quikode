@@ -140,11 +140,11 @@ class Config(BaseModel):
             "Per-subtask doer agent timeout. Plan 33 calibration (after the "
             "tanren deploy where 7 consecutive opencode/glm-5.1 doer calls "
             "rc=124'd at duration_s ~= 1314s, hitting the prior 1200s "
-            "ceiling): bumped to 1800s (30 min). The new SELF_AUDIT block + "
-            "scoped EvaluationContract + standards/rubric scaffolding makes "
-            "the doer prompt meaningfully heavier than the pre-Plan-33 "
-            "shape, and smaller models need the headroom to land both the "
-            "diff and the deterministic SELF_AUDIT footer before SIGTERM."
+            "ceiling): bumped to 1800s (30 min). The doer prompt's targeted "
+            "rubric / standards / architecture context makes the call "
+            "meaningfully heavier than the pre-Plan-33 shape, and smaller "
+            "models need the headroom to land both the diff and the "
+            "DoerEnvelope JSON before SIGTERM."
         ),
     )
     subtask_checker_timeout_s: int = Field(

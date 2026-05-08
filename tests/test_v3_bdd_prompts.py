@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from quikode.agent_schemas import PlannerOutput
+from quikode.agent_schemas import DoerEnvelope, PlannerOutput
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.evaluation_contract import build_for
@@ -23,7 +23,6 @@ from quikode.prompts import (
     subtask_checker_prompt,
     subtask_doer_prompt,
 )
-from quikode.self_audit import ParsedSelfAudit
 from quikode.subtask_schema import Subtask
 from quikode.workers.planner_driver import _wire_to_runtime_plan
 
@@ -131,13 +130,13 @@ def test_subtask_checker_renders_plan_33_targeted_block(tmp_path):
         interfaces=("web", "api"),
         notes="follow behavior-proof.md",
     )
-    parsed = ParsedSelfAudit(gate_local_ci_rc=0, gate_local_ci_cmd="just check")
+    envelope = DoerEnvelope(summary="implemented bdd")
     out = subtask_checker_prompt(
         cfg,
         dag.nodes["R-001"],
         sub,
         contract,
-        self_audit=parsed,
+        doer_envelope=envelope,
         diff_text="diff --git a/x b/x",
         witness_results={},
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from quikode.agent_schemas import DoerEnvelope
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.evaluation_contract import build_for
@@ -18,7 +19,6 @@ from quikode.prompts import (
     subtask_triage_prompt,
     triage_prompt,
 )
-from quikode.self_audit import ParsedSelfAudit, RubricRow
 from quikode.subtask_schema import Subtask
 
 
@@ -158,9 +158,9 @@ def test_subtask_doer_prompt_includes_acceptance_and_files(tmp_path):
     assert "crates/foo/src/account.rs" in out
     assert "cargo check passes" in out
     assert "Domain crate only." in out
-    # Plan 33: §6 SELF_AUDIT block is mandatory output.
-    assert "SELF_AUDIT:" in out
-    assert "gate_local_ci" in out
+    # Plan 38: doer emits a DoerEnvelope JSON object — bookkeeping only.
+    assert "DoerEnvelope" in out or "files_touched" in out
+    assert "summary" in out
 
 
 def test_subtask_doer_renders_triage_as_context(tmp_path):
@@ -179,52 +179,49 @@ def test_subtask_doer_renders_triage_as_context(tmp_path):
     assert "missing field" in out
 
 
-def test_subtask_doer_renders_prior_self_audit_when_present(tmp_path):
-    """Plan 33 D14: structured `prior_self_audit` flows in instead of loose stdout."""
+def test_subtask_doer_renders_prior_doer_envelope_when_present(tmp_path):
+    """Plan 38 PR-B.5: structured `prior_doer_envelope` flows in as the
+    next attempt's bookkeeping context (DoerEnvelope replaces the prior
+    SELF_AUDIT carry-forward)."""
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
     contract = build_for(dag.nodes["R-001"], cfg)
-    prior = ParsedSelfAudit(
-        gate_local_ci_rc=0,
-        gate_local_ci_cmd="just check",
-        gate_rubric={
-            "code_quality": RubricRow(
-                category="code_quality",
-                predicted_score=5,
-                rationale="weak filter logic",
-                evidence="src/list.tsx:4",
-            )
-        },
+    prior = DoerEnvelope(
+        summary="weak filter logic",
+        files_touched=["src/list.tsx"],
+        witness_commands_run=["npm test"],
+        notes="needs follow-up",
     )
     out = subtask_doer_prompt(
         cfg,
         dag.nodes["R-001"],
         _subtask(),
         contract,
-        prior_self_audit=prior,
+        prior_doer_envelope=prior,
     )
     assert "Prior attempt" in out
-    assert "code_quality" in out
-    assert "predicted_score=5" in out
+    assert "weak filter logic" in out
+    assert "src/list.tsx" in out
 
 
 def test_subtask_checker_prompt_format(tmp_path):
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
     contract = build_for(dag.nodes["R-001"], cfg)
-    parsed = ParsedSelfAudit(gate_local_ci_rc=0, gate_local_ci_cmd="just check")
+    envelope = DoerEnvelope(summary="implemented filter", files_touched=["src/list.tsx"])
     out = subtask_checker_prompt(
         cfg,
         dag.nodes["R-001"],
         _subtask(),
         contract,
-        self_audit=parsed,
+        doer_envelope=envelope,
         diff_text="diff --git a/x b/x",
         witness_results={},
     )
     assert "S-01-domain" in out
-    assert "VERDICT:" in out  # backwards-compat verdict line stays in the prompt
     assert "Plan 14 preserved" in out
+    # The doer's self-report is in the prompt but labeled informational only.
+    assert "INFORMATIONAL" in out or "informational" in out
 
 
 def test_conflict_resolver_prompt_renders_diffs(tmp_path):
@@ -248,25 +245,28 @@ def test_conflict_resolver_prompt_renders_diffs(tmp_path):
 
 
 def test_subtask_triage_prompt_senior_engineer_framing(tmp_path):
-    """Plan 33 PR-B: triage rewrite — senior-engineer-tutoring-junior. The
-    prompt surfaces the targeted contract slice, parsed SELF_AUDIT, the
+    """Plan 38 PR-B.5: triage on the JsonAgent layer — senior-engineer-
+    tutoring-junior framing preserved (Plan 14). The prompt surfaces
+    the targeted contract slice, the doer envelope (informational), the
     checker's verdict, and the unified diff."""
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
     contract = build_for(dag.nodes["R-001"], cfg)
-    parsed = ParsedSelfAudit(gate_local_ci_rc=0, gate_local_ci_cmd="just check")
+    envelope = DoerEnvelope(summary="initial attempt", files_touched=["src/x.py"])
     out = subtask_triage_prompt(
         cfg,
         dag.nodes["R-001"],
         _subtask(),
         contract,
-        self_audit=parsed,
+        doer_envelope=envelope,
         checker_verdict="VERDICT: FAIL\n[FAIL] foo",
         diff_text="diff --git a/x b/x",
     )
     assert "S-01-domain" in out
     assert "VERDICT: FAIL" in out
     assert "senior engineer" in out.lower()
-    assert "Plan 14 preserved" in out
-    # Plan 33: failure_layer set is fixed.
-    assert "self_audit_mismatch" in out
+    # Plan 38: closed enum on failure_layer drops self_audit_mismatch
+    # and adds parse_failure + architecture.
+    assert "parse_failure" in out
+    assert "architecture" in out
+    assert "self_audit_mismatch" not in out
