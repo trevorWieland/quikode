@@ -1,15 +1,27 @@
 """Plan 33: hard validators on planner output.
 
-Three validators run against every parsed `Plan` (and its
-`EvaluationContract`) before the planner's output is accepted:
+Validators run against every parsed `Plan` / `FixupPlan` before the
+planner's output is accepted. The spec-planner driver runs all four:
 
 * `validate_rubric_coverage(plan, contract)` — every category in the
   contract's rubric appears in at least one subtask's `rubric_targets`.
+  **Spec plans only.** A fixup plan addresses specific audit findings,
+  not whole rubric categories — so the fixup driver replaces this with
+  `validate_finding_coverage` instead (Plan 33 calibration follow-up).
 * `validate_evidence_partition(plan, node)` — every id in
   `node.expected_evidence` appears in **exactly one** subtask's
-  `behavior_evidence_advanced` (not zero, not more than one).
+  `behavior_evidence_advanced` (not zero, not more than one). Applies
+  to both spec and fixup plans (fixups can only narrow the partition,
+  not widen it; the audit's `behavior:<id>` findings need exactly-once
+  coverage).
 * `validate_standards_paths(plan, repo_root)` — every cited standards
-  doc path resolves to an existing file under `repo_root`.
+  doc path resolves to an existing file under `repo_root`. Applies to
+  both spec and fixup plans.
+* `validate_finding_coverage(plan, audit_findings)` — fixup-only.
+  Every audit finding-id is covered by exactly one subtask's
+  stage-typed field, with namespace dispatch (`rubric:<cat>` →
+  `rubric_targets`, `standards:<doc§section>` → `standards_referenced`,
+  `behavior:<id>` → `behavior_evidence_advanced`).
 
 On failure, callers re-prompt the planner with the validator's message
 (max 2 re-prompts per Plan 33 D3) before BLOCKing with
@@ -27,7 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .evaluation_contract import EvaluationContract, _evidence_canonical_id
-from .subtask_schema import STABILIZATION_SUBTASK_ID, Plan
+from .subtask_schema import STABILIZATION_SUBTASK_ID, FixupPlan, Plan
 
 if TYPE_CHECKING:
     from .dag import Node
@@ -116,7 +128,7 @@ def _evidence_ids_for_node(node: Node) -> list[str]:
 
 
 def _classify_evidence_claims(
-    plan: Plan, expected: list[str]
+    plan: Plan | FixupPlan, expected: list[str]
 ) -> tuple[list[str], list[tuple[str, list[str]]], list[tuple[str, str]]]:
     """Partition the plan's behavior_evidence_advanced declarations into
     (missing, duplicated, unknown). Returns three lists ready for the
@@ -140,7 +152,7 @@ def _classify_evidence_claims(
     return missing, duplicated, unknown
 
 
-def validate_evidence_partition(plan: Plan, node: Node) -> None:
+def validate_evidence_partition(plan: Plan | FixupPlan, node: Node) -> None:
     """Every id in `node.expected_evidence` appears in EXACTLY ONE
     subtask's `behavior_evidence_advanced` across the whole plan.
 
@@ -225,7 +237,7 @@ def validate_gauntlet_strategy(plan: Plan) -> None:
         )
 
 
-def validate_standards_paths(plan: Plan, repo_root: Path) -> None:
+def validate_standards_paths(plan: Plan | FixupPlan, repo_root: Path) -> None:
     """Every `standards_referenced[].doc_path` must resolve to an existing
     file under `repo_root` at planning time.
 
@@ -254,3 +266,121 @@ def validate_standards_paths(plan: Plan, repo_root: Path) -> None:
             f"validate_standards_paths: {len(bad)} standards reference(s) "
             f"do not resolve to existing files. Fix:\n{bullets}",
         )
+
+
+def _classify_finding_coverage(
+    plan: FixupPlan, expected: list[str]
+) -> tuple[list[str], list[tuple[str, list[str]]], list[tuple[str, str]]]:
+    """Partition the fixup plan's stage-typed coverage into
+    (missing, duplicated, unknown) for the audit-finding namespace.
+
+    A finding id is covered when it can be matched to a subtask's
+    stage-typed field by namespace prefix:
+
+    * `rubric:<category>` → subtask's `rubric_targets[*].category` == category
+    * `standards:<doc_path>` or `standards:<doc_path>§<section>` →
+      subtask's `standards_referenced[*].doc_path` matches.
+    * `behavior:<id>` → subtask's `behavior_evidence_advanced` contains id.
+
+    `plan.findings_addressed` (the plan-level array) is consulted as a
+    secondary signal: if the planner declares a finding addressed there,
+    we trust it ONLY when at least one subtask owns the matching stage-
+    typed coverage. The audit-completeness check stays partition-shaped
+    (exactly one subtask) so two subtasks claiming the same finding via
+    overlapping coverage surface as `duplicated`.
+    """
+    holders: dict[str, list[str]] = defaultdict(list)
+    for s in plan.subtasks:
+        for tgt in s.rubric_targets:
+            holders[f"rubric:{tgt.category}"].append(s.id)
+        for ref in s.standards_referenced:
+            holders[f"standards:{ref.doc_path}"].append(s.id)
+            holders[f"standards:{ref.doc_path}§{ref.section}"].append(s.id)
+        for evid in s.behavior_evidence_advanced:
+            holders[f"behavior:{evid}"].append(s.id)
+
+    missing: list[str] = []
+    duplicated: list[tuple[str, list[str]]] = []
+    for fid in expected:
+        owners = holders.get(fid, [])
+        if not owners:
+            missing.append(fid)
+        elif len(set(owners)) > 1:
+            duplicated.append((fid, sorted(set(owners))))
+
+    expected_set = set(expected)
+    unknown: list[tuple[str, str]] = []
+    for fid_key, owners in holders.items():
+        # Don't flag standards-doc-only keys that we synthesize as a fallback
+        # for finding ids that lack an explicit `§section` part.
+        if fid_key in expected_set:
+            continue
+        # Skip the synthetic doc-only standards key — only flag stage-typed
+        # claims that don't map to any expected finding when the namespace is
+        # rubric: or behavior: (those are unambiguous).
+        if fid_key.startswith(("rubric:", "behavior:")):
+            for owner in owners:
+                unknown.append((owner, fid_key))
+    return missing, duplicated, unknown
+
+
+def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> None:
+    """Plan 33 calibration: fixup-only completeness check.
+
+    Every id in `audit_findings` must be addressed by EXACTLY ONE
+    subtask via the stage-typed field matching the finding's namespace
+    (`rubric:` → `rubric_targets`; `standards:` → `standards_referenced`;
+    `behavior:` → `behavior_evidence_advanced`). Mirrors the partition
+    discipline of `validate_evidence_partition` but scoped to the audit
+    bundle.
+
+    No-op when `audit_findings` is empty (e.g. `fixup-final` /
+    `fixup-ci` / `fixup-review` triggers that don't carry a typed
+    finding bundle — the trigger context is the failure context).
+
+    Why this exists (vs. `validate_rubric_coverage`):
+    `validate_rubric_coverage` insists every rubric **category** be
+    advanced. A fixup plan's job is to close specific audit gaps —
+    declaring `rubric_targets: []` on a transport/CI fix is correct
+    behavior. The fixup driver swaps `validate_rubric_coverage` for
+    this validator (Plan 33 calibration follow-up after the tanren
+    R-0002 BLOCK).
+    """
+    if not audit_findings:
+        return
+    missing, duplicated, unknown = _classify_finding_coverage(plan, audit_findings)
+    if not missing and not duplicated and not unknown:
+        return
+
+    parts: list[str] = []
+    if missing:
+        parts.append(
+            "missing finding coverage (no subtask's stage-typed field "
+            "matches the finding's namespace):\n"
+            + "\n".join(f"- {fid!r}" for fid in missing)
+            + "\nAssign each finding to exactly one subtask: a "
+            "`rubric:<cat>` finding goes into `rubric_targets`; "
+            "`standards:<doc_path>[§section]` goes into "
+            "`standards_referenced`; `behavior:<id>` goes into "
+            "`behavior_evidence_advanced`."
+        )
+    if duplicated:
+        parts.append(
+            "duplicated finding coverage (multiple subtasks claim the "
+            "same audit finding):\n"
+            + "\n".join(f"- {fid!r}: {owners!r}" for fid, owners in duplicated)
+            + "\nThe audit completeness check is a partition; assign "
+            "each finding to exactly one subtask."
+        )
+    if unknown:
+        parts.append(
+            "unknown stage-typed claim (subtask declares a "
+            "rubric/behavior coverage that doesn't match any audit "
+            "finding):\n"
+            + "\n".join(f"- subtask {sid!r}: {fid!r}" for sid, fid in unknown)
+            + f"\nValid finding ids from this audit: {audit_findings!r}"
+        )
+    raise PlannerValidationError(
+        "finding_coverage",
+        "validate_finding_coverage:\n\n" + "\n\n".join(parts),
+    )

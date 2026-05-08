@@ -133,15 +133,32 @@ class Config(BaseModel):
 
     # ----- v2 Phase 0: subtasks -----
     subtask_doer_timeout_s: int = Field(
-        default=1200,
+        default=1800,
         ge=60,
         le=14400,
+        description=(
+            "Per-subtask doer agent timeout. Plan 33 calibration (after the "
+            "tanren deploy where 7 consecutive opencode/glm-5.1 doer calls "
+            "rc=124'd at duration_s ~= 1314s, hitting the prior 1200s "
+            "ceiling): bumped to 1800s (30 min). The new SELF_AUDIT block + "
+            "scoped EvaluationContract + standards/rubric scaffolding makes "
+            "the doer prompt meaningfully heavier than the pre-Plan-33 "
+            "shape, and smaller models need the headroom to land both the "
+            "diff and the deterministic SELF_AUDIT footer before SIGTERM."
+        ),
     )
     subtask_checker_timeout_s: int = Field(
-        default=600,
+        default=900,
         ge=30,
         le=3600,
-        description="Per-subtask checker agent timeout.",
+        description=(
+            "Per-subtask checker agent timeout. Plan 33 calibration: bumped "
+            "from 600s to 900s alongside the doer bump — the targeted "
+            "EvaluationContract (rubric grading template + standards refs) "
+            "makes the checker's reasoning surface bigger too, and we want "
+            "the proportional headroom so the checker doesn't false-fail "
+            "doer work that just barely fit in the new doer ceiling."
+        ),
     )
 
     # ----- v3 Phase A: progress-driven retry overhaul -----
@@ -218,10 +235,18 @@ class Config(BaseModel):
         le=10,
     )
     fixup_planner_timeout_s: int = Field(
-        default=1200,
+        default=1800,
         ge=120,
         le=3600,
-        description="Per-invocation timeout for the fixup planner. 20m absorbs the audit-bundle decomposition path (large structured JSON output).",
+        description=(
+            "Per-invocation timeout for the fixup planner. Plan 33 "
+            "calibration (after the tanren deploy doer-timeout incident): "
+            "bumped from 1200s to 1800s. The fixup-planner now renders the "
+            "full EvaluationContract (planner-equivalent prompt) in addition "
+            "to the audit-bundle decomposition; the planner-equivalent "
+            "prompt growth + structured JSON output for multi-finding "
+            "decomposition needs the same headroom as the doer."
+        ),
     )
     fixup_planner_retries_on_transient: int = Field(
         default=2,

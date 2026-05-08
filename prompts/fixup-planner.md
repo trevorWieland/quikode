@@ -101,6 +101,27 @@ completeness check).
 
 Emit your output as a single JSON object **inside a fenced ```json ... ``` block**.
 
+### Stage-typed field shapes (MUST match exactly)
+
+The three stage-typed fields are typed Pydantic models — emitting them as
+plain strings will fail schema validation and burn a re-prompt:
+
+- `rubric_targets[]` is an array of `{"category": "<rubric-category-name>",
+  "predicted_score": <int 1-10>}` objects.
+- `standards_referenced[]` is an array of `{"doc_path": "<repo-relative
+  path>", "section": "<heading or anchor>"}` objects — **NOT** an array
+  of strings. `"docs/architecture/operations.md#Section"` is wrong;
+  `{"doc_path": "docs/architecture/operations.md", "section": "Section"}`
+  is right.
+- `behavior_evidence_advanced[]` is an array of evidence-id strings (each
+  must appear in `node.expected_evidence`).
+
+Empty arrays are accepted on every stage-typed field — a transport/CI
+fixup that doesn't advance any rubric category, cite any standards
+passage, or claim any behavior witness should emit `[]` for the
+corresponding fields. The audit-completeness union still requires every
+finding-id to be matched by SOME subtask via the namespace dispatch.
+
 ```jsonc
 {
   "summary": "1-2 sentences on what this fixup round addresses",
@@ -123,7 +144,9 @@ Emit your output as a single JSON object **inside a fenced ```json ... ``` block
       "rubric_targets": [
         { "category": "edge-case-handling", "predicted_score": 8 }
       ],
-      "standards_referenced": [],
+      "standards_referenced": [
+        { "doc_path": "docs/architecture/operations.md", "section": "Input validation" }
+      ],
       "behavior_evidence_advanced": [],
       "interfaces": [],
       "notes": "closes rubric:add-input-validation-on-org-name",

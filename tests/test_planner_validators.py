@@ -23,12 +23,14 @@ from quikode.evaluation_contract import EvaluationContract, StageRubric
 from quikode.planner_validators import (
     PlannerValidationError,
     validate_evidence_partition,
+    validate_finding_coverage,
     validate_gauntlet_strategy,
     validate_rubric_coverage,
     validate_standards_paths,
 )
 from quikode.subtask_schema import (
     STABILIZATION_SUBTASK_ID,
+    FixupPlan,
     Plan,
     RubricTarget,
     StandardsRef,
@@ -328,3 +330,113 @@ def test_gauntlet_strategy_fails_when_too_long():
         validate_gauntlet_strategy(plan)
     assert exc_info.value.which == "gauntlet_strategy"
     assert "<= 2000" in exc_info.value.message
+
+
+# ----- validate_finding_coverage (Plan 33 calibration: fixup-only) -----
+
+
+def _fixup_plan(*subtasks: Subtask) -> FixupPlan:
+    return FixupPlan(summary="x", subtasks=subtasks, findings_addressed=())
+
+
+def test_finding_coverage_no_op_on_empty_findings():
+    """fixup-final / fixup-ci / fixup-review rounds carry no typed
+    finding bundle; the validator should short-circuit."""
+    plan = _fixup_plan(_subtask("F-01"))
+    validate_finding_coverage(plan, [])  # no raise
+
+
+def test_finding_coverage_passes_when_every_finding_covered():
+    plan = _fixup_plan(
+        _subtask(
+            "F-01",
+            rubric_targets=(RubricTarget(category="security", predicted_score=8),),
+        ),
+        _subtask(
+            "F-02",
+            standards_referenced=(StandardsRef(doc_path="docs/x.md", section="A"),),
+        ),
+        _subtask(
+            "F-03",
+            behavior_evidence_advanced=("B-0066",),
+        ),
+    )
+    validate_finding_coverage(
+        plan,
+        [
+            "rubric:security",
+            "standards:docs/x.md§A",
+            "behavior:B-0066",
+        ],
+    )
+
+
+def test_finding_coverage_fails_when_finding_missing():
+    """A `rubric:security` finding with NO subtask claiming security in
+    rubric_targets is the partition-failure shape that surfaced as the
+    R-0002 BLOCK on the tanren deploy."""
+    plan = _fixup_plan(
+        _subtask(
+            "F-01",
+            rubric_targets=(RubricTarget(category="maintainability", predicted_score=7),),
+        ),
+    )
+    with pytest.raises(PlannerValidationError) as exc_info:
+        validate_finding_coverage(plan, ["rubric:security", "rubric:maintainability"])
+    assert exc_info.value.which == "finding_coverage"
+    assert "rubric:security" in exc_info.value.message
+    assert "missing" in exc_info.value.message
+
+
+def test_finding_coverage_fails_on_duplicate_coverage():
+    """Two subtasks both claim `rubric:security` — partition discipline
+    requires exactly-one ownership."""
+    plan = _fixup_plan(
+        _subtask(
+            "F-01",
+            rubric_targets=(RubricTarget(category="security", predicted_score=8),),
+        ),
+        _subtask(
+            "F-02",
+            rubric_targets=(RubricTarget(category="security", predicted_score=9),),
+        ),
+    )
+    with pytest.raises(PlannerValidationError) as exc_info:
+        validate_finding_coverage(plan, ["rubric:security"])
+    assert exc_info.value.which == "finding_coverage"
+    assert "duplicated" in exc_info.value.message
+    assert "F-01" in exc_info.value.message
+    assert "F-02" in exc_info.value.message
+
+
+def test_finding_coverage_flags_unknown_rubric_claim():
+    """A subtask declares `rubric_targets=[security]` but no audit finding
+    references security — surfaces as `unknown` so the planner trims the
+    over-claim."""
+    plan = _fixup_plan(
+        _subtask(
+            "F-01",
+            rubric_targets=(RubricTarget(category="security", predicted_score=8),),
+        ),
+        _subtask(
+            "F-02",
+            behavior_evidence_advanced=("B-0066",),
+        ),
+    )
+    with pytest.raises(PlannerValidationError) as exc_info:
+        validate_finding_coverage(plan, ["behavior:B-0066"])
+    assert exc_info.value.which == "finding_coverage"
+    assert "unknown" in exc_info.value.message
+    assert "rubric:security" in exc_info.value.message
+
+
+def test_finding_coverage_accepts_empty_rubric_targets_when_finding_is_behavior_only():
+    """Plan 33 calibration: `rubric_targets=[]` is legitimate on a fixup
+    that only addresses a behavior witness — the prior validator
+    `validate_rubric_coverage` would have rejected this even though the
+    audit only flagged a behavior id, which is exactly the pathology
+    that BLOCKed R-0002 on the tanren deploy."""
+    plan = _fixup_plan(
+        _subtask("F-01", behavior_evidence_advanced=("B-0066",)),
+    )
+    validate_finding_coverage(plan, ["behavior:B-0066"])  # no raise

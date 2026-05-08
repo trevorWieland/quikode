@@ -7,8 +7,13 @@ from typing import Any
 
 from quikode import fsm_runtime
 from quikode.state import State, SubtaskState
-from quikode.subtask_schema import FixupPlan, PlanValidationError
-from quikode.workers.fixup_coverage import missing_finding_coverage
+from quikode.subtask_schema import FixupPlan
+from quikode.workers.fixup_coverage import (
+    build_coverage_gap_addendum,
+    missing_finding_coverage,
+    parse_and_validate_fixup_plan,
+    split_subtask_rows_for_planner,
+)
 from quikode.workers.outcomes import WorkerOutcome
 
 
@@ -60,16 +65,14 @@ class PrePrWorkerMixin:
             ci_excerpt=ci_excerpt,
             review_threads_block=review_threads_block,
             triage_root_cause=triage_root_cause,
+            audit_findings=expected_finding_ids,
         )
         # Completeness check (Plan 33 PR-B): for audit-driven fixup rounds,
-        # every `expected_finding_ids` entry must be covered. PR-A retired
-        # `addresses_findings` per-subtask; PR-B replaces the completeness
-        # rule with a stage-typed union over `rubric_targets` /
-        # `standards_referenced` / `behavior_evidence_advanced` plus the
-        # plan-level `findings_addressed` array. We accept either path
-        # (the planner declares `findings_addressed` AND advances the
-        # corresponding stage-typed field) so the audit-bundle matcher
-        # remains tolerant of finding-id namespaces (rubric:..., behavior:...).
+        # every `expected_finding_ids` entry must be covered. The driver-
+        # side wrapper unions `rubric_targets` / `standards_referenced` /
+        # `behavior_evidence_advanced` plus the plan-level
+        # `findings_addressed` array, tolerating namespace prefixes; see
+        # `fixup_coverage.missing_finding_coverage`.
         if (
             fixup_plan is not None
             and fixup_plan.subtasks
@@ -85,18 +88,7 @@ class PrePrWorkerMixin:
                     round_no,
                     ", ".join(sorted(missing)[:8]),
                 )
-                gap_addendum = (
-                    "## Coverage gap from your previous attempt\n\n"
-                    "Your previous plan missed the following finding ids. "
-                    "Include each one in `findings_addressed` AND in at least "
-                    "one subtask's stage-typed coverage (`rubric_targets`, "
-                    "`standards_referenced`, or `behavior_evidence_advanced` "
-                    "matching the finding's namespace):\n\n"
-                    + "\n".join(f"- `{fid}`" for fid in sorted(missing))
-                    + "\n\n"
-                    "Re-emit the COMPLETE plan (do not emit only the deltas)."
-                )
-                augmented_root = (gap_addendum + "\n\n---\n\n" + (triage_root_cause or ""))[:16000]
+                augmented_root = build_coverage_gap_addendum(missing, triage_root_cause)
                 fixup_plan = self._invoke_fixup_planner(
                     kind=kind,
                     round_no=round_no,
@@ -105,6 +97,7 @@ class PrePrWorkerMixin:
                     ci_excerpt=ci_excerpt,
                     review_threads_block=review_threads_block,
                     triage_root_cause=augmented_root,
+                    audit_findings=expected_finding_ids,
                 )
                 if fixup_plan is not None and fixup_plan.subtasks:
                     still_missing = self._missing_finding_coverage(fixup_plan, expected_finding_ids)
@@ -181,29 +174,22 @@ class PrePrWorkerMixin:
         ci_excerpt: str | None,
         review_threads_block: str | None,
         triage_root_cause: str | None,
+        audit_findings: list[str] | None = None,
     ) -> FixupPlan | None:
-        """Run the fixup planner agent and parse its output. Returns None on
-        any error so the caller can fall back to the monolithic doer."""
+        """Run the fixup planner agent, parse + validate its output.
+
+        Plan 33 calibration: the fixup driver runs `validate_finding_coverage`
+        (replaces rubric_coverage), `validate_evidence_partition`, and
+        `validate_standards_paths`. Validator failure triggers one re-prompt
+        with the structured feedback; a second failure returns None.
+        """
         agent = _tw.build_agent(self.cfg.planner)
         # Build the context the planner needs: original final_acceptance,
         # done spec subtasks, and any prior fixup subtasks (so the new round
         # can avoid duplicating earlier fixup work).
-        rows = self.store.list_subtasks(self.node.id)
-        done_subtasks: list[dict] = []
-        prior_fixup_subtasks: list[dict] = []
-        for r in rows:
-            kind_val = (r.get("kind") or "spec") if isinstance(r, dict) else "spec"
-            row_view = {
-                "subtask_id": r["subtask_id"],
-                "title": r.get("title") or "",
-                "kind": kind_val,
-                "state": r["state"],
-            }
-            if kind_val == "spec":
-                if r["state"] == SubtaskState.DONE.value:
-                    done_subtasks.append(row_view)
-            else:
-                prior_fixup_subtasks.append(row_view)
+        done_subtasks, prior_fixup_subtasks = split_subtask_rows_for_planner(
+            self.store.list_subtasks(self.node.id), SubtaskState.DONE.value
+        )
         original_final_acceptance: list[str] = []
         if self.plan is not None:
             original_final_acceptance = list(self.plan.final_acceptance)
@@ -230,11 +216,13 @@ class PrePrWorkerMixin:
         # (codex CLI flake, container hiccup). Retry once or twice before giving up so
         # infra noise doesn't burn fixup_max_rounds on a transient.
         retries_left = self.cfg.fixup_planner_retries_on_transient
+        validator_retries_left = 1
         attempt_no = 0
+        cur_prompt = prompt
         while True:
             attempt_no += 1
             result = agent.run(
-                prompt,
+                cur_prompt,
                 handle=self._h,
                 log_path=self.log_path,
                 timeout=self.cfg.fixup_planner_timeout_s,
@@ -258,8 +246,6 @@ class PrePrWorkerMixin:
                 f"fixup_planner_output:{kind}:{round_no}:attempt{attempt_no}",
                 result.stdout,
             )
-            if result.rc == 0:
-                break
             if result.rc == 124 and retries_left > 0:
                 retries_left -= 1
                 _tw.log.warning(
@@ -269,18 +255,32 @@ class PrePrWorkerMixin:
                     retries_left,
                 )
                 continue
-            _tw.log.warning("fixup planner exited rc=%d (kind=%s round=%d)", result.rc, kind, round_no)
-            return None
-        try:
-            return _tw.parse_fixup_planner_output(result.stdout)
-        except PlanValidationError as e:
+            if result.rc != 0:
+                _tw.log.warning("fixup planner exited rc=%d (kind=%s round=%d)", result.rc, kind, round_no)
+                return None
+            plan, feedback = parse_and_validate_fixup_plan(
+                result.stdout,
+                repo_root=self.cfg.repo_path,
+                node=self.node,
+                audit_findings=audit_findings,
+            )
+            if plan is not None:
+                return plan
+            if validator_retries_left <= 0:
+                _tw.log.warning(
+                    "fixup planner output failed parse/validators after retry (kind=%s round=%d): %s",
+                    kind,
+                    round_no,
+                    (feedback or "")[:300],
+                )
+                return None
+            validator_retries_left -= 1
             _tw.log.warning(
-                "fixup planner output didn't validate (kind=%s round=%d): %s",
+                "fixup planner output failed parse/validators (kind=%s round=%d); re-prompting once",
                 kind,
                 round_no,
-                e,
             )
-            return None
+            cur_prompt = (feedback or "") + "\n\n---\n\n" + prompt
 
     def _run_manual_probes(self: Any) -> str:
         """Run `kind="manual"` items from `expected_evidence` and return

@@ -254,11 +254,15 @@ def test_resume_refuses_for_unknown_task(tmp_path, monkeypatch):
 # ----- timeout default -----
 
 
-def test_default_subtask_doer_timeout_is_20_minutes():
-    """Default is now 1200s (20 min). Median observed time is ~9 min;
-    20-min cap = 2x headroom and halves the cost of a hang."""
+def test_default_subtask_doer_timeout_is_30_minutes():
+    """Default is 1800s (30 min). Plan 33 calibration (after the tanren
+    deploy where 7 consecutive opencode/glm-5.1 doer calls rc=124'd at
+    duration_s ~= 1314s): bumped from 1200s to 1800s because the new
+    SELF_AUDIT block + scoped EvaluationContract makes the doer prompt
+    meaningfully heavier and smaller models need the headroom to land
+    both the diff and the SELF_AUDIT footer before SIGTERM."""
     cfg = Config(repo_path=Path("/tmp"), dag_path=Path("/tmp"))
-    assert cfg.subtask_doer_timeout_s == 1200
+    assert cfg.subtask_doer_timeout_s == 1800
 
 
 # ----- --reason flag on manual-action commands -----
