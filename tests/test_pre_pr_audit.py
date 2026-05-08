@@ -1,21 +1,45 @@
 """Unit tests for `quikode.pre_pr_audit`.
 
-Each stage is independently testable: the audit module composes
-prompts + parses agent JSON envelopes, both of which are deterministic
-under stub-agent harnesses. Tests cover:
+Plan 38 PR-B.3: the three audit stages (rubric / standards / behavior)
+run through the JsonAgent layer. The legacy heuristic JSON-extract path
+(`json.loads(cand)` over a regex-extracted candidate) is gone; tests
+that exercised the parser are replaced with stub-`make_agent` cases that
+hand the audit either a validated pydantic instance or a `parse_errors`
+non-empty `JsonAgentResult` to verify the structural-failure mode.
 
-- Stage parser handling of well-formed JSON, prose-wrapped JSON, garbage
-- Stage outcome shape on success / failure / parse error
-- merge_failed_stage_reports produces a single bundle the fixup planner
-  can ingest
-- collect_standards_text reads cfg-globbed docs from the repo
+Tests cover:
+- Rubric / standards / behavior happy path → outcome reflects the
+  validated pydantic instance.
+- Rubric / standards / behavior gating semantics (any category below
+  threshold, any severity ≥ medium, any unverified behavior).
+- `parse_errors` non-empty → synthetic FAIL outcome labeled
+  `parse_failure` (plan-12/14 invariant: structural failure, NOT a
+  fabricated content finding).
+- Agent rc != 0 → synthetic FAIL outcome labeled `infra`.
+- merge_failed_stage_reports + collect_finding_ids preserved across
+  the rewrite (legacy dict shape).
+- collect_standards_text reads contract source_text.
+- Source-level regression: heuristic regex / `json.loads(cand)` cannot
+  re-appear.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 from quikode import pre_pr_audit
+from quikode.agent_schemas import (
+    BehaviorCompletenessGap,
+    BehaviorVerification,
+    PrePRBehaviorAuditOutput,
+    PrePRRubricAuditOutput,
+    PrePRStandardsAuditOutput,
+    RubricCategoryScore,
+    RubricGap,
+    StandardsFinding,
+)
+from quikode.agents.json_protocol import JsonAgentResult
 from quikode.architecture_docs import ArchitectureCorpus
 from quikode.config import Config
 from quikode.evaluation_contract import (
@@ -25,62 +49,380 @@ from quikode.evaluation_contract import (
     StandardsStageRubric,
 )
 
-# ----- Rubric envelope parsing -----
+# ----- helpers -----
 
 
-def test_parse_rubric_envelope_well_formed():
-    raw = '{"categories":[{"name":"security","score":8,"rationale":"ok"},{"name":"performance","score":6,"rationale":"slow"}]}'
-    parsed = pre_pr_audit._parse_rubric_envelope(raw)
-    assert parsed is not None
-    assert len(parsed["categories"]) == 2
-
-
-def test_parse_rubric_envelope_prose_wrapped():
-    raw = 'Sure, here is the assessment.\n{"categories":[{"name":"security","score":9,"rationale":"good"}]}\nDone.'
-    parsed = pre_pr_audit._parse_rubric_envelope(raw)
-    assert parsed is not None
-    assert parsed["categories"][0]["score"] == 9
-
-
-def test_parse_rubric_envelope_garbage_returns_none():
-    assert pre_pr_audit._parse_rubric_envelope("") is None
-    assert pre_pr_audit._parse_rubric_envelope("just prose, no json") is None
-    assert pre_pr_audit._parse_rubric_envelope('{"foo":"bar"}') is None  # missing categories
-
-
-# ----- Standards envelope parsing -----
-
-
-def test_parse_findings_envelope_serious_finding():
-    raw = '{"findings":[{"file":"x.py","line":42,"severity":"high","description":"crosses module boundary","suggested_fix":"move to xtask"}]}'
-    parsed = pre_pr_audit._parse_findings_envelope(raw)
-    assert parsed is not None
-    assert parsed["findings"][0]["severity"] == "high"
-
-
-def test_parse_findings_envelope_empty_findings():
-    raw = '{"findings":[]}'
-    parsed = pre_pr_audit._parse_findings_envelope(raw)
-    assert parsed is not None
-    assert parsed["findings"] == []
-
-
-# ----- Behavior envelope parsing -----
-
-
-def test_parse_behavior_envelope_mixed_verified():
-    raw = (
-        '{"behaviors":[{"behavior_id":"B-1","verified":true,"evidence_seen":"test passes"},'
-        '{"behavior_id":"B-2","verified":false,"gap_explanation":"endpoint not implemented"}]}'
+def _build_cfg(tmp_path: Path) -> Config:
+    cfg = Config(
+        repo_path=tmp_path,
+        dag_path=tmp_path / "dag.json",
+        state_dir=tmp_path / ".quikode",
+        log_dir=tmp_path / ".quikode" / "logs",
+        prompts_dir=tmp_path / "missing-prompts",
+        worktree_root=tmp_path / ".quikode" / "worktrees",
+        sccache_dir=tmp_path / ".quikode" / "sccache",
     )
-    parsed = pre_pr_audit._parse_behavior_envelope(raw)
-    assert parsed is not None
-    bs = parsed["behaviors"]
-    assert sum(1 for b in bs if b["verified"]) == 1
-    assert sum(1 for b in bs if not b["verified"]) == 1
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    return cfg
 
 
-# ----- Outcome construction -----
+def _stub_handle() -> MagicMock:
+    h = MagicMock()
+    h.container_name = "qk-stub"
+    return h
+
+
+def _make_json_result(
+    *,
+    structured=None,
+    rc: int = 0,
+    parse_errors: tuple[str, ...] = (),
+    raw_text: str | None = None,
+) -> JsonAgentResult:
+    return JsonAgentResult(
+        structured=structured,
+        rc=rc,
+        transient=False,
+        duration_s=0.1,
+        parse_errors=parse_errors,
+        raw_text=raw_text,
+    )
+
+
+# ----- Rubric audit -----
+
+
+def test_run_rubric_audit_happy_path_all_pass(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    audit = PrePRRubricAuditOutput(
+        categories=[
+            RubricCategoryScore(name="security", score=8, rationale="ok"),
+            RubricCategoryScore(name="performance", score=9, rationale="great"),
+        ],
+        overall_assessment="solid",
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_rubric_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert outcome.passed
+    assert outcome.name == "rubric"
+    assert "security=8" in outcome.summary
+    assert "performance=9" in outcome.summary
+
+
+def test_run_rubric_audit_failing_category_below_threshold(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    audit = PrePRRubricAuditOutput(
+        categories=[
+            RubricCategoryScore(
+                name="security",
+                score=4,
+                rationale="missing input validation",
+                gaps_to_reach_ten=[
+                    RubricGap(
+                        id="validate-org-name",
+                        description="Org name length unchecked",
+                        concrete_fix="Add len<=64 guard in create_organization_atomic",
+                        files=["src/org.rs"],
+                    )
+                ],
+            ),
+            RubricCategoryScore(name="performance", score=8, rationale="ok"),
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_rubric_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert not outcome.passed
+    assert "rubric failed" in outcome.summary
+    # Legacy dict shape preserved (collect_finding_ids reads `id` /
+    # `category` / `gaps_to_reach_ten`).
+    assert len(outcome.findings) == 1
+    f = outcome.findings[0]
+    assert f["category"] == "security"
+    assert f["score"] == 4
+    assert f["id"] == "category-security"
+    assert f["gaps_to_reach_ten"][0]["id"] == "validate-org-name"
+
+
+def test_run_rubric_audit_parse_failure_returns_synthetic_fail(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(
+        structured=None,
+        parse_errors=("categories.0.score: Input should be a valid integer",),
+        raw_text="garbage prose",
+    )
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_rubric_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert not outcome.passed
+    assert "parse_failure" in outcome.summary
+    # Plan-12/14 invariant: parse_failure is a STRUCTURAL signal, not a
+    # fabricated content finding masquerading as a real grade.
+    assert len(outcome.findings) == 1
+    assert outcome.findings[0]["kind"] == "parse_failure"
+    assert "Input should be a valid integer" in outcome.findings[0]["rationale"]
+
+
+def test_run_rubric_audit_agent_rc_nonzero_returns_infra_fail(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=None, rc=124)
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_rubric_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert not outcome.passed
+    assert "rc=124" in outcome.summary
+    assert outcome.findings[0]["kind"] == "infra"
+
+
+# ----- Standards audit -----
+
+
+def test_run_standards_audit_no_standards_text_returns_config_error(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    outcome = pre_pr_audit.run_standards_audit(
+        cfg=cfg,
+        handle=_stub_handle(),
+        diff_excerpt="diff",
+        standards_text="",
+    )
+    assert not outcome.passed
+    assert "no standards profile docs loaded" in outcome.summary
+    assert outcome.findings[0]["kind"] == "config_error"
+
+
+def test_run_standards_audit_happy_path_low_severity(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    audit = PrePRStandardsAuditOutput(
+        findings=[
+            StandardsFinding(
+                id="x",
+                file="a.py",
+                line=12,
+                severity="low",
+                standards_doc_ref="docs/std.md#naming",
+                description="minor naming nit",
+            )
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_standards_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            standards_text="STANDARDS",
+        )
+    assert outcome.passed
+    assert "low-severity note(s)" in outcome.summary
+    assert outcome.findings[0]["severity"] == "low"
+
+
+def test_run_standards_audit_serious_finding_fails(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    audit = PrePRStandardsAuditOutput(
+        findings=[
+            StandardsFinding(
+                id="rename-account-orgs",
+                file="src/x.rs",
+                line=42,
+                severity="high",
+                standards_doc_ref="docs/std.md#naming",
+                description="crosses module boundary",
+                concrete_fix="move to xtask",
+            )
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_standards_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            standards_text="STANDARDS",
+        )
+    assert not outcome.passed
+    assert "1 medium+ severity" in outcome.summary
+    # Legacy dict shape preserved.
+    assert outcome.findings[0]["id"] == "rename-account-orgs"
+    assert outcome.findings[0]["severity"] == "high"
+
+
+def test_run_standards_audit_parse_failure_returns_synthetic_fail(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(
+        structured=None,
+        parse_errors=("findings.0.severity: Input should be 'low', 'medium', 'high' or 'critical'",),
+    )
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_standards_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            standards_text="STANDARDS",
+        )
+    assert not outcome.passed
+    assert "parse_failure" in outcome.summary
+    assert outcome.findings[0]["kind"] == "parse_failure"
+
+
+# ----- Behavior audit -----
+
+
+def test_run_behavior_audit_no_evidence_passes_skipped(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    outcome = pre_pr_audit.run_behavior_audit(
+        cfg=cfg,
+        handle=_stub_handle(),
+        expected_evidence=[],
+        diff_excerpt="diff",
+        plan_text="plan",
+    )
+    assert outcome.passed
+    assert "gate skipped" in outcome.summary
+
+
+def test_run_behavior_audit_all_verified_passes(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    audit = PrePRBehaviorAuditOutput(
+        behaviors=[
+            BehaviorVerification(
+                behavior_id="B-1",
+                verified=True,
+                evidence_seen="test passes",
+            )
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_behavior_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            expected_evidence=[{"behavior_id": "B-1"}],
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert outcome.passed
+    assert "1 verified" in outcome.summary
+
+
+def test_run_behavior_audit_unverified_behavior_fails(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    audit = PrePRBehaviorAuditOutput(
+        behaviors=[
+            BehaviorVerification(
+                behavior_id="B-1",
+                verified=True,
+                evidence_seen="test passes",
+            ),
+            BehaviorVerification(
+                behavior_id="B-2",
+                verified=False,
+                gap_explanation="endpoint not implemented",
+                concrete_fix="add /v1/foo",
+                completeness_gaps=[
+                    BehaviorCompletenessGap(
+                        id="falsification-on-dup",
+                        description="dup-key path untested",
+                    )
+                ],
+            ),
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_behavior_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            expected_evidence=[{"behavior_id": "B-1"}, {"behavior_id": "B-2"}],
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert not outcome.passed
+    assert "1 unverified" in outcome.summary
+    assert outcome.findings[0]["behavior_id"] == "B-2"
+    # Bridge preserves completeness_gaps so collect_finding_ids picks them up.
+    assert outcome.findings[0]["completeness_gaps"][0]["id"] == "falsification-on-dup"
+
+
+def test_run_behavior_audit_parse_failure_returns_synthetic_fail(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(
+        structured=None,
+        parse_errors=("behaviors.0.verified: Input should be a valid boolean",),
+    )
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_behavior_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            expected_evidence=[{"behavior_id": "B-1"}],
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert not outcome.passed
+    assert "parse_failure" in outcome.summary
+    assert outcome.findings[0]["kind"] == "parse_failure"
+
+
+# ----- Outcome construction (preserved across rewrite) -----
 
 
 def test_pipeline_cycle_passed_when_all_pass():
@@ -247,3 +589,23 @@ def test_collect_standards_text_no_contract_returns_empty(tmp_path: Path):
     cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json")
     text = pre_pr_audit.collect_standards_text(cfg)
     assert text == ""
+
+
+# ----- Source-level guards (Plan 38 PR-B.3 regression) -----
+
+
+def test_pre_pr_audit_source_has_no_heuristic_json_extract():
+    """Plan 38 PR-B.3 regression: pre_pr_audit.py must not re-introduce
+    the heuristic JSON-extract path. The JsonAgent layer owns parsing for
+    all three audit stages."""
+    src = Path("quikode/pre_pr_audit.py").read_text()
+    # No regex-based JSON extraction.
+    assert "_JSON_OBJ_RE" not in src, "regex extraction must be gone"
+    assert "_JSON_OBJECT_RE" not in src, "regex extraction must be gone"
+    assert "import re" not in src, "re module no longer needed"
+    # No cand-based json.loads heuristic.
+    assert "json.loads(cand)" not in src, "json.loads heuristic must be gone"
+    # The legacy parse helpers are deleted.
+    assert "_parse_rubric_envelope" not in src, "rubric parser helper must be gone"
+    assert "_parse_findings_envelope" not in src, "standards parser helper must be gone"
+    assert "_parse_behavior_envelope" not in src, "behavior parser helper must be gone"

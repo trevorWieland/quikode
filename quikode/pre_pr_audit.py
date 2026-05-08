@@ -1,53 +1,50 @@
 """v3.6 pre-PR pipeline: 4-stage gate before opening a PR.
 
-Stage 0  Local CI gate  — run `cfg.local_ci_command` (default `just ci`)
-                          inside the dev container. The full raw output is
-                          passed through to downstream consumers (triage +
-                          fixup planner) without regex-based extraction —
-                          structured-failure parsing was lossy on outputs
-                          the patterns didn't match (e.g. R-0021's "0
-                          structured failure(s) extracted").
-Stage 1  Rubric audit   — codex agent rates the diff on
-                          `cfg.pre_pr_rubric_categories` from 1-10. Any
-                          category < `cfg.pre_pr_rubric_min_score` fails.
-Stage 2  Standards audit — claude-opus reads cfg-globbed standards
-                          profile docs + branch diff, outputs structured
-                          findings (severity ≥ medium gates).
-Stage 3  Behavior audit  — codex verifies each item in
-                          `node.expected_evidence` is real (run the
-                          witness, exercise the interface).
+Stage 0 (local_ci) runs `cfg.local_ci_command` and passes raw output
+through to triage. Stages 1-3 (rubric / standards / behavior) invoke
+JsonAgent roles `pre_pr_rubric` / `pre_pr_standards` / `pre_pr_behavior`,
+each with a closed pydantic schema (`PrePR*AuditOutput`).
 
-If any stage fails, all findings are merged → triage agent → fixup
-planner with `kind="fixup-pre-pr-audit"` → per-subtask doer/checker
-loop. After the loop completes, the pipeline re-runs from stage 0.
-Cycles cap via `cfg.pre_pr_audit_max_cycles` (default 3) — anything
-beyond is BLOCKED with the merged findings as the operator-actionable
-context.
+Failures merge into a `audit_findings` bundle → triage → fixup planner
+(kind="fixup-pre-pr-audit") → per-subtask doer/checker loop, then the
+pipeline re-runs. Cycles cap at `cfg.pre_pr_audit_max_cycles` (default
+3); beyond that the node is BLOCKED.
 
-Each audit returns a `StageOutcome` carrying `passed: bool`, a
-short `summary`, the raw (truncated) agent stdout, and the
-structured `findings` JSON the triage layer consumes.
+Plan 38 PR-B.3: prose parsing (heuristic JSON extraction) is gone for
+all three audit stages. Each audit's outcome is built from the validated
+pydantic instance the JsonAgent layer hands back. A schema-validation
+failure (`parse_errors` non-empty) collapses to a synthetic FAIL labeled
+`parse_failure` — the plan-12/14 invariant (no fabrication) means
+downstream FIXUP planning sees this as "the audit couldn't run cleanly",
+NOT a real grading failure.
 
-Failures from this layer are *not* the same as a checker FAIL — the
-PR was *blocked from opening* because the system caught the issue
-before review. The merged report is therefore an operator-readable
-artifact ("here's what we caught, here's how the doer fixed it") that
-can sit on the eventual PR description for transparency.
+Failures from this layer are *not* the same as a checker FAIL — the PR
+was *blocked from opening* because the system caught the issue before
+review. The merged report is an operator-readable artifact ("here's what
+we caught, here's how the doer fixed it") that sits on the eventual PR
+description for transparency.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from pydantic import BaseModel
+
 from . import prompts as prompts_mod
-from .agents import build_agent
-from .config import AgentRole, Config
+from .agent_registry import make_agent
+from .agent_schemas import (
+    PrePRBehaviorAuditOutput,
+    PrePRRubricAuditOutput,
+    PrePRStandardsAuditOutput,
+)
+from .agents.json_protocol import JsonAgentResult
+from .config import Config
 from .evaluation_contract import EvaluationContract
 from .execution import ExecutionSandbox, exec_in
 
@@ -133,27 +130,111 @@ def run_local_ci_gate(
             summary=f"local CI passed: `{cmd_str}` rc=0",
             raw_output=_tail(blob, 80),
         )
-    # Pass the full raw output through to the fixup planner. Pre-plan-29 we
-    # ran `triage.parse_ci_failure` to extract structured findings via regex,
-    # but on outputs the patterns didn't match (custom test runners, BDD
-    # scenario blocks, just-recipe wrappers) the extraction returned 0
-    # findings AND we tailed the output to 200 lines — leaving the planner
-    # blind. Hand over the unfiltered context and let the planner decide what
-    # to fix. Cap is generous (16k chars / ~250 lines) to fit the prompt
-    # budget without truncating typical multi-failure runs.
-    summary = f"local CI failed: rc={rc} (full output below)"
+    # Pass the full raw output through to the fixup planner. Plan-29
+    # retired `triage.parse_ci_failure`'s regex-based extraction because
+    # custom runners / BDD blocks / just-recipe wrappers blew up the
+    # patterns and left the planner blind. Cap is generous (~250 lines).
     return StageOutcome(
         name="local_ci",
         passed=False,
-        summary=summary,
+        summary=f"local CI failed: rc={rc} (full output below)",
         raw_output=_tail(blob, 600),
     )
 
 
+# ----- shared dispatch for the JsonAgent-backed audit stages -----
+
+
+def _invoke_audit(
+    stage: StageName,
+    role: str,
+    *,
+    cfg: Config,
+    handle: ExecutionSandbox,
+    log_path: Path | None,
+    template: str,
+    template_ctx: dict,
+    expected_schema: type[BaseModel],
+) -> tuple[BaseModel | None, JsonAgentResult, StageOutcome | None]:
+    """Render the prompt, dispatch through `make_agent`, and pre-validate.
+
+    Returns `(structured, result, early_outcome)`. When `early_outcome`
+    is non-None the caller surfaces it verbatim (render failure, agent
+    rc != 0, parse failure, registry/schema mismatch). Otherwise
+    `structured` is the validated pydantic instance.
+    """
+    try:
+        prompt = prompts_mod.render(cfg, template, **template_ctx)
+    except Exception as e:
+        empty = JsonAgentResult(structured=None, rc=0, transient=False, duration_s=0.0)
+        return None, empty, _render_failure_outcome(stage, e)
+    agent = make_agent(role, cfg)
+    result = agent.invoke(prompt, handle=handle, log_path=log_path, timeout=cfg.pre_pr_audit_timeout_s)
+    if result.rc != 0:
+        return None, result, _agent_failure_outcome(stage, result)
+    if result.parse_errors or result.structured is None:
+        return None, result, _parse_failure_outcome(stage, result)
+    if not isinstance(result.structured, expected_schema):
+        # Defensive: registry binds the role to its schema; only fires
+        # on a registry misconfiguration.
+        mismatch = StageOutcome(
+            name=stage,
+            passed=False,
+            summary=(
+                f"{stage} agent returned unexpected schema "
+                f"{type(result.structured).__name__}; expected {expected_schema.__name__}"
+            ),
+            findings=[{"kind": "infra", "message": "registry/schema mismatch"}],
+        )
+        return None, result, mismatch
+    return result.structured, result, None
+
+
+def _parse_failure_outcome(stage: StageName, result: JsonAgentResult) -> StageOutcome:
+    """Synthetic FAIL for a schema-validation failure. The
+    `kind="parse_failure"` label preserves the plan-12/14 no-fabrication
+    invariant — this is "the audit couldn't run cleanly", NOT a content
+    finding the FIXUP planner should treat as a real grading failure."""
+    parse_errors = list(result.parse_errors)
+    rationale = "; ".join(parse_errors)[:500] if parse_errors else "no structured output"
+    return StageOutcome(
+        name=stage,
+        passed=False,
+        summary=f"{stage} audit response failed schema validation — failing closed (parse_failure)",
+        raw_output=_tail(result.raw_text or "", 200),
+        findings=[
+            {
+                "kind": "parse_failure",
+                "message": f"{stage} audit response failed schema validation",
+                "rationale": rationale,
+                "parse_errors": parse_errors,
+            }
+        ],
+    )
+
+
+def _agent_failure_outcome(stage: StageName, result: JsonAgentResult) -> StageOutcome:
+    """FAIL outcome for transport-level agent failure (rc != 0)."""
+    return StageOutcome(
+        name=stage,
+        passed=False,
+        summary=f"{stage} agent rc={result.rc}",
+        raw_output=_tail(result.raw_text or "", 80),
+        findings=[{"kind": "infra", "message": f"{stage} agent failed", "rc": result.rc}],
+    )
+
+
+def _render_failure_outcome(stage: StageName, exc: Exception) -> StageOutcome:
+    """FAIL outcome for a prompt-render exception."""
+    return StageOutcome(
+        name=stage,
+        passed=False,
+        summary=f"{stage} prompt render failed: {exc}",
+        findings=[{"kind": "infra", "message": str(exc)[:500]}],
+    )
+
+
 # ----- Stage 1: rubric audit -----
-
-
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def run_rubric_audit(
@@ -162,92 +243,78 @@ def run_rubric_audit(
     handle: ExecutionSandbox,
     diff_excerpt: str,
     plan_text: str,
-    role: AgentRole | None = None,
     log_path: Path | None = None,
 ) -> StageOutcome:
-    """Score the diff on `cfg.pre_pr_rubric_categories`. Default uses the
-    checker role (codex 5.5-class) — better at structural reasoning than
-    the lightweight intent-reviewer model."""
-    role = role or cfg.checker
-    try:
-        prompt = prompts_mod.render(
-            cfg,
-            "pre-pr-rubric.md",
-            categories=list(cfg.pre_pr_rubric_categories),
-            min_score=cfg.pre_pr_rubric_min_score,
-            diff_excerpt=diff_excerpt[:20000],
-            plan_text=plan_text[:6000],
-        )
-    except Exception as e:
-        return StageOutcome(
-            name="rubric",
-            passed=False,
-            summary=f"rubric prompt render failed: {e}",
-            findings=[{"kind": "infra", "message": str(e)[:500]}],
-        )
-    agent = build_agent(role)
-    result = agent.run(prompt, handle=handle, log_path=log_path, timeout=cfg.pre_pr_audit_timeout_s)
-    if not result.ok:
-        return StageOutcome(
-            name="rubric",
-            passed=False,
-            summary=f"rubric agent rc={result.rc}",
-            raw_output=_tail(result.stdout, 80),
-            findings=[{"kind": "infra", "message": "rubric agent failed", "rc": result.rc}],
-        )
-    parsed = _parse_rubric_envelope(result.stdout)
-    if parsed is None:
-        return StageOutcome(
-            name="rubric",
-            passed=False,
-            summary="rubric envelope unparseable — failing closed",
-            raw_output=_tail(result.stdout, 200),
-            findings=[{"kind": "parse_error", "message": "rubric agent produced no parseable JSON"}],
-        )
-    scores: list[dict] = parsed.get("categories", [])
-    failing = [s for s in scores if int(s.get("score", 0)) < cfg.pre_pr_rubric_min_score]
-    summary_lines = ", ".join(f"{s.get('name')}={s.get('score')}" for s in scores)
+    """Score the diff on `cfg.pre_pr_rubric_categories`. Invokes the
+    `pre_pr_rubric` role; schema-validation failure → `parse_failure`."""
+    structured, result, early = _invoke_audit(
+        "rubric",
+        "pre_pr_rubric",
+        cfg=cfg,
+        handle=handle,
+        log_path=log_path,
+        template="pre-pr-rubric.md",
+        template_ctx={
+            "categories": list(cfg.pre_pr_rubric_categories),
+            "min_score": cfg.pre_pr_rubric_min_score,
+            "diff_excerpt": diff_excerpt[:20000],
+            "plan_text": plan_text[:6000],
+        },
+        expected_schema=PrePRRubricAuditOutput,
+    )
+    if early is not None:
+        return early
+    assert isinstance(structured, PrePRRubricAuditOutput)
+    return _build_rubric_outcome(cfg, structured, result)
+
+
+def _build_rubric_outcome(
+    cfg: Config,
+    audit: PrePRRubricAuditOutput,
+    result: JsonAgentResult,
+) -> StageOutcome:
+    """Bridge `PrePRRubricAuditOutput` → `StageOutcome`. Findings retain
+    the existing dict shape so `collect_finding_ids` and the audit-bundle
+    renderer keep working without change."""
+    scores = audit.categories
+    failing = [s for s in scores if s.score < cfg.pre_pr_rubric_min_score]
+    summary_lines = ", ".join(f"{s.name}={s.score}" for s in scores)
+    raw_excerpt = _tail(result.raw_text or "", 200 if failing else 80)
     if failing:
+        findings: list[dict] = [
+            {
+                "kind": "rubric_below_threshold",
+                "id": f"category-{s.name}",
+                "category": s.name,
+                "score": s.score,
+                "rationale": s.rationale,
+                "gaps_to_reach_ten": [
+                    {
+                        "id": gap.id,
+                        "description": gap.description,
+                        "concrete_fix": gap.concrete_fix,
+                        "files": list(gap.files),
+                    }
+                    for gap in s.gaps_to_reach_ten
+                ],
+            }
+            for s in failing
+        ]
         return StageOutcome(
             name="rubric",
             passed=False,
-            summary=f"rubric failed: {len(failing)} category(s) < {cfg.pre_pr_rubric_min_score} ({summary_lines})",
-            raw_output=_tail(result.stdout, 200),
-            findings=[
-                {
-                    "kind": "rubric_below_threshold",
-                    "category": s.get("name"),
-                    "score": s.get("score"),
-                    "rationale": s.get("rationale", ""),
-                }
-                for s in failing
-            ],
+            summary=(
+                f"rubric failed: {len(failing)} category(s) < {cfg.pre_pr_rubric_min_score} ({summary_lines})"
+            ),
+            raw_output=raw_excerpt,
+            findings=findings,
         )
     return StageOutcome(
         name="rubric",
         passed=True,
         summary=f"rubric passed ({summary_lines})",
-        raw_output=_tail(result.stdout, 80),
+        raw_output=raw_excerpt,
     )
-
-
-def _parse_rubric_envelope(text: str) -> dict | None:
-    """Parse `{"categories":[{"name":"x","score":N,"rationale":"..."}]}`
-    out of the agent's stdout. Tolerates leading prose."""
-    if not text or not text.strip():
-        return None
-    candidates = [text.strip()]
-    m = _JSON_OBJ_RE.search(text)
-    if m:
-        candidates.append(m.group(0))
-    for cand in candidates:
-        try:
-            data = json.loads(cand)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict) and "categories" in data and isinstance(data["categories"], list):
-            return data
-    return None
 
 
 # ----- Stage 2: standards audit -----
@@ -271,13 +338,11 @@ def run_standards_audit(
     handle: ExecutionSandbox,
     diff_excerpt: str,
     standards_text: str,
-    role: AgentRole | None = None,
     log_path: Path | None = None,
 ) -> StageOutcome:
-    """Compare branch diff against the configured standards profile. Uses
-    `cfg.triage` (claude-opus) by default — the structural reasoning load
-    is the same as the conflict-resolver / triage agent."""
-    role = role or cfg.triage
+    """Compare branch diff against the configured standards profile.
+    Invokes the `pre_pr_standards` role; schema-validation failure →
+    `parse_failure`."""
     if not standards_text.strip():
         return StageOutcome(
             name="standards",
@@ -297,74 +362,60 @@ def run_standards_audit(
                 }
             ],
         )
-    try:
-        prompt = prompts_mod.render(
-            cfg,
-            "pre-pr-standards.md",
-            standards_text=standards_text,
-            diff_excerpt=diff_excerpt[:30000],
-        )
-    except Exception as e:
-        return StageOutcome(
-            name="standards",
-            passed=False,
-            summary=f"standards prompt render failed: {e}",
-            findings=[{"kind": "infra", "message": str(e)[:500]}],
-        )
-    agent = build_agent(role)
-    result = agent.run(prompt, handle=handle, log_path=log_path, timeout=cfg.pre_pr_audit_timeout_s)
-    if not result.ok:
-        return StageOutcome(
-            name="standards",
-            passed=False,
-            summary=f"standards agent rc={result.rc}",
-            raw_output=_tail(result.stdout, 80),
-            findings=[{"kind": "infra", "message": "standards agent failed", "rc": result.rc}],
-        )
-    parsed = _parse_findings_envelope(result.stdout)
-    if parsed is None:
-        return StageOutcome(
-            name="standards",
-            passed=False,
-            summary="standards envelope unparseable — failing closed",
-            raw_output=_tail(result.stdout, 200),
-            findings=[{"kind": "parse_error", "message": "standards agent produced no parseable JSON"}],
-        )
-    findings = parsed.get("findings", [])
-    serious = [f for f in findings if f.get("severity") in ("high", "medium", "critical")]
+    structured, result, early = _invoke_audit(
+        "standards",
+        "pre_pr_standards",
+        cfg=cfg,
+        handle=handle,
+        log_path=log_path,
+        template="pre-pr-standards.md",
+        template_ctx={
+            "standards_text": standards_text,
+            "diff_excerpt": diff_excerpt[:30000],
+        },
+        expected_schema=PrePRStandardsAuditOutput,
+    )
+    if early is not None:
+        return early
+    assert isinstance(structured, PrePRStandardsAuditOutput)
+    return _build_standards_outcome(structured, result)
+
+
+def _build_standards_outcome(
+    audit: PrePRStandardsAuditOutput,
+    result: JsonAgentResult,
+) -> StageOutcome:
+    """Bridge `PrePRStandardsAuditOutput` → `StageOutcome`. Findings
+    retain the existing dict shape so downstream consumers don't change."""
+    findings_dicts: list[dict] = [
+        {
+            "id": f.id,
+            "file": f.file,
+            "line": f.line,
+            "severity": f.severity,
+            "standards_doc_ref": f.standards_doc_ref,
+            "description": f.description,
+            "concrete_fix": f.concrete_fix,
+        }
+        for f in audit.findings
+    ]
+    serious = [f for f in findings_dicts if f.get("severity") in ("medium", "high", "critical")]
+    raw_excerpt = _tail(result.raw_text or "", 200 if serious else 80)
     if serious:
         return StageOutcome(
             name="standards",
             passed=False,
             summary=f"standards failed: {len(serious)} medium+ severity finding(s)",
-            raw_output=_tail(result.stdout, 200),
-            findings=findings,
+            raw_output=raw_excerpt,
+            findings=findings_dicts,
         )
     return StageOutcome(
         name="standards",
         passed=True,
-        summary=f"standards passed ({len(findings)} low-severity note(s))",
-        raw_output=_tail(result.stdout, 80),
-        findings=findings,
+        summary=f"standards passed ({len(findings_dicts)} low-severity note(s))",
+        raw_output=raw_excerpt,
+        findings=findings_dicts,
     )
-
-
-def _parse_findings_envelope(text: str) -> dict | None:
-    """Parse `{"findings":[{"file":"x","severity":"low|medium|high|critical",...}]}`."""
-    if not text or not text.strip():
-        return None
-    candidates = [text.strip()]
-    m = _JSON_OBJ_RE.search(text)
-    if m:
-        candidates.append(m.group(0))
-    for cand in candidates:
-        try:
-            data = json.loads(cand)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict) and "findings" in data and isinstance(data["findings"], list):
-            return data
-    return None
 
 
 # ----- Stage 3: behavior audit -----
@@ -377,96 +428,78 @@ def run_behavior_audit(
     expected_evidence: list[dict],
     diff_excerpt: str,
     plan_text: str,
-    role: AgentRole | None = None,
     log_path: Path | None = None,
 ) -> StageOutcome:
-    """Verify each `expected_evidence` item is real (run the witness or
-    exercise the cited interface). Uses `cfg.checker` (codex) since it has
-    `--dangerously-bypass-approvals-and-sandbox` to actually exercise
-    code, unlike the safer claude-class roles."""
-    role = role or cfg.checker
+    """Verify each `expected_evidence` item is real. Invokes the
+    `pre_pr_behavior` role; schema-validation failure → `parse_failure`."""
     if not expected_evidence:
         return StageOutcome(
             name="behavior",
             passed=True,
             summary="no expected_evidence on this node — gate skipped",
         )
-    try:
-        prompt = prompts_mod.render(
-            cfg,
-            "pre-pr-behavior.md",
-            expected_evidence=expected_evidence,
-            diff_excerpt=diff_excerpt[:20000],
-            plan_text=plan_text[:6000],
-        )
-    except Exception as e:
-        return StageOutcome(
-            name="behavior",
-            passed=False,
-            summary=f"behavior prompt render failed: {e}",
-            findings=[{"kind": "infra", "message": str(e)[:500]}],
-        )
-    agent = build_agent(role)
-    result = agent.run(prompt, handle=handle, log_path=log_path, timeout=cfg.pre_pr_audit_timeout_s)
-    if not result.ok:
-        return StageOutcome(
-            name="behavior",
-            passed=False,
-            summary=f"behavior agent rc={result.rc}",
-            raw_output=_tail(result.stdout, 80),
-            findings=[{"kind": "infra", "message": "behavior agent failed", "rc": result.rc}],
-        )
-    parsed = _parse_behavior_envelope(result.stdout)
-    if parsed is None:
-        return StageOutcome(
-            name="behavior",
-            passed=False,
-            summary="behavior envelope unparseable — failing closed",
-            raw_output=_tail(result.stdout, 200),
-            findings=[{"kind": "parse_error", "message": "behavior agent produced no parseable JSON"}],
-        )
-    behaviors = parsed.get("behaviors", [])
-    unverified = [b for b in behaviors if not b.get("verified")]
+    structured, result, early = _invoke_audit(
+        "behavior",
+        "pre_pr_behavior",
+        cfg=cfg,
+        handle=handle,
+        log_path=log_path,
+        template="pre-pr-behavior.md",
+        template_ctx={
+            "expected_evidence": expected_evidence,
+            "diff_excerpt": diff_excerpt[:20000],
+            "plan_text": plan_text[:6000],
+        },
+        expected_schema=PrePRBehaviorAuditOutput,
+    )
+    if early is not None:
+        return early
+    assert isinstance(structured, PrePRBehaviorAuditOutput)
+    return _build_behavior_outcome(structured, result)
+
+
+def _build_behavior_outcome(
+    audit: PrePRBehaviorAuditOutput,
+    result: JsonAgentResult,
+) -> StageOutcome:
+    """Bridge `PrePRBehaviorAuditOutput` → `StageOutcome`. Findings
+    retain the existing dict shape so `collect_finding_ids` (walks
+    `behavior_id` + `completeness_gaps`) keeps working unchanged."""
+    behaviors = audit.behaviors
+    unverified = [b for b in behaviors if not b.verified]
+    raw_excerpt = _tail(result.raw_text or "", 200 if unverified else 80)
     if unverified:
+        findings: list[dict] = [
+            {
+                "kind": "behavior_unverified",
+                "behavior_id": b.behavior_id,
+                "evidence_seen": b.evidence_seen,
+                "gap_explanation": b.gap_explanation,
+                "concrete_fix": b.concrete_fix,
+                "completeness_gaps": [
+                    {
+                        "id": gap.id,
+                        "description": gap.description,
+                        "concrete_fix": gap.concrete_fix,
+                    }
+                    for gap in b.completeness_gaps
+                ],
+            }
+            for b in unverified
+        ]
         return StageOutcome(
             name="behavior",
             passed=False,
             summary=f"behavior failed: {len(unverified)} unverified behavior(s)",
-            raw_output=_tail(result.stdout, 200),
-            findings=[
-                {
-                    "kind": "behavior_unverified",
-                    "behavior_id": b.get("behavior_id"),
-                    "evidence_seen": b.get("evidence_seen", ""),
-                    "gap_explanation": b.get("gap_explanation", ""),
-                }
-                for b in unverified
-            ],
+            raw_output=raw_excerpt,
+            findings=findings,
         )
     return StageOutcome(
         name="behavior",
         passed=True,
         summary=f"behavior passed ({len(behaviors)} verified)",
-        raw_output=_tail(result.stdout, 80),
+        raw_output=raw_excerpt,
     )
-
-
-def _parse_behavior_envelope(text: str) -> dict | None:
-    """Parse `{"behaviors":[{"behavior_id":"x","verified":bool,...}]}`."""
-    if not text or not text.strip():
-        return None
-    candidates = [text.strip()]
-    m = _JSON_OBJ_RE.search(text)
-    if m:
-        candidates.append(m.group(0))
-    for cand in candidates:
-        try:
-            data = json.loads(cand)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict) and "behaviors" in data and isinstance(data["behaviors"], list):
-            return data
-    return None
 
 
 # ----- merge findings into a triage-ready bundle -----
@@ -499,17 +532,9 @@ def merge_failed_stage_reports(failed: list[StageOutcome]) -> str:
 def collect_finding_ids(failed: list[StageOutcome]) -> list[str]:
     """Extract every finding `id` (namespaced by stage) across the failed
     stages. Used by the orchestrator's completeness check to verify the
-    fixup planner mapped every finding to a subtask.
-
-    The audit prompts emit a stable kebab-case `id` field per finding /
-    gap; we namespace with the stage name (rubric / standards / behavior)
-    to avoid collisions across stages and to keep the planner's
-    `findings_addressed` list traceable.
-
-    Findings without an `id` (e.g. local_ci's structured CI failures
-    which have file/line but no semantic id, or rubric `gaps_to_reach_ten`
-    on the older prompt format) get a synthetic id derived from stage +
-    file/line so they still appear in the coverage check.
+    fixup planner mapped every finding to a subtask. Findings without an
+    explicit `id` get a synthetic id derived from stage + file/kind so
+    they still appear in the coverage check.
     """
     ids: list[str] = []
     seen: set[str] = set()
@@ -519,8 +544,7 @@ def collect_finding_ids(failed: list[StageOutcome]) -> list[str]:
                 f.get("id") or f.get("behavior_id") or f.get("category") or f.get("file") or f.get("kind")
             )
             fid = f"{stage.name}:{raw_id}" if raw_id else f"{stage.name}:auto-{idx}"
-            # Walk each rubric category's gaps_to_reach_ten if present
-            # (the v3.7 rubric prompt emits these inline).
+            # Walk each rubric category's gaps_to_reach_ten if present.
             gaps = f.get("gaps_to_reach_ten") or []
             if isinstance(gaps, list):
                 for gap in gaps:
