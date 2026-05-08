@@ -55,6 +55,12 @@ class SubtaskExecutionMixin:
         )
         self.last_doer_summary = result.stdout[-2000:]
         self.store.add_artifact(self.node.id, f"subtask_doer:{subtask.id}", result.stdout)
+        # TODO-PR-B: parse the doer's SELF_AUDIT block here
+        # (`quikode/self_audit.py::parse_self_audit`), apply the
+        # deterministic short-circuit (Plan 33 §6.4), run scoped witnesses
+        # (Plan 33 §7.2), and feed the parsed structure into the LLM
+        # checker. Until PR-B lands, the existing checker pipeline runs
+        # against the raw doer output unchanged.
 
     def _fetch_prior_doer_output(self: Any, subtask: Subtask, attempt: int) -> str | None:
         """Return a context-sized excerpt of the prior attempt's doer

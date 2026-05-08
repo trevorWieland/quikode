@@ -220,13 +220,15 @@ That's the plan."""
 # ----------------------------- FixupPlan -----------------------------
 
 
-def test_fixup_plan_accepts_per_subtask_addresses_findings():
-    """R-0020/R-0021 regression: the fixup-planner.md prompt instructs the
-    planner to emit a per-subtask `addresses_findings` array for
-    `kind="fixup-pre-pr-audit"` so the orchestrator can verify every audit
-    finding is mapped to a slice. The Subtask model previously had
-    `extra="forbid"` with no such field — every subtask carrying that key
-    was rejected, the tuple emptied, and the worker BLOCKed the task."""
+def test_fixup_plan_accepts_findings_addressed_top_level():
+    """Plan 33: `addresses_findings` per-subtask is retired (D2). The
+    fixup-planner emits `findings_addressed` at the top level of the
+    FixupPlan; per-subtask coverage will be derived from the stage-typed
+    fields (`rubric_targets`, `standards_referenced`,
+    `behavior_evidence_advanced`) once PR-B rewrites the fixup-planner
+    prompt and pipeline. Until then the orchestrator's completeness
+    check trusts only the top-level array (see
+    `pre_pr.py::_missing_finding_coverage`)."""
     text = """```json
 {
   "summary": "decompose audit findings",
@@ -239,8 +241,7 @@ def test_fixup_plan_accepts_per_subtask_addresses_findings():
       "files_to_touch": ["src/foo.rs"],
       "boundary": "validation only",
       "acceptance": ["cargo check passes"],
-      "kind": "fixup-pre-pr-audit",
-      "addresses_findings": ["rubric:add-validation"]
+      "kind": "fixup-pre-pr-audit"
     },
     {
       "id": "F-1-2-add-witness",
@@ -249,8 +250,7 @@ def test_fixup_plan_accepts_per_subtask_addresses_findings():
       "files_to_touch": ["tests/bdd/features/B-0030.feature"],
       "boundary": "test fixture only",
       "acceptance": ["scenario runs"],
-      "kind": "fixup-pre-pr-audit",
-      "addresses_findings": ["behavior:missing-witness"]
+      "kind": "fixup-pre-pr-audit"
     }
   ]
 }
@@ -261,12 +261,9 @@ def test_fixup_plan_accepts_per_subtask_addresses_findings():
         "rubric:add-validation",
         "behavior:missing-witness",
     )
-    # Per-subtask traceability survives.
-    assert plan.subtasks[0].addresses_findings == ("rubric:add-validation",)
-    assert plan.subtasks[1].addresses_findings == ("behavior:missing-witness",)
 
 
-def test_fixup_plan_accepts_subtasks_without_addresses_findings():
+def test_fixup_plan_accepts_subtasks_without_top_level_findings():
     """Spec subtasks + non-audit fixup kinds don't need the field. Default
     is empty tuple; absence is fine."""
     text = """```json
@@ -287,7 +284,6 @@ def test_fixup_plan_accepts_subtasks_without_addresses_findings():
 ```"""
     plan = parse_fixup_planner_output(text)
     assert len(plan.subtasks) == 1
-    assert plan.subtasks[0].addresses_findings == ()
     assert plan.findings_addressed == ()
 
 

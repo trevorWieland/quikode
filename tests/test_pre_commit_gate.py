@@ -305,9 +305,7 @@ def test_e2e_pre_commit_failure_then_pass_converges(tmp_path):
             return False, "rustfmt: needs reformat"
         return True, "ok"
 
-    def fake_commit(
-        handle, subtask, message, *, branch, remote, push, log_path, timeout=300, lane_review_fn=None
-    ):
+    def fake_commit(handle, subtask, message, *, branch, remote, push, log_path, timeout=300):
         return CommitResult(success=True, commit_sha="abc123", transient=False, output="ok")
 
     with (

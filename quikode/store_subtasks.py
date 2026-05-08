@@ -111,7 +111,7 @@ class StoreSubtaskMixin:
         commit sha, retry-reason history, accepted-files override,
         pre-commit failures, and progress-check counter. Leaves the
         immutable fields (id, title, depends_on, files_to_touch,
-        boundary, acceptance, notes, kind, addresses_findings) intact
+        boundary, acceptance, notes, kind) intact
         so the worker re-runs the same subtask shape on resume.
         """
         with self.tx() as c:

@@ -13,15 +13,16 @@ from typing import Any, cast
 
 from quikode import (
     docker_env,
+    evaluation_contract,
     fsm_runtime,
     github,
     github_graphql,
     manual_probe,
     merge_node,
+    planner_validators,
     pre_pr_audit,
     prompts,
     retry_classify,
-    scope_review,
     sound,
     worktree,
 )
@@ -67,14 +68,15 @@ _PATCH_EXPORTS = (
     time,
     cast,
     docker_env,
+    evaluation_contract,
     github,
     github_graphql,
     manual_probe,
     merge_node,
+    planner_validators,
     pre_pr_audit,
     prompts,
     retry_classify,
-    scope_review,
     sound,
     worktree,
     build_agent,
@@ -108,6 +110,12 @@ class TaskWorker(
         self.plan: Plan | None = None  # parsed structured plan
         self.last_doer_summary: str = ""
         self.last_triage_notes: str = ""
+        # Plan 33: per-task EvaluationContract; built once at PROVISIONING →
+        # PLANNING in _build_and_persist_contract, cached on the worker after
+        # first load. Every prompt-render call reads this same instance so
+        # the planner / doer / checker / triage / fixup / merge-planner
+        # all see the same four-stage rubric.
+        self._contract: evaluation_contract.EvaluationContract | None = None
 
     @property
     def _h(self) -> Any:
@@ -124,6 +132,27 @@ class TaskWorker(
         row = self.store.get(self.node.id)
         assert row is not None, f"task {self.node.id!r} should be in store but isn't"
         return row
+
+    # ----- Plan 33: EvaluationContract lifecycle -----
+
+    def _evaluation_contract(self) -> evaluation_contract.EvaluationContract:
+        """Return the per-task EvaluationContract, building+persisting it
+        on first call (Plan 33 D1 lifecycle). Subsequent calls reuse the
+        cached instance — same `(node, cfg)` always produces the same
+        contract per the build_for invariant.
+
+        Resilience: if a prior worker pass already persisted the contract
+        (e.g. a daemon restart mid-run), we load it from disk rather than
+        rebuilding — keeps the on-disk artifact authoritative.
+        """
+        if self._contract is not None:
+            return self._contract
+        try:
+            self._contract = evaluation_contract.EvaluationContract.load(self.cfg.state_dir, self.node.id)
+        except FileNotFoundError:
+            self._contract = evaluation_contract.build_for(self.node, self.cfg)
+            self._contract.persist(self.cfg.state_dir, self.node.id)
+        return self._contract
 
     # ----- top-level lifecycle -----
 

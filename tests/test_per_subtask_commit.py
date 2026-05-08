@@ -135,9 +135,7 @@ def test_pass_with_clean_commit_marks_done_and_records_sha(tmp_path):
     plan = _build_plan(["S-01"])
     worker = _build_worker(tmp_path, plan)
 
-    def fake_commit_subtask(
-        handle, subtask, message, *, branch, remote, push, log_path, timeout=300, lane_review_fn=None
-    ):
+    def fake_commit_subtask(handle, subtask, message, *, branch, remote, push, log_path, timeout=300):
         return CommitResult(success=True, commit_sha="deadbeef" * 5, transient=False, output="ok")
 
     with (
@@ -172,9 +170,7 @@ def test_pass_with_transient_push_failure_retries_without_burning_budget(tmp_pat
 
     call_count = {"n": 0}
 
-    def fake_commit(
-        handle, subtask, message, *, branch, remote, push, log_path, timeout=300, lane_review_fn=None
-    ):
+    def fake_commit(handle, subtask, message, *, branch, remote, push, log_path, timeout=300):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return CommitResult(
@@ -217,9 +213,7 @@ def test_pass_with_real_commit_failure_falls_into_triage_and_bumps_retries(tmp_p
     plan = _build_plan(["S-01"])
     worker = _build_worker(tmp_path, plan)
 
-    def fake_commit(
-        handle, subtask, message, *, branch, remote, push, log_path, timeout=300, lane_review_fn=None
-    ):
+    def fake_commit(handle, subtask, message, *, branch, remote, push, log_path, timeout=300):
         return CommitResult(
             success=False,
             commit_sha=None,
@@ -353,9 +347,7 @@ def test_subtask_loop_picks_up_leftover_fixup_subtasks_on_resume(tmp_path):
 
     fixup_ids_run: list[str] = []
 
-    def fake_commit(
-        handle, subtask, message, *, branch, remote, push, log_path, timeout=300, lane_review_fn=None
-    ):
+    def fake_commit(handle, subtask, message, *, branch, remote, push, log_path, timeout=300):
         fixup_ids_run.append(subtask.id)
         return CommitResult(success=True, commit_sha="cafe" * 10, transient=False, output="ok")
 

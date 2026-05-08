@@ -7,6 +7,7 @@ from pathlib import Path
 
 from quikode.config import Config
 from quikode.dag import DAG
+from quikode.evaluation_contract import build_for
 from quikode.prompts import (
     checker_prompt,
     conflict_resolver_prompt,
@@ -68,9 +69,10 @@ def _make_dag(tmp_path: Path) -> DAG:
 def test_planner_renders_with_evidence_and_playbook(tmp_path):
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
-    out = planner_prompt(cfg, dag, dag.nodes["R-001"])
-    # v2 planner emits JSON-structured plan; the prompt instructs the agent
-    # to wrap output in ```json ... ``` and includes the spec details.
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = planner_prompt(cfg, dag, dag.nodes["R-001"], contract)
+    # Plan 33 planner emits JSON-structured plan; the prompt includes the
+    # spec details + the four-stage audit gauntlet rubric verbatim.
     assert "R-001" in out
     assert "Sign in flow" in out
     assert "B-100" in out

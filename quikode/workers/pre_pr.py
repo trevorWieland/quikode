@@ -161,18 +161,16 @@ class PrePrWorkerMixin:
     def _missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -> set[str]:
         """Compute the set of expected finding ids the plan does NOT cover.
 
-        Coverage = id appears in `plan.findings_addressed` OR in any
-        subtask's `addresses_findings`. The prompt asks the planner to
-        emit BOTH (top-level summary array + per-subtask traceability),
-        but real planners are sloppy — sometimes only one shows up.
-        Unioning the sources is the lenient + robust check: we'd rather
-        accept a plan where every finding lands in *some* slice than
-        re-prompt over a redundancy mismatch.
+        TODO-PR-B: Plan 33 §5.5 retires `addresses_findings` per-subtask;
+        the fixup-planner rewrite (PR-B) replaces this completeness check
+        with a stage-typed coverage rule (every finding id must appear
+        in the union of `rubric_targets`/`standards_referenced`/
+        `behavior_evidence_advanced` across the plan's subtasks). Until
+        PR-B lands, coverage is computed solely from the top-level
+        `findings_addressed` array.
         """
         expected = set(expected_finding_ids)
         covered: set[str] = set(plan.findings_addressed)
-        for s in plan.subtasks:
-            covered.update(s.addresses_findings)
         return expected - covered
 
     def _invoke_fixup_planner(

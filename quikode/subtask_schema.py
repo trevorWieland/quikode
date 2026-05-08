@@ -40,6 +40,37 @@ class PlanValidationError(ValueError):
     """
 
 
+class RubricTarget(BaseModel):
+    """Plan 33: one rubric category this subtask claims to advance.
+
+    `category` must be a member of the contract's rubric category list
+    (validated post-construction by `validate_rubric_coverage`).
+    `predicted_score` is the planner's projection of where the audit
+    grader will land this category after this subtask's diff merges; the
+    doer treats it as a self-audit threshold (see Plan 33 §4 + §6.4).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    category: str = Field(min_length=1)
+    predicted_score: int = Field(ge=1, le=10)
+
+
+class StandardsRef(BaseModel):
+    """Plan 33: one pinned standards-doc passage governing this subtask.
+
+    `doc_path` is repo-relative and validated to exist at planning time
+    by `validate_standards_paths`. `section` is free-form (heading,
+    anchor, paragraph cite). The per-subtask checker reads the cited
+    passage and verifies the diff aligns with it.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    doc_path: str = Field(min_length=1)
+    section: str = Field(min_length=1)
+
+
 class Subtask(BaseModel):
     """One independently-verifiable slice of a node's implementation."""
 
@@ -53,7 +84,12 @@ class Subtask(BaseModel):
     )
     files_to_touch: tuple[str, ...] = Field(
         default=(),
-        description="Best-effort list of files the doer should focus on.",
+        description=(
+            "Plan 33: advisory metadata only. Surfaced in the doer prompt and "
+            "in `qk show` rendering, but NO commit-time enforcement. The "
+            "audit gauntlet is the truth — `files_to_touch` is just a "
+            "scoping hint to anchor the doer's investigation."
+        ),
     )
     boundary: str = Field(default="", description="What the doer must NOT touch.")
     acceptance: tuple[str, ...] = Field(
@@ -81,14 +117,31 @@ class Subtask(BaseModel):
             "to render fixup rounds distinctly."
         ),
     )
-    addresses_findings: tuple[str, ...] = Field(
+    rubric_targets: tuple[RubricTarget, ...] = Field(
         default=(),
         description=(
-            "For `kind='fixup-pre-pr-audit'` subtasks: the audit-finding ids "
-            "this slice resolves (rubric/standards/behavior namespaces). The "
-            "orchestrator's completeness check unions these across the plan's "
-            "subtasks and verifies every finding from the audit bundle is "
-            "covered. Empty for spec subtasks and other fixup kinds."
+            "Plan 33: rubric categories this subtask claims to materially "
+            "advance, with predicted scores. Empty allowed only on "
+            "kind='fixup-*' subtasks where the fix is purely transport/CI; "
+            "validate_rubric_coverage enforces every category in the "
+            "contract appears in at least one subtask."
+        ),
+    )
+    standards_referenced: tuple[StandardsRef, ...] = Field(
+        default=(),
+        description=(
+            "Plan 33: standards-doc passages the planner has pinned for this "
+            "subtask. Each `doc_path` must exist at planning time "
+            "(validate_standards_paths)."
+        ),
+    )
+    behavior_evidence_advanced: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Plan 33: canonical ids of `node.expected_evidence` items this "
+            "subtask delivers a witness for. Each id appears in EXACTLY ONE "
+            "subtask across the plan (partition, not cover) — enforced by "
+            "validate_evidence_partition."
         ),
     )
 
@@ -97,7 +150,9 @@ class Subtask(BaseModel):
         "depends_on",
         "files_to_touch",
         "interfaces",
-        "addresses_findings",
+        "rubric_targets",
+        "standards_referenced",
+        "behavior_evidence_advanced",
         mode="before",
     )
     @classmethod
@@ -117,6 +172,18 @@ class Plan(BaseModel):
     summary: str = Field(default="")
     subtasks: tuple[Subtask, ...] = Field(min_length=1)
     final_acceptance: tuple[str, ...] = Field(min_length=1)
+    gauntlet_strategy: str = Field(
+        default="",
+        description=(
+            "Plan 33: prose section explaining how this plan is positioned "
+            "to pass the four-stage audit on cycle 1. The 200-2000 char "
+            "length bound is enforced by `planner_validators."
+            "validate_gauntlet_strategy` (separate from pydantic-level "
+            "constraints) so unit-tests that construct minimal Plan "
+            "objects don't have to ship 200 chars of prose. Real planner "
+            "output IS validated."
+        ),
+    )
 
     @field_validator("subtasks", "final_acceptance", mode="before")
     @classmethod
@@ -201,21 +268,28 @@ def extract_json(text: str) -> dict[str, Any]:
 STABILIZATION_SUBTASK_ID = "Z-99-stabilize-spec-gate"
 
 
-def _build_stabilization_subtask(*, prior_ids: list[str], spec_gate_command: str) -> dict[str, Any]:
-    """Plan 24: deterministic final subtask appended to every spec plan.
+def _build_stabilization_subtask(
+    *,
+    prior_ids: list[str],
+    spec_gate_command: str,
+    rubric_categories: list[str] | None = None,
+    rubric_min_score: int | None = None,
+) -> dict[str, Any]:
+    """Plan 24 + Plan 33 D4: deterministic final subtask appended to every
+    spec plan with `rubric_targets` covering every rubric category at the
+    minimum score.
 
     Sits after every planner-emitted subtask and depends on all of them.
-    Its job is to run the spec gate (`{cfg.subtask_check_command}`) and
-    fix any breakage the prior subtasks left. Without this, the first
-    pre-PR audit cycle nearly always burns a fixup-planner round on
-    cross-subtask integration failures the planner couldn't have
-    foreseen — wasting one cycle of every audit gauntlet.
-
-    `files_to_touch` is intentionally empty: this subtask's "lane" is
-    "anything required to make the gate green". Scope-review still
-    adjudicates each cross-file edit using the existing invariant
-    "gate-keeping cross-file fixes are always legitimate" (plan 13).
+    Its job is to run the spec gate and fix any breakage the prior
+    subtasks left, AND to act as the holistic-pass guardian: by claiming
+    every rubric category at `cfg.pre_pr_rubric_min_score`, the planner
+    is structurally guaranteed to clear `validate_rubric_coverage` even
+    when a per-subtask plan happens to omit a category. (Plan 33 D4.)
     """
+    rubric_targets: list[dict[str, Any]] = []
+    if rubric_categories and rubric_min_score is not None:
+        for cat in rubric_categories:
+            rubric_targets.append({"category": cat, "predicted_score": rubric_min_score})
     return {
         "id": STABILIZATION_SUBTASK_ID,
         "title": "Stabilize spec gate — ensure all gate checks pass cleanly",
@@ -223,27 +297,36 @@ def _build_stabilization_subtask(*, prior_ids: list[str], spec_gate_command: str
         "files_to_touch": [],
         "boundary": (
             f"Make the spec gate (`{spec_gate_command}`) pass cleanly. May "
-            f"edit any file required to fix gate failures; cross-file edits "
-            f"are adjudicated by scope review under the standing invariant "
-            f"that gate-keeping cross-file fixes are always legitimate."
+            f"edit any file required to fix gate failures. Plan 33: "
+            f"`files_to_touch` is advisory — the audit gauntlet is the "
+            f"truth; gate-keeping cross-file fixes are always legitimate."
         ),
         "acceptance": [
             f"Spec gate (`{spec_gate_command}`) passes with rc=0",
             "All committed changes from prior subtasks remain functional",
         ],
         "notes": (
-            "System-injected stabilization subtask (plan 24). Every prior "
-            "subtask has already landed and been committed. Your job is to "
-            "run the gate, fix anything that fails, run it again, and "
-            "repeat until rc=0. If a fix requires editing files outside "
-            "any prior subtask's lane, do it and explain why in your "
-            "summary — the scope reviewer accepts gate-fix justifications."
+            "System-injected stabilization subtask (plan 24, plan 33 D4). "
+            "Every prior subtask has already landed and been committed. "
+            "Your job is to run the gate, fix anything that fails, run it "
+            "again, and repeat until rc=0. As the holistic-pass guardian, "
+            "your `rubric_targets` cover every category at the minimum "
+            "score — the audit must clear that bar by the time you commit."
         ),
         "kind": "spec",
+        "rubric_targets": rubric_targets,
+        "standards_referenced": [],
+        "behavior_evidence_advanced": [],
     }
 
 
-def _maybe_inject_stabilization(raw: dict[str, Any], *, spec_gate_command: str | None) -> dict[str, Any]:
+def _maybe_inject_stabilization(
+    raw: dict[str, Any],
+    *,
+    spec_gate_command: str | None,
+    rubric_categories: list[str] | None = None,
+    rubric_min_score: int | None = None,
+) -> dict[str, Any]:
     """Append the stabilization subtask to a planner-emitted dict if not
     already present and the caller supplied a gate command. Idempotent —
     safe to re-call across resumes / re-parses (`plan_text` is persisted
@@ -262,7 +345,12 @@ def _maybe_inject_stabilization(raw: dict[str, Any], *, spec_gate_command: str |
     new_raw = dict(raw)
     new_raw["subtasks"] = [
         *subtasks,
-        _build_stabilization_subtask(prior_ids=prior_ids, spec_gate_command=spec_gate_command),
+        _build_stabilization_subtask(
+            prior_ids=prior_ids,
+            spec_gate_command=spec_gate_command,
+            rubric_categories=rubric_categories,
+            rubric_min_score=rubric_min_score,
+        ),
     ]
     return new_raw
 
@@ -272,15 +360,24 @@ def validate_and_build_plan(
     *,
     expected_node_id: str | None = None,
     spec_gate_command: str | None = None,
+    rubric_categories: list[str] | None = None,
+    rubric_min_score: int | None = None,
 ) -> Plan:
     """Validate a parsed JSON object and return a Plan, or raise PlanValidationError.
 
     When `spec_gate_command` is supplied, a system-injected stabilization
     subtask (plan 24) is appended to the plan before validation. Pass
     None to skip injection (used for tests of pre-injection planner
-    output).
+    output). When `rubric_categories` + `rubric_min_score` are supplied,
+    the injected Z-99 carries `rubric_targets` covering every category
+    at the min score (plan 33 D4 holistic-pass guardian).
     """
-    raw = _maybe_inject_stabilization(raw, spec_gate_command=spec_gate_command)
+    raw = _maybe_inject_stabilization(
+        raw,
+        spec_gate_command=spec_gate_command,
+        rubric_categories=rubric_categories,
+        rubric_min_score=rubric_min_score,
+    )
     try:
         plan = Plan.model_validate(raw)
     except ValidationError as e:
@@ -299,13 +396,19 @@ def parse_planner_output(
     *,
     expected_node_id: str | None = None,
     spec_gate_command: str | None = None,
+    rubric_categories: list[str] | None = None,
+    rubric_min_score: int | None = None,
 ) -> Plan:
     """Convenience: extract + validate in one step. Pass `spec_gate_command`
-    to enable plan 24's stabilization-subtask injection."""
+    to enable plan 24's stabilization-subtask injection. Pass
+    `rubric_categories` + `rubric_min_score` so the Z-99 holistic guardian
+    declares every rubric category at the min score (plan 33 D4)."""
     return validate_and_build_plan(
         extract_json(text),
         expected_node_id=expected_node_id,
         spec_gate_command=spec_gate_command,
+        rubric_categories=rubric_categories,
+        rubric_min_score=rubric_min_score,
     )
 
 
@@ -321,9 +424,9 @@ class FixupPlan(BaseModel):
 
     For audit-driven fixup rounds (`kind="fixup-pre-pr-audit"`), the planner
     must emit `findings_addressed` listing every finding id from the audit
-    bundle and per-subtask `addresses_findings` arrays mapping each slice
-    to the specific finding ids it covers. Used by the orchestrator's
-    completeness check to ensure no finding gets dropped.
+    bundle. Plan 33 retired `addresses_findings` per-subtask: fixup slices
+    now declare which gaps they close via the stage-typed fields
+    (`rubric_targets`, `standards_referenced`, `behavior_evidence_advanced`).
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

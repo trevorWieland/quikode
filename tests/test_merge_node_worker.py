@@ -20,6 +20,7 @@ import pytest
 from quikode import fsm_runtime, merge_node, pre_pr_audit, prompts
 from quikode.config import Config
 from quikode.dag import DAG, Node
+from quikode.evaluation_contract import build_for
 from quikode.fsm import State
 from quikode.state import Store
 from quikode.subtask_schema import Plan, Subtask
@@ -719,7 +720,25 @@ def test_merge_planner_prompt_renders_with_parent_diffs(tmp_path):
             "diff_excerpt": "diff --git a/foo b/foo\n-foo\n+bar",
         },
     ]
-    rendered = prompts.merge_planner_prompt(cfg, "M-abcdef12", parent_contexts)
+    # Plan 33: merge_planner_prompt now takes a Node and EvaluationContract.
+    merge_node_obj = Node(
+        id="M-abcdef12",
+        kind="merge",
+        milestone="",
+        title="merge-node",
+        scope="",
+        depends_on=("R-A", "R-B"),
+        completes_behaviors=(),
+        supports_behaviors=(),
+        boundary_with_neighbors="",
+        expected_evidence=(),
+        playbook=(),
+        rationale="",
+        risks=(),
+        raw={},
+    )
+    contract = build_for(merge_node_obj, cfg)
+    rendered = prompts.merge_planner_prompt(cfg, merge_node_obj, parent_contexts, contract)
 
     assert "M-abcdef12" in rendered
     assert "R-A" in rendered and "R-B" in rendered

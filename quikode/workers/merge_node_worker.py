@@ -405,9 +405,16 @@ class MergeNodeWorker(TaskWorker):
     def _invoke_merge_planner(self, parent_ids: list[str], parent_branches: list[str]) -> Plan | None:
         """Build per-parent context from the runtime DAG (when present)
         and the worktree git state, then run the merge-planner agent.
-        Returns the parsed Plan or None on agent / parse failure."""
+        Returns the parsed Plan or None on agent / parse failure.
+
+        Plan 33: merge nodes also get an EvaluationContract built/loaded
+        at the same lifecycle point as spec tasks. The merge planner sees
+        the same four-stage rubric the audit gauntlet will apply to the
+        merged branch.
+        """
+        contract = self._evaluation_contract()
         parent_contexts = self._build_parent_contexts(parent_ids, parent_branches)
-        prompt = prompts.merge_planner_prompt(self.cfg, self.node.id, parent_contexts)
+        prompt = prompts.merge_planner_prompt(self.cfg, self.node, parent_contexts, contract)
         self._write_log_header("MERGE PLANNER", prompt)
         agent = build_agent(self.cfg.planner)
         result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
@@ -430,7 +437,13 @@ class MergeNodeWorker(TaskWorker):
             log.warning("merge-planner agent rc=%d for %s", result.rc, self.node.id)
             return None
         try:
-            return parse_planner_output(result.stdout, expected_node_id=self.node.id)
+            return parse_planner_output(
+                result.stdout,
+                expected_node_id=self.node.id,
+                spec_gate_command=self.cfg.local_ci_command,
+                rubric_categories=list(self.cfg.pre_pr_rubric_categories or []),
+                rubric_min_score=int(self.cfg.pre_pr_rubric_min_score),
+            )
         except PlanValidationError as e:
             log.warning("merge-planner output failed validation for %s: %s", self.node.id, e)
             return None

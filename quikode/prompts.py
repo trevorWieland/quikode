@@ -8,6 +8,7 @@ from jinja2 import ChoiceLoader, Environment, FileSystemLoader, StrictUndefined
 
 from .config import Config
 from .dag import DAG, Node
+from .evaluation_contract import EvaluationContract
 from .subtask_schema import STABILIZATION_SUBTASK_ID
 
 # Bundled prompts ship inside the quikode package itself (../prompts at the repo root,
@@ -36,13 +37,23 @@ def render(cfg: Config, template: str, **ctx) -> str:
     return env.get_template(template).render(**ctx)
 
 
-def planner_prompt(cfg: Config, dag: DAG, node: Node) -> str:
+def planner_prompt(
+    cfg: Config,
+    dag: DAG,
+    node: Node,
+    contract: EvaluationContract,
+    *,
+    prior_attempt_notes: str | None = None,
+) -> str:
     milestone = dag.milestones.get(node.milestone, {})
     return render(
         cfg,
         "planner.md",
         node=node,
+        contract=contract,
+        repo_root=str(cfg.repo_path),
         milestone_title=milestone.get("title", ""),
+        prior_attempt_notes=prior_attempt_notes,
     )
 
 
@@ -243,10 +254,15 @@ def conflict_resolver_prompt(
 
 def merge_planner_prompt(
     cfg: Config,
-    merge_node_id: str,
+    merge_node: Node,
     parent_contexts: list[dict],
+    contract: EvaluationContract,
 ) -> str:
     """Render the merge-planner prompt for plan 32 PR-B's doer-subloop.
+
+    Plan 33 PR-A: takes `merge_node` (Node) and `contract`
+    (EvaluationContract) so the same four-stage rubric the spec planner
+    sees flows into merge planning.
 
     `parent_contexts` is a list of per-parent dicts with keys:
       * `task_id` — source parent's task id (e.g. `R-0042`)
@@ -256,12 +272,6 @@ def merge_planner_prompt(
         no DAG node available
       * `diff_excerpt` — parent's diff against `cfg.base_branch`
         truncated to ~3000 chars
-
-    The output JSON shape matches `planner.md` (see `Plan` /
-    `parse_planner_output` for the contract). Subtasks are scoped to
-    the integration work; typical pattern is 1 subtask per file with
-    a cross-parent conflict, plus a final "verify both parents still
-    pass" subtask.
     """
     diff_cap = 3000
     capped: list[dict] = []
@@ -278,9 +288,11 @@ def merge_planner_prompt(
     return render(
         cfg,
         "merge-planner.md",
-        merge_node_id=merge_node_id,
+        merge_node=merge_node,
+        contract=contract,
         parent_contexts=capped,
         base_branch=cfg.base_branch,
+        repo_root=str(cfg.repo_path),
         local_ci_command=(cfg.local_ci_command or "just ci"),
     )
 

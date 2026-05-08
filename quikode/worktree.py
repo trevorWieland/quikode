@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -29,13 +28,7 @@ log = logging.getLogger("quikode.worktree")
 
 if TYPE_CHECKING:
     from .execution import ExecutionSandbox
-    from .scope_review import ScopeReviewResult
     from .subtask_schema import Subtask
-
-# Callback type for advisory lane review. Worker passes a closure that
-# wraps `scope_review.review_scope_drift` with the cfg + handle bound.
-# Signature: (subtask, declared_files, actually_touched_files) → review result.
-LaneReviewFn = Callable[["Subtask", list[str], list[str]], "ScopeReviewResult"]
 
 _worktree_lock = threading.RLock()
 
@@ -50,10 +43,9 @@ class CommitResult:
     container/network glitches (free retry) from real failures (burns a
     retry, surfaces as a checker-style FAIL).
 
-    `accepted_files` is the effective lane after scope review — equals
-    `subtask.files_to_touch` when no drift, or the reviewer-accepted
-    actual touched set when drift was deemed legitimate. Empty on
-    failure paths.
+    `accepted_files` is the effective set of files staged at commit
+    time — Plan 33 retired scope-review, so this is just the actual
+    touched set. Empty on failure paths.
     """
 
     success: bool
@@ -138,9 +130,17 @@ def commit_subtask(
     push: bool = True,
     log_path: Path | None = None,
     timeout: int = 300,
-    lane_review_fn: LaneReviewFn | None = None,
 ) -> CommitResult:
-    """`git add -A && git commit && git push` for one subtask, with advisory lane review on drift. `transient=True` → free retry. Plan 24's Z-99 declares `files_to_touch=[]` by design (lane is "make the gate green"); empty staging there is success, not failure — see `_classify_empty_staging`."""
+    """`git add -A && git commit && git push` for one subtask. Plan 33
+    retired the scope-review adjudicator; `files_to_touch` is advisory
+    only and there is no commit-time gating against it.
+
+    `transient=True` → free retry. Plan 24's Z-99 declares
+    `files_to_touch=[]` by design (lane is "make the gate green");
+    empty staging there is success, not failure — see
+    `_classify_empty_staging` (load-bearing for Z-99's gate-only
+    success path).
+    """
     declared = list(subtask.files_to_touch)
 
     rc, out, err = exec_in(
@@ -161,14 +161,6 @@ def commit_subtask(
     early = _classify_empty_staging(handle, declared, actually_touched, log_path, timeout)
     if early is not None:
         return early
-
-    if lane_review_fn is not None and actually_touched and not (set(actually_touched) <= set(declared)):
-        review_outcome = _apply_lane_review(
-            handle, subtask, declared, actually_touched, lane_review_fn, log_path
-        )
-        if isinstance(review_outcome, CommitResult):
-            return review_outcome
-        accepted_files = review_outcome
 
     commit_outcome = _commit_or_idempotent(handle, message, log_path, timeout)
     if isinstance(commit_outcome, CommitResult):
@@ -229,44 +221,6 @@ def _commit_or_idempotent(
     if ahead == 0:
         return _commit_failure(f"git commit failed (rc={rc}):\n{combined}")
     return None
-
-
-def _apply_lane_review(
-    handle: ExecutionSandbox,
-    subtask: Subtask,
-    declared: list[str],
-    actually_touched: list[str],
-    lane_review_fn: LaneReviewFn,
-    log_path: Path | None,
-) -> CommitResult | list[str]:
-    """Run scope review. On reject: unstage and return CommitResult.
-    On accept: return the accepted files list."""
-    review = lane_review_fn(subtask, declared, actually_touched)
-    if not review.legitimate:
-        _rc_reset, reset_out, reset_err = exec_in(
-            handle,
-            ["bash", "-lc", "cd /workspace && git reset HEAD -- ."],
-            log_path=log_path,
-            timeout=30,
-        )
-        return _commit_failure(
-            f"scope review rejected commit as overreach: {review.reason}\n\n"
-            f"declared lane: {declared!r}\n"
-            f"actually touched: {actually_touched!r}\n"
-            f"out-of-lane files: {sorted(set(actually_touched) - set(declared))!r}\n\n"
-            f"git reset output:\n{reset_out}\n{reset_err}"
-        )
-    accepted_files = list(review.accepted_files) or list(actually_touched)
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a") as f:
-            f.write(
-                f"[commit_subtask] scope review accepted lane drift for "
-                f"{subtask.id}: {review.reason}\n"
-                f"  declared:  {declared!r}\n"
-                f"  accepted:  {accepted_files!r}\n"
-            )
-    return accepted_files
 
 
 def _commit_failure(output: str, *, commit_sha: str | None = None, transient: bool = False) -> CommitResult:

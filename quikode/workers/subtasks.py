@@ -8,9 +8,10 @@ from typing import Any
 
 from quikode import fsm_runtime
 from quikode.state import State, SubtaskState
-from quikode.subtask_schema import Plan, PlanValidationError, Subtask
+from quikode.subtask_schema import PlanValidationError, Subtask
 from quikode.types import Verdict
 from quikode.workers.outcomes import WorkerOutcome
+from quikode.workers.planner_driver import PlannerDriverMixin
 from quikode.workers.subtask_completion import SubtaskCompletionMixin
 from quikode.workers.subtask_execution import SubtaskExecutionMixin
 from quikode.workers.subtask_progress import SubtaskProgressMixin
@@ -39,8 +40,20 @@ def _subtask_from_row(row: dict) -> Subtask:
     )
 
 
-class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCompletionMixin):
+class SubtaskWorkerMixin(
+    PlannerDriverMixin,
+    SubtaskProgressMixin,
+    SubtaskExecutionMixin,
+    SubtaskCompletionMixin,
+):
     def _plan(self: Any) -> None:
+        # Plan 33 D1: build (or load) the EvaluationContract before
+        # invoking the planner. The contract drives every prompt render
+        # downstream (planner, doer, checker, triage, fixup, merge).
+        contract = self._evaluation_contract()
+        rubric_categories = list(self.cfg.pre_pr_rubric_categories or [])
+        rubric_min_score = int(self.cfg.pre_pr_rubric_min_score)
+
         # Resume path: when `quikode resume <id>` set the flag, skip the
         # planner agent and reconstruct the Plan from the existing subtasks
         # (and stored plan_text). The subtask loop will skip rows already
@@ -50,22 +63,10 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
             fsm_runtime.environment_ready(self.store, self.node.id, note="resume - skipping planner")
             self.plan_text = str(row["plan_text"] or "")
             # Plan 26: skip Z-99 stabilization injection on resume when the
-            # task already has fixup subtasks. The presence of `kind="fixup-…"`
-            # rows means cycle 1 of the pre-PR audit has already run and
-            # produced findings; re-injecting Z-99 mid-fixup creates a
-            # parallel-but-unsequenced spec subtask that competes with the
-            # in-flight fixups and burns retries on a gate that can't pass
-            # until the fixups land. (Observed on R-0021 after the plan-24
-            # ship: Z-99 attempt 2 ran while F-1-11 was still doing.)
-            # Plan 24 fix: Z-99 must run `just ci` (the full CI gate), not
-            # `just check` (the per-subtask fast gate). Z-99's whole purpose
-            # is catching cross-subtask integration failures BEFORE the
-            # pre-PR audit gauntlet — failures that the per-subtask checker
-            # already missed because they only surface when ALL subtasks'
-            # work is on the branch. Running `just check` for Z-99 is a
-            # no-op (the per-subtask checker already ran it). Use
-            # `local_ci_command` for the gate the audit gauntlet's Stage 0
-            # also runs, so Z-99 catches the same class of failures.
+            # task already has fixup subtasks (re-injecting Z-99 mid-fixup
+            # creates a parallel-but-unsequenced spec subtask that competes
+            # with the in-flight fixups and burns retries on a gate that
+            # can't pass until the fixups land).
             spec_gate_command = self.cfg.local_ci_command
             if self._has_existing_fixup_subtasks():
                 spec_gate_command = None
@@ -74,6 +75,8 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
                     self.plan_text,
                     expected_node_id=self.node.id,
                     spec_gate_command=spec_gate_command,
+                    rubric_categories=rubric_categories,
+                    rubric_min_score=rubric_min_score,
                 )
             except PlanValidationError as e:
                 # plan_text was malformed for some reason — fall through to
@@ -87,33 +90,7 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
                 return
 
         fsm_runtime.environment_ready(self.store, self.node.id)
-        agent = _tw.build_agent(self.cfg.planner)
-        prompt = _tw.prompts.planner_prompt(self.cfg, self.dag, self.node)
-        self._write_log_header("PLANNER", prompt)
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
-        self.store.record_agent_call(
-            self.node.id,
-            phase="planner",
-            cli=self.cfg.planner.cli,
-            model=self.cfg.planner.model,
-            rc=result.rc,
-            duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
-            tokens_input=result.tokens_input,
-            tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
-            cost_usd=result.cost_usd,
-        )
-        if not result.ok:
-            raise RuntimeError(f"planner agent exited {result.rc}: {result.stderr[:500]}")
-        self.plan_text = result.stdout
-        self.store.add_artifact(self.node.id, "planner_output", result.stdout)
-        self.store.set_field(self.node.id, plan_text=self.plan_text)
-
-        # v2: parse the structured plan. On parse failure, re-prompt the planner
-        # once with the validation error before giving up.
-        plan = self._parse_or_retry_plan(result.stdout)
+        plan = self._invoke_planner_with_validators(contract)
         self.plan = plan
         # Persist subtasks so `quikode show / subtasks / export` can surface them.
         self.store.upsert_subtasks(
@@ -143,48 +120,6 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
             if kind.startswith("fixup-"):
                 return True
         return False
-
-    def _parse_or_retry_plan(self: Any, stdout: str) -> Plan:
-        try:
-            return _tw.parse_planner_output(
-                stdout,
-                expected_node_id=self.node.id,
-                spec_gate_command=self.cfg.local_ci_command,
-            )
-        except PlanValidationError as e:
-            # One retry with the validation error fed back as user input
-            _tw.log.warning("planner output failed validation (%s); re-prompting once", e)
-            agent = _tw.build_agent(self.cfg.planner)
-            prompt = _tw.prompts.planner_prompt(self.cfg, self.dag, self.node)
-            prompt += (
-                "\n\n## RETRY\n\n"
-                "Your prior output failed validation:\n\n"
-                f"```\n{e}\n```\n\n"
-                "Re-emit a single fenced ```json ... ``` block that conforms strictly to the schema. "
-                "No prose outside the fence other than a one-line preamble."
-            )
-            self._write_log_header("PLANNER (retry after validation error)", prompt)
-            result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
-            self.store.record_agent_call(
-                self.node.id,
-                phase="planner_retry",
-                cli=self.cfg.planner.cli,
-                model=self.cfg.planner.model,
-                rc=result.rc,
-                duration_s=result.duration_s or 0,
-                tokens_used=result.tokens_used,
-                tokens_input=result.tokens_input,
-                tokens_output=result.tokens_output,
-                tokens_cached_read=result.tokens_cached_read,
-                tokens_cached_creation=result.tokens_cached_creation,
-                cost_usd=result.cost_usd,
-            )
-            self.store.add_artifact(self.node.id, "planner_output", result.stdout)
-            return _tw.parse_planner_output(
-                result.stdout,
-                expected_node_id=self.node.id,
-                spec_gate_command=self.cfg.local_ci_command,
-            )
 
     def _subtask_loop(self: Any) -> WorkerOutcome | None:
         """Iterate subtasks in topological order. Each subtask retries

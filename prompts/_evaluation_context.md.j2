@@ -1,0 +1,152 @@
+{# Plan 33: shared evaluation-context partial used by every prompt that
+   needs to render the four-stage audit rubric verbatim. Three macros:
+
+   * ec_full(contract)                   — all four stage cards (planner,
+                                            fixup-planner, merge-planner)
+   * ec_stage_card(contract, stage_name) — one stage card (subtask-doer
+                                            renders four times in order)
+   * ec_targeted(contract, subtask)      — only the rubric_targets,
+                                            standards_referenced, and
+                                            behavior_evidence_advanced
+                                            this subtask owns; plus the
+                                            always-on local_ci card
+                                            (subtask-checker + triage)
+
+   StrictUndefined is enabled in `quikode/prompts.py:25` — missing
+   contract fields fail loudly at render time, never silently empty. #}
+
+{# ---- helpers ---- #}
+
+{% macro _stage_block(stage) -%}
+### {{ stage.name }} stage
+
+{{ stage.one_line }}
+
+**Threshold:** {{ stage.threshold }}
+
+**Grading template (verbatim — what the audit grader emits):**
+
+{{ stage.grading_template }}
+
+**Source text (canonical):**
+
+{{ stage.source_text }}
+{%- endmacro %}
+
+{# ---- public macros ---- #}
+
+{% macro ec_full(contract) -%}
+## The four-stage audit gauntlet (verbatim)
+
+This is the bar your work will be graded against. Every claim you make
+about your work — every subtask declaration, every doer self-audit,
+every checker verdict — should map back onto these stage cards. The
+audit is the truth-of-record; everything upstream of it that contradicts
+the bar will surface as a failed cycle.
+
+{{ _stage_block(contract.local_ci) }}
+
+{{ _stage_block(contract.rubric) }}
+
+{{ _stage_block(contract.standards) }}
+
+{{ _stage_block(contract.behavior) }}
+{%- endmacro %}
+
+{% macro ec_stage_card(contract, stage_name) -%}
+{% if stage_name == "local_ci" -%}
+{{ _stage_block(contract.local_ci) }}
+{%- elif stage_name == "rubric" -%}
+{{ _stage_block(contract.rubric) }}
+{%- elif stage_name == "standards" -%}
+{{ _stage_block(contract.standards) }}
+{%- elif stage_name == "behavior" -%}
+{{ _stage_block(contract.behavior) }}
+{%- else -%}
+{# StrictUndefined doesn't catch unknown stage_name strings — make it
+   loud here so a typo in the caller surfaces during render. #}
+{{ ({}).__missing__("ec_stage_card: unknown stage_name=" ~ stage_name) }}
+{%- endif %}
+{%- endmacro %}
+
+{% macro ec_targeted(contract, subtask) -%}
+## Targeted bar for this subtask (scoped from the four-stage audit)
+
+The stage cards below are filtered to the categories, standards refs,
+and witnesses **this subtask explicitly claims to advance**. The
+local-CI card is always-on (every subtask must keep `rc=0`). For the
+full unfiltered contract see the planner's planning-time render.
+
+{{ _stage_block(contract.local_ci) }}
+
+{% if subtask.rubric_targets -%}
+### rubric stage (scoped to this subtask's claimed targets)
+
+{{ contract.rubric.one_line }}
+
+**Threshold:** {{ contract.rubric.threshold }}
+
+**Targets the planner declared for this subtask:**
+
+{% for tgt in subtask.rubric_targets -%}
+- `{{ tgt.category }}` (predicted score: {{ tgt.predicted_score }})
+{% endfor %}
+
+**Grading template (verbatim — applied per-category by the audit):**
+
+{{ contract.rubric.grading_template }}
+{%- else %}
+### rubric stage
+
+(no rubric targets claimed by this subtask — the work is purely
+transport / CI / integration; the audit will still grade the diff
+holistically and Z-99 will sweep any drift)
+{% endif %}
+
+{% if subtask.standards_referenced -%}
+### standards stage (scoped to this subtask's pinned passages)
+
+{{ contract.standards.one_line }}
+
+**Threshold:** {{ contract.standards.threshold }}
+
+**Standards passages the planner pinned for this subtask:**
+
+{% for ref in subtask.standards_referenced -%}
+- `{{ ref.doc_path }}` § {{ ref.section }}
+{% endfor %}
+
+**Grading template (verbatim):**
+
+{{ contract.standards.grading_template }}
+{%- else %}
+### standards stage
+
+(no standards refs pinned — typical for behavior-only or
+infrastructure-only subtasks; Z-99 will sweep any drift the
+audit catches holistically)
+{% endif %}
+
+{% if subtask.behavior_evidence_advanced -%}
+### behavior stage (scoped to this subtask's claimed witnesses)
+
+{{ contract.behavior.one_line }}
+
+**Threshold:** {{ contract.behavior.threshold }}
+
+**Behavior evidence ids this subtask must materially advance:**
+
+{% for evid in subtask.behavior_evidence_advanced -%}
+- `{{ evid }}`
+{% endfor %}
+
+**Grading template (verbatim):**
+
+{{ contract.behavior.grading_template }}
+{%- else %}
+### behavior stage
+
+(no behavior evidence claimed by this subtask — it does not advance
+any expected_evidence id; another subtask in the plan owns those)
+{% endif %}
+{%- endmacro %}

@@ -1,9 +1,10 @@
 """V3-001/002/003 — BDD convention awareness in prompts + Subtask.interfaces field.
 
-Asserts the prompts mention F-0002's mechanical contract so the doer/checker
-agents have the rules in their context. The actual convergence test is
-running quikode against R-0001 — these tests just gate the prompt content
-so we don't accidentally drift away from the convention.
+Plan 33 generalized the planner.md template (the BDD specifics live in the
+repo-specific standards docs that the EvaluationContract loads). The
+planner-level BDD-content assertions in this file have been retired; the
+remaining tests still cover Subtask.interfaces shape and downstream
+checker/doer prompt behavior that DOES still call out BDD validators.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from pathlib import Path
 
 from quikode.config import Config
 from quikode.dag import DAG
+from quikode.evaluation_contract import build_for
 from quikode.prompts import (
     checker_prompt,
     doer_prompt,
@@ -69,40 +71,30 @@ def _make_dag_with_behaviors(tmp_path: Path, behaviors: list[str]) -> DAG:
 # ----- V3-001: planner mentions BDD convention -----
 
 
-def test_planner_includes_bdd_convention_section(tmp_path):
+def test_planner_renders_evaluation_contract(tmp_path):
+    """Plan 33: the generalized planner.md emits the four-stage audit
+    rubric verbatim. BDD specifics are in the standards docs the contract
+    loads — not hard-coded into the planner prompt."""
     dag = _make_dag_with_behaviors(tmp_path, ["B-0001"])
     cfg = _cfg(tmp_path)
-    out = planner_prompt(cfg, dag, dag.nodes["R-001"])
-    # Section header
-    assert "BDD" in out
-    assert "F-0002" in out
-    # Mechanical rules cited verbatim — these are the things that fail builds
-    assert "@B-XXXX" in out
-    assert "@positive" in out
-    assert "@falsification" in out
-    assert "@web" in out and "@api" in out and "@mcp" in out and "@cli" in out and "@tui" in out
-    assert "Scenario Outline" in out
-    assert "strict" in out.lower()
-    # Convention reference
-    assert "behavior-proof.md" in out
-    # Validator commands
-    assert "just check-bdd-tags" in out
-    assert "scripts/roadmap_check.py" in out
-
-
-def test_planner_instructs_one_bdd_subtask_per_behavior(tmp_path):
-    dag = _make_dag_with_behaviors(tmp_path, ["B-0001", "B-0002"])
-    cfg = _cfg(tmp_path)
-    out = planner_prompt(cfg, dag, dag.nodes["R-001"])
-    # Instruction text about per-behavior subtasks
-    assert "one BDD subtask per behavior" in out or "one feature file per behavior" in out
-    assert "S-NN-bdd-B-XXXX" in out or "S-NN-bdd" in out
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = planner_prompt(cfg, dag, dag.nodes["R-001"], contract)
+    # Contract stage cards land in the prompt
+    assert "local_ci stage" in out
+    assert "rubric stage" in out
+    assert "standards stage" in out
+    assert "behavior stage" in out
+    # The Plan 33 stage-typed schema fields appear
+    assert "rubric_targets" in out
+    assert "standards_referenced" in out
+    assert "behavior_evidence_advanced" in out
 
 
 def test_planner_json_example_includes_interfaces_field(tmp_path):
     dag = _make_dag_with_behaviors(tmp_path, ["B-0001"])
     cfg = _cfg(tmp_path)
-    out = planner_prompt(cfg, dag, dag.nodes["R-001"])
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = planner_prompt(cfg, dag, dag.nodes["R-001"], contract)
     assert '"interfaces"' in out
 
 
