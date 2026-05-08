@@ -84,7 +84,7 @@ def test_rebase_to_base_branch_blocks_when_ahead_zero(tmp_path):
 
     w._git_in_workspace = fake_git
 
-    ok = w._rebase_to_base_branch()
+    ok = w._rebase_inline("main")
     assert ok is False
     row = w.store.get("T-X")
     assert row["state"] == State.BLOCKED.value
@@ -118,7 +118,7 @@ def test_rebase_to_base_branch_proceeds_when_ahead_positive(tmp_path):
 
     w._git_in_workspace = fake_git
 
-    ok = w._rebase_to_base_branch()
+    ok = w._rebase_inline("main")
     assert ok is True
     push_calls = [c for c in git_calls if c[:1] == ["push"]]
     assert len(push_calls) == 1

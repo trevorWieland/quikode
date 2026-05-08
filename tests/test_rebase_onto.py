@@ -92,7 +92,7 @@ def test_rebase_to_base_branch_uses_onto_when_parent_resolves(tmp_path):
 
     w._git_in_workspace = fake_git
 
-    ok = w._rebase_to_base_branch()
+    ok = w._rebase_inline("main")
     assert ok is True
 
     # The rebase call should include --onto <base> <parent_sha>
@@ -125,7 +125,7 @@ def test_rebase_to_base_branch_falls_back_when_parent_ref_missing(tmp_path):
 
     w._git_in_workspace = fake_git
 
-    ok = w._rebase_to_base_branch()
+    ok = w._rebase_inline("main")
     assert ok is True
 
     rebase_calls = [c for c in git_calls if "rebase" in c]
@@ -152,7 +152,7 @@ def test_rebase_to_base_branch_falls_back_with_no_parent_branch(tmp_path):
 
     w._git_in_workspace = fake_git
 
-    ok = w._rebase_to_base_branch()
+    ok = w._rebase_inline("main")
     assert ok is True
 
     # No rev-parse --verify call at all

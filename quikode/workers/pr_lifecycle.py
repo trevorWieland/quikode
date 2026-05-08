@@ -63,7 +63,7 @@ class PrLifecycleWorkerMixin:
                 pr_base,
                 self.cfg.base_branch,
             )
-            rebase_ok = self._rebase_to_base_branch()
+            rebase_ok = self._rebase_inline("main")
             if not rebase_ok:
                 raise RuntimeError(
                     f"parent branch {pr_base} deleted; rebase to {self.cfg.base_branch} failed"
@@ -188,7 +188,7 @@ class PrLifecycleWorkerMixin:
         if (
             status.mergeable != "CONFLICTING"
             or not self.cfg.conflict_auto_resolve
-            or retries >= self.cfg.conflict_max_resolve_attempts
+            or retries >= self.cfg.rebase_max_attempts
         ):
             return None
         rebase_outcome = self._rebase_or_resolve()

@@ -1,10 +1,28 @@
-"""Rebases worker mixin."""
+"""Rebases worker mixin (plan 31).
+
+Two named worker entries, picked by the orchestrator based on trigger:
+
+- `run_rebase_to_parent_tip` — fires on `parent_tip_advanced` (parent's PR
+  branch advanced via fixup commit / review-feedback push). Child rebases
+  onto the parent's NEW tip, PR base stays = parent's branch. Stack
+  identity preserved.
+- `run_rebase_to_main` — fires on `parent_merged` / `sibling_conflict` /
+  `manual` (parent merged → branch gone; or this task's own PR is
+  CONFLICTING against main). Child rebases onto main, PR base retargets
+  to main. Used to be the only entry; pre-plan-31 it ran on every parent
+  push, destroying stacked identity on the first parent fixup.
+
+Multi-parent (plan 32 territory): when `len(parent_branches) > 1` AND
+target_kind = parent_tip, the worker BLOCKs cleanly with a note pointing
+at plan 32 (merge-node first-class entity). Single-parent and L1
+(no-parent / parent-merged-and-gone) cases work fully at plan 31.
+"""
 
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from quikode import fsm_runtime
 from quikode.state import State
@@ -21,46 +39,47 @@ class _TaskWorkerGlobals:
 _tw = _TaskWorkerGlobals()
 
 
+TargetKind = Literal["parent_tip", "main"]
+
+
 @dataclass
 class _RebasePlan:
     pre_state: State
     onto_sha: str
     rebase_target: str
+    target_kind: TargetKind
+    parent_branch: str  # populated when target_kind="parent_tip"
 
 
 class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
-    def run_rebase_to_main(self: Any) -> WorkerOutcome:
-        """v3 Phase C alternate worker entry mode: parent merged → rebase
-        this child's branch onto main, retarget its PR, and restore the
-        prior active state.
+    def run_rebase_to_parent_tip(self: Any) -> WorkerOutcome:
+        """Plan 31: parent's PR branch advanced (push, not merge). Rebase the
+        child onto the parent's new tip, force-push, leave PR base as parent.
 
-        Lifecycle:
-          1. provision a fresh container against the existing worktree
-          2. fetch origin main
-          3. rebase the worktree branch onto origin/main
-          4. on conflict → reuse `_spawn_conflict_resolver` (which is
-             scoped to a generic "resolve current rebase conflict" task,
-             so it works the same whether the conflict came from a
-             scheduled rebase or a parent-merge rebase)
-          5. on success: force-push, retarget the PR base to main, clear
-             `parent_pr_branch` + `parent_branch`, transition back to the
-             stashed `pre_rebase_state`
-          6. on any failure: leave the row in REBASING_TO_MAIN with
-             last_error set so an operator can intervene
-
-        Returns the WorkerOutcome carrying the resumed state. The
-        orchestrator's reaper just logs it; the persistent state in the
-        store is what drives subsequent picks/polls.
+        Returns the WorkerOutcome carrying the resumed state. Multi-parent
+        cases are deferred to plan 32 (merge-node first-class entity); this
+        entry BLOCKs cleanly with a forensic note when called on a child
+        with > 1 parent branch.
         """
+        return self._run_rebase("parent_tip")
+
+    def run_rebase_to_main(self: Any) -> WorkerOutcome:
+        """Plan 31: parent merged (branch gone) OR own PR is CONFLICTING.
+        Rebase the child onto main, retarget the PR base to main, clear
+        parent metadata.
+        """
+        return self._run_rebase("main")
+
+    def _run_rebase(self: Any, target_kind: TargetKind) -> WorkerOutcome:
         row = self.store.get(self.node.id) or {}
         pre_state = self._pre_rebase_state(row)
 
         try:
             self._provision(provision_worktree=False)
-            plan = self._prepare_rebase_plan(row, pre_state)
+            plan = self._prepare_rebase_plan(row, pre_state, target_kind)
             if isinstance(plan, WorkerOutcome):
                 return plan
-            fetch_outcome = self._fetch_base_for_rebase(pre_state)
+            fetch_outcome = self._fetch_base_for_rebase(plan, pre_state)
             if fetch_outcome is not None:
                 return fetch_outcome
             push_done = self._run_rebase_plan(plan)
@@ -69,18 +88,17 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
             push_outcome = self._push_rebased_branch(row, push_done)
             if push_outcome is not None:
                 return push_outcome
-            return self._finish_rebase_to_main(row, pre_state)
+            return self._finish_rebase(row, plan)
         except Exception as e:
-            _tw.log.exception("rebase-to-main for task %s crashed", self.node.id)
+            _tw.log.exception("rebase (%s) for task %s crashed", target_kind, self.node.id)
             fsm_runtime.enter_pending_ci(
                 self.store,
                 self.node.id,
-                note=f"rebase-to-main crashed: {e}; restoring {pre_state.value}",
+                note=f"rebase ({target_kind}) crashed: {e}; restoring {pre_state.value}",
                 last_error=str(e)[:1000],
             )
-            return WorkerOutcome(pre_state, f"rebase-to-main crashed: {e}")
+            return WorkerOutcome(pre_state, f"rebase ({target_kind}) crashed: {e}")
         finally:
-            # Tear down the container only — keep the _tw.worktree.
             if self.handle is not None:
                 self.execution_backend.teardown(self._h)
                 self.handle = None
@@ -93,19 +111,68 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
             return State.PENDING_CI
         return State.PENDING_CI if pre_state is State.REBASING_TO_MAIN else pre_state
 
-    def _prepare_rebase_plan(self: Any, row: dict[str, Any], pre_state: State) -> _RebasePlan | WorkerOutcome:
+    def _prepare_rebase_plan(
+        self: Any, row: dict[str, Any], pre_state: State, target_kind: TargetKind
+    ) -> _RebasePlan | WorkerOutcome:
         parent_branches = self.store.get_parent_branches(self.node.id)
+        # Plan 31 multi-parent: deferred to plan 32. BLOCK with a clear note.
+        if target_kind == "parent_tip" and len(parent_branches) > 1:
+            note = (
+                f"multi-parent stack-on-parent rebase requested for {self.node.id} "
+                f"with parents={parent_branches}; deferred to plan 32 "
+                f"(merge-node first-class entity). BLOCKING."
+            )
+            fsm_runtime.block_current(self.store, self.node.id, note=note, last_error=note[:1000])
+            return WorkerOutcome(State.BLOCKED, "multi-parent rebase deferred to plan 32")
+        if target_kind == "parent_tip":
+            return self._prepare_parent_tip_plan(parent_branches, pre_state)
+        return self._prepare_main_plan(row, parent_branches, pre_state)
+
+    def _prepare_parent_tip_plan(
+        self: Any, parent_branches: list[str], pre_state: State
+    ) -> _RebasePlan | WorkerOutcome:
+        if not parent_branches:
+            note = (
+                f"parent_tip rebase requested for {self.node.id} but no parent branches "
+                f"recorded. This shouldn't happen — orchestrator schedules parent_tip only "
+                f"on cascade-on-push from a parent. BLOCKING for inspection."
+            )
+            fsm_runtime.block_current(self.store, self.node.id, note=note, last_error=note[:1000])
+            return WorkerOutcome(State.BLOCKED, "parent_tip rebase with no parent")
+        parent_branch = parent_branches[0]
+        rc_fetch, _ = self._git_in_workspace(["fetch", self.cfg.pr_remote, parent_branch])
+        if rc_fetch != 0:
+            note = f"fetch of parent branch {parent_branch} failed for parent_tip rebase"
+            fsm_runtime.enter_pending_ci(self.store, self.node.id, note=note, last_error=note[:1000])
+            return WorkerOutcome(pre_state, note)
+        return _RebasePlan(
+            pre_state=pre_state,
+            onto_sha="",
+            rebase_target=f"{self.cfg.pr_remote}/{parent_branch}",
+            target_kind="parent_tip",
+            parent_branch=parent_branch,
+        )
+
+    def _prepare_main_plan(
+        self: Any,
+        row: dict[str, Any],
+        parent_branches: list[str],
+        pre_state: State,
+    ) -> _RebasePlan | WorkerOutcome:
+        # The `--onto` form moves child commits OFF parent_branch and ONTO main.
+        # When there's no parent (true L1), we just rebase the branch onto main.
         onto_sha = self._verified_prior_merge_base(row)
-        new_merge_base_sha = ""
-        if parent_branches:
-            for parent_branch in parent_branches:
-                self._git_in_workspace(["fetch", self.cfg.pr_remote, parent_branch])
-            parent_result = self._parent_rebase_boundary(parent_branches, onto_sha)
-            if isinstance(parent_result, WorkerOutcome):
-                return parent_result
-            onto_sha, new_merge_base_sha = parent_result
-        rebase_target = new_merge_base_sha or f"{self.cfg.pr_remote}/{self.cfg.base_branch}"
-        return _RebasePlan(pre_state=pre_state, onto_sha=onto_sha, rebase_target=rebase_target)
+        if not onto_sha and parent_branches:
+            rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branches[0]])
+            if rc_ps == 0 and ps_out.strip():
+                onto_sha = ps_out.strip().splitlines()[-1]
+        return _RebasePlan(
+            pre_state=pre_state,
+            onto_sha=onto_sha,
+            rebase_target=f"{self.cfg.pr_remote}/{self.cfg.base_branch}",
+            target_kind="main",
+            parent_branch="",
+        )
 
     def _verified_prior_merge_base(self: Any, row: dict[str, Any]) -> str:
         prior_merge_base_sha = str(row.get("parent_merge_base_sha") or "")
@@ -114,42 +181,17 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
         rc_ps, _ = self._git_in_workspace(["rev-parse", "--verify", prior_merge_base_sha])
         return prior_merge_base_sha if rc_ps == 0 else ""
 
-    def _parent_rebase_boundary(
-        self: Any, parent_branches: list[str], onto_sha: str
-    ) -> tuple[str, str] | WorkerOutcome:
-        if len(parent_branches) > 1:
-            return self._multi_parent_rebase_boundary(parent_branches, onto_sha)
-        if onto_sha:
-            return onto_sha, ""
-        rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branches[0]])
-        single_parent_sha = ps_out.strip().splitlines()[-1] if rc_ps == 0 and ps_out.strip() else ""
-        return single_parent_sha, ""
-
-    def _multi_parent_rebase_boundary(
-        self: Any, parent_branches: list[str], onto_sha: str
-    ) -> tuple[str, str] | WorkerOutcome:
-        mb_name = _tw.stacking.compute_merge_base_branch_name(self.node.id, parent_branches)
-        mb_sha = _tw.stacking.construct_merge_base(
-            repo_path=self.cfg.repo_path,
-            parent_branches=parent_branches,
-            branch_name=mb_name,
-            base_branch=self.cfg.base_branch,
-        )
-        if mb_sha:
-            self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
-            return onto_sha, mb_sha
-        note = f"multi-parent merge-base recompute failed for {parent_branches}; cannot rebase"
-        fsm_runtime.block_current(self.store, self.node.id, note=note, last_error=note[:1000])
-        return WorkerOutcome(State.BLOCKED, note)
-
-    def _fetch_base_for_rebase(self: Any, pre_state: State) -> WorkerOutcome | None:
-        rc, fetch_out = self._git_in_workspace(["fetch", self.cfg.pr_remote, self.cfg.base_branch])
+    def _fetch_base_for_rebase(self: Any, plan: _RebasePlan, pre_state: State) -> WorkerOutcome | None:
+        if plan.target_kind == "main":
+            rc, fetch_out = self._git_in_workspace(["fetch", self.cfg.pr_remote, self.cfg.base_branch])
+        else:
+            rc, fetch_out = self._git_in_workspace(["fetch", self.cfg.pr_remote, plan.parent_branch])
         if rc == 0:
             return None
         fsm_runtime.enter_pending_ci(
             self.store,
             self.node.id,
-            note=f"rebase-to-main: fetch failed ({fetch_out[:200]}); restoring {pre_state.value}",
+            note=f"rebase fetch failed ({fetch_out[:200]}); restoring {pre_state.value}",
             last_error=f"rebase fetch: {fetch_out[:500]}",
         )
         return WorkerOutcome(pre_state, "rebase fetch failed")
@@ -163,10 +205,12 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
             rc, _rebase_out = self._git_in_workspace(["-c", "core.editor=true", "rebase", plan.rebase_target])
         if rc == 0:
             return False
-        resolver_outcome = self._spawn_conflict_resolver()
+        resolver_outcome = self._spawn_conflict_resolver(
+            rebase_target_kind=plan.target_kind, parent_branch=plan.parent_branch
+        )
         if resolver_outcome is None:
             return True
-        _tw.log.warning("rebase-to-main: conflict resolver gave up for task %s", self.node.id)
+        _tw.log.warning("rebase (%s): conflict resolver gave up for task %s", plan.target_kind, self.node.id)
         return resolver_outcome
 
     def _push_rebased_branch(self: Any, row: dict[str, Any], push_already_done: bool) -> WorkerOutcome | None:
@@ -184,7 +228,7 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
         fsm_runtime.block_current(
             self.store,
             self.node.id,
-            note=f"rebase-to-main: force-push failed: {push_out[:200]}",
+            note=f"rebase: force-push failed: {push_out[:200]}",
             last_error=f"rebase push: {push_out[:500]}",
         )
         return WorkerOutcome(State.BLOCKED, "rebase push failed")
@@ -200,25 +244,28 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
         fsm_runtime.block_current(self.store, self.node.id, note=note, last_error=note[:1000])
         return WorkerOutcome(State.BLOCKED, "post-rebase empty branch")
 
-    def _finish_rebase_to_main(self: Any, row: dict[str, Any], pre_state: State) -> WorkerOutcome:
+    def _finish_rebase(self: Any, row: dict[str, Any], plan: _RebasePlan) -> WorkerOutcome:
         _, new_main_sha = self._git_in_workspace(
             ["rev-parse", f"{self.cfg.pr_remote}/{self.cfg.base_branch}"]
         )
         pr_number = row.get("pr_number") or self._row().get("pr_number")
-        if pr_number:
-            self._safe_retarget_or_recreate(int(_tw.cast(Any, pr_number)))
-        self.store.clear_parent_branch(self.node.id)
+        if plan.target_kind == "main":
+            # Reattach: retarget PR to main + clear parent metadata.
+            if pr_number:
+                self._safe_retarget_or_recreate(int(_tw.cast(Any, pr_number)))
+            self.store.clear_parent_branch(self.node.id)
+            note = f"rebased onto main; restored {plan.pre_state.value}"
+        else:
+            # Stay-stacked: PR stays on parent's branch; parent metadata
+            # preserved so future cascades still find this child.
+            note = f"rebased onto parent tip ({plan.parent_branch}); restored {plan.pre_state.value}"
         self.store.set_field(
             self.node.id,
             last_synced_main_sha=new_main_sha.strip() or None,
             pre_rebase_state=None,
         )
-        fsm_runtime.enter_pending_ci(
-            self.store,
-            self.node.id,
-            note=f"rebased onto main; restored {pre_state.value}",
-        )
-        return WorkerOutcome(pre_state, "rebased onto main")
+        fsm_runtime.enter_pending_ci(self.store, self.node.id, note=note)
+        return WorkerOutcome(plan.pre_state, note)
 
     def _retarget_pr_to_main(self: Any, pr_number: int) -> bool:
         """Retarget an open PR's base to `cfg.base_branch`. Returns True on
@@ -328,7 +375,6 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
             return
         state = self._pr_state(pr_number)
         if state == "OPEN":
-            # Transient hiccup; one retry with a tiny backoff.
             _tw.time.sleep(2)
             if self._retarget_pr_to_main(pr_number):
                 return
@@ -366,8 +412,6 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
                 pr_number,
             )
             return
-        # state is None — couldn't even read it. Refuse to create a new
-        # PR (might be transient), mark BLOCKED so a human eyeballs it.
         _tw.log.warning(
             "task %s: PR #%d state unreachable; refusing to recreate to avoid duplicate",
             self.node.id,

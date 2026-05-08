@@ -1,4 +1,21 @@
-"""Parent merge and rebase cascade mixin."""
+"""Parent merge and rebase cascade mixin (plan 31).
+
+Two scheduling entries, one per worker target:
+
+- `_schedule_rebase_to_main(task_id, ..., trigger_reason=...)` — fires when
+  a parent merged (its branch is gone) OR this task's own PR is
+  CONFLICTING against main. Worker reattaches the child to main and
+  retargets the PR.
+
+- `_schedule_rebase_to_parent_tip(task_id, ..., parent_branch=...)` — fires
+  when a parent's PR branch advanced (push/fixup, not merge). Worker stays
+  stacked on the parent's new tip; PR base preserved.
+
+Plus cascade-walk-level coalesce: per-parent-branch `_last_cascade_walk_ts`
+suppresses redundant descendant-tree walks within
+`cfg.rebase_coalesce_window_s`. Per-child coalesce inside the schedulers
+remains as belt-and-suspenders.
+"""
 
 from __future__ import annotations
 
@@ -26,24 +43,17 @@ class RebaseWatchMixin:
         futures: dict[str, Future],
         review_response_futures: set[str],
     ) -> None:
-        """When a parent task transitions to MERGED, scan for children
-        whose `parent_pr_branch` matches and trigger an auto-rebase only
-        for children that actually need one. Children that are already
-        terminal (MERGED/ABORTED/etc) are excluded by
-        `children_of_parent_branch`.
+        """Parent task merged → for each child whose `parent_pr_branch`
+        matches, schedule a rebase-to-main (parent's branch is gone).
 
         Smart-skip: if a child's PR is still MERGEABLE against the base
-        branch AND its base ref still exists, no rebase is required —
-        github already maintained the rebased view. We just clear the
-        stale parent metadata so the child is treated as a top-level task
-        going forward. Rebase is only scheduled when the child is
-        CONFLICTING or its base ref has been deleted.
+        branch AND its base ref still exists, no rebase is required.
         """
         children = self.store.children_of_parent_branch(parent_branch)
         if not children:
             return
         _rt.log.info(
-            "parent branch %s merged → evaluating %d child(ren) for rebase",
+            "parent branch %s merged → evaluating %d child(ren) for rebase-to-main",
             parent_branch,
             len(children),
         )
@@ -51,10 +61,6 @@ class RebaseWatchMixin:
         for child in children:
             child_id = str(child["id"])
             pr_number = child.get("pr_number")
-            # Decide whether a rebase is actually needed. With no PR yet
-            # (e.g. mid-DOING_SUBTASK before pr_opening), we keep the
-            # current behavior — flag + schedule — because we don't have
-            # a mergeable signal to consult.
             needs_rebase = True
             if pr_number:
                 try:
@@ -70,9 +76,6 @@ class RebaseWatchMixin:
                 if pr_status is not None:
                     base_intact = self._remote_branch_exists(parent_branch)
                     if pr_status.mergeable == "MERGEABLE" and base_intact:
-                        # No work to do — child PR is still in good shape
-                        # against its base ref. Clear stale metadata so
-                        # later picks treat the child as top-level.
                         self.store.clear_parent_branch(child_id)
                         _rt.log.info(
                             "child %s PR #%s mergeable + base intact; skipping rebase, cleared parent metadata",
@@ -83,32 +86,28 @@ class RebaseWatchMixin:
                         continue
                     if pr_status.mergeable == "CONFLICTING":
                         _rt.log.info(
-                            "child %s PR #%s CONFLICTING — scheduling rebase",
+                            "child %s PR #%s CONFLICTING — scheduling rebase-to-main",
                             child_id,
                             pr_number,
                         )
                     elif not base_intact:
                         _rt.log.info(
-                            "child %s base ref %s missing on remote — scheduling rebase",
+                            "child %s base ref %s missing on remote — scheduling rebase-to-main",
                             child_id,
                             parent_branch,
                         )
             if not needs_rebase:
                 continue
-            # Always raise the mid-flight flag. The worker checks it at
-            # safe checkpoints and handles the rebase inline. For non-active
-            # children we additionally schedule a worker future as today.
             self.store.mark_needs_parent_rebase(child_id)
             if child_id in futures:
-                # An active worker is mid-flight on this child. Don't submit
-                # a duplicate future — the flag is enough; the worker will
-                # handle the rebase + PR retarget before continuing.
                 _rt.log.info(
                     "child %s has active worker; flagged needs_parent_rebase for inline handling",
                     child_id,
                 )
                 continue
-            self._schedule_rebase_to_main(child_id, pool, futures, review_response_futures)
+            self._schedule_rebase_to_main(
+                child_id, pool, futures, review_response_futures, trigger_reason="parent_merged"
+            )
         if skipped:
             _rt.log.info(
                 "parent branch %s: %d child(ren) skipped rebase (PR still mergeable)",
@@ -123,38 +122,34 @@ class RebaseWatchMixin:
         futures: dict[str, Future],
         review_response_futures: set[str],
     ) -> None:
-        """v3.5 Phase 2 follow-up: when a parent's branch advances (push, not
-        merge), schedule rebases for every descendant whose merge-base or
-        single-parent base referenced this branch. Walks the parent DAG
-        downward via `children_of_parent_branch` (matches both scalar and
-        JSON-array linkage). Active workers get `needs_parent_rebase=1`
-        (handled inline at safe checkpoints); non-active children are
-        scheduled through the existing rebase pool.
+        """Parent branch advanced (push, not merge) → cascade rebase-to-parent-tip
+        through every descendant. Plan 31 keeps children stacked on the
+        parent's new tip (not un-stacked onto main).
 
-        Critical guarantee: descendants are queued in topo order so a child
-        rebases AFTER its own parents have themselves rebased. We approximate
-        topo-order by sorting candidate ids and recursing — workspaces are
-        small (< 300 nodes), so the overhead is negligible.
+        Cascade-walk-level coalesce: per-parent-branch ts map suppresses
+        redundant walks within `cfg.rebase_coalesce_window_s`. Without this
+        the orchestrator walks the descendant tree on every observed
+        `head_sha` change, even when the per-child coalesce would dedupe
+        each individual schedule. The walk itself is cheap but the recursion
+        + DB queries add up at high cascade fanout.
         """
+        if not self._cascade_walk_should_proceed(parent_branch):
+            return
         children = self.store.children_of_parent_branch(parent_branch)
         if not children:
             return
         _rt.log.info(
-            "parent branch %s tip advanced → cascading rebase to %d direct descendant(s)",
+            "parent branch %s tip advanced → cascading parent_tip rebase to %d direct descendant(s)",
             parent_branch,
             len(children),
         )
-        # Track which descendants have been queued already so we don't
-        # re-enqueue across recursion.
         scheduled: set[str] = set()
 
-        def _enqueue(child_row: TaskRow) -> None:
+        def _enqueue(child_row: TaskRow, parent_for_child: str) -> None:
             child_id = str(child_row["id"])
             if child_id in scheduled:
                 return
             scheduled.add(child_id)
-            # Always raise the mid-flight flag. When the worker exits the
-            # current safe checkpoint it'll pick this up and rebase inline.
             self.store.mark_needs_parent_rebase(child_id)
             if child_id in futures:
                 _rt.log.info(
@@ -162,33 +157,45 @@ class RebaseWatchMixin:
                     child_id,
                 )
             else:
-                self._schedule_rebase_to_main(
+                self._schedule_rebase_to_parent_tip(
                     child_id,
                     pool,
                     futures,
                     review_response_futures,
-                    trigger_reason="parent_tip_advanced",
+                    parent_branch=parent_for_child,
                 )
-            # Recurse into the *child's* descendants — D depends on B, B
-            # advances → D rebases → D's downstream descendants also need
-            # to rebase against the new D.
             child_branch = child_row.get("branch")
             if child_branch:
                 grandchildren = self.store.children_of_parent_branch(str(child_branch))
                 for gc in grandchildren:
-                    _enqueue(gc)
+                    _enqueue(gc, str(child_branch))
 
         for child in children:
-            _enqueue(child)
+            _enqueue(child, parent_branch)
+
+    def _cascade_walk_should_proceed(self: Any, parent_branch: str) -> bool:
+        """Plan 31 cascade-walk-level coalesce. Suppress redundant descendant
+        walks for the same parent within `cfg.rebase_coalesce_window_s`.
+        """
+        window = self.cfg.rebase_coalesce_window_s
+        if window <= 0:
+            return True
+        if not hasattr(self, "_last_cascade_walk_ts"):
+            self._last_cascade_walk_ts = {}
+        now = _rt.time.time()
+        last = self._last_cascade_walk_ts.get(parent_branch)
+        if last is not None and (now - last) < window:
+            _rt.log.info(
+                "cascade-walk coalesce: parent %s last walked %.1fs ago < %ds window; skipping",
+                parent_branch,
+                now - last,
+                window,
+            )
+            return False
+        self._last_cascade_walk_ts[parent_branch] = now
+        return True
 
     def _remote_branch_exists(self: Any, branch: str) -> bool:
-        """Check if `branch` still exists on the configured remote.
-
-        Used by the smart-rebase path to decide whether a child whose PR
-        is currently MERGEABLE actually needs a rebase. If the remote
-        branch is gone (parent merged with --delete-branch), github will
-        have auto-closed the child PR and we DO need to recreate / rebase.
-        """
         try:
             r = _rt.subprocess.run(
                 ["git", "ls-remote", "--heads", self.cfg.pr_remote, branch],
@@ -202,7 +209,7 @@ class RebaseWatchMixin:
             _rt.log.warning("ls-remote for %s failed: %s; assuming branch exists", branch, e)
             return True
         if r.returncode != 0:
-            return True  # be conservative — assume present on error
+            return True
         return bool(r.stdout.strip())
 
     def _schedule_rebase_to_main(
@@ -214,68 +221,96 @@ class RebaseWatchMixin:
         *,
         trigger_reason: str = "parent_merged",
     ) -> None:
-        """Stash the child's pre-rebase state, transition to REBASING_TO_MAIN,
-        and submit a worker future. Mirror of `_schedule_review_response`.
+        """Schedule a rebase-to-main worker future. Used when the parent
+        branch is gone (parent merged) or this task's own PR is CONFLICTING.
+        """
+        if not self._begin_scheduled_rebase(task_id, trigger_reason, "main"):
+            return
+        fut = pool.submit(self._run_rebase_to_main_one, task_id)
+        futures[task_id] = fut
+        review_response_futures.add(task_id)
 
-        `trigger_reason` is one of: parent_merged, sibling_conflict,
-        worker_checkpoint_flag, manual. It's surfaced in the state-log
-        note so debuggers don't have to guess WHY a given rebase fired.
+    def _schedule_rebase_to_parent_tip(
+        self: Any,
+        task_id: str,
+        pool: ThreadPoolExecutor,
+        futures: dict[str, Future],
+        review_response_futures: set[str],
+        *,
+        parent_branch: str,
+    ) -> None:
+        """Schedule a rebase-to-parent-tip worker future. Used when a
+        parent's branch advanced via push/fixup (parent still un-merged).
+        """
+        if not self._begin_scheduled_rebase(task_id, "parent_tip_advanced", "parent_tip"):
+            return
+        _rt.log.info(
+            "scheduling rebase-to-parent-tip for task %s (parent branch %s)",
+            task_id,
+            parent_branch,
+        )
+        fut = pool.submit(self._run_rebase_to_parent_tip_one, task_id)
+        futures[task_id] = fut
+        review_response_futures.add(task_id)
+
+    def _begin_scheduled_rebase(
+        self: Any,
+        task_id: str,
+        trigger_reason: str,
+        target_kind: str,
+    ) -> bool:
+        """Common pre-flight for both schedulers. Coalesces, stashes
+        pre-rebase state, transitions to REBASING_TO_MAIN. Returns False
+        when the trigger should be suppressed (coalesce window, missing row).
         """
         row = self.store.get(task_id)
         if row is None:
-            _rt.log.warning("_schedule_rebase_to_main: task %s missing from store", task_id)
-            return
-        # Coalescing: if a rebase was already triggered for this task within
-        # the configured window, skip. The first rebase will run shortly and
-        # the watcher's next tick will surface any genuinely-new conflict
-        # against fresh main; another trigger fires from there if needed.
-        # This avoids burning a container + agent call on the second of two
-        # back-to-back triggers (e.g. parent-merge then sibling-merge within
-        # ~30s) where the first rebase already covers both shifts.
+            _rt.log.warning("_begin_scheduled_rebase: task %s missing from store", task_id)
+            return False
         window = self.cfg.rebase_coalesce_window_s
         if window > 0:
             last_ts = self.store.get_last_rebase_scheduled_ts(task_id)
             if last_ts is not None and (_rt.time.time() - last_ts) < window:
                 _rt.log.info(
-                    "task %s: coalescing rebase trigger (%s) — last trigger %.1fs ago < %ds window",
+                    "task %s: coalescing rebase trigger (%s/%s) — last trigger %.1fs ago < %ds",
                     task_id,
                     trigger_reason,
+                    target_kind,
                     _rt.time.time() - last_ts,
                     window,
                 )
-                return
+                return False
         self.store.set_last_rebase_scheduled(task_id, _rt.time.time())
         pre_state = str(row.get("state") or State.PENDING.value)
-        # Stash the pre-rebase active state so the rebase worker can restore
-        # it on success. Post-PR flows return to the post-PR state; mid-loop
-        # active states return where they were (the worker re-enters from the
-        # FSM at the same point).
         self.store.set_pre_rebase_state(task_id, pre_state)
         reason_label = {
             "parent_merged": "parent merged",
+            "parent_tip_advanced": "parent tip advanced",
             "sibling_conflict": "sibling conflict via mergeable=CONFLICTING",
             "worker_checkpoint_flag": "worker checkpoint flag",
             "manual": "manual",
+            "parent_merge_auto_close": "parent merge auto-close",
         }.get(trigger_reason, trigger_reason)
         fsm_runtime.enter_rebasing_to_main(
             self.store,
             task_id,
-            note=f"rebasing onto main ({reason_label}; was {pre_state})",
+            note=f"rebasing onto {target_kind} ({reason_label}; was {pre_state})",
         )
         _rt.log.info(
-            "scheduling rebase-to-main for task %s (pre-rebase state %s, reason %s)",
+            "scheduling rebase (%s) for task %s (pre-rebase state %s, reason %s)",
+            target_kind,
             task_id,
             pre_state,
             trigger_reason,
         )
-        fut = pool.submit(self._run_rebase_to_main_one, task_id)
-        futures[task_id] = fut
-        # Track in the same set as review-response futures so the heartbeat
-        # surfaces the count under "addressing_feedback_futures". Ground truth
-        # lives in the store's REBASING_TO_MAIN state.
-        review_response_futures.add(task_id)
+        return True
 
     def _run_rebase_to_main_one(self: Any, task_id: str):
         node = self.dag.nodes[task_id]
         worker = _rt.TaskWorker(self.cfg, self.dag, self.store, node)
         return worker.run_rebase_to_main()
+
+    def _run_rebase_to_parent_tip_one(self: Any, task_id: str):
+        node = self.dag.nodes[task_id]
+        worker = _rt.TaskWorker(self.cfg, self.dag, self.store, node)
+        return worker.run_rebase_to_parent_tip()

@@ -262,6 +262,30 @@ class StoreSubtaskMixin:
             return []
         return [str(x) for x in arr if x]
 
+    def all_parents_merged(self: Any, task_id: str) -> bool:
+        """Plan 31: True iff the task has parents AND all of them are MERGED.
+
+        Returns False when the task has no parents (no parents = no rebase
+        target distinction; caller decides). Used by the rebase worker to
+        pick between staying-stacked-on-parent (parent_tip target) vs
+        reattaching to main (target=main, retarget PR).
+        """
+        parent_ids = self.get_parent_task_ids(task_id)
+        if not parent_ids:
+            return False
+        placeholders = ",".join("?" * len(parent_ids))
+        with self._tx_lock:
+            rows = self.conn.execute(
+                f"SELECT state FROM tasks WHERE id IN ({placeholders})",
+                tuple(parent_ids),
+            ).fetchall()
+        if len(rows) != len(parent_ids):
+            # Some parents missing from the store — be conservative and
+            # treat as "not all merged" so the rebase stays stacked. The
+            # missing-parent case shouldn't happen on a healthy seeded DAG.
+            return False
+        return all(r["state"] == "merged" for r in rows)
+
     def get_parent_branches(self: Any, task_id: str) -> list[str]:
         """Read JSON-array parent_branches. Always returns a list."""
         with self._tx_lock:

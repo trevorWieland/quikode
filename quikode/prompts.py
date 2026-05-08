@@ -197,6 +197,8 @@ def conflict_resolver_prompt(
     main_log_excerpt: str,
     main_diff_excerpt: str,
     conflicted_files: list[dict],
+    rebase_target_kind: str = "main",
+    parent_branch: str = "",
 ) -> str:
     return render(
         cfg,
@@ -206,6 +208,8 @@ def conflict_resolver_prompt(
         main_log_excerpt=main_log_excerpt[:4000],
         main_diff_excerpt=main_diff_excerpt[:8000],
         conflicted_files=conflicted_files,
+        rebase_target_kind=rebase_target_kind,
+        parent_branch=parent_branch,
     )
 
 

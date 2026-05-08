@@ -428,10 +428,13 @@ def test_cascade_rebase_recurses_into_grandchildren(tmp_path, monkeypatch):
 
     scheduled: list[str] = []
 
-    def _stub_schedule(self, task_id, pool, futures, rrf, *, trigger_reason="parent_merged"):
+    # Plan 31: cascade-on-push routes through `_schedule_rebase_to_parent_tip`
+    # (children stay stacked on parent's evolving tip), not the legacy
+    # `_schedule_rebase_to_main`. Stub the parent_tip entry.
+    def _stub_schedule(self, task_id, pool, futures, rrf, *, parent_branch):
         scheduled.append(task_id)
 
-    monkeypatch.setattr(Orchestrator, "_schedule_rebase_to_main", _stub_schedule)
+    monkeypatch.setattr(Orchestrator, "_schedule_rebase_to_parent_tip", _stub_schedule)
 
     # Trigger cascade: R-001's branch tip advanced.
     o._schedule_cascade_rebase("quikode/r-001-aaa", pool=None, futures={}, review_response_futures=set())
@@ -467,10 +470,10 @@ def test_cascade_rebase_skips_terminal_descendants(tmp_path, monkeypatch):
 
     scheduled: list[str] = []
 
-    def _stub_schedule(self, task_id, pool, futures, rrf, *, trigger_reason="parent_merged"):
+    def _stub_schedule(self, task_id, pool, futures, rrf, *, parent_branch):
         scheduled.append(task_id)
 
-    monkeypatch.setattr(Orchestrator, "_schedule_rebase_to_main", _stub_schedule)
+    monkeypatch.setattr(Orchestrator, "_schedule_rebase_to_parent_tip", _stub_schedule)
     o._schedule_cascade_rebase("quikode/r-001-aaa", pool=None, futures={}, review_response_futures=set())
     assert scheduled == []
 

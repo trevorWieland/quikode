@@ -157,29 +157,95 @@ class RebaseBranchMixin:
         return None
 
     def _handle_parent_rebase_if_needed(self: Any) -> WorkerOutcome | None:
+        """Plan 31 inline-checkpoint path. Drained by the active worker at
+        safe checkpoints when the orchestrator stamped `needs_parent_rebase`.
+
+        Picks the rebase target by inspecting the CURRENT state of the
+        parents (vs the trigger-reason path the schedulers use):
+
+        - All parents MERGED (or no parents) → reattach to main + retarget PR.
+        - At least one parent still un-merged → stay stacked on parent's tip;
+          keep PR base = parent's branch.
+        """
         row = self._row()
         if not row.get("needs_parent_rebase"):
             return None
-        _tw.log.info("task %s: needs_parent_rebase set; running inline rebase + retarget", self.node.id)
+        _tw.log.info("task %s: needs_parent_rebase set; running inline rebase", self.node.id)
         if self.handle is None:
             return None
-        ok = self._rebase_to_base_branch()
+        target_kind = "main" if self._inline_rebase_target_is_main() else "parent_tip"
+        ok = self._rebase_inline(target_kind)
         if not ok:
             fsm_runtime.block_current(
-                self.store, self.node.id, note="needs_parent_rebase: inline rebase failed"
+                self.store, self.node.id, note=f"needs_parent_rebase: inline rebase ({target_kind}) failed"
             )
-            return WorkerOutcome(State.BLOCKED, "parent-merge rebase failed")
+            return WorkerOutcome(State.BLOCKED, f"parent-rebase ({target_kind}) failed")
         row = self._row()
         pr_number = row.get("pr_number")
-        if pr_number:
-            self._retarget_pr_to_main(int(_tw.cast(Any, pr_number)))
-        self.store.clear_parent_branch(self.node.id)
+        if target_kind == "main":
+            if pr_number:
+                self._retarget_pr_to_main(int(_tw.cast(Any, pr_number)))
+            self.store.clear_parent_branch(self.node.id)
+        # parent_tip: PR base + parent metadata stay as-is. Future cascades
+        # still need this child rebased when the parent advances again.
+        self.store.clear_needs_parent_rebase(self.node.id)
         return None
 
-    def _rebase_to_base_branch(self: Any) -> bool:
+    def _inline_rebase_target_is_main(self: Any) -> bool:
+        """Plan 31: derive inline rebase target. True (main) iff:
+        - the task has no recorded parents, OR
+        - every parent is in MERGED state (their branches are gone).
+
+        Otherwise (at least one parent still un-merged), stay stacked on
+        the parent's evolving tip.
+        """
+        parent_branches = self.store.get_parent_branches(self.node.id)
+        if not parent_branches:
+            return True
+        return self.store.all_parents_merged(self.node.id)
+
+    def _rebase_inline(self: Any, target_kind: str) -> bool:
+        """Plan 31 inline rebase. Refactor of pre-plan-31 `_rebase_to_base_branch`
+        which always targeted main; now picks `--onto main parent.sha` (target=main,
+        un-stack semantic) vs `git rebase origin/parent.branch` (target=parent_tip,
+        stay-stacked semantic).
+        """
         row = self._row()
         branch = str(row["branch"])
         parent_branches = self.store.get_parent_branches(self.node.id)
+        # Plan 31: multi-parent rebase deferred to plan 32 (merge-node).
+        if target_kind == "parent_tip" and len(parent_branches) > 1:
+            note = (
+                f"inline parent_tip rebase requested for {self.node.id} with "
+                f"parents={parent_branches}; deferred to plan 32 (merge-node "
+                f"first-class entity)"
+            )
+            fsm_runtime.block_current(self.store, self.node.id, note=note, last_error=note[:1000])
+            return False
+        if target_kind == "parent_tip":
+            return self._rebase_inline_to_parent_tip(branch, parent_branches[0])
+        return self._rebase_inline_to_main(branch, parent_branches)
+
+    def _rebase_inline_to_parent_tip(self: Any, branch: str, parent_branch: str) -> bool:
+        rc_fetch, _ = self._git_in_workspace(["fetch", self.cfg.pr_remote, parent_branch])
+        if rc_fetch != 0:
+            return False
+        rc, _out = self._git_in_workspace(
+            ["-c", "core.editor=true", "rebase", f"{self.cfg.pr_remote}/{parent_branch}"]
+        )
+        if rc != 0:
+            resolver_outcome = self._spawn_conflict_resolver(
+                rebase_target_kind="parent_tip", parent_branch=parent_branch
+            )
+            if resolver_outcome and resolver_outcome.final_state == State.BLOCKED:
+                return False
+        push_rc, _push_out = self._git_in_workspace(
+            ["push", "--force-with-lease", self.cfg.pr_remote, branch]
+        )
+        return push_rc == 0
+
+    def _rebase_inline_to_main(self: Any, branch: str, parent_branches: list[str]) -> bool:
+        row = self._row()
         parent_sha = ""
         if len(parent_branches) == 1:
             rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branches[0]])
@@ -204,7 +270,7 @@ class RebaseBranchMixin:
                 ["-c", "core.editor=true", "rebase", f"{self.cfg.pr_remote}/{self.cfg.base_branch}"]
             )
         if rc != 0:
-            resolver_outcome = self._spawn_conflict_resolver()
+            resolver_outcome = self._spawn_conflict_resolver(rebase_target_kind="main")
             if resolver_outcome and resolver_outcome.final_state == State.BLOCKED:
                 return False
         ahead = self._git_ahead_count(branch)

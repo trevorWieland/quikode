@@ -277,17 +277,24 @@ def test_handle_parent_rebase_noop_when_flag_unset(tmp_path):
 
 
 def test_handle_parent_rebase_runs_rebase_and_clears(tmp_path, monkeypatch):
-    """Flag set → rebase runs, PR retargets, parent metadata cleared,
-    flag cleared. Worker continues."""
+    """Plan 31: when all parents are MERGED, inline rebase targets main,
+    retargets PR, clears parent metadata, clears the needs_parent_rebase
+    flag. (When a parent is still un-merged, the inline path takes the
+    parent_tip branch; that semantic is covered by the dedicated
+    parent_tip tests.)"""
     w = _worker(tmp_path)
+    # Seed the parent in MERGED state so all_parents_merged() returns True.
+    w.store.upsert_pending("T-PARENT")
+    w.store.transition("T-PARENT", State.MERGED, branch="quikode/parent-xyz")
     w.store.upsert_pending("T-CHILD")
     w.store.transition("T-CHILD", State.PR_OPENING, branch="quikode/t-child-abc")
-    w.store.set_field(
+    w.store.set_parent_chain(
         "T-CHILD",
-        parent_branches='["quikode/parent-xyz"]',
-        parent_pr_branches='["quikode/parent-xyz"]',
-        pr_number=42,
+        parent_task_ids=["T-PARENT"],
+        parent_branches=["quikode/parent-xyz"],
+        parent_pr_branches=["quikode/parent-xyz"],
     )
+    w.store.set_field("T-CHILD", pr_number=42)
     w.store.mark_needs_parent_rebase("T-CHILD")
     w.handle = MagicMock(container_name="qk-stub")
 

@@ -68,11 +68,20 @@ class RebaseConflictMixin:
         self.store.increment(self.node.id, "conflict_resolve_retries")
         return self._spawn_conflict_resolver()
 
-    def _spawn_conflict_resolver(self: Any) -> WorkerOutcome | None:
+    def _spawn_conflict_resolver(
+        self: Any,
+        *,
+        rebase_target_kind: str = "main",
+        parent_branch: str = "",
+    ) -> WorkerOutcome | None:
         fsm_runtime.enter_conflict_resolving(self.store, self.node.id)
-        max_iterations = 6
+        max_iterations = self.cfg.conflict_resolver_max_iterations
         for iteration in range(1, max_iterations + 1):
-            outcome = self._resolve_one_conflict_step(iteration=iteration)
+            outcome = self._resolve_one_conflict_step(
+                iteration=iteration,
+                rebase_target_kind=rebase_target_kind,
+                parent_branch=parent_branch,
+            )
             if outcome is not None:
                 return outcome
             if not self._rebase_in_progress():
@@ -130,16 +139,36 @@ class RebaseConflictMixin:
             return WorkerOutcome(State.BLOCKED, "rebase resolved but push failed")
         return None
 
-    def _resolve_one_conflict_step(self: Any, *, iteration: int) -> WorkerOutcome | None:
+    def _resolve_one_conflict_step(
+        self: Any,
+        *,
+        iteration: int,
+        rebase_target_kind: str = "main",
+        parent_branch: str = "",
+    ) -> WorkerOutcome | None:
         row = self._row()
         base_sha = row.get("base_ref_sha") or "HEAD~1"
         _, task_diff = self._git_in_workspace(["diff", f"{base_sha}...HEAD", "--no-color"])
-        _, main_log = self._git_in_workspace(
-            ["log", "--oneline", f"{base_sha}..{self.cfg.pr_remote}/{self.cfg.base_branch}"]
-        )
-        _, main_diff = self._git_in_workspace(
-            ["diff", f"{base_sha}..{self.cfg.pr_remote}/{self.cfg.base_branch}", "--no-color"]
-        )
+        # Plan 31: when rebasing onto a parent's tip (not main), the resolver
+        # needs the parent's diff context, not main's. main_diff/main_log are
+        # still useful for L1 (parent-merged-and-gone) cases where the rebase
+        # really IS onto main.
+        if rebase_target_kind == "parent_tip" and parent_branch:
+            _, parent_log = self._git_in_workspace(
+                ["log", "--oneline", f"{base_sha}..{self.cfg.pr_remote}/{parent_branch}"]
+            )
+            _, parent_diff = self._git_in_workspace(
+                ["diff", f"{base_sha}..{self.cfg.pr_remote}/{parent_branch}", "--no-color"]
+            )
+            main_log = parent_log
+            main_diff = parent_diff
+        else:
+            _, main_log = self._git_in_workspace(
+                ["log", "--oneline", f"{base_sha}..{self.cfg.pr_remote}/{self.cfg.base_branch}"]
+            )
+            _, main_diff = self._git_in_workspace(
+                ["diff", f"{base_sha}..{self.cfg.pr_remote}/{self.cfg.base_branch}", "--no-color"]
+            )
         _, status_out = self._git_in_workspace(["diff", "--name-only", "--diff-filter=U"])
         conflicted: list[dict] = []
         for path in status_out.splitlines():
@@ -174,6 +203,8 @@ class RebaseConflictMixin:
             main_log_excerpt=main_log,
             main_diff_excerpt=main_diff,
             conflicted_files=conflicted,
+            rebase_target_kind=rebase_target_kind,
+            parent_branch=parent_branch,
         )
         self._write_log_header(f"CONFLICT RESOLVER (iter {iteration})", prompt)
         result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)

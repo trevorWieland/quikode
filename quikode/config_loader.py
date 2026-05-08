@@ -44,6 +44,16 @@ def load_config(root: Path | None = None) -> Config:
     agents = raw.get("agents", {})
     resources = raw.get("resources", {})
     conflicts = raw.get("conflicts", {})
+
+    # Plan 31 explicit-fail on retired key. The old `max_resolve_attempts`
+    # conflated two distinct knobs (inner resolver-iteration cap, outer
+    # rebase-attempt cap); plan 31 split them. No silent acceptance.
+    if "max_resolve_attempts" in conflicts:
+        raise ValueError(
+            "[conflicts].max_resolve_attempts is retired (plan 31). Replace with "
+            "`resolver_max_iterations` (inner; default 6) and/or "
+            "`rebase_max_attempts` (outer; default 2) under [conflicts]."
+        )
     intent = raw.get("intent", {})
     stacking = raw.get("stacking", {})
     daemon = raw.get("daemon", {})
@@ -132,9 +142,13 @@ def load_config(root: Path | None = None) -> Config:
             resources.get("container_stats_sample_seconds", defaults.container_stats_sample_seconds)
         ),
         conflict_auto_resolve=bool(conflicts.get("auto_resolve", defaults.conflict_auto_resolve)),
-        conflict_max_resolve_attempts=int(
-            conflicts.get("max_resolve_attempts", defaults.conflict_max_resolve_attempts)
+        conflict_resolver_max_iterations=int(
+            conflicts.get(
+                "resolver_max_iterations",
+                defaults.conflict_resolver_max_iterations,
+            )
         ),
+        rebase_max_attempts=int(conflicts.get("rebase_max_attempts", defaults.rebase_max_attempts)),
         intent_max_reviews_per_task=int(
             intent.get("max_reviews_per_task", defaults.intent_max_reviews_per_task)
         ),

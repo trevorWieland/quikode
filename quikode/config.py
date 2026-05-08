@@ -302,16 +302,32 @@ class Config(BaseModel):
         description="How often the orchestrator polls docker stats for in-flight containers.",
     )
 
-    # ----- v2 Phase A: conflicts -----
+    # ----- v2 Phase A: conflicts (plan 31 cleanup) -----
     conflict_auto_resolve: bool = Field(
         default=True,
         description="Run the conflict-resolver agent automatically on rebase conflict.",
     )
-    conflict_max_resolve_attempts: int = Field(
+    conflict_resolver_max_iterations: int = Field(
+        default=6,
+        ge=1,
+        le=20,
+        description=(
+            "Max conflict-resolver iterations within ONE rebase attempt before "
+            "aborting + BLOCK. Each iteration runs the resolver agent on the "
+            "current conflict markers and continues `git rebase --continue`."
+        ),
+    )
+    rebase_max_attempts: int = Field(
         default=2,
-        ge=0,
+        ge=1,
         le=10,
-        description="Max conflict-resolver retries before marking BLOCKED for human resolution.",
+        description=(
+            "Max OUTER rebase attempts (each containing up to "
+            "`conflict_resolver_max_iterations` resolver iterations) before "
+            "BLOCKING. Plan 31 split this from the resolver-iteration cap; "
+            "they were the same knob pre-plan-31, which made the budget gate "
+            "ambiguous."
+        ),
     )
 
     # ----- intent gap detection -----
