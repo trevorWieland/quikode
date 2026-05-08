@@ -331,9 +331,9 @@ Plans `01–27` and `29` are pre-`optimizations`-branch context; see `plans/00-I
 - **z.ai** has a 5-hour usage window; if a `glm-zai` model returns 429 with "Usage limit reached for 5 hour", swap to `glm-wafer` until the window resets (Beijing-time reset stamp in the error message).
 - **API keys:** `~/.codex/.env` (mode 600) + `~/.bashrc` sources via `set -a; . ~/.codex/.env; set +a`. NEVER commit these or echo them.
 
-### 9.3 Resume sequence (when sweep is fully done)
+### 9.3 Deploy sequence (executed; recipe preserved for next sweep)
 
-When PR-B.7 + Plan 35 PR-B + Plan 38 PR-C all land:
+The post-sweep deploy ran at 2026-05-08 PM. Sequence:
 
 ```bash
 # 1. Verify ladder green at HEAD.
@@ -343,26 +343,85 @@ uv run ruff format --check quikode tests
 uv run ty check quikode tests
 uv run pytest tests/ -q
 
-# 2. Reinstall.
+# 2. Reinstall (always cd to the source repo first).
+cd /home/trevor/github/quikode
 bash scripts/reinstall.sh --skip-tests
 
 # 3. Verify proxy health.
 curl -sS http://127.0.0.1:4000/health/readiness
 # expect status: healthy
 
-# 4. Re-seed the workspace.
+# 4. Migrate the live workspace's config.toml off the retired
+#    [agents.<phase>] sections — config_loader REJECTS them with a
+#    ValueError per plan 38 PR-B.7's hard cutover. Add top-level
+#    <role>_model knobs (one per ROLES entry; see
+#    quikode/agent_registry.py for the canonical list).
+
+# 5. Re-seed the workspace. seed-from-base only marks merged nodes that
+#    have a verifiable upstream commit; F-* fixture nodes that don't
+#    correspond to upstream commits need an explicit qk mark-merged.
 cd /home/trevor/github/quikode-runs/tanren
 cat > /tmp/merged.json <<'EOF'
-[{"node_id": "F-0001"}, {"node_id": "F-0002"}, {"node_id": "R-0001"}]
+[{"node_id": "R-0001"}]
 EOF
 qk seed-from-base --merged-nodes-file /tmp/merged.json
+qk mark-merged F-0001 F-0002
 
-# 5. Restart daemon.
+# 6. Restart daemon.
 qk daemon start --detach --max-parallel 12 --retry-failed
 
-# 6. Watch first wave.
+# 7. Watch first wave.
 qk monitor --keywords "attempt 4,attempt 5"
 ```
+
+### 9.4 Deploy lessons (calibration findings, 2026-05-08 PM)
+
+Three issues surfaced during first deploy; one is fixed in code, two are operational:
+
+- **Codex shim schema-write hotfix (commit `9240255`).** The original
+  `CodexDirectJsonAgent` / `CodexLitellmJsonAgent` shim wrote the schema
+  via `python3 -c 'import sys; open({path!r}, "w").write(...)' <<EOF`.
+  The Python repr (`!r`) added single quotes around the path inside an
+  already-single-quoted shell context, so bash split at the inner quote
+  and the path passed to python was bare → `SyntaxError`. Symptom: every
+  task's planner call failed with `bash: line 3: warning: here-document
+  ... wanted '__QK_SCHEMA_EOF__'` + `SyntaxError: invalid syntax`.
+  Replaced with a clean `cat > {path} <<'__QK_SCHEMA_EOF__'` heredoc.
+  Tests stayed green during PR-A because they mock `exec_in` and don't
+  shell-evaluate the constructed cmd; the bug only surfaced under real
+  subprocess execution.
+  **Lesson:** any new agent shim that constructs a shell pipeline MUST
+  have at least one integration test that actually invokes `bash -lc`
+  against the constructed command. Mocking `exec_in` is fine for
+  contract tests but doesn't catch shell-level mistakes.
+
+- **`[agents.<phase>]` config migration is operator-driven.** Plan 38
+  PR-B.7's hard cutover means workspaces with the legacy
+  `[agents.planner] cli="codex" model="gpt-5.5"` shape get `ValueError`
+  at load. The migration is mechanical (delete the sections, add
+  top-level `<role>_model = "..."` keys for every entry in
+  `agent_registry.ROLES`) but a fresh manager session won't know to do
+  this until it tries to seed/start. The error message names the
+  replacement keys so it's diagnosable, but worth knowing in advance.
+
+- **`qk seed-from-base --merged-nodes-file` only marks merged nodes that
+  resolve to an upstream commit.** Tanren has F-0001 and F-0002 as
+  fixture/scaffolding nodes that don't have corresponding `main` commits
+  (they were marked merged in prior runs as a setup convention). The
+  seeder silently skipped them; only R-0001 (which does have an
+  upstream commit per its task title) got marked. The fix is post-seed
+  `qk mark-merged F-0001 F-0002` to declare them merged regardless.
+  **Lesson:** if you're seeing fewer merged nodes than expected after
+  `seed-from-base`, check `qk briefing`'s merged count vs. your
+  expectation; the diff is fixture nodes that need explicit
+  `mark-merged` follow-up.
+
+After hotfix + reinstall, daemon stable at pid (varies per restart);
+8 tasks in PROVISIONING, first wave running fresh under the new
+contract. Remaining calibration windows: cycle-1 audit pass rate,
+client-side schema validation re-prompt frequency on glm-zai/glm-wafer
+proxy-routed roles, behavior of the new architecture stage on real
+diffs.
 
 The first 5–10 spec plans landing under the new flow are the calibration window. Watch:
 - Whether the JsonAgent client-side re-prompt-once fires (parse-fail + retry). Frequent fires = a prompt/schema mismatch worth investigating.
