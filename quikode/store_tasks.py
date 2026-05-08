@@ -132,24 +132,6 @@ class StoreTaskMixin:
                 ).fetchall()
             ]
 
-    def last_entered_state_ts(self: Any, task_id: str, state: State) -> float | None:
-        """Most recent ts at which `task_id` transitioned INTO `state`, or None.
-
-        Reads `state_log`. Used by the stacking-readiness gate to compute "how
-        long has this parent been quietly in MERGE_READY?" — a parent that
-        flapped through ADDRESSING_FEEDBACK and back gets a fresh ts and
-        falls back below the quiet threshold until it stabilizes.
-        """
-        with self._tx_lock:
-            r = self.conn.execute(
-                "SELECT MAX(ts) FROM state_log WHERE task_id = ? AND to_state = ?",
-                (task_id, state.value),
-            ).fetchone()
-        if r is None:
-            return None
-        ts = r[0]
-        return float(ts) if ts is not None else None
-
     def subtask_progress(self: Any, task_id: str) -> tuple[int, int]:
         """Return (done, total) subtask counts for `task_id`.
 

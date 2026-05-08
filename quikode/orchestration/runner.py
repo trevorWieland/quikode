@@ -404,8 +404,8 @@ class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWa
 
         Post-PR states are not terminal: the orchestrator's review watcher
         polls those PRs for new threads + human merge. We keep the
-        loop alive on PENDING_CI, ADDRESSING_FEEDBACK, REBASING_TO_MAIN,
-        CONFLICT_RESOLVING, TRIAGING_FEEDBACK, and the subtask-loop states.
+        loop alive on PENDING_CI, AWAITING_REVIEW, ADDRESSING_FEEDBACK,
+        REBASING_TO_MAIN, CONFLICT_RESOLVING, and the subtask-loop states.
 
         The four genuine terminal states — MERGED, BLOCKED, FAILED,
         ABORTED — are the only ones that count toward "done."

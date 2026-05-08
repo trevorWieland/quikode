@@ -62,12 +62,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- this task. Used by `_schedule_rebase_to_main` to skip extra triggers
     -- within `cfg.rebase_coalesce_window_s`.
     last_rebase_scheduled_ts REAL,
-    -- v3 settled-notification: when the daemon's review-watcher detects the
-    -- task has been quiet (MERGE_READY + green + no churn for
-    -- cfg.notify_settled_after_s), it pings the configured channel and
-    -- stamps this column. Re-pings are gated on the task having LEFT
-    -- MERGE_READY since the last notify (e.g. responded to a thread)
-    -- so we don't spam on every poll tick.
+    -- Plan 30 review-ready notification: ts of the most recent ntfy fire
+    -- announcing a task reached AWAITING_REVIEW (CI green, ready for human
+    -- review). Column name is a plan-28 carry-over (the original v3
+    -- "settled" notification surface retired with MERGE_READY); SQLite
+    -- column-drop requires a table rebuild so the name was retained and
+    -- repurposed. See `store_review.get_last_review_ready_notified_ts`.
     last_notified_settled_ts REAL,
     -- Plan 28: most recent GitHub Review id we've already routed into
     -- ADDRESSING_FEEDBACK. Prevents re-trigger on the same CHANGES_REQUESTED

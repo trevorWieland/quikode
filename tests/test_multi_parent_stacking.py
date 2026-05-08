@@ -1,21 +1,18 @@
-"""v3.5 Phase 2: multi-parent stacking.
+"""Multi-parent stacking: store helpers + picker side-effects.
 
-Schema + Store helpers + merge-base name derivation + picker side-effects.
-The actual `git merge` is exercised against a real bare repo where
-useful, otherwise asserted via subprocess fakes — `construct_merge_base`
-is thin enough that pattern-checking the call sequence is sufficient.
+Plan 32 replaced the synthetic merge-base branch helpers (`stacking.py`)
+with the first-class merge-node entity. The remaining tests here cover
+the multi-parent JSON-array store schema and the orchestrator picker's
+behavior when a child has multiple stack-ready parents (it materializes a
+merge-node and picks the merge-node first).
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
-import pytest
-
 from quikode import merge_node as merge_node_mod
-from quikode import stacking
 from quikode.config import Config, StackingStrategy
 from quikode.dag import DAG
 from quikode.orchestrator import Orchestrator
@@ -54,127 +51,6 @@ def test_store_clear_multi_parent(tmp_path):
     # Clear by passing empty list.
     store.set_parent_chain("R-099", parent_task_ids=[])
     assert store.get_parent_task_ids("R-099") == []
-
-
-# ----- Merge-base branch naming -----
-
-
-def test_merge_base_branch_name_deterministic_for_same_parents():
-    n1 = stacking.compute_merge_base_branch_name("R-099", ["a", "b", "c"])
-    n2 = stacking.compute_merge_base_branch_name("R-099", ["c", "b", "a"])
-    # Sort-canonical so order doesn't matter.
-    assert n1 == n2
-    assert "r-099-base-" in n1
-
-
-def test_merge_base_branch_name_changes_with_parent_set():
-    n_with_b = stacking.compute_merge_base_branch_name("R-099", ["a", "b"])
-    n_with_b_c = stacking.compute_merge_base_branch_name("R-099", ["a", "b", "c"])
-    assert n_with_b != n_with_b_c
-
-
-def test_merge_base_branch_name_empty_raises():
-    with pytest.raises(ValueError):
-        stacking.compute_merge_base_branch_name("R-099", [])
-
-
-# ----- construct_merge_base subprocess shape -----
-
-
-def test_construct_merge_base_octopus_succeeds(tmp_path, monkeypatch):
-    """Octopus merge succeeds → returns sha from rev-parse HEAD."""
-    calls: list[list[str]] = []
-
-    def _fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        if cmd[:3] == ["git", "checkout", "-B"]:
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        if cmd[:2] == ["git", "merge"] and "--no-ff" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, "Merge made", "")
-        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
-            return subprocess.CompletedProcess(cmd, 0, "abc1234567\n", "")
-        return subprocess.CompletedProcess(cmd, 1, "", "unexpected")
-
-    monkeypatch.setattr(stacking.subprocess, "run", _fake_run)
-    sha = stacking.construct_merge_base(
-        repo_path=tmp_path,
-        parent_branches=["quikode/r-001-aaa", "quikode/r-002-bbb"],
-        branch_name="quikode/r-099-base-deadbe",
-    )
-    assert sha == "abc1234567"
-    # First call should be the checkout, second the octopus merge.
-    assert calls[0][:3] == ["git", "checkout", "-B"]
-    assert calls[1][:2] == ["git", "merge"]
-    assert "quikode/r-001-aaa" in calls[1] and "quikode/r-002-bbb" in calls[1]
-
-
-def test_construct_merge_base_octopus_fails_falls_back_to_sequential(tmp_path, monkeypatch):
-    """When octopus fails, the helper aborts + retries pairwise. Sequential
-    success → returns sha."""
-    phase = ["octopus"]
-    merges_done = [0]
-
-    def _fake_run(cmd, **kwargs):
-        # Strip the leading `git` plus any `-c key=value` options so we
-        # can match on the actual git verb.
-        verb_idx = 1
-        while verb_idx < len(cmd) and cmd[verb_idx] == "-c":
-            verb_idx += 2  # skip `-c` + its value
-        verb = cmd[verb_idx] if verb_idx < len(cmd) else ""
-        rest = cmd[verb_idx + 1 :]
-        if verb == "checkout" and rest[:1] == ["-B"]:
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        if verb == "merge" and "--abort" in rest:
-            phase[0] = "sequential"
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        if verb == "merge" and "--no-ff" in rest:
-            if phase[0] == "octopus" and cmd.count("quikode/r-001-aaa") + cmd.count("quikode/r-002-bbb") == 2:
-                return subprocess.CompletedProcess(cmd, 1, "", "CONFLICT")
-            # Sequential form has a single branch.
-            merges_done[0] += 1
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        if verb == "rev-parse" and rest[:1] == ["HEAD"]:
-            return subprocess.CompletedProcess(cmd, 0, "deadbeef00\n", "")
-        return subprocess.CompletedProcess(cmd, 1, "", "unexpected")
-
-    monkeypatch.setattr(stacking.subprocess, "run", _fake_run)
-    sha = stacking.construct_merge_base(
-        repo_path=tmp_path,
-        parent_branches=["quikode/r-001-aaa", "quikode/r-002-bbb"],
-        branch_name="quikode/r-099-base-deadbe",
-    )
-    assert sha == "deadbeef00"
-    assert merges_done[0] == 2  # both sequential merges ran
-
-
-def test_construct_merge_base_returns_none_on_unrecoverable_conflict(tmp_path, monkeypatch):
-    """When sequential merges also conflict, the helper aborts + returns None."""
-
-    def _fake_run(cmd, **kwargs):
-        if cmd[:3] == ["git", "checkout", "-B"]:
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        if cmd[:2] == ["git", "merge"] and "--no-ff" in cmd:
-            return subprocess.CompletedProcess(cmd, 1, "", "CONFLICT")
-        return subprocess.CompletedProcess(cmd, 1, "", "unexpected")
-
-    monkeypatch.setattr(stacking.subprocess, "run", _fake_run)
-    sha = stacking.construct_merge_base(
-        repo_path=tmp_path,
-        parent_branches=["quikode/r-001-aaa", "quikode/r-002-bbb"],
-        branch_name="quikode/r-099-base-cafe00",
-    )
-    assert sha is None
-
-
-def test_construct_merge_base_empty_parents_returns_none(tmp_path):
-    sha = stacking.construct_merge_base(
-        repo_path=tmp_path,
-        parent_branches=[],
-        branch_name="quikode/x",
-    )
-    assert sha is None
 
 
 # ----- Picker side-effects: multi-parent stamping -----
