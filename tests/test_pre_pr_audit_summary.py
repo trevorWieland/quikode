@@ -13,7 +13,7 @@ from quikode.state import State, Store
 from quikode.tui.widgets.detail_panel import DetailSnapshot, _gauntlet_block, _state_long_description
 
 
-def test_begin_cycle_seeds_four_queued_stages(tmp_path):
+def test_begin_cycle_seeds_five_queued_stages(tmp_path):
     store = Store(tmp_path / "q.db")
     store.upsert_pending("R-001")
     store.begin_pre_pr_audit_cycle("R-001", 1)
@@ -21,7 +21,8 @@ def test_begin_cycle_seeds_four_queued_stages(tmp_path):
     assert summary is not None
     assert summary["cycle"] == 1
     names = [s["name"] for s in summary["stages"]]
-    assert names == ["local_ci", "rubric", "standards", "behavior"]
+    # Plan 35 PR-B: 5-stage gauntlet (architecture between standards + behavior).
+    assert names == ["local_ci", "rubric", "standards", "architecture", "behavior"]
     # All seeded as queued (passed=None, summary="queued").
     assert all(s["passed"] is None for s in summary["stages"])
     assert all(s["summary"] == "queued" for s in summary["stages"])

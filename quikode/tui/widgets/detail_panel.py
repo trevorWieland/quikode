@@ -427,18 +427,21 @@ def _state_long_description(state: str) -> str | None:
     return _STATE_LONG_DESCRIPTION.get(state)
 
 
-# Stage display order + human labels. The same four stages always render —
+# Stage display order + human labels. The same five stages always render —
 # ones that haven't run yet in the current cycle show as "queued" so the
 # operator sees the full pipeline shape rather than just "what's done so far."
 # Labels describe the stage's purpose, not the implementation. The CLI/model
 # that actually ran each stage is visible per-call in the agent_calls tab,
 # and is configurable via the per-role `cfg.<role>_model` knobs (see
 # `quikode.agent_registry.ROLES`); baking concrete CLI names into these
-# labels lies whenever the operator overrides those roles.
+# labels lies whenever the operator overrides those roles. Plan 35 PR-B grew
+# the gauntlet from four stages to five — added `architecture` between
+# `standards` and `behavior`.
 _GAUNTLET_STAGES = [
     ("local_ci", "local CI gate (just ci)"),
     ("rubric", "rubric audit (6 categories)"),
-    ("standards", "standards audit (repo profile)"),
+    ("standards", "standards audit (language profile)"),
+    ("architecture", "architecture audit (project subsystems)"),
     ("behavior", "behavior audit (verifies expected_evidence)"),
 ]
 
@@ -466,7 +469,7 @@ _GAUNTLET_RELEVANT_STATES = frozenset(
 
 
 def _gauntlet_block(snap: DetailSnapshot) -> str | None:
-    """Render the 4-stage pre-PR audit gauntlet as a pass/fail/queued block.
+    """Render the 5-stage pre-PR audit gauntlet as a pass/fail/queued block.
 
     Shape per stage:
       ✓ local_ci    — passed (CI green; rc=0)

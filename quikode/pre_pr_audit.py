@@ -1,9 +1,11 @@
-"""v3.6 pre-PR pipeline: 4-stage gate before opening a PR.
+"""v3.6 pre-PR pipeline: 5-stage gate before opening a PR.
 
 Stage 0 (local_ci) runs `cfg.local_ci_command` and passes raw output
-through to triage. Stages 1-3 (rubric / standards / behavior) invoke
-JsonAgent roles `pre_pr_rubric` / `pre_pr_standards` / `pre_pr_behavior`,
-each with a closed pydantic schema (`PrePR*AuditOutput`).
+through to triage. Stages 1-4 (rubric / standards / architecture /
+behavior) invoke JsonAgent roles `pre_pr_rubric` / `pre_pr_standards`
+/ `pre_pr_architecture` / `pre_pr_behavior`, each with a closed
+pydantic schema (`PrePR*AuditOutput`). Plan 35 PR-B added the
+architecture stage between standards and behavior.
 
 Failures merge into a `audit_findings` bundle → triage → fixup planner
 (kind="fixup-pre-pr-audit") → per-subtask doer/checker loop, then the
@@ -41,17 +43,27 @@ from .agent_registry import make_agent
 from .agent_schemas import (
     PrePRBehaviorAuditOutput,
     PrePRRubricAuditOutput,
-    PrePRStandardsAuditOutput,
 )
 from .agents.json_protocol import JsonAgentResult
 from .config import Config
 from .evaluation_contract import EvaluationContract
 from .execution import ExecutionSandbox, exec_in
 
+# Two child modules carry the standards / architecture audit bodies
+# (split out to keep this file under the 600-line architecture budget).
+# Cycle-tolerant: the children import `from . import pre_pr_audit as
+# _pp` at the top of THEIR files, getting the partial module. They
+# only access `_pp.X` inside function bodies, called at runtime — by
+# then this module is fully constructed. We place these imports here
+# so workers / tests can call `pre_pr_audit.run_standards_audit` etc.
+# directly (stable import path).
+from .pre_pr_audit_architecture import run_architecture_audit
+from .pre_pr_audit_standards import run_standards_audit
+
 log = logging.getLogger("quikode.pre_pr_audit")
 
 
-StageName = Literal["local_ci", "rubric", "standards", "behavior"]
+StageName = Literal["local_ci", "rubric", "standards", "architecture", "behavior"]
 
 
 @dataclass
@@ -332,93 +344,32 @@ def collect_standards_text(cfg: Config, *, contract: EvaluationContract | None =
     return text[:60000]
 
 
-def run_standards_audit(
-    *,
-    cfg: Config,
-    handle: ExecutionSandbox,
-    diff_excerpt: str,
-    standards_text: str,
-    log_path: Path | None = None,
-) -> StageOutcome:
-    """Compare branch diff against the configured standards profile.
-    Invokes the `pre_pr_standards` role; schema-validation failure →
-    `parse_failure`."""
-    if not standards_text.strip():
-        return StageOutcome(
-            name="standards",
-            passed=False,
-            summary=(
-                "no standards profile docs loaded — configure "
-                "`standards_profiles_dir` + `standards_profiles` to enable the gate"
-            ),
-            findings=[
-                {
-                    "kind": "config_error",
-                    "message": (
-                        "No standards profile docs loaded. Set "
-                        "`standards_profiles_dir` and `standards_profiles` "
-                        "in quikode config (plan 35)."
-                    ),
-                }
-            ],
-        )
-    structured, result, early = _invoke_audit(
-        "standards",
-        "pre_pr_standards",
-        cfg=cfg,
-        handle=handle,
-        log_path=log_path,
-        template="pre-pr-standards.md",
-        template_ctx={
-            "standards_text": standards_text,
-            "diff_excerpt": diff_excerpt[:30000],
-        },
-        expected_schema=PrePRStandardsAuditOutput,
-    )
-    if early is not None:
-        return early
-    assert isinstance(structured, PrePRStandardsAuditOutput)
-    return _build_standards_outcome(structured, result)
+# `run_standards_audit` is re-exported from `pre_pr_audit_standards`
+# (see the bottom of this file). The body lives in the sibling module
+# to keep this file under the 600-line architecture budget after Plan
+# 35 PR-B added the architecture stage. The sibling imports
+# `_invoke_audit` + `StageOutcome` from here using
+# `from . import pre_pr_audit as _pp`, which Python's import machinery
+# resolves to the partial module at child-import time (the children
+# only access `_pp.X` inside function bodies at call time, never at
+# their own import time, so the partial-module reference is safe).
 
 
-def _build_standards_outcome(
-    audit: PrePRStandardsAuditOutput,
-    result: JsonAgentResult,
-) -> StageOutcome:
-    """Bridge `PrePRStandardsAuditOutput` → `StageOutcome`. Findings
-    retain the existing dict shape so downstream consumers don't change."""
-    findings_dicts: list[dict] = [
-        {
-            "id": f.id,
-            "file": f.file,
-            "line": f.line,
-            "severity": f.severity,
-            "standards_doc_ref": f.standards_doc_ref,
-            "description": f.description,
-            "concrete_fix": f.concrete_fix,
-        }
-        for f in audit.findings
-    ]
-    serious = [f for f in findings_dicts if f.get("severity") in ("medium", "high", "critical")]
-    raw_excerpt = _tail(result.raw_text or "", 200 if serious else 80)
-    if serious:
-        return StageOutcome(
-            name="standards",
-            passed=False,
-            summary=f"standards failed: {len(serious)} medium+ severity finding(s)",
-            raw_output=raw_excerpt,
-            findings=findings_dicts,
-        )
-    return StageOutcome(
-        name="standards",
-        passed=True,
-        summary=f"standards passed ({len(findings_dicts)} low-severity note(s))",
-        raw_output=raw_excerpt,
-        findings=findings_dicts,
-    )
+# ----- Stage 3: architecture audit (Plan 35 PR-B) -----
+#
+# The architecture audit's `run_architecture_audit` + outcome bridge
+# live in `pre_pr_audit_architecture.py` to keep this file under the
+# 600-line architecture budget. The public function is re-exported
+# below for stable import paths (workers + tests use
+# `pre_pr_audit.run_architecture_audit`).
 
 
-# ----- Stage 3: behavior audit -----
+# `run_architecture_audit` is bound at module import time (bottom of
+# file) from `pre_pr_audit_architecture.run_architecture_audit`. Same
+# split rationale as `run_standards_audit` above.
+
+
+# ----- Stage 4: behavior audit -----
 
 
 def run_behavior_audit(
@@ -573,3 +524,18 @@ def _tail(text: str, n_lines: int) -> str:
         return ""
     lines = text.splitlines()
     return "\n".join(lines[-n_lines:]) if len(lines) > n_lines else text
+
+
+__all__ = [
+    "PipelineCycleResult",
+    "StageName",
+    "StageOutcome",
+    "collect_finding_ids",
+    "collect_standards_text",
+    "merge_failed_stage_reports",
+    "run_architecture_audit",
+    "run_behavior_audit",
+    "run_local_ci_gate",
+    "run_rubric_audit",
+    "run_standards_audit",
+]

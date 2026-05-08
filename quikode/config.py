@@ -489,6 +489,7 @@ class Config(BaseModel):
     subtask_triage_model: str = Field(default="gpt-5.5")
     pre_pr_rubric_model: str = Field(default="gpt-5.5")
     pre_pr_standards_model: str = Field(default="gpt-5.5")
+    pre_pr_architecture_model: str = Field(default="gpt-5.5")
     pre_pr_behavior_model: str = Field(default="gpt-5.5")
     fixup_planner_model: str = Field(default="gpt-5.5")
     merge_planner_model: str = Field(default="gpt-5.5")

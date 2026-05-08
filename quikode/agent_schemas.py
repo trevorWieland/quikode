@@ -272,6 +272,7 @@ SubtaskTriageFailureLayer = Literal[
     "local_ci",
     "rubric",
     "standards",
+    "architecture",
     "behavior",
     "parse_failure",
     "transport",
@@ -367,6 +368,45 @@ class PrePRStandardsAuditOutput(BaseModel):
     overall_assessment: str = Field(default="")
 
 
+# ---------- pre-PR architecture audit ----------
+
+
+ArchitectureSeverity = Literal["low", "medium", "high", "critical"]
+
+
+class ArchitectureFinding(BaseModel):
+    """One project-architecture-alignment finding.
+
+    Plan 35 PR-B: parallel to `StandardsFinding`, but cites architecture
+    docs (under `cfg.architecture_docs_dir`) instead of profile docs.
+    The `architecture_doc_ref` is required and MUST resolve to a real
+    `architecture_corpus` doc + section per Plan 12/14 no-fabrication.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1)
+    file: str = Field(default="")
+    line: int | None = Field(default=None)
+    severity: ArchitectureSeverity
+    architecture_doc_ref: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    concrete_fix: str = Field(default="")
+
+
+class PrePRArchitectureAuditOutput(BaseModel):
+    """Top-level shape from the pre-PR architecture audit.
+
+    Mirrors `prompts/pre-pr-architecture.md`. Worker gates on `severity`
+    >= medium (same gating as standards). Plan 35 §2.10.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    findings: list[ArchitectureFinding] = Field(default_factory=list)
+    overall_assessment: str = Field(default="")
+
+
 # ---------- pre-PR behavior audit ----------
 
 
@@ -427,7 +467,9 @@ class ProgressVerdict(BaseModel):
 
 
 __all__ = [
+    "ArchitectureFinding",
     "ArchitectureRefSchema",
+    "ArchitectureSeverity",
     "BehaviorCompletenessGap",
     "BehaviorVerification",
     "ConflictResolverEnvelope",
@@ -438,6 +480,7 @@ __all__ = [
     "MergePlannerOutput",
     "PerRowVerdict",
     "PlannerOutput",
+    "PrePRArchitectureAuditOutput",
     "PrePRBehaviorAuditOutput",
     "PrePRRubricAuditOutput",
     "PrePRStandardsAuditOutput",

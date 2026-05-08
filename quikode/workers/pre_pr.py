@@ -302,17 +302,19 @@ class PrePrWorkerMixin:
         return None
 
     def _run_pre_pr_pipeline(self: Any, *, merge_node_mode: bool = False) -> WorkerOutcome | None:
-        """4-stage gate before opening a PR. Returns None on pass,
+        """5-stage gate before opening a PR. Returns None on pass,
         WorkerOutcome(BLOCKED) after `cfg.pre_pr_audit_max_cycles` fails.
         Each cycle runs all stages, merges failed-stage findings into a
         triage bundle, hands them to the fixup planner
         (`kind="fixup-pre-pr-audit"`), and re-runs from the top.
 
-        Plan 32 PR-B: `merge_node_mode=True` adapts for a merge-node —
-        `local_ci` + `behavior` always run; `rubric` + `standards` are
-        skipped unless the cycle's subtasks include `kind="merge-integration"`
-        (the merge-doer emitted real new code). The `behavior` audit's
-        `expected_evidence` is the union of source parents' `expected_evidence`.
+        Plan 32 PR-B / Plan 35 PR-B: `merge_node_mode=True` adapts for a
+        merge-node — `local_ci` + `behavior` always run; `rubric` +
+        `standards` + `architecture` are skipped unless the cycle's
+        subtasks include `kind="merge-integration"` (the merge-doer
+        emitted real new code). The `behavior` audit's
+        `expected_evidence` is the union of source parents'
+        `expected_evidence`.
         """
         for cycle in range(1, self.cfg.pre_pr_audit_max_cycles + 1):
             _tw.log.info(
@@ -459,7 +461,10 @@ class PrePrWorkerMixin:
         self: Any, *, cycle: int, diff_excerpt: str, plan_text: str, merge_node_mode: bool
     ) -> list[Any]:
         """Run the audit stages in order. On a merge-node cycle without
-        `kind="merge-integration"` subtasks, rubric + standards skip."""
+        `kind="merge-integration"` subtasks, rubric + standards +
+        architecture skip (only local_ci + behavior gate the integration
+        commit). Plan 35 PR-B grew the order to FIVE stages:
+        `local_ci, rubric, standards, architecture, behavior`."""
 
         def rec(name: str, oc: Any) -> None:
             self.store.update_pre_pr_audit_stage(
@@ -473,9 +478,8 @@ class PrePrWorkerMixin:
         rec("local_ci", local_ci)
         stages: list[Any] = [local_ci]
         if (not merge_node_mode) or self._merge_integration_subtasks_present():
-            standards_text = _tw.pre_pr_audit.collect_standards_text(
-                self.cfg, contract=self._evaluation_contract()
-            )
+            contract = self._evaluation_contract()
+            cited_standards, cited_architecture = self._collect_cited_refs()
             enter("rubric audit")
             rubric = _tw.pre_pr_audit.run_rubric_audit(
                 cfg=self.cfg,
@@ -489,12 +493,23 @@ class PrePrWorkerMixin:
             standards = _tw.pre_pr_audit.run_standards_audit(
                 cfg=self.cfg,
                 handle=self._h,
+                contract=contract,
                 diff_excerpt=diff_excerpt,
-                standards_text=standards_text,
+                cited_refs=cited_standards,
                 log_path=self.log_path,
             )
             rec("standards", standards)
-            stages.extend([rubric, standards])
+            enter("architecture audit")
+            architecture = _tw.pre_pr_audit.run_architecture_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                contract=contract,
+                diff_excerpt=diff_excerpt,
+                cited_refs=cited_architecture,
+                log_path=self.log_path,
+            )
+            rec("architecture", architecture)
+            stages.extend([rubric, standards, architecture])
         enter("behavior audit")
         behavior = _tw.pre_pr_audit.run_behavior_audit(
             cfg=self.cfg,
@@ -507,6 +522,35 @@ class PrePrWorkerMixin:
         rec("behavior", behavior)
         stages.append(behavior)
         return stages
+
+    def _collect_cited_refs(self: Any) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+        """Plan 35 PR-B: union the `standards_referenced` and
+        `architecture_referenced` citations across all subtasks of this
+        task's plan. Returns `(cited_standards, cited_architecture)`
+        — each a list of `(doc_path, section)` tuples, deduplicated.
+        Empty lists when there's no parsed plan (e.g. resumed merge node
+        with no spec planner output).
+        """
+        cited_standards: list[tuple[str, str]] = []
+        cited_architecture: list[tuple[str, str]] = []
+        seen_s: set[tuple[str, str]] = set()
+        seen_a: set[tuple[str, str]] = set()
+        if self.plan is None:
+            return cited_standards, cited_architecture
+        for subtask in self.plan.subtasks:
+            for ref in subtask.standards_referenced:
+                key = (ref.doc_path, ref.section)
+                if key in seen_s:
+                    continue
+                seen_s.add(key)
+                cited_standards.append(key)
+            for ref in subtask.architecture_referenced:
+                key = (ref.doc_path, ref.section)
+                if key in seen_a:
+                    continue
+                seen_a.add(key)
+                cited_architecture.append(key)
+        return cited_standards, cited_architecture
 
     def _merge_integration_subtasks_present(self: Any) -> bool:
         """True iff any of the merge-node's subtasks carry

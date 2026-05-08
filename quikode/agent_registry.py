@@ -31,6 +31,7 @@ from .agent_schemas import (
     IntentReviewVerdict,
     MergePlannerOutput,
     PlannerOutput,
+    PrePRArchitectureAuditOutput,
     PrePRBehaviorAuditOutput,
     PrePRRubricAuditOutput,
     PrePRStandardsAuditOutput,
@@ -112,6 +113,18 @@ ROLES: dict[str, RoleSpec] = {
     "pre_pr_standards": RoleSpec(
         name="pre_pr_standards",
         output_schema=PrePRStandardsAuditOutput,
+        writes_files=False,
+        default_model="gpt-5.5",
+        timeout_s_field="pre_pr_audit_timeout_s",
+    ),
+    "pre_pr_architecture": RoleSpec(
+        # Plan 35 PR-B: 5th gauntlet stage — grades the diff against the
+        # project's documented subsystem contracts. Same shape + same
+        # default model as `pre_pr_standards` (claude-class structural
+        # reasoning); separate role so the operator can point it at a
+        # different model without forcing standards onto the same one.
+        name="pre_pr_architecture",
+        output_schema=PrePRArchitectureAuditOutput,
         writes_files=False,
         default_model="gpt-5.5",
         timeout_s_field="pre_pr_audit_timeout_s",

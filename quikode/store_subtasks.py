@@ -467,8 +467,10 @@ class StoreSubtaskMixin:
     def begin_pre_pr_audit_cycle(self: Any, task_id: str, cycle: int) -> None:
         """Reset the audit summary at the top of a new cycle so stale stage
         results from prior cycles don't bleed into the TUI display. The
-        four stages are pre-seeded with `passed=None` (in-flight) so the
+        five stages are pre-seeded with `passed=None` (in-flight) so the
         operator sees a "queued" indicator before each stage actually runs.
+        Plan 35 PR-B grew this from four stages to five — added the
+        `architecture` stage between `standards` and `behavior`.
         """
         seeded = {
             "cycle": cycle,
@@ -477,6 +479,7 @@ class StoreSubtaskMixin:
                 {"name": "local_ci", "passed": None, "summary": "queued"},
                 {"name": "rubric", "passed": None, "summary": "queued"},
                 {"name": "standards", "passed": None, "summary": "queued"},
+                {"name": "architecture", "passed": None, "summary": "queued"},
                 {"name": "behavior", "passed": None, "summary": "queued"},
             ],
         }

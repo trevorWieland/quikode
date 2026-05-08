@@ -479,9 +479,14 @@ def _build_pipeline_worker(tmp_path, store, mn_id, parent_ev_lists, monkeypatch)
         captured_evidence["expected_evidence"] = list(kwargs.get("expected_evidence") or [])
         return _StageStub("behavior")
 
+    def fake_architecture(**kwargs):
+        captured["stages_run"].append("architecture")
+        return _StageStub("architecture")
+
     monkeypatch.setattr(pre_pr_audit, "run_local_ci_gate", fake_local_ci)
     monkeypatch.setattr(pre_pr_audit, "run_rubric_audit", fake_rubric)
     monkeypatch.setattr(pre_pr_audit, "run_standards_audit", fake_standards)
+    monkeypatch.setattr(pre_pr_audit, "run_architecture_audit", fake_architecture)
     monkeypatch.setattr(pre_pr_audit, "run_behavior_audit", fake_behavior)
     monkeypatch.setattr(pre_pr_audit, "collect_standards_text", lambda cfg, **kw: "STANDARDS")
     # The audit-stage helper transitions to PRE_PR_AUDITING per stage as
@@ -512,7 +517,7 @@ def test_merge_node_mode_skips_rubric_and_standards_on_trivial_cycle(tmp_path, m
 
 
 def test_merge_node_mode_re_enables_rubric_when_integration_subtasks_present(tmp_path, monkeypatch):
-    """`kind=merge-integration` subtasks → rubric+standards re-enabled."""
+    """`kind=merge-integration` subtasks → rubric+standards+architecture re-enabled."""
     store, mn_id, _ = _seed_merge_node(tmp_path, ["R-001", "R-002"])
     store.upsert_subtasks(
         mn_id,
@@ -538,12 +543,18 @@ def test_merge_node_mode_re_enables_rubric_when_integration_subtasks_present(tmp
         merge_node_mode=True,
     )
 
-    assert captured["stages_run"] == ["local_ci", "rubric", "standards", "behavior"]
-    assert [s.name for s in stages] == ["local_ci", "rubric", "standards", "behavior"]
+    assert captured["stages_run"] == ["local_ci", "rubric", "standards", "architecture", "behavior"]
+    assert [s.name for s in stages] == [
+        "local_ci",
+        "rubric",
+        "standards",
+        "architecture",
+        "behavior",
+    ]
 
 
-def test_spec_mode_runs_all_four_stages(tmp_path, monkeypatch):
-    """`merge_node_mode=False` → standard 4-stage pipeline regardless of subtasks."""
+def test_spec_mode_runs_all_five_stages(tmp_path, monkeypatch):
+    """`merge_node_mode=False` → standard 5-stage pipeline regardless of subtasks."""
     store, mn_id, _ = _seed_merge_node(tmp_path, ["R-001", "R-002"])
     worker, captured, _ = _build_pipeline_worker(tmp_path, store, mn_id, [[], []], monkeypatch)
 
@@ -554,7 +565,7 @@ def test_spec_mode_runs_all_four_stages(tmp_path, monkeypatch):
         merge_node_mode=False,
     )
 
-    assert captured["stages_run"] == ["local_ci", "rubric", "standards", "behavior"]
+    assert captured["stages_run"] == ["local_ci", "rubric", "standards", "architecture", "behavior"]
 
 
 def test_behavior_audit_uses_union_of_parent_expected_evidence(tmp_path, monkeypatch):

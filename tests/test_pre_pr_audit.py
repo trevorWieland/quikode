@@ -1,11 +1,15 @@
 """Unit tests for `quikode.pre_pr_audit`.
 
 Plan 38 PR-B.3: the three audit stages (rubric / standards / behavior)
-run through the JsonAgent layer. The legacy heuristic JSON-extract path
-(`json.loads(cand)` over a regex-extracted candidate) is gone; tests
-that exercised the parser are replaced with stub-`make_agent` cases that
-hand the audit either a validated pydantic instance or a `parse_errors`
-non-empty `JsonAgentResult` to verify the structural-failure mode.
+run through the JsonAgent layer. Plan 35 PR-B added a fourth audit
+stage: `architecture`, between standards and behavior; tests for it
+live in `tests/test_pre_pr_architecture_audit.py`.
+
+The legacy heuristic JSON-extract path (`json.loads(cand)` over a
+regex-extracted candidate) is gone; tests that exercised the parser
+are replaced with stub-`make_agent` cases that hand the audit either
+a validated pydantic instance or a `parse_errors` non-empty
+`JsonAgentResult` to verify the structural-failure mode.
 
 Tests cover:
 - Rubric / standards / behavior happy path → outcome reflects the
@@ -19,6 +23,9 @@ Tests cover:
 - merge_failed_stage_reports + collect_finding_ids preserved across
   the rewrite (legacy dict shape).
 - collect_standards_text reads contract source_text.
+- Plan 35 PR-B `unreferenced-applicable-standard` finding fires when
+  a profile doc's `applies_to` glob matches changed files but no
+  subtask cited it.
 - Source-level regression: heuristic regex / `json.loads(cand)` cannot
   re-appear.
 """
@@ -48,6 +55,7 @@ from quikode.evaluation_contract import (
     StageRubric,
     StandardsStageRubric,
 )
+from quikode.standards_profiles import StandardsDoc, StandardsProfile
 
 # ----- helpers -----
 
@@ -70,6 +78,57 @@ def _stub_handle() -> MagicMock:
     h = MagicMock()
     h.container_name = "qk-stub"
     return h
+
+
+def _make_contract(
+    *,
+    profiles: tuple[StandardsProfile, ...] = (),
+    arch_corpus: ArchitectureCorpus | None = None,
+    standards_source_text: str = "",
+) -> EvaluationContract:
+    if arch_corpus is None:
+        arch_corpus = ArchitectureCorpus(root=Path("/tmp"), docs=())
+    return EvaluationContract(
+        task_id="R-T",
+        local_ci=StageRubric(name="local_ci", one_line="", threshold="", grading_template="", source_text=""),
+        rubric=StageRubric(name="rubric", one_line="", threshold="", grading_template="", source_text=""),
+        standards=StandardsStageRubric(profiles=profiles, source_text=standards_source_text),
+        architecture=ArchitectureStageRubric(corpus=arch_corpus),
+        behavior=StageRubric(name="behavior", one_line="", threshold="", grading_template="", source_text=""),
+    )
+
+
+def _make_profile(
+    name: str,
+    *,
+    docs: tuple[StandardsDoc, ...] = (),
+) -> StandardsProfile:
+    return StandardsProfile(name=name, root=Path("/tmp/profiles") / name, docs=docs)
+
+
+def _make_standards_doc(
+    *,
+    profile: str = "rust-cargo",
+    repo_relative: str = "profiles/rust-cargo/rust/error-handling.md",
+    sections: tuple[str, ...] = ("Rules",),
+    body: str = "## Rules\n\nNo unwrap.\n",
+    applies_to: tuple[str, ...] = (),
+    name: str = "error-handling",
+    category: str = "rust",
+) -> StandardsDoc:
+    return StandardsDoc(
+        profile=profile,
+        category=category,
+        name=name,
+        path=Path("/tmp") / repo_relative,
+        repo_relative=repo_relative,
+        importance="high",
+        applies_to=applies_to,
+        applies_to_languages=("rust",),
+        applies_to_domains=(),
+        body=body,
+        sections=sections,
+    )
 
 
 def _make_json_result(
@@ -212,13 +271,15 @@ def test_run_rubric_audit_agent_rc_nonzero_returns_infra_fail(tmp_path):
 # ----- Standards audit -----
 
 
-def test_run_standards_audit_no_standards_text_returns_config_error(tmp_path):
+def test_run_standards_audit_no_profiles_returns_config_error(tmp_path):
     cfg = _build_cfg(tmp_path)
+    contract = _make_contract(profiles=(), standards_source_text="")
     outcome = pre_pr_audit.run_standards_audit(
         cfg=cfg,
         handle=_stub_handle(),
+        contract=contract,
         diff_excerpt="diff",
-        standards_text="",
+        cited_refs=[],
     )
     assert not outcome.passed
     assert "no standards profile docs loaded" in outcome.summary
@@ -227,6 +288,8 @@ def test_run_standards_audit_no_standards_text_returns_config_error(tmp_path):
 
 def test_run_standards_audit_happy_path_low_severity(tmp_path):
     cfg = _build_cfg(tmp_path)
+    profile = _make_profile("rust-cargo", docs=(_make_standards_doc(),))
+    contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
     audit = PrePRStandardsAuditOutput(
         findings=[
             StandardsFinding(
@@ -234,7 +297,7 @@ def test_run_standards_audit_happy_path_low_severity(tmp_path):
                 file="a.py",
                 line=12,
                 severity="low",
-                standards_doc_ref="docs/std.md#naming",
+                standards_doc_ref="profiles/rust-cargo/rust/error-handling.md§Rules",
                 description="minor naming nit",
             )
         ]
@@ -248,16 +311,21 @@ def test_run_standards_audit_happy_path_low_severity(tmp_path):
         outcome = pre_pr_audit.run_standards_audit(
             cfg=cfg,
             handle=_stub_handle(),
+            contract=contract,
             diff_excerpt="diff",
-            standards_text="STANDARDS",
+            cited_refs=[("profiles/rust-cargo/rust/error-handling.md", "Rules")],
         )
     assert outcome.passed
     assert "low-severity note(s)" in outcome.summary
     assert outcome.findings[0]["severity"] == "low"
+    # Plan 35 PR-B: the rename to `profile_doc_ref` carries through.
+    assert outcome.findings[0]["profile_doc_ref"].startswith("profiles/rust-cargo")
 
 
 def test_run_standards_audit_serious_finding_fails(tmp_path):
     cfg = _build_cfg(tmp_path)
+    profile = _make_profile("rust-cargo", docs=(_make_standards_doc(),))
+    contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
     audit = PrePRStandardsAuditOutput(
         findings=[
             StandardsFinding(
@@ -265,7 +333,7 @@ def test_run_standards_audit_serious_finding_fails(tmp_path):
                 file="src/x.rs",
                 line=42,
                 severity="high",
-                standards_doc_ref="docs/std.md#naming",
+                standards_doc_ref="profiles/rust-cargo/rust/error-handling.md§Rules",
                 description="crosses module boundary",
                 concrete_fix="move to xtask",
             )
@@ -280,8 +348,9 @@ def test_run_standards_audit_serious_finding_fails(tmp_path):
         outcome = pre_pr_audit.run_standards_audit(
             cfg=cfg,
             handle=_stub_handle(),
+            contract=contract,
             diff_excerpt="diff",
-            standards_text="STANDARDS",
+            cited_refs=[],
         )
     assert not outcome.passed
     assert "1 medium+ severity" in outcome.summary
@@ -292,6 +361,8 @@ def test_run_standards_audit_serious_finding_fails(tmp_path):
 
 def test_run_standards_audit_parse_failure_returns_synthetic_fail(tmp_path):
     cfg = _build_cfg(tmp_path)
+    profile = _make_profile("rust-cargo", docs=(_make_standards_doc(),))
+    contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
     fake_agent = MagicMock()
     fake_agent.invoke.return_value = _make_json_result(
         structured=None,
@@ -304,12 +375,80 @@ def test_run_standards_audit_parse_failure_returns_synthetic_fail(tmp_path):
         outcome = pre_pr_audit.run_standards_audit(
             cfg=cfg,
             handle=_stub_handle(),
+            contract=contract,
             diff_excerpt="diff",
-            standards_text="STANDARDS",
+            cited_refs=[],
         )
     assert not outcome.passed
     assert "parse_failure" in outcome.summary
     assert outcome.findings[0]["kind"] == "parse_failure"
+
+
+def test_run_standards_audit_unreferenced_applicable_fires(tmp_path):
+    """Plan 35 PR-B §2.10: when the diff touches a file matching a profile
+    doc's `applies_to` glob and no subtask cited that doc, an
+    `unreferenced-applicable-standard` finding fires (severity medium)."""
+    cfg = _build_cfg(tmp_path)
+    doc = _make_standards_doc(
+        repo_relative="profiles/rust-cargo/rust/no-any.md",
+        applies_to=("**/*.ts",),
+        sections=("Rules",),
+        name="no-any",
+    )
+    profile = _make_profile("rust-cargo", docs=(doc,))
+    contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
+    audit = PrePRStandardsAuditOutput(findings=[])
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{}")
+    diff = "diff --git a/src/app.ts b/src/app.ts\n@@ -1 +1 @@\n-x\n+y\n"
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_standards_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            contract=contract,
+            diff_excerpt=diff,
+            cited_refs=[],  # nothing cited
+        )
+    assert not outcome.passed
+    assert any(
+        f.get("kind") == "unreferenced_applicable_standard"
+        and f.get("profile_doc_ref") == "profiles/rust-cargo/rust/no-any.md"
+        for f in outcome.findings
+    )
+
+
+def test_run_standards_audit_unreferenced_applicable_skips_when_cited(tmp_path):
+    """When the subtask DOES cite the matching profile doc, the
+    unreferenced-applicable detector is silent."""
+    cfg = _build_cfg(tmp_path)
+    doc = _make_standards_doc(
+        repo_relative="profiles/rust-cargo/rust/no-any.md",
+        applies_to=("**/*.ts",),
+        sections=("Rules",),
+        name="no-any",
+    )
+    profile = _make_profile("rust-cargo", docs=(doc,))
+    contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
+    audit = PrePRStandardsAuditOutput(findings=[])
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{}")
+    diff = "diff --git a/src/app.ts b/src/app.ts\n@@ -1 +1 @@\n-x\n+y\n"
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_standards_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            contract=contract,
+            diff_excerpt=diff,
+            cited_refs=[("profiles/rust-cargo/rust/no-any.md", "Rules")],
+        )
+    assert outcome.passed
+    assert not any(f.get("kind") == "unreferenced_applicable_standard" for f in outcome.findings)
 
 
 # ----- Behavior audit -----

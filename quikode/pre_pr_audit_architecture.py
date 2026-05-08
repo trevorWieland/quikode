@@ -1,0 +1,143 @@
+"""Plan 35 PR-B: the architecture audit stage (5th gauntlet stage).
+
+Lives in its own module so `pre_pr_audit.py` stays under the 600-line
+architecture budget. Same shape as `pre_pr_audit.run_standards_audit`:
+renders the architecture corpus TOC + cited section bodies + the diff,
+invokes the `pre_pr_architecture` JsonAgent role, and bridges the
+validated `PrePRArchitectureAuditOutput` into a `StageOutcome` with
+the existing dict-shape findings. Severity gating is `>= medium` (same
+as standards). Plan 35 §2.10's `unreferenced-applicable-architecture`
+detector runs after the LLM auditor returns and contributes additional
+findings keyed off `cfg.architecture_path_map`.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from . import pre_pr_audit as _pp
+from .agent_schemas import PrePRArchitectureAuditOutput
+from .agents.json_protocol import JsonAgentResult
+from .config import Config
+from .evaluation_contract import EvaluationContract
+from .execution import ExecutionSandbox
+from .pre_pr_audit_refs import (
+    changed_files_from_diff,
+    collect_architecture_refs_in_diff,
+    render_cited_sections,
+    unreferenced_applicable_architecture,
+)
+
+
+def run_architecture_audit(
+    *,
+    cfg: Config,
+    handle: ExecutionSandbox,
+    contract: EvaluationContract,
+    diff_excerpt: str,
+    cited_refs: list[tuple[str, str]],
+    log_path: Path | None = None,
+) -> _pp.StageOutcome:
+    """Plan 35 PR-B: compare branch diff against the project's documented
+    subsystem contracts. Parallel to `run_standards_audit`. Renders
+    `contract.architecture.source_text` (the architecture-doc TOC) +
+    cited sections inlined from the union of `architecture_referenced`
+    across the plan's subtasks. Invokes the `pre_pr_architecture` role;
+    schema-validation failure → `parse_failure`. Adds
+    `unreferenced-applicable-architecture` findings post-hoc per
+    `cfg.architecture_path_map`.
+    """
+    if not contract.architecture.corpus.docs:
+        return _pp.StageOutcome(
+            name="architecture",
+            passed=False,
+            summary=(
+                "no architecture docs loaded — configure "
+                "`architecture_docs_dir` + `architecture_doc_globs` to "
+                "enable the gate"
+            ),
+            findings=[
+                {
+                    "kind": "config_error",
+                    "message": (
+                        "No architecture docs loaded. Set "
+                        "`architecture_docs_dir` (and optionally "
+                        "`architecture_doc_globs`) in quikode config (plan 35)."
+                    ),
+                }
+            ],
+        )
+    architecture_corpus_text = (contract.architecture.source_text or "").strip()
+    cited_sections, cited_doc_paths = collect_architecture_refs_in_diff(contract=contract, cited=cited_refs)
+    architecture_refs_in_diff = render_cited_sections(cited_sections)
+    structured, result, early = _pp._invoke_audit(
+        "architecture",
+        "pre_pr_architecture",
+        cfg=cfg,
+        handle=handle,
+        log_path=log_path,
+        template="pre-pr-architecture.md",
+        template_ctx={
+            "architecture_corpus": architecture_corpus_text,
+            "architecture_refs_in_diff": architecture_refs_in_diff,
+            "diff_excerpt": diff_excerpt[:30000],
+        },
+        expected_schema=PrePRArchitectureAuditOutput,
+    )
+    if early is not None:
+        return early
+    assert isinstance(structured, PrePRArchitectureAuditOutput)
+    changed_files = changed_files_from_diff(diff_excerpt)
+    extra = unreferenced_applicable_architecture(
+        cfg=cfg,
+        changed_files=changed_files,
+        cited_doc_paths=cited_doc_paths,
+    )
+    return _build_architecture_outcome(structured, result, unreferenced_findings=extra)
+
+
+def _build_architecture_outcome(
+    audit: PrePRArchitectureAuditOutput,
+    result: JsonAgentResult,
+    *,
+    unreferenced_findings: list[dict] | None = None,
+) -> _pp.StageOutcome:
+    """Bridge `PrePRArchitectureAuditOutput` → `StageOutcome`. Same gating
+    and findings shape as the standards audit; uses the
+    `architecture_doc_ref` field name to keep the bucket distinction
+    visible in fixup planning + downstream rendering.
+    """
+    findings_dicts: list[dict] = [
+        {
+            "id": f.id,
+            "file": f.file,
+            "line": f.line,
+            "severity": f.severity,
+            "architecture_doc_ref": f.architecture_doc_ref,
+            "description": f.description,
+            "concrete_fix": f.concrete_fix,
+        }
+        for f in audit.findings
+    ]
+    if unreferenced_findings:
+        findings_dicts.extend(unreferenced_findings)
+    serious = [f for f in findings_dicts if f.get("severity") in ("medium", "high", "critical")]
+    raw_excerpt = _pp._tail(result.raw_text or "", 200 if serious else 80)
+    if serious:
+        return _pp.StageOutcome(
+            name="architecture",
+            passed=False,
+            summary=f"architecture failed: {len(serious)} medium+ severity finding(s)",
+            raw_output=raw_excerpt,
+            findings=findings_dicts,
+        )
+    return _pp.StageOutcome(
+        name="architecture",
+        passed=True,
+        summary=f"architecture passed ({len(findings_dicts)} low-severity note(s))",
+        raw_output=raw_excerpt,
+        findings=findings_dicts,
+    )
+
+
+__all__ = ["run_architecture_audit"]
