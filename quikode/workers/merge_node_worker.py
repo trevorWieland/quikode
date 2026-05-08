@@ -27,13 +27,14 @@ from pathlib import Path
 from typing import Any
 
 from quikode import fsm_runtime, prompts, worktree
-from quikode.agents import build_agent
+from quikode.agent_registry import make_agent
+from quikode.agent_schemas import MergePlannerOutput, SubtaskSpec
 from quikode.execution import exec_in
 from quikode.fsm import Event, State
 from quikode.subtask_schema import (
     Plan,
     PlanValidationError,
-    parse_planner_output,
+    validate_and_build_plan,
 )
 from quikode.workers.outcomes import WorkerOutcome
 from quikode.workers.task_worker import TaskWorker
@@ -404,48 +405,77 @@ class MergeNodeWorker(TaskWorker):
 
     def _invoke_merge_planner(self, parent_ids: list[str], parent_branches: list[str]) -> Plan | None:
         """Build per-parent context from the runtime DAG (when present)
-        and the worktree git state, then run the merge-planner agent.
-        Returns the parsed Plan or None on agent / parse failure.
+        and the worktree git state, then run the merge-planner agent
+        through the JsonAgent layer. Returns the runtime Plan or None
+        on agent / parse / runtime-validation failure.
 
         Plan 33: merge nodes also get an EvaluationContract built/loaded
         at the same lifecycle point as spec tasks. The merge planner sees
         the same four-stage rubric the audit gauntlet will apply to the
         merged branch.
+
+        Plan 38 PR-B.4: the agent is built via `make_agent("merge_planner",
+        cfg)` and returns a validated `MergePlannerOutput`. The wire→runtime
+        translator runs Z-99 stabilization injection (the merged branch
+        runs the same spec gate as a spec task).
         """
         contract = self._evaluation_contract()
         parent_contexts = self._build_parent_contexts(parent_ids, parent_branches)
         prompt = prompts.merge_planner_prompt(self.cfg, self.node, parent_contexts, contract)
         self._write_log_header("MERGE PLANNER", prompt)
-        agent = build_agent(self.cfg.planner)
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
+        agent = make_agent("merge_planner", self.cfg)
+        result = agent.invoke(
+            prompt,
+            handle=self._h,
+            log_path=self.log_path,
+            timeout=self.cfg.merge_planner_timeout_s,
+        )
         self.store.record_agent_call(
             self.node.id,
             phase="merge_planner",
-            cli=self.cfg.planner.cli,
-            model=self.cfg.planner.model,
+            cli="json_agent",
+            model=self.cfg.merge_planner_model,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
+            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
+            tokens_cached_read=None,
+            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
-        self.store.add_artifact(self.node.id, "merge_planner_output", result.stdout)
-        if not result.ok:
+        artifact_text = result.raw_text or (
+            result.structured.model_dump_json() if result.structured is not None else ""
+        )
+        if artifact_text:
+            self.store.add_artifact(self.node.id, "merge_planner_output", artifact_text)
+        if result.rc != 0:
             log.warning("merge-planner agent rc=%d for %s", result.rc, self.node.id)
             return None
+        if result.parse_errors or result.structured is None:
+            log.warning(
+                "merge-planner output failed schema validation for %s: %s",
+                self.node.id,
+                "; ".join(result.parse_errors)[:300] if result.parse_errors else "no structured output",
+            )
+            return None
+        if not isinstance(result.structured, MergePlannerOutput):
+            log.warning(
+                "merge-planner returned unexpected schema %s for %s",
+                type(result.structured).__name__,
+                self.node.id,
+            )
+            return None
         try:
-            return parse_planner_output(
-                result.stdout,
+            return _wire_to_runtime_merge_plan(
+                result.structured,
                 expected_node_id=self.node.id,
                 spec_gate_command=self.cfg.local_ci_command,
                 rubric_categories=list(self.cfg.pre_pr_rubric_categories or []),
                 rubric_min_score=int(self.cfg.pre_pr_rubric_min_score),
             )
         except PlanValidationError as e:
-            log.warning("merge-planner output failed validation for %s: %s", self.node.id, e)
+            log.warning("merge-planner output failed runtime validation for %s: %s", self.node.id, e)
             return None
 
     def _build_parent_contexts(self, parent_ids: list[str], parent_branches: list[str]) -> list[dict]:
@@ -482,3 +512,68 @@ class MergeNodeWorker(TaskWorker):
         row = self.store.get(self.node.id)
         assert row is not None, f"merge-node {self.node.id!r} should exist in store"
         return row
+
+
+# ---------- wire ↔ runtime translation for merge-planner output ----------
+
+
+def _wire_subtask_to_runtime_dict(spec: SubtaskSpec) -> dict[str, Any]:
+    """Translate one wire `SubtaskSpec` to the runtime `Subtask` ingest dict.
+
+    Mirrors the spec-planner driver's helper of the same name; kept
+    duplicated rather than imported so a future divergence (e.g.
+    merge-only `kind="merge-integration"` defaults) doesn't cause a
+    circular import between the two modules.
+    """
+    return {
+        "id": spec.id,
+        "title": spec.title,
+        "depends_on": list(spec.depends_on),
+        "files_to_touch": list(spec.files_to_touch),
+        "boundary": spec.boundary,
+        "acceptance": list(spec.acceptance),
+        "notes": spec.notes,
+        "interfaces": list(spec.interfaces),
+        "kind": spec.kind,
+        "rubric_targets": [
+            {"category": t.category, "predicted_score": t.predicted_score} for t in spec.rubric_targets
+        ],
+        "standards_referenced": [
+            {"doc_path": r.doc_path, "section": r.section} for r in spec.standards_referenced
+        ],
+        "architecture_referenced": [
+            {"doc_path": r.doc_path, "section": r.section} for r in spec.architecture_referenced
+        ],
+        "behavior_evidence_advanced": list(spec.behavior_evidence_advanced),
+    }
+
+
+def _wire_to_runtime_merge_plan(
+    merge_output: MergePlannerOutput,
+    *,
+    expected_node_id: str | None,
+    spec_gate_command: str | None,
+    rubric_categories: list[str] | None,
+    rubric_min_score: int | None,
+) -> Plan:
+    """Translate a wire `MergePlannerOutput` into a runtime `Plan`.
+
+    Same shape as the spec-planner translator; the merge-planner output
+    drops `merge_context_summary` (informational, not consumed by the
+    runtime Plan model) and otherwise hands off to
+    `validate_and_build_plan` for Z-99 injection + runtime validation.
+    """
+    raw_plan = {
+        "node_id": merge_output.node_id,
+        "summary": merge_output.summary,
+        "gauntlet_strategy": merge_output.gauntlet_strategy,
+        "subtasks": [_wire_subtask_to_runtime_dict(s) for s in merge_output.subtasks],
+        "final_acceptance": list(merge_output.final_acceptance),
+    }
+    return validate_and_build_plan(
+        raw_plan,
+        expected_node_id=expected_node_id,
+        spec_gate_command=spec_gate_command,
+        rubric_categories=rubric_categories,
+        rubric_min_score=rubric_min_score,
+    )

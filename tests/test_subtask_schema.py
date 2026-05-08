@@ -1,60 +1,30 @@
-"""Schema parsing + validation for v2 planner output."""
+"""Schema + validator tests for the v2 runtime planner output.
+
+Plan 38 PR-B.4 retired the prose-parsing path (`extract_json` /
+`parse_planner_output` / `parse_fixup_planner_output`). The wire schema
+(`agent_schemas.PlannerOutput` / `FixupPlannerOutput`) is validated by
+the JsonAgent layer; the runtime shape (`Plan` / `FixupPlan`) is built
+through `validate_and_build_plan` / direct `FixupPlan.model_validate`
+plus the per-driver wire→runtime translators.
+
+These tests pin the runtime model + Z-99 stabilization injection
+behavior directly against `validate_and_build_plan` / `FixupPlan`,
+bypassing the wire layer (which has its own tests in
+`test_agent_schemas.py`).
+"""
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
+from quikode.agent_schemas import PlannerOutput
 from quikode.subtask_schema import (
     STABILIZATION_SUBTASK_ID,
+    FixupPlan,
     PlanValidationError,
-    extract_json,
-    parse_fixup_planner_output,
-    parse_planner_output,
     validate_and_build_plan,
 )
-
-# ----------------------------- extract_json --------------------------------
-
-
-def test_extract_fenced_json():
-    text = """Some narrative.
-
-```json
-{
-  "node_id": "R-1",
-  "subtasks": []
-}
-```
-
-More narrative."""
-    obj = extract_json(text)
-    assert obj["node_id"] == "R-1"
-
-
-def test_extract_unfenced_json():
-    text = """Here you go: { "node_id": "R-1", "x": "y", "nested": { "a": 1 } } and more text."""
-    obj = extract_json(text)
-    assert obj["node_id"] == "R-1"
-    assert obj["nested"]["a"] == 1
-
-
-def test_extract_handles_strings_with_braces():
-    text = """{ "id": "x", "msg": "{ literal braces }" }"""
-    obj = extract_json(text)
-    assert obj["msg"] == "{ literal braces }"
-
-
-def test_extract_empty_raises():
-    with pytest.raises(PlanValidationError, match="empty"):
-        extract_json("")
-
-
-def test_extract_no_json_raises():
-    with pytest.raises(PlanValidationError, match="no JSON"):
-        extract_json("plain text with no braces")
-
+from quikode.workers.planner_driver import _wire_to_runtime_plan
 
 # ----------------------------- validate_and_build_plan ---------------------
 
@@ -173,50 +143,6 @@ def test_topo_order_simple():
     assert order == ["A", "B", "C"]
 
 
-# ----------------------------- end-to-end ----------------------------------
-
-
-def test_parse_full_planner_output():
-    text = """The agent thought hard and produced this plan:
-
-```json
-{
-  "node_id": "R-0001",
-  "summary": "Add account create + sign-in",
-  "subtasks": [
-    {
-      "id": "S-01-domain",
-      "title": "Account domain types",
-      "depends_on": [],
-      "files_to_touch": ["crates/tanren-identity-policy/src/account.rs"],
-      "boundary": "Domain only",
-      "acceptance": ["compiles", "exports Account struct"]
-    },
-    {
-      "id": "S-02-events",
-      "title": "Account events",
-      "depends_on": ["S-01-domain"],
-      "files_to_touch": ["crates/tanren-identity-policy/src/events.rs"],
-      "boundary": "Events module",
-      "acceptance": ["compiles"]
-    }
-  ],
-  "final_acceptance": [
-    "just ci passes",
-    "B-0043 BDD scenarios pass"
-  ]
-}
-```
-
-That's the plan."""
-    plan = parse_planner_output(text, expected_node_id="R-0001")
-    assert plan.node_id == "R-0001"
-    assert plan.summary.startswith("Add account")
-    assert len(plan.subtasks) == 2
-    assert plan.subtasks[0].id == "S-01-domain"
-    assert plan.final_acceptance == ("just ci passes", "B-0043 BDD scenarios pass")
-
-
 # ----------------------------- FixupPlan -----------------------------
 
 
@@ -229,33 +155,31 @@ def test_fixup_plan_accepts_findings_addressed_top_level():
     prompt and pipeline. Until then the orchestrator's completeness
     check trusts only the top-level array (see
     `pre_pr.py::_missing_finding_coverage`)."""
-    text = """```json
-{
-  "summary": "decompose audit findings",
-  "findings_addressed": ["rubric:add-validation", "behavior:missing-witness"],
-  "subtasks": [
-    {
-      "id": "F-1-1-add-validation",
-      "title": "Add input validation",
-      "depends_on": [],
-      "files_to_touch": ["src/foo.rs"],
-      "boundary": "validation only",
-      "acceptance": ["cargo check passes"],
-      "kind": "fixup-pre-pr-audit"
-    },
-    {
-      "id": "F-1-2-add-witness",
-      "title": "Add B-0030 BDD witness",
-      "depends_on": [],
-      "files_to_touch": ["tests/bdd/features/B-0030.feature"],
-      "boundary": "test fixture only",
-      "acceptance": ["scenario runs"],
-      "kind": "fixup-pre-pr-audit"
+    raw = {
+        "summary": "decompose audit findings",
+        "findings_addressed": ["rubric:add-validation", "behavior:missing-witness"],
+        "subtasks": [
+            {
+                "id": "F-1-1-add-validation",
+                "title": "Add input validation",
+                "depends_on": [],
+                "files_to_touch": ["src/foo.rs"],
+                "boundary": "validation only",
+                "acceptance": ["cargo check passes"],
+                "kind": "fixup-pre-pr-audit",
+            },
+            {
+                "id": "F-1-2-add-witness",
+                "title": "Add B-0030 BDD witness",
+                "depends_on": [],
+                "files_to_touch": ["tests/bdd/features/B-0030.feature"],
+                "boundary": "test fixture only",
+                "acceptance": ["scenario runs"],
+                "kind": "fixup-pre-pr-audit",
+            },
+        ],
     }
-  ]
-}
-```"""
-    plan = parse_fixup_planner_output(text)
+    plan = FixupPlan.model_validate(raw)
     assert len(plan.subtasks) == 2
     assert plan.findings_addressed == (
         "rubric:add-validation",
@@ -266,23 +190,21 @@ def test_fixup_plan_accepts_findings_addressed_top_level():
 def test_fixup_plan_accepts_subtasks_without_top_level_findings():
     """Spec subtasks + non-audit fixup kinds don't need the field. Default
     is empty tuple; absence is fine."""
-    text = """```json
-{
-  "summary": "fixup CI",
-  "subtasks": [
-    {
-      "id": "F-1-1-fix-ci",
-      "title": "Fix CI",
-      "depends_on": [],
-      "files_to_touch": ["src/lib.rs"],
-      "boundary": "",
-      "acceptance": ["just ci passes"],
-      "kind": "fixup-ci"
+    raw = {
+        "summary": "fixup CI",
+        "subtasks": [
+            {
+                "id": "F-1-1-fix-ci",
+                "title": "Fix CI",
+                "depends_on": [],
+                "files_to_touch": ["src/lib.rs"],
+                "boundary": "",
+                "acceptance": ["just ci passes"],
+                "kind": "fixup-ci",
+            }
+        ],
     }
-  ]
-}
-```"""
-    plan = parse_fixup_planner_output(text)
+    plan = FixupPlan.model_validate(raw)
     assert len(plan.subtasks) == 1
     assert plan.findings_addressed == ()
 
@@ -336,6 +258,59 @@ def test_stabilization_injection_skipped_when_command_none():
     assert all(s.id != STABILIZATION_SUBTASK_ID for s in plan.subtasks)
 
 
+def test_wire_to_runtime_plan_round_trips_architecture_referenced():
+    """Plan 38 PR-B.1 added `architecture_referenced` to the wire schema
+    `SubtaskSpec`. The runtime `Subtask.architecture_referenced` is a
+    `tuple[ArchitectureRef, ...]` (plan 35 PR-A) where the wire shape is
+    a plain `list[ArchitectureRefSchema]`. The wire→runtime translator
+    must preserve every doc_path/section pair across the boundary."""
+    payload = {
+        "node_id": "R-001",
+        "summary": "x",
+        "subtasks": [
+            {
+                "id": "S-01-domain",
+                "title": "domain",
+                "depends_on": [],
+                "files_to_touch": ["a.rs"],
+                "boundary": "x",
+                "acceptance": ["compiles"],
+                "interfaces": [],
+                "notes": "",
+                "architecture_referenced": [
+                    {"doc_path": "docs/architecture/subsystems/x.md", "section": "API"},
+                    {"doc_path": "docs/architecture/subsystems/y.md", "section": "Z"},
+                ],
+                "standards_referenced": [
+                    {"doc_path": "profiles/rust/error-handling.md", "section": "Rules"},
+                ],
+            },
+        ],
+        "final_acceptance": ["just ci passes"],
+    }
+    planner_output = PlannerOutput.model_validate(payload)
+    plan = _wire_to_runtime_plan(
+        planner_output,
+        expected_node_id="R-001",
+        spec_gate_command=None,
+        rubric_categories=None,
+        rubric_min_score=None,
+    )
+    s = plan.subtasks[0]
+    # Wire schema's plain list became the runtime's tuple, with each
+    # entry preserved as the runtime ArchitectureRef shape.
+    assert isinstance(s.architecture_referenced, tuple)
+    assert len(s.architecture_referenced) == 2
+    assert s.architecture_referenced[0].doc_path == "docs/architecture/subsystems/x.md"
+    assert s.architecture_referenced[0].section == "API"
+    assert s.architecture_referenced[1].doc_path == "docs/architecture/subsystems/y.md"
+    assert s.architecture_referenced[1].section == "Z"
+    # standards_referenced makes the same trip across the same translator.
+    assert isinstance(s.standards_referenced, tuple)
+    assert s.standards_referenced[0].doc_path == "profiles/rust/error-handling.md"
+    assert s.standards_referenced[0].section == "Rules"
+
+
 def test_stabilization_injection_idempotent_if_already_present():
     """Re-parsing the same plan_text on resume must not double-inject."""
     raw = _two_subtask_plan_dict()
@@ -362,10 +337,3 @@ def test_stabilization_injection_idempotent_if_already_present():
     plan_v2 = validate_and_build_plan(raw_v2, spec_gate_command="just check")
     assert len(plan_v2.subtasks) == len(plan_v1.subtasks)
     assert sum(1 for s in plan_v2.subtasks if s.id == STABILIZATION_SUBTASK_ID) == 1
-
-
-def test_parse_planner_output_threads_command_through():
-    raw = _two_subtask_plan_dict()
-    text = "```json\n" + json.dumps(raw) + "\n```"
-    plan = parse_planner_output(text, expected_node_id="R-001", spec_gate_command="just check")
-    assert any(s.id == STABILIZATION_SUBTASK_ID for s in plan.subtasks)

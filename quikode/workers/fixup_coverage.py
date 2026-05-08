@@ -1,4 +1,4 @@
-"""Plan 33 PR-B: stage-typed coverage check for the fixup planner.
+"""Plan 33 PR-B + Plan 38 PR-B.4: stage-typed coverage check + driver loop for the fixup planner.
 
 Used by `quikode.workers.pre_pr.PrePrWorkerMixin._run_fixup_round` to
 verify the fixup planner's `FixupPlan` covers every audit finding id.
@@ -17,12 +17,23 @@ fixup plan addresses specific audit gaps (per-finding), not whole
 rubric categories — so empty `rubric_targets` is legitimate when a
 fixup is purely transport/CI/standards. Driver-side validator routing
 stays out of `pre_pr.py` to keep that file under budget.
+
+Plan 38 PR-B.4 retired the heuristic JSON-extraction path. The fixup
+planner now runs through the JsonAgent layer and returns a validated
+wire-schema `FixupPlannerOutput`; `validate_fixup_plan` consumes that
+pydantic instance directly. The `_wire_to_runtime_fixup_plan` helper
+translates the wire schema's `list[...]` shape to the runtime
+`FixupPlan` (tuple-coerced fields).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from pydantic import ValidationError
+
+from quikode.agent_registry import make_agent
+from quikode.agent_schemas import FixupPlannerOutput, SubtaskSpec
 from quikode.planner_validators import (
     PlannerValidationError,
     validate_architecture_refs,
@@ -30,7 +41,7 @@ from quikode.planner_validators import (
     validate_finding_coverage,
     validate_standards_refs,
 )
-from quikode.subtask_schema import FixupPlan, PlanValidationError, parse_fixup_planner_output
+from quikode.subtask_schema import FixupPlan, PlanValidationError
 
 if TYPE_CHECKING:
     from quikode.dag import Node
@@ -98,19 +109,74 @@ def missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -
     return expected - covered
 
 
-def parse_and_validate_fixup_plan(
-    stdout: str,
+def _wire_subtask_to_runtime_dict(spec: SubtaskSpec) -> dict[str, Any]:
+    """Translate one wire `SubtaskSpec` to the runtime `Subtask` ingest dict.
+
+    The wire schema uses plain `list[...]` for collection fields; the
+    runtime `Subtask` carries `tuple[...]` (coerced via `_coerce_tuple`).
+    Going through the dict shape lets the runtime validators apply
+    without re-implementing them here. Mirrors the spec-planner driver's
+    helper of the same name; kept duplicated rather than imported so
+    a future divergence (e.g. fixup-only fields) doesn't cause a
+    circular import between the two modules.
+    """
+    return {
+        "id": spec.id,
+        "title": spec.title,
+        "depends_on": list(spec.depends_on),
+        "files_to_touch": list(spec.files_to_touch),
+        "boundary": spec.boundary,
+        "acceptance": list(spec.acceptance),
+        "notes": spec.notes,
+        "interfaces": list(spec.interfaces),
+        "kind": spec.kind,
+        "rubric_targets": [
+            {"category": t.category, "predicted_score": t.predicted_score} for t in spec.rubric_targets
+        ],
+        "standards_referenced": [
+            {"doc_path": r.doc_path, "section": r.section} for r in spec.standards_referenced
+        ],
+        "architecture_referenced": [
+            {"doc_path": r.doc_path, "section": r.section} for r in spec.architecture_referenced
+        ],
+        "behavior_evidence_advanced": list(spec.behavior_evidence_advanced),
+    }
+
+
+def _wire_to_runtime_fixup_plan(fixup_output: FixupPlannerOutput) -> FixupPlan:
+    """Translate a wire `FixupPlannerOutput` into a runtime `FixupPlan`.
+
+    Same pattern as the spec planner's `_wire_to_runtime_plan` (subtask
+    schema's collection fields are plain lists on the wire and tuples
+    at runtime); the fixup plan has no Z-99 injection (Z-99 is
+    spec-only) so this is a straight translation.
+    """
+    raw_plan = {
+        "summary": fixup_output.summary,
+        "subtasks": [_wire_subtask_to_runtime_dict(s) for s in fixup_output.subtasks],
+        "findings_addressed": list(fixup_output.findings_addressed),
+    }
+    try:
+        return FixupPlan.model_validate(raw_plan)
+    except ValidationError as e:
+        msgs = [f"{'.'.join(str(x) for x in err['loc'])}: {err['msg']}" for err in e.errors()]
+        raise PlanValidationError("; ".join(msgs)) from e
+
+
+def validate_fixup_plan(
+    fixup_output: FixupPlannerOutput,
     *,
     contract: EvaluationContract,
     node: Node,
     audit_findings: list[str] | None,
 ) -> tuple[FixupPlan | None, str | None]:
-    """Parse + run the fixup-side validator suite on a planner stdout.
+    """Translate the wire `FixupPlannerOutput` to runtime, then run the
+    fixup-side validator suite.
 
-    Returns `(plan, None)` on success, or `(None, error_message)` if the
-    parse failed or any validator raised. The error_message is the
-    structured feedback the caller should feed into the next planner
-    re-prompt (matches the spec planner's re-prompt shape).
+    Returns `(plan, None)` on success, or `(None, error_message)` if
+    the runtime translation failed (uniqueness / depends_on / cycle) or
+    any validator raised. The error_message is the structured feedback
+    the caller should feed into the next planner re-prompt.
 
     Validators run, in order:
 
@@ -131,17 +197,14 @@ def parse_and_validate_fixup_plan(
     finding bundle).
     """
     try:
-        plan = parse_fixup_planner_output(stdout)
+        plan = _wire_to_runtime_fixup_plan(fixup_output)
     except PlanValidationError as e:
         return None, (
-            "Your previous fixup plan failed JSON-schema validation:\n\n"
+            "Your previous fixup plan was structurally valid JSON but failed "
+            "the runtime fixup-plan validators:\n\n"
             f"```\n{e}\n```\n\n"
-            "Re-emit a single fenced ```json ... ``` block that conforms "
-            "strictly to the schema. Note specifically: "
-            "`standards_referenced` items MUST be objects with "
-            '`{"doc_path": "...", "section": "..."}`, not strings; '
-            '`architecture_referenced` items MUST also be `{"doc_path": '
-            '"...", "section": "..."}` objects (plan 35).'
+            "Re-emit the COMPLETE fixup plan correcting the issue (e.g. "
+            "duplicate subtask ids or `depends_on` referencing an unknown id)."
         )
     try:
         validate_finding_coverage(plan, audit_findings or [])
@@ -202,10 +265,159 @@ def build_coverage_gap_addendum(missing: set[str], triage_root_cause: str | None
     return (addendum + "\n\n---\n\n" + (triage_root_cause or ""))[:16000]
 
 
+def run_fixup_planner_loop(
+    worker: Any,
+    *,
+    kind: str,
+    round_no: int,
+    base_prompt: str,
+    audit_findings: list[str] | None,
+    contract: EvaluationContract,
+    log: Any,
+) -> FixupPlan | None:
+    """Plan 38 PR-B.4: agent-invocation + retry loop for the fixup planner.
+
+    Extracted from `pre_pr.py` to keep that module under the 600-line
+    architecture budget. Owns:
+
+    * Building the fixup-planner agent through `make_agent`.
+    * The transient-retry budget (`cfg.fixup_planner_retries_on_transient`).
+    * One re-prompt round on schema-validation failure (parse_errors)
+      and one on runtime-validator failure — separate from each other,
+      both using the same `validator_retries_left=1` budget per round.
+    * Persisting the agent-call record + the per-attempt artifact.
+
+    Returns the runtime `FixupPlan` on success, or None on agent
+    rc != 0 / exhausted-retry / persistent schema or validator failure.
+    """
+    agent = make_agent("fixup_planner", worker.cfg)
+    cfg = worker.cfg
+    retries_left = cfg.fixup_planner_retries_on_transient
+    validator_retries_left = 1
+    attempt_no = 0
+    cur_prompt = base_prompt
+    while True:
+        attempt_no += 1
+        result = agent.invoke(
+            cur_prompt,
+            handle=worker._h,
+            log_path=worker.log_path,
+            timeout=cfg.fixup_planner_timeout_s,
+        )
+        worker.store.record_agent_call(
+            worker.node.id,
+            phase=f"fixup_planner:{kind}",
+            cli="json_agent",
+            model=cfg.fixup_planner_model,
+            rc=result.rc,
+            duration_s=result.duration_s or 0,
+            tokens_used=None,
+            tokens_input=result.tokens_input,
+            tokens_output=result.tokens_output,
+            tokens_cached_read=None,
+            tokens_cached_creation=None,
+            cost_usd=result.cost_usd,
+        )
+        artifact_text = result.raw_text or (
+            result.structured.model_dump_json() if result.structured is not None else ""
+        )
+        if artifact_text:
+            worker.store.add_artifact(
+                worker.node.id,
+                f"fixup_planner_output:{kind}:{round_no}:attempt{attempt_no}",
+                artifact_text,
+            )
+        if result.transient and retries_left > 0:
+            retries_left -= 1
+            log.warning(
+                "fixup planner transient (rc=%d) for %s round %d, retrying (%d left)",
+                result.rc,
+                kind,
+                round_no,
+                retries_left,
+            )
+            continue
+        if result.rc != 0:
+            log.warning("fixup planner exited rc=%d (kind=%s round=%d)", result.rc, kind, round_no)
+            return None
+        if result.parse_errors or result.structured is None:
+            if validator_retries_left <= 0:
+                log.warning(
+                    "fixup planner output failed schema validation after retry (kind=%s round=%d): %s",
+                    kind,
+                    round_no,
+                    "; ".join(result.parse_errors)[:300] if result.parse_errors else "no output",
+                )
+                return None
+            validator_retries_left -= 1
+            log.warning(
+                "fixup planner output failed schema validation (kind=%s round=%d); re-prompting once",
+                kind,
+                round_no,
+            )
+            cur_prompt = build_schema_failure_feedback(result.parse_errors) + "\n\n---\n\n" + base_prompt
+            continue
+        if not isinstance(result.structured, FixupPlannerOutput):
+            log.warning(
+                "fixup planner returned unexpected schema %s (kind=%s round=%d)",
+                type(result.structured).__name__,
+                kind,
+                round_no,
+            )
+            return None
+        plan, feedback = validate_fixup_plan(
+            result.structured,
+            contract=contract,
+            node=worker.node,
+            audit_findings=audit_findings,
+        )
+        if plan is not None:
+            return plan
+        if validator_retries_left <= 0:
+            log.warning(
+                "fixup planner output failed validators after retry (kind=%s round=%d): %s",
+                kind,
+                round_no,
+                (feedback or "")[:300],
+            )
+            return None
+        validator_retries_left -= 1
+        log.warning(
+            "fixup planner output failed validators (kind=%s round=%d); re-prompting once",
+            kind,
+            round_no,
+        )
+        cur_prompt = (feedback or "") + "\n\n---\n\n" + base_prompt
+
+
+def build_schema_failure_feedback(parse_errors: tuple[str, ...]) -> str:
+    """Render the re-prompt feedback when the wire schema's pydantic
+    validation fails. Lives here so `pre_pr.py` stays under the 600-
+    line architecture budget.
+
+    The body cites the typed-tuple parse errors (capped at 1000 chars)
+    and reminds the planner of the two most-misemitted shapes
+    (`standards_referenced`, `architecture_referenced` — both must be
+    `{doc_path, section}` objects per plan 35)."""
+    body = "; ".join(parse_errors)[:1000] if parse_errors else "(agent returned no structured output)"
+    return (
+        "Your previous fixup plan failed JSON-schema validation:\n\n"
+        f"```\n{body}\n```\n\n"
+        "Re-emit a single fenced ```json ... ``` block that conforms "
+        "strictly to the schema. Note specifically: "
+        "`standards_referenced` items MUST be objects with "
+        '`{"doc_path": "...", "section": "..."}`, not strings; '
+        '`architecture_referenced` items MUST also be `{"doc_path": '
+        '"...", "section": "..."}` objects (plan 35).'
+    )
+
+
 __all__ = [
     "build_coverage_gap_addendum",
+    "build_schema_failure_feedback",
     "collect_stage_coverage",
     "missing_finding_coverage",
-    "parse_and_validate_fixup_plan",
+    "run_fixup_planner_loop",
     "split_subtask_rows_for_planner",
+    "validate_fixup_plan",
 ]

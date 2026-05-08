@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from quikode.agent_schemas import PlannerOutput
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.evaluation_contract import build_for
@@ -23,7 +24,8 @@ from quikode.prompts import (
     subtask_doer_prompt,
 )
 from quikode.self_audit import ParsedSelfAudit
-from quikode.subtask_schema import Subtask, parse_planner_output
+from quikode.subtask_schema import Subtask
+from quikode.workers.planner_driver import _wire_to_runtime_plan
 
 
 def _cfg(prompts_dir: Path) -> Config:
@@ -175,36 +177,45 @@ def test_subtask_interfaces_accepts_list_from_json():
 
 
 def test_planner_json_round_trips_with_interfaces():
-    raw = """```json
-{
-  "node_id": "R-001",
-  "summary": "x",
-  "subtasks": [
-    {
-      "id": "S-01-domain",
-      "title": "domain",
-      "depends_on": [],
-      "files_to_touch": ["a.rs"],
-      "boundary": "x",
-      "acceptance": ["compiles"],
-      "interfaces": [],
-      "notes": ""
-    },
-    {
-      "id": "S-09-bdd-B-0001",
-      "title": "BDD B-0001",
-      "depends_on": ["S-01-domain"],
-      "files_to_touch": ["tests/bdd/features/B-0001-sign-in.feature"],
-      "boundary": "feature only",
-      "acceptance": ["just check-bdd-tags passes"],
-      "interfaces": ["web", "api"],
-      "notes": ""
+    """Plan 38 PR-B.4: the planner now hands back a validated wire-schema
+    `PlannerOutput`; the runtime translator preserves `interfaces` as a
+    tuple. This test pins that the JsonAgent pipeline preserves the
+    interfaces field round-trip from JSON → wire schema → runtime Plan."""
+    payload = {
+        "node_id": "R-001",
+        "summary": "x",
+        "subtasks": [
+            {
+                "id": "S-01-domain",
+                "title": "domain",
+                "depends_on": [],
+                "files_to_touch": ["a.rs"],
+                "boundary": "x",
+                "acceptance": ["compiles"],
+                "interfaces": [],
+                "notes": "",
+            },
+            {
+                "id": "S-09-bdd-B-0001",
+                "title": "BDD B-0001",
+                "depends_on": ["S-01-domain"],
+                "files_to_touch": ["tests/bdd/features/B-0001-sign-in.feature"],
+                "boundary": "feature only",
+                "acceptance": ["just check-bdd-tags passes"],
+                "interfaces": ["web", "api"],
+                "notes": "",
+            },
+        ],
+        "final_acceptance": ["just ci passes"],
     }
-  ],
-  "final_acceptance": ["just ci passes"]
-}
-```"""
-    plan = parse_planner_output(raw, expected_node_id="R-001")
+    planner_output = PlannerOutput.model_validate(payload)
+    plan = _wire_to_runtime_plan(
+        planner_output,
+        expected_node_id="R-001",
+        spec_gate_command=None,
+        rubric_categories=None,
+        rubric_min_score=None,
+    )
     assert plan.subtasks[0].interfaces == ()
     assert plan.subtasks[1].interfaces == ("web", "api")
 

@@ -146,3 +146,31 @@ def test_no_import_cycles_in_top_level_quikode_modules():
 def test_reinstall_script_runs_ty_over_source_and_tests():
     script = (ROOT / "scripts" / "reinstall.sh").read_text()
     assert "uv run ty check quikode tests" in script
+
+
+def test_planner_modules_have_no_prose_parsing_residue():
+    """Plan 38 PR-B.4: the planner / fixup-planner / merge-planner drivers
+    consume already-validated wire-schema pydantic instances. The
+    heuristic JSON-extract surface (`extract_json`, `_FENCED_JSON_RE`,
+    `parse_planner_output`, `parse_fixup_planner_output`,
+    `_JSON_OBJECT_RE`) must not appear in the four targeted modules."""
+    targeted = [
+        ROOT / "quikode" / "subtask_schema.py",
+        ROOT / "quikode" / "workers" / "planner_driver.py",
+        ROOT / "quikode" / "workers" / "fixup_coverage.py",
+        ROOT / "quikode" / "workers" / "merge_node_worker.py",
+    ]
+    banned = (
+        "extract_json(",
+        "_FENCED_JSON_RE",
+        "_JSON_OBJECT_RE",
+        "first_balanced_object",
+        "parse_planner_output",
+        "parse_fixup_planner_output",
+    )
+    for path in targeted:
+        text = path.read_text()
+        for term in banned:
+            assert term not in text, (
+                f"{path.relative_to(ROOT)} still references prose-parsing surface {term!r}"
+            )

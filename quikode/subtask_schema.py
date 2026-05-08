@@ -1,22 +1,23 @@
-"""Schema + validator + extraction for the v2 structured planner output.
+"""Schema + validator for the v2 structured planner output.
 
-The planner agent is asked to return a JSON block describing the implementation
+The planner agent is asked to return JSON describing the implementation
 as a directed acyclic graph of *subtasks* — small, independently verifiable
 slices of the spec. The orchestrator then drives a per-subtask doer/checker
 loop instead of a monolithic do-the-whole-thing pass. See `docs/design-v2.md`
 Phase 0 for the rationale.
 
-This module owns the *shape* of the planner contract — a single source of
-truth for both the prompt (which describes the schema to the agent) and the
-worker (which validates + consumes the output). Implemented as Pydantic
-models so validation errors are clean and field-typed; pydantic v2's native
-JSON parsing is used in `parse_planner_output`.
+This module owns the *runtime shape* of the planner contract used by the
+worker (`Plan` / `Subtask` with tuple-coerced fields + topo validators).
+The wire-level pydantic shape the JsonAgent layer hands back lives in
+`quikode.agent_schemas` (`PlannerOutput` / `FixupPlannerOutput` /
+`MergePlannerOutput` / `SubtaskSpec`). Plan 38 PR-B.4 retired the
+heuristic JSON-extraction path; planner / fixup / merge drivers now
+consume already-validated pydantic instances and use the per-driver
+`_wire_to_runtime_*` helpers to produce the runtime shape.
 """
 
 from __future__ import annotations
 
-import json
-import re
 from collections import defaultdict
 from typing import Any
 
@@ -28,8 +29,6 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-
-from quikode.json_extract import first_balanced_object
 
 
 class PlanValidationError(ValueError):
@@ -262,35 +261,7 @@ class Plan(BaseModel):
         return self._topo_order_raise_on_cycle()
 
 
-# ---------- JSON extraction (pre-validation) ----------
-
-_FENCED_JSON_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
-
-
-def extract_json(text: str) -> dict[str, Any]:
-    """Pull the first JSON object out of an agent's response.
-
-    The planner is instructed to wrap its output in ```json...``` fences. We try
-    that first; failing that, we look for the first balanced { ... } block.
-    """
-    if not text or not text.strip():
-        raise PlanValidationError("planner returned empty output")
-
-    m = _FENCED_JSON_RE.search(text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError as e:
-            raise PlanValidationError(f"fenced block was not valid JSON: {e}") from e
-
-    blob = first_balanced_object(text)
-    if blob is None:
-        raise PlanValidationError("no JSON object found in planner output")
-    try:
-        return json.loads(blob)
-    except json.JSONDecodeError as e:
-        raise PlanValidationError(f"unfenced JSON not parseable: {e}") from e
-
+# ---------- Z-99 stabilization injection ----------
 
 STABILIZATION_SUBTASK_ID = "Z-99-stabilize-spec-gate"
 
@@ -419,27 +390,6 @@ def validate_and_build_plan(
     return plan
 
 
-def parse_planner_output(
-    text: str,
-    *,
-    expected_node_id: str | None = None,
-    spec_gate_command: str | None = None,
-    rubric_categories: list[str] | None = None,
-    rubric_min_score: int | None = None,
-) -> Plan:
-    """Convenience: extract + validate in one step. Pass `spec_gate_command`
-    to enable plan 24's stabilization-subtask injection. Pass
-    `rubric_categories` + `rubric_min_score` so the Z-99 holistic guardian
-    declares every rubric category at the min score (plan 33 D4)."""
-    return validate_and_build_plan(
-        extract_json(text),
-        expected_node_id=expected_node_id,
-        spec_gate_command=spec_gate_command,
-        rubric_categories=rubric_categories,
-        rubric_min_score=rubric_min_score,
-    )
-
-
 # ---------- v3 fixup decomposition ----------
 
 
@@ -489,13 +439,3 @@ class FixupPlan(BaseModel):
                 if d not in ids:
                     raise ValueError(f"fixup subtask {s.id} depends_on unknown id {d!r}")
         return self
-
-
-def parse_fixup_planner_output(text: str) -> FixupPlan:
-    """Extract + validate fixup planner JSON output."""
-    raw = extract_json(text)
-    try:
-        return FixupPlan.model_validate(raw)
-    except ValidationError as e:
-        msgs = [f"{'.'.join(str(x) for x in err['loc'])}: {err['msg']}" for err in e.errors()]
-        raise PlanValidationError("; ".join(msgs)) from e

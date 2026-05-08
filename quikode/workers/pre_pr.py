@@ -11,7 +11,7 @@ from quikode.subtask_schema import FixupPlan
 from quikode.workers.fixup_coverage import (
     build_coverage_gap_addendum,
     missing_finding_coverage,
-    parse_and_validate_fixup_plan,
+    run_fixup_planner_loop,
     split_subtask_rows_for_planner,
 )
 from quikode.workers.outcomes import WorkerOutcome
@@ -176,17 +176,16 @@ class PrePrWorkerMixin:
         triage_root_cause: str | None,
         audit_findings: list[str] | None = None,
     ) -> FixupPlan | None:
-        """Run the fixup planner agent, parse + validate its output.
+        """Run the fixup planner agent (JsonAgent layer) + validate.
 
         Plan 33 calibration: the fixup driver runs `validate_finding_coverage`
         (replaces rubric_coverage), `validate_evidence_partition`, and
-        `validate_standards_paths`. Validator failure triggers one re-prompt
-        with the structured feedback; a second failure returns None.
+        `validate_standards_refs` / `validate_architecture_refs`. Plan 38
+        PR-B.4: the agent runs through `make_agent("fixup_planner", cfg)`
+        and the retry loop lives in `fixup_coverage.run_fixup_planner_loop`
+        (extracted to keep this module under the 600-line architecture
+        budget). This method just builds the prompt + delegates.
         """
-        agent = _tw.build_agent(self.cfg.planner)
-        # Build the context the planner needs: original final_acceptance,
-        # done spec subtasks, and any prior fixup subtasks (so the new round
-        # can avoid duplicating earlier fixup work).
         done_subtasks, prior_fixup_subtasks = split_subtask_rows_for_planner(
             self.store.list_subtasks(self.node.id), SubtaskState.DONE.value
         )
@@ -211,76 +210,15 @@ class PrePrWorkerMixin:
             triage_root_cause=triage_root_cause,
         )
         self._write_log_header(f"FIXUP PLANNER {kind} round {round_no}", prompt)
-
-        # rc=124 maps to either a real timeout or `agents.base._is_transient_container_failure`
-        # (codex CLI flake, container hiccup). Retry once or twice before giving up so
-        # infra noise doesn't burn fixup_max_rounds on a transient.
-        retries_left = self.cfg.fixup_planner_retries_on_transient
-        validator_retries_left = 1
-        attempt_no = 0
-        cur_prompt = prompt
-        while True:
-            attempt_no += 1
-            result = agent.run(
-                cur_prompt,
-                handle=self._h,
-                log_path=self.log_path,
-                timeout=self.cfg.fixup_planner_timeout_s,
-            )
-            self.store.record_agent_call(
-                self.node.id,
-                phase=f"fixup_planner:{kind}",
-                cli=self.cfg.planner.cli,
-                model=self.cfg.planner.model,
-                rc=result.rc,
-                duration_s=result.duration_s or 0,
-                tokens_used=result.tokens_used,
-                tokens_input=result.tokens_input,
-                tokens_output=result.tokens_output,
-                tokens_cached_read=result.tokens_cached_read,
-                tokens_cached_creation=result.tokens_cached_creation,
-                cost_usd=result.cost_usd,
-            )
-            self.store.add_artifact(
-                self.node.id,
-                f"fixup_planner_output:{kind}:{round_no}:attempt{attempt_no}",
-                result.stdout,
-            )
-            if result.rc == 124 and retries_left > 0:
-                retries_left -= 1
-                _tw.log.warning(
-                    "fixup planner rc=124 (timeout/transient) for %s round %d, retrying (%d left)",
-                    kind,
-                    round_no,
-                    retries_left,
-                )
-                continue
-            if result.rc != 0:
-                _tw.log.warning("fixup planner exited rc=%d (kind=%s round=%d)", result.rc, kind, round_no)
-                return None
-            plan, feedback = parse_and_validate_fixup_plan(
-                result.stdout,
-                contract=contract,
-                node=self.node,
-                audit_findings=audit_findings,
-            )
-            if plan is not None:
-                return plan
-            if validator_retries_left <= 0:
-                _tw.log.warning(
-                    "fixup planner output failed parse/validators after retry (kind=%s round=%d): %s",
-                    kind,
-                    round_no,
-                    (feedback or "")[:300],
-                )
-                return None
-            validator_retries_left -= 1
-            _tw.log.warning(
-                "fixup planner output failed parse/validators (kind=%s round=%d); re-prompting once",
-                kind,
-                round_no,
-            )
-            cur_prompt = (feedback or "") + "\n\n---\n\n" + prompt
+        return run_fixup_planner_loop(
+            self,
+            kind=kind,
+            round_no=round_no,
+            base_prompt=prompt,
+            audit_findings=audit_findings,
+            contract=contract,
+            log=_tw.log,
+        )
 
     def _run_manual_probes(self: Any) -> str:
         """Run `kind="manual"` items from `expected_evidence` and return

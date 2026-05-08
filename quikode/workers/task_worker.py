@@ -38,11 +38,7 @@ from quikode.execution import ExecutionBackend, build_execution_backend, exec_in
 from quikode.fsm import TERMINAL_STATES
 from quikode.orchestration import scheduler
 from quikode.state import State, Store, TaskRow
-from quikode.subtask_schema import (
-    Plan,
-    parse_fixup_planner_output,
-    parse_planner_output,
-)
+from quikode.subtask_schema import Plan
 from quikode.types import IntentReviewOutcome, IntentVerdict, Verdict
 from quikode.workers.feedback import FeedbackWorkerMixin
 from quikode.workers.outcomes import (
@@ -86,8 +82,6 @@ _PATCH_EXPORTS = (
     exec_in,
     build_execution_backend,
     scheduler,
-    parse_fixup_planner_output,
-    parse_planner_output,
 )
 
 

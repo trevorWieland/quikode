@@ -6,12 +6,15 @@ import json
 import sys
 from typing import Any
 
+from pydantic import ValidationError
+
 from quikode import fsm_runtime
+from quikode.agent_schemas import PlannerOutput
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import PlanValidationError, Subtask
 from quikode.types import Verdict
 from quikode.workers.outcomes import WorkerOutcome
-from quikode.workers.planner_driver import PlannerDriverMixin
+from quikode.workers.planner_driver import PlannerDriverMixin, _wire_to_runtime_plan
 from quikode.workers.subtask_completion import SubtaskCompletionMixin
 from quikode.workers.subtask_execution import SubtaskExecutionMixin
 from quikode.workers.subtask_progress import SubtaskProgressMixin
@@ -70,15 +73,20 @@ class SubtaskWorkerMixin(
             spec_gate_command = self.cfg.local_ci_command
             if self._has_existing_fixup_subtasks():
                 spec_gate_command = None
+            # Plan 38 PR-B.4: plan_text is now the wire-schema PlannerOutput
+            # JSON (no fences, no prose) since the planner runs through the
+            # JsonAgent layer. Parse via pydantic, then translate wire →
+            # runtime via the same helper the live planner driver uses.
             try:
-                self.plan = _tw.parse_planner_output(
-                    self.plan_text,
+                planner_output = PlannerOutput.model_validate_json(self.plan_text)
+                self.plan = _wire_to_runtime_plan(
+                    planner_output,
                     expected_node_id=self.node.id,
                     spec_gate_command=spec_gate_command,
                     rubric_categories=rubric_categories,
                     rubric_min_score=rubric_min_score,
                 )
-            except PlanValidationError as e:
+            except (ValidationError, PlanValidationError) as e:
                 # plan_text was malformed for some reason — fall through to
                 # re-plan with the agent rather than crash.
                 _tw.log.warning(

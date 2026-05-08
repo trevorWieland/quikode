@@ -1,24 +1,33 @@
-"""Plan 33 calibration: fixup-planner driver routing tests.
+"""Plan 33 calibration + Plan 38 PR-B.4: fixup-planner driver routing tests.
 
 After the tanren R-0002 BLOCK (a structurally-valid 11.5KB fixup plan
 was rejected because `validate_rubric_coverage` demanded every rubric
 category be advanced), the fixup driver was rerouted to call
 `validate_finding_coverage` instead of `validate_rubric_coverage`. The
-spec-planner driver still calls all three spec validators.
+spec-planner driver still calls all four spec validators.
 
-These tests pin that routing decision so a future refactor can't
+Plan 38 PR-B.4 retired the prose-parsing path: `validate_fixup_plan`
+now consumes a pre-validated `FixupPlannerOutput` (wire schema) instead
+of free text. These tests build the wire pydantic instance directly
+from a dict and feed it to the validator function. Behavior of the
+validators themselves (finding coverage, evidence partition, standards/
+architecture refs) is unchanged.
+
+These tests pin the routing decision so a future refactor can't
 silently re-introduce the cross-validator coupling.
 """
 
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from quikode import planner_validators
+from quikode.agent_schemas import FixupPlannerOutput
 from quikode.architecture_docs import ArchitectureCorpus, load_architecture
 from quikode.config import Config
 from quikode.dag import Node
@@ -34,7 +43,7 @@ from quikode.workers import fixup_coverage as fc
 from quikode.workers import planner_driver
 from quikode.workers.fixup_coverage import (
     missing_finding_coverage,
-    parse_and_validate_fixup_plan,
+    validate_fixup_plan,
 )
 
 _PROFILE_FIX = Path(__file__).resolve().parent / "fixtures" / "standards_profiles"
@@ -43,8 +52,8 @@ _ARCH_FIX = Path(__file__).resolve().parent / "fixtures" / "architecture_docs"
 
 def _populated_contract(tmp_path: Path) -> EvaluationContract:
     """Stand up a contract with the fixture profile + architecture trees
-    so `parse_and_validate_fixup_plan` (which now takes a contract) has
-    real corpora to dispatch against. Tests still only exercise the
+    so `validate_fixup_plan` (which now takes a contract) has real
+    corpora to dispatch against. Tests still only exercise the
     finding/rubric/evidence routing — the standards/architecture refs
     they emit must point at fixture docs."""
     profile_root = tmp_path / "profiles"
@@ -104,17 +113,18 @@ def _node(evidence_ids: list[str] | None = None) -> Node:
     )
 
 
-def _fixup_plan_text(
+def _fixup_planner_output(
     *,
     findings_addressed: list[str] | None = None,
     rubric_targets: list[dict] | None = None,
     standards_referenced: list[dict] | None = None,
+    architecture_referenced: list[dict] | None = None,
     behavior_evidence_advanced: list[str] | None = None,
-) -> str:
-    """Build a single-subtask fixup plan JSON for the parser. The
+) -> FixupPlannerOutput:
+    """Build a single-subtask wire-schema `FixupPlannerOutput`. The
     defaults are deliberately empty so each test exercises one
     stage-typed field at a time."""
-    payload = {
+    payload: dict[str, Any] = {
         "summary": "calibration test",
         "findings_addressed": findings_addressed or [],
         "subtasks": [
@@ -127,6 +137,7 @@ def _fixup_plan_text(
                 "acceptance": ["passes"],
                 "rubric_targets": rubric_targets or [],
                 "standards_referenced": standards_referenced or [],
+                "architecture_referenced": architecture_referenced or [],
                 "behavior_evidence_advanced": behavior_evidence_advanced or [],
                 "interfaces": [],
                 "notes": "",
@@ -134,7 +145,7 @@ def _fixup_plan_text(
             }
         ],
     }
-    return f"```json\n{json.dumps(payload)}\n```"
+    return FixupPlannerOutput.model_validate(payload)
 
 
 # ----- routing: rubric_targets=[] is OK on a fixup plan -----
@@ -147,12 +158,12 @@ def test_fixup_plan_accepts_empty_rubric_targets_when_only_behavior_finding(
     `rubric_targets=[]` because the audit only flagged a behavior
     witness. The fixup driver must accept this; the prior wiring
     rejected it via `validate_rubric_coverage`."""
-    text = _fixup_plan_text(
+    fixup_output = _fixup_planner_output(
         findings_addressed=["behavior:B-0066"],
         behavior_evidence_advanced=["B-0066"],
     )
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
         contract=_populated_contract(tmp_path),
         node=_node(["B-0066"]),
         audit_findings=["behavior:B-0066"],
@@ -163,10 +174,13 @@ def test_fixup_plan_accepts_empty_rubric_targets_when_only_behavior_finding(
 
 
 def test_fixup_plan_rejects_string_standards_referenced(tmp_path: Path):
-    """The actual schema-validation failure observed on the tanren
-    R-0002 deploy: the fixup-planner emitted `standards_referenced` as
-    bare strings instead of `{doc_path, section}` objects. The driver
-    must surface a clear schema-violation feedback for the re-prompt."""
+    """Plan 38 PR-B.4: the wire schema (`StandardsRefSchema`) requires
+    `{doc_path, section}` objects; bare strings fail at the wire layer
+    (the JsonAgent layer surfaces this to the driver as parse_errors).
+    `FixupPlannerOutput.model_validate` raises `ValidationError`
+    directly, so the malformed-shape branch is exercised by the
+    JsonAgent layer, not by `validate_fixup_plan`. Pin the wire-layer
+    rejection here."""
     bad_payload = {
         "summary": "x",
         "findings_addressed": ["rubric:security"],
@@ -185,29 +199,26 @@ def test_fixup_plan_rejects_string_standards_referenced(tmp_path: Path):
             }
         ],
     }
-    text = f"```json\n{json.dumps(bad_payload)}\n```"
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
-        contract=_populated_contract(tmp_path),
-        node=_node(),
-        audit_findings=["rubric:security"],
-    )
-    assert plan is None
-    assert feedback is not None
-    assert "doc_path" in feedback
+    with pytest.raises(ValidationError) as excinfo:
+        FixupPlannerOutput.model_validate(bad_payload)
+    msg = str(excinfo.value)
+    # The wire schema's StandardsRefSchema requires objects; a bare
+    # string fails with a typed error referencing the field name.
+    assert "standards_referenced" in msg
+    _ = tmp_path  # unused fixture in this branch
 
 
 def test_fixup_plan_passes_when_finding_coverage_complete(tmp_path: Path):
     """Plan 35: cite a real fixture profile doc + section so the
     bucket-routing validator passes."""
-    text = _fixup_plan_text(
+    fixup_output = _fixup_planner_output(
         findings_addressed=["rubric:security", "behavior:B-0066"],
         rubric_targets=[{"category": "security", "predicted_score": 8}],
         standards_referenced=[{"doc_path": "profiles/rust-cargo/rust/error-handling.md", "section": "Rules"}],
         behavior_evidence_advanced=["B-0066"],
     )
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
         contract=_populated_contract(tmp_path),
         node=_node(["B-0066"]),
         audit_findings=["rubric:security", "behavior:B-0066"],
@@ -220,12 +231,12 @@ def test_fixup_plan_fails_on_missing_finding(tmp_path: Path):
     """When the audit cited `rubric:security` but no subtask claims
     that category, the validator surfaces a `finding_coverage` failure
     so the driver can re-prompt with the gap."""
-    text = _fixup_plan_text(
+    fixup_output = _fixup_planner_output(
         findings_addressed=["rubric:security"],
         rubric_targets=[{"category": "maintainability", "predicted_score": 7}],
     )
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
         contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=["rubric:security"],
@@ -239,12 +250,12 @@ def test_fixup_plan_fails_on_missing_finding(tmp_path: Path):
 def test_fixup_plan_fails_on_unknown_standards_ref(tmp_path: Path):
     """Plan 35: `validate_standards_refs` rejects citations that don't
     resolve under any loaded profile (here a fictional `docs/missing.md`)."""
-    text = _fixup_plan_text(
+    fixup_output = _fixup_planner_output(
         findings_addressed=["standards:docs/missing.md§A"],
         standards_referenced=[{"doc_path": "docs/missing.md", "section": "A"}],
     )
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
         contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=["standards:docs/missing.md§A"],
@@ -258,9 +269,9 @@ def test_fixup_plan_accepts_when_audit_findings_empty(tmp_path: Path):
     """`fixup-final` / `fixup-ci` / `fixup-review` rounds carry no
     typed finding bundle — the driver passes `audit_findings=None`
     and the finding-coverage validator should short-circuit."""
-    text = _fixup_plan_text()
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
+    fixup_output = _fixup_planner_output()
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
         contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=None,
@@ -278,12 +289,12 @@ def test_missing_finding_coverage_short_circuits_when_findings_addressed_lists_i
     """When `plan.findings_addressed` lists an id, the wrapper trusts
     it regardless of stage-typed coverage. Used so the planner can
     group multiple findings into one subtask via notes."""
-    text = _fixup_plan_text(
+    fixup_output = _fixup_planner_output(
         findings_addressed=["rubric:security"],
         rubric_targets=[{"category": "security", "predicted_score": 8}],
     )
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
         contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=["rubric:security"],
@@ -293,12 +304,12 @@ def test_missing_finding_coverage_short_circuits_when_findings_addressed_lists_i
 
 
 def test_missing_finding_coverage_flags_uncovered_finding(tmp_path: Path):
-    text = _fixup_plan_text(
+    fixup_output = _fixup_planner_output(
         findings_addressed=[],
         rubric_targets=[{"category": "maintainability", "predicted_score": 7}],
     )
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
         contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=None,  # short-circuit the validator
@@ -325,12 +336,12 @@ def test_fixup_driver_does_not_invoke_validate_rubric_coverage(monkeypatch, tmp_
     monkeypatch.setattr(planner_validators, "validate_rubric_coverage", _spy_rubric)
     monkeypatch.setattr(fc, "validate_rubric_coverage", _spy_rubric, raising=False)
 
-    text = _fixup_plan_text(
+    fixup_output = _fixup_planner_output(
         findings_addressed=["behavior:B-0066"],
         behavior_evidence_advanced=["B-0066"],
     )
-    plan, feedback = parse_and_validate_fixup_plan(
-        text,
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
         contract=_populated_contract(tmp_path),
         node=_node(["B-0066"]),
         audit_findings=["behavior:B-0066"],
