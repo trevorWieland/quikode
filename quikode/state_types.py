@@ -57,6 +57,9 @@ class TaskRow(TypedDict):
     # ADDRESSING_FEEDBACK so we don't re-trigger on the same CHANGES_REQUESTED
     # after a daemon restart. NULL until the first non-bot review arrives.
     last_processed_review_id: NotRequired[str | None]
+    # Plan 32: row kind. 'spec' for regular DAG-seeded tasks, 'merge' for
+    # synthetic merge-nodes integrating multiple parents.
+    kind: NotRequired[str]
     # rebase coalescing: timestamp of the most recent rebase trigger for
     # this task, used by `_schedule_rebase_to_main` to dedupe rapid-fire
     # triggers within `cfg.rebase_coalesce_window_s`.
@@ -147,6 +150,8 @@ class ContainerStatsRow(TypedDict):
 # States with no active worker (briefing's "in flight" excludes these).
 TERMINAL = {
     State.MERGED,
+    State.MERGE_NODE_READY,
+    State.MERGE_NODE_RETIRED,
     State.PENDING_CI,
     State.AWAITING_REVIEW,
     State.BLOCKED,

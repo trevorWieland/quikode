@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ADDRESSING_FEEDBACK. Prevents re-trigger on the same CHANGES_REQUESTED
     -- after a daemon restart. NULL until first non-bot review observed.
     last_processed_review_id TEXT,
+    -- Plan 32: row kind. 'spec' = regular DAG-seeded task (default).
+    -- 'merge' = synthetic merge-node integrating multiple parents into a
+    -- shared base branch. Merge-nodes have no PR; their lifecycle ends in
+    -- MERGE_NODE_READY (serving as a base) or MERGE_NODE_RETIRED (all
+    -- source parents merged to main). Plan-22 carry-forward, plan-30
+    -- review-ready settle, plan-31 rebase semantics all key off `kind`.
+    kind TEXT NOT NULL DEFAULT 'spec',
     parent_task_ids TEXT,
     parent_branches TEXT,
     parent_pr_branches TEXT,
@@ -253,6 +260,12 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN last_processed_review_id TEXT")
     except sqlite3.OperationalError:
         # Column already present (fresh install via SCHEMA, or re-run).
+        pass
+    # Plan 32: add `kind` column (spec | merge). Default 'spec' for any
+    # pre-existing rows.
+    try:
+        conn.execute("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'spec'")
+    except sqlite3.OperationalError:
         pass
     # Plan 28 state migration. `merge_ready` re-evaluates on next poll;
     # `triaging_feedback` was always a transient classifier state — recovering

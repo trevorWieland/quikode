@@ -38,6 +38,13 @@ class State(StrEnum):
     REBASING_TO_MAIN = "rebasing_to_main"
     CONFLICT_RESOLVING = "conflict_resolving"
     MERGED = "merged"
+    # Plan 32: merge-nodes are first-class synthetic tasks with `kind="merge"`.
+    # MERGE_NODE_READY = the integrated branch is built + audited; serves as
+    # base for downstream children. PARENT_ADVANCED resets it to PENDING for
+    # a re-merge cycle. ALL_PARENTS_MERGED retires it once every source
+    # parent has merged to main.
+    MERGE_NODE_READY = "merge_node_ready"
+    MERGE_NODE_RETIRED = "merge_node_retired"
     BLOCKED = "blocked"
     FAILED = "failed"
     ABORTED = "aborted"
@@ -74,6 +81,10 @@ class Event(StrEnum):
     CI_FAILED = "ci_failed"
     CHANGES_REQUESTED_RECEIVED = "changes_requested_received"
     MERGED = "merged"
+    # Plan 32: merge-node lifecycle events.
+    MERGE_NODE_BUILT = "merge_node_built"
+    PARENT_ADVANCED = "parent_advanced"
+    ALL_PARENTS_MERGED = "all_parents_merged"
     FEEDBACK_PUSHED = "feedback_pushed"
     FEEDBACK_EXHAUSTED = "feedback_exhausted"
     PARENT_MERGED_OR_CONFLICT = "parent_merged_or_conflict"
@@ -121,6 +132,13 @@ TRANSITIONS: dict[tuple[State, Event], State] = {
     (State.AWAITING_REVIEW, Event.MERGED): State.MERGED,
     (State.ADDRESSING_FEEDBACK, Event.FEEDBACK_PUSHED): State.PENDING_CI,
     (State.ADDRESSING_FEEDBACK, Event.FEEDBACK_EXHAUSTED): State.BLOCKED,
+    # Plan 32: merge-node terminal/refresh transitions. Merge-nodes reach
+    # PRE_PR_AUDITING via the same path as spec tasks; on AUDIT_PASSED for
+    # a `kind="merge"` row, the worker fires MERGE_NODE_BUILT instead of
+    # AUDIT_PASSED (handled at the worker layer via kind dispatch).
+    (State.PRE_PR_AUDITING, Event.MERGE_NODE_BUILT): State.MERGE_NODE_READY,
+    (State.MERGE_NODE_READY, Event.PARENT_ADVANCED): State.PENDING,
+    (State.MERGE_NODE_READY, Event.ALL_PARENTS_MERGED): State.MERGE_NODE_RETIRED,
     (State.PENDING_CI, Event.PARENT_MERGED_OR_CONFLICT): State.REBASING_TO_MAIN,
     (State.AWAITING_REVIEW, Event.PARENT_MERGED_OR_CONFLICT): State.REBASING_TO_MAIN,
     (State.REBASING_TO_MAIN, Event.REBASE_PUSHED): State.PENDING_CI,
@@ -184,10 +202,16 @@ TRANSITIONS.update(
         if state is not State.REBASING_TO_MAIN and (state, Event.PARENT_MERGED_OR_CONFLICT) not in TRANSITIONS
     }
 )
-TERMINAL_STATES = frozenset({State.MERGED, State.BLOCKED, State.FAILED, State.ABORTED})
+TERMINAL_STATES = frozenset(
+    {State.MERGED, State.MERGE_NODE_RETIRED, State.BLOCKED, State.FAILED, State.ABORTED}
+)
 POST_PR_STATES = frozenset({State.PENDING_CI, State.AWAITING_REVIEW})
 RETRYABLE_STATES = frozenset({State.BLOCKED, State.FAILED, State.ABORTED})
-STACK_READY_STATES = frozenset({State.PENDING_CI, State.AWAITING_REVIEW})
+# Plan 32: MERGE_NODE_READY joins STACK_READY_STATES — children depending on a
+# merge-node fork off it once it's built + audited.
+STACK_READY_STATES = frozenset(
+    {State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_NODE_READY}
+)
 
 
 def _coerce_state(state: State | str) -> State:

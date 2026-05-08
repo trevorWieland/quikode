@@ -25,6 +25,8 @@ stateDiagram-v2
   state rebasing_to_main
   state conflict_resolving
   state merged
+  state merge_node_ready
+  state merge_node_retired
   state blocked
   state failed
   state aborted
@@ -53,6 +55,9 @@ stateDiagram-v2
   awaiting_review --> merged: merged
   addressing_feedback --> pending_ci: feedback_pushed
   addressing_feedback --> blocked: feedback_exhausted
+  pre_pr_auditing --> merge_node_ready: merge_node_built
+  merge_node_ready --> pending: parent_advanced
+  merge_node_ready --> merge_node_retired: all_parents_merged
   pending_ci --> rebasing_to_main: parent_merged_or_conflict
   awaiting_review --> rebasing_to_main: parent_merged_or_conflict
   rebasing_to_main --> pending_ci: rebase_pushed
@@ -82,32 +87,32 @@ stateDiagram-v2
   pending --> merged: mark_merged
   pending_ci --> aborted: pr_closed
   awaiting_review --> aborted: pr_closed
-  addressing_feedback --> blocked: block_task
-  local_ci_checking --> blocked: block_task
+  committing --> blocked: block_task
+  pr_opening --> blocked: block_task
   pushing --> blocked: block_task
   checking_subtask --> blocked: block_task
-  doing_subtask --> blocked: block_task
-  provisioning --> blocked: block_task
-  committing --> blocked: block_task
   pre_pr_auditing --> blocked: block_task
-  pr_opening --> blocked: block_task
+  fixup_planning --> blocked: block_task
+  addressing_feedback --> blocked: block_task
+  triaging_subtask --> blocked: block_task
+  local_ci_checking --> blocked: block_task
   rebasing_to_main --> blocked: block_task
   planning --> blocked: block_task
-  fixup_planning --> blocked: block_task
-  triaging_subtask --> blocked: block_task
-  addressing_feedback --> rebasing_to_main: parent_merged_or_conflict
-  local_ci_checking --> rebasing_to_main: parent_merged_or_conflict
-  conflict_resolving --> rebasing_to_main: parent_merged_or_conflict
+  provisioning --> blocked: block_task
+  doing_subtask --> blocked: block_task
+  committing --> rebasing_to_main: parent_merged_or_conflict
+  pr_opening --> rebasing_to_main: parent_merged_or_conflict
   pushing --> rebasing_to_main: parent_merged_or_conflict
   checking_subtask --> rebasing_to_main: parent_merged_or_conflict
-  doing_subtask --> rebasing_to_main: parent_merged_or_conflict
-  provisioning --> rebasing_to_main: parent_merged_or_conflict
-  committing --> rebasing_to_main: parent_merged_or_conflict
   pre_pr_auditing --> rebasing_to_main: parent_merged_or_conflict
-  pr_opening --> rebasing_to_main: parent_merged_or_conflict
-  planning --> rebasing_to_main: parent_merged_or_conflict
   fixup_planning --> rebasing_to_main: parent_merged_or_conflict
+  addressing_feedback --> rebasing_to_main: parent_merged_or_conflict
   triaging_subtask --> rebasing_to_main: parent_merged_or_conflict
+  local_ci_checking --> rebasing_to_main: parent_merged_or_conflict
+  planning --> rebasing_to_main: parent_merged_or_conflict
+  provisioning --> rebasing_to_main: parent_merged_or_conflict
+  conflict_resolving --> rebasing_to_main: parent_merged_or_conflict
+  doing_subtask --> rebasing_to_main: parent_merged_or_conflict
 ```
 
 ## Store

@@ -4,6 +4,7 @@ import json
 import time
 from typing import Any, cast
 
+from quikode import fsm
 from quikode.state_types import ContainerStatsRow, SubtaskRow, SubtaskState
 
 
@@ -261,6 +262,122 @@ class StoreSubtaskMixin:
         if not isinstance(arr, list):
             return []
         return [str(x) for x in arr if x]
+
+    def create_merge_node(
+        self: Any,
+        merge_node_id: str,
+        *,
+        parent_task_ids: list[str],
+        parent_branches: list[str],
+        branch: str,
+    ) -> None:
+        """Plan 32: insert a new merge-node row in PENDING state.
+
+        Idempotent in the sense that the caller (lookup_or_create_merge_node)
+        checks existence first; this raises on duplicate via the PK
+        constraint. The row's `kind="merge"` distinguishes it from spec tasks
+        in the FSM dispatch + audit gauntlet handlers.
+        """
+        now = time.time()
+        with self.tx() as c:
+            c.execute(
+                "INSERT INTO tasks ("
+                " id, state, kind, branch, parent_task_ids, parent_branches, "
+                " parent_pr_branches, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    merge_node_id,
+                    fsm.State.PENDING.value,
+                    "merge",
+                    branch,
+                    json.dumps(parent_task_ids),
+                    json.dumps(parent_branches),
+                    json.dumps(parent_branches),  # PR branches mirror task branches for merge-nodes
+                    now,
+                    now,
+                ),
+            )
+            c.execute(
+                "INSERT INTO state_log (task_id, from_state, to_state, note, ts) VALUES (?, ?, ?, ?, ?)",
+                (
+                    merge_node_id,
+                    None,
+                    fsm.State.PENDING.value,
+                    f"merge-node created for parents={parent_task_ids}",
+                    now,
+                ),
+            )
+
+    def merge_nodes_with_parent(self: Any, parent_task_id: str) -> list[dict]:
+        """Plan 32: return all merge-node rows that include `parent_task_id`
+        in their `parent_task_ids` JSON array. Excludes terminal merge-nodes
+        (MERGE_NODE_RETIRED, BLOCKED, FAILED, ABORTED) — those don't need
+        re-merge propagation.
+        """
+        excluded = (
+            fsm.State.MERGE_NODE_RETIRED.value,
+            fsm.State.BLOCKED.value,
+            fsm.State.FAILED.value,
+            fsm.State.ABORTED.value,
+        )
+        q = ",".join("?" * len(excluded))
+        with self._tx_lock:
+            rows = self.conn.execute(
+                f"SELECT * FROM tasks "
+                f"WHERE kind = 'merge' "
+                f"AND state NOT IN ({q}) "
+                f"AND parent_task_ids IS NOT NULL "
+                f"AND EXISTS (SELECT 1 FROM json_each(parent_task_ids) "
+                f"            WHERE json_each.value = ?) "
+                f"ORDER BY id",
+                (*excluded, parent_task_id),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def prune_merge_node_parent(self: Any, merge_node_id: str, parent_task_id: str) -> list[str]:
+        """Plan 32: remove `parent_task_id` from a merge-node's parent_task_ids,
+        parent_branches, parent_pr_branches. Returns the remaining parent_task_ids
+        list. Used by `propagate_parent_merged` to drop a merged source.
+        """
+        with self.tx() as c:
+            r = c.execute(
+                "SELECT parent_task_ids, parent_branches, parent_pr_branches "
+                "FROM tasks WHERE id = ?",
+                (merge_node_id,),
+            ).fetchone()
+            if r is None:
+                return []
+            try:
+                ids = list(json.loads(r["parent_task_ids"]) or [])
+                branches = list(json.loads(r["parent_branches"] or "[]") or [])
+                pr_branches = list(json.loads(r["parent_pr_branches"] or "[]") or [])
+            except (json.JSONDecodeError, TypeError):
+                return []
+            # Remove parent_task_id and the index-aligned branches (best-effort —
+            # we don't know which branch corresponded to which task without a
+            # mapping; conservatively just drop matching entries).
+            if parent_task_id not in ids:
+                return ids
+            idx = ids.index(parent_task_id)
+            ids.pop(idx)
+            if idx < len(branches):
+                branches.pop(idx)
+            if idx < len(pr_branches):
+                pr_branches.pop(idx)
+            c.execute(
+                "UPDATE tasks SET "
+                " parent_task_ids = ?, parent_branches = ?, parent_pr_branches = ?, "
+                " updated_at = ? "
+                "WHERE id = ?",
+                (
+                    json.dumps(ids),
+                    json.dumps(branches),
+                    json.dumps(pr_branches),
+                    time.time(),
+                    merge_node_id,
+                ),
+            )
+            return ids
 
     def all_parents_merged(self: Any, task_id: str) -> bool:
         """Plan 31: True iff the task has parents AND all of them are MERGED.

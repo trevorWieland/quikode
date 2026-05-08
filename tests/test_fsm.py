@@ -17,8 +17,12 @@ def test_invalid_transition_fails():
 
 def test_terminal_states_are_not_active():
     assert not (fsm.TERMINAL_STATES & fsm.ACTIVE_STATES)
+    # Plan 32: MERGE_NODE_RETIRED joins the terminal set (merge-node's
+    # equivalent of MERGED — all source parents merged to main, the
+    # synthetic integration branch is no longer needed).
     assert {
         fsm.State.MERGED,
+        fsm.State.MERGE_NODE_RETIRED,
         fsm.State.BLOCKED,
         fsm.State.FAILED,
         fsm.State.ABORTED,
