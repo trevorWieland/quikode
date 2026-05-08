@@ -447,6 +447,12 @@ def _build_pipeline_worker(tmp_path, store, mn_id, parent_ev_lists, monkeypatch)
     worker.log_path = tmp_path / "log"
     worker.plan = None
     worker.plan_text = ""
+    # Plan 33: per-task EvaluationContract is built/loaded by `_evaluation_contract`.
+    # In unit tests the worker is constructed via __new__ so the cache slot
+    # must be primed; the audit-stage stubs already replace `collect_standards_text`
+    # so the contract isn't actually consulted here.
+    worker._contract = None
+    worker._last_witness_results = {}
     captured: dict[str, list[str]] = {"stages_run": []}
 
     def fake_local_ci(**kwargs):
@@ -472,7 +478,7 @@ def _build_pipeline_worker(tmp_path, store, mn_id, parent_ev_lists, monkeypatch)
     monkeypatch.setattr(pre_pr_audit, "run_rubric_audit", fake_rubric)
     monkeypatch.setattr(pre_pr_audit, "run_standards_audit", fake_standards)
     monkeypatch.setattr(pre_pr_audit, "run_behavior_audit", fake_behavior)
-    monkeypatch.setattr(pre_pr_audit, "collect_standards_text", lambda cfg: "STANDARDS")
+    monkeypatch.setattr(pre_pr_audit, "collect_standards_text", lambda cfg, **kw: "STANDARDS")
     # The audit-stage helper transitions to PRE_PR_AUDITING per stage as
     # a TUI-progress signal; the store is in PENDING in unit tests so we
     # stub the transition to a no-op.

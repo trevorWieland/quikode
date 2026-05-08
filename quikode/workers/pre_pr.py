@@ -8,6 +8,7 @@ from typing import Any
 from quikode import fsm_runtime
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import FixupPlan, PlanValidationError
+from quikode.workers.fixup_coverage import missing_finding_coverage
 from quikode.workers.outcomes import WorkerOutcome
 
 
@@ -60,13 +61,15 @@ class PrePrWorkerMixin:
             review_threads_block=review_threads_block,
             triage_root_cause=triage_root_cause,
         )
-        # Completeness check: for audit-driven fixup rounds, every
-        # `expected_finding_ids` entry must appear in the planner's
-        # `findings_addressed` AND in at least one subtask's
-        # `addresses_findings`. If any are missing, re-prompt the planner
-        # once with an explicit gap list. If still missing after the
-        # retry, BLOCK — better to surface to the operator than to ship
-        # a fixup that drops findings.
+        # Completeness check (Plan 33 PR-B): for audit-driven fixup rounds,
+        # every `expected_finding_ids` entry must be covered. PR-A retired
+        # `addresses_findings` per-subtask; PR-B replaces the completeness
+        # rule with a stage-typed union over `rubric_targets` /
+        # `standards_referenced` / `behavior_evidence_advanced` plus the
+        # plan-level `findings_addressed` array. We accept either path
+        # (the planner declares `findings_addressed` AND advances the
+        # corresponding stage-typed field) so the audit-bundle matcher
+        # remains tolerant of finding-id namespaces (rubric:..., behavior:...).
         if (
             fixup_plan is not None
             and fixup_plan.subtasks
@@ -83,10 +86,12 @@ class PrePrWorkerMixin:
                     ", ".join(sorted(missing)[:8]),
                 )
                 gap_addendum = (
-                    "## ⚠️ Coverage gap from your previous attempt\n\n"
-                    "Your previous plan missed the following finding ids — "
-                    "include each one in `findings_addressed` and assign "
-                    "each to a subtask's `addresses_findings`:\n\n"
+                    "## Coverage gap from your previous attempt\n\n"
+                    "Your previous plan missed the following finding ids. "
+                    "Include each one in `findings_addressed` AND in at least "
+                    "one subtask's stage-typed coverage (`rubric_targets`, "
+                    "`standards_referenced`, or `behavior_evidence_advanced` "
+                    "matching the finding's namespace):\n\n"
                     + "\n".join(f"- `{fid}`" for fid in sorted(missing))
                     + "\n\n"
                     "Re-emit the COMPLETE plan (do not emit only the deltas)."
@@ -159,19 +164,12 @@ class PrePrWorkerMixin:
 
     @staticmethod
     def _missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -> set[str]:
-        """Compute the set of expected finding ids the plan does NOT cover.
+        """Plan 33 PR-B: stage-typed audit-completeness check.
 
-        TODO-PR-B: Plan 33 §5.5 retires `addresses_findings` per-subtask;
-        the fixup-planner rewrite (PR-B) replaces this completeness check
-        with a stage-typed coverage rule (every finding id must appear
-        in the union of `rubric_targets`/`standards_referenced`/
-        `behavior_evidence_advanced` across the plan's subtasks). Until
-        PR-B lands, coverage is computed solely from the top-level
-        `findings_addressed` array.
-        """
-        expected = set(expected_finding_ids)
-        covered: set[str] = set(plan.findings_addressed)
-        return expected - covered
+        Implementation lives in `quikode.workers.fixup_coverage` so this
+        module stays under the architecture line-budget; this thin
+        wrapper preserves the existing call site shape."""
+        return missing_finding_coverage(plan, expected_finding_ids)
 
     def _invoke_fixup_planner(
         self: Any,
@@ -209,9 +207,11 @@ class PrePrWorkerMixin:
         original_final_acceptance: list[str] = []
         if self.plan is not None:
             original_final_acceptance = list(self.plan.final_acceptance)
+        contract = self._evaluation_contract()
         prompt = _tw.prompts.fixup_planner_prompt(
             self.cfg,
             self.node,
+            contract,
             kind=kind,
             round_no=round_no,
             max_rounds=self.cfg.fixup_max_rounds,
@@ -443,9 +443,12 @@ class PrePrWorkerMixin:
                 augmented = (
                     "## Required finding coverage\n\n"
                     "Every id below MUST appear in your output's "
-                    "`findings_addressed` array AND be referenced by at "
-                    "least one subtask's `addresses_findings` field. "
-                    "Dropping ids is forbidden.\n\n"
+                    "`findings_addressed` array AND be addressed by at "
+                    "least one subtask's stage-typed coverage "
+                    "(`rubric_targets`, `standards_referenced`, or "
+                    "`behavior_evidence_advanced` matching the finding's "
+                    "namespace). The per-subtask `addresses_findings` "
+                    "field is gone (Plan 33 D2). Dropping ids is forbidden.\n\n"
                     + "\n".join(f"- `{fid}`" for fid in expected_finding_ids)
                     + "\n\n---\n\n"
                     + findings_block
@@ -532,7 +535,9 @@ class PrePrWorkerMixin:
         rec("local_ci", local_ci)
         stages: list[Any] = [local_ci]
         if (not merge_node_mode) or self._merge_integration_subtasks_present():
-            standards_text = _tw.pre_pr_audit.collect_standards_text(self.cfg)
+            standards_text = _tw.pre_pr_audit.collect_standards_text(
+                self.cfg, contract=self._evaluation_contract()
+            )
             enter("rubric audit")
             rubric = _tw.pre_pr_audit.run_rubric_audit(
                 cfg=self.cfg,

@@ -9,7 +9,8 @@ from jinja2 import ChoiceLoader, Environment, FileSystemLoader, StrictUndefined
 from .config import Config
 from .dag import DAG, Node
 from .evaluation_contract import EvaluationContract
-from .subtask_schema import STABILIZATION_SUBTASK_ID
+from .self_audit import ParsedSelfAudit
+from .subtask_schema import STABILIZATION_SUBTASK_ID, Plan
 
 # Bundled prompts ship inside the quikode package itself (../prompts at the repo root,
 # i.e. one level up from the package dir). They serve as the default if the user
@@ -114,15 +115,18 @@ def subtask_doer_prompt(
     cfg: Config,
     node: Node,
     subtask,
+    contract: EvaluationContract,
+    *,
+    plan: Plan | None = None,
     triage_notes: str | None = None,
-    prior_doer_output: str | None = None,
+    prior_self_audit: ParsedSelfAudit | None = None,
 ) -> str:
-    # Plan 24 fix: Z-99 stabilization subtask runs `just ci` (full CI gate),
-    # not `just check` (the per-subtask fast gate). The per-subtask checker
-    # already ran `just check` on every prior subtask; Z-99 exists precisely
-    # to catch cross-subtask integration failures the per-subtask gate
-    # misses. Detect by id; the subtask record's boundary already references
-    # the right command via `_build_stabilization_subtask`.
+    """Plan 33 PR-B: subtask-doer prompt now takes the full
+    `EvaluationContract` (rendered into §3 via `ec_targeted`) plus an
+    optional structured `prior_self_audit` (replaces the loose
+    `prior_doer_output: str` from PR-A). Z-99 still runs the full
+    local-CI gate; per-subtask gating uses `cfg.subtask_check_command`.
+    """
     gate_command = (
         cfg.local_ci_command if subtask.id == STABILIZATION_SUBTASK_ID else cfg.subtask_check_command
     )
@@ -130,36 +134,61 @@ def subtask_doer_prompt(
         cfg,
         "subtask-doer.md",
         node=node,
+        plan=plan,
         subtask=subtask,
+        contract=contract,
         triage_notes=triage_notes,
-        prior_doer_output=prior_doer_output,
+        prior_self_audit=prior_self_audit,
         subtask_check_command=gate_command,
     )
 
 
-def subtask_checker_prompt(cfg: Config, node: Node, subtask) -> str:
-    return render(cfg, "subtask-checker.md", node=node, subtask=subtask)
+def subtask_checker_prompt(
+    cfg: Config,
+    node: Node,
+    subtask,
+    contract: EvaluationContract,
+    *,
+    self_audit: ParsedSelfAudit,
+    diff_text: str,
+    witness_results: dict[str, dict],
+) -> str:
+    """Plan 33 PR-B: checker now consumes the structured `ParsedSelfAudit`,
+    the unified diff, and the per-subtask scoped witness results."""
+    return render(
+        cfg,
+        "subtask-checker.md",
+        node=node,
+        subtask=subtask,
+        contract=contract,
+        self_audit=self_audit,
+        diff_text=diff_text[:20000],
+        witness_results=witness_results,
+    )
 
 
 def subtask_triage_prompt(
     cfg: Config,
     node: Node,
     subtask,
+    contract: EvaluationContract,
     *,
-    retry_count: int,
-    retry_budget: int,
-    checker_output: str,
-    recent_doer_summary: str | None = None,
+    self_audit: ParsedSelfAudit,
+    checker_verdict: str,
+    diff_text: str,
 ) -> str:
+    """Plan 33 PR-B: senior-engineer-tutoring-junior triage. Inputs are
+    the targeted contract slice, the structured SELF_AUDIT, the
+    checker's verdict, and the unified diff."""
     return render(
         cfg,
         "subtask-triage.md",
         node=node,
         subtask=subtask,
-        retry_count=retry_count,
-        retry_budget=retry_budget,
-        checker_output=checker_output,
-        recent_doer_summary=recent_doer_summary,
+        contract=contract,
+        self_audit=self_audit,
+        checker_verdict=checker_verdict,
+        diff_text=diff_text[:20000],
     )
 
 
@@ -169,6 +198,7 @@ def subtask_triage_prompt(
 def fixup_planner_prompt(
     cfg: Config,
     node: Node,
+    contract: EvaluationContract,
     *,
     kind: str,
     round_no: int,
@@ -184,15 +214,21 @@ def fixup_planner_prompt(
 ) -> str:
     """Render the fixup-planner prompt.
 
-    `kind` is one of `fixup-final` / `fixup-ci` / `fixup-review`. `trigger`
-    is a human-readable label echoed back into the prompt ("final-check",
-    "ci", "review"). All failure-context fields are optional — pass only
-    what's available for the current trigger.
+    Plan 33 PR-B: takes `contract` so the fixup planner sees the same
+    four-stage rubric the spec planner saw (rendered via `ec_full`).
+    `addresses_findings` per-subtask is gone (Plan 33 D2) — fixup slices
+    declare their gap-closure via the stage-typed fields directly.
+
+    `kind` is one of `fixup-final` / `fixup-ci` / `fixup-review` /
+    `fixup-pre-pr-audit`. `trigger` is a human-readable label echoed
+    back into the prompt. All failure-context fields are optional —
+    pass only what's available for the current trigger.
     """
     return render(
         cfg,
         "fixup-planner.md",
         node=node,
+        contract=contract,
         kind=kind,
         round_no=round_no,
         max_rounds=max_rounds,

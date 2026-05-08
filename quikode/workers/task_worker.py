@@ -116,6 +116,10 @@ class TaskWorker(
         # the planner / doer / checker / triage / fixup / merge-planner
         # all see the same four-stage rubric.
         self._contract: evaluation_contract.EvaluationContract | None = None
+        # Plan 33 PR-B: per-attempt cache populated by `_do_subtask`,
+        # consumed by `_check_subtask` and `_triage_subtask`. See
+        # `quikode.workers.subtask_execution.SubtaskExecutionMixin`.
+        self._last_witness_results: dict[str, dict[str, Any]] = {}
 
     @property
     def _h(self) -> Any:

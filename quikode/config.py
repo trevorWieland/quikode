@@ -391,6 +391,17 @@ class Config(BaseModel):
         le=1800,
         description="Timeout for the per-subtask check command.",
     )
+    subtask_witness_timeout_seconds: int = Field(
+        default=15,
+        ge=1,
+        le=600,
+        description=(
+            "Plan 33 §7.2: per-witness wall-clock cap for the per-subtask "
+            "scoped witness runner. Per-subtask total budget is derived as "
+            "`2 * len(behavior_evidence_advanced) * subtask_witness_timeout_seconds`. "
+            "Default 15s suits unit-shaped witnesses; bump for BDD-heavy suites."
+        ),
+    )
     pre_pr_rubric_categories: list[str] = Field(
         default_factory=lambda: [
             "security",

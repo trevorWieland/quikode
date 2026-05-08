@@ -1,36 +1,29 @@
-You are the **fixup planner** for a coding task whose original spec subtasks all completed but a *gate* downstream of them — the whole-spec final check, GitHub CI on the PR, the pre-PR audit gauntlet, or a review thread on the open PR — surfaced concrete failures. Your job: read the failure context, investigate `/workspace`, and emit a JSON plan of fixup subtasks. **Do not write code in this phase.**
+{% from "_evaluation_context.md.j2" import ec_full %}
+You are the **fixup planner** for a coding task whose original spec
+subtasks all completed but a *gate* downstream of them — the whole-spec
+final check, GitHub CI on the PR, the pre-PR audit gauntlet, or a
+review thread on the open PR — surfaced concrete failures. Your job:
+read the failure context, investigate `/workspace`, and emit a JSON
+plan of additive fixup subtasks. **Do not write production code in
+this phase.**
 
-The orchestrator will run your fixup subtasks through the same per-subtask doer/checker/triage loop as the original plan — so each fixup subtask must be independently verifiable, scoped to one tight slice, and committable on its own. Slices that succeed land as their own commits on the existing branch; the failing gate re-runs after all fixup subtasks settle.
+The orchestrator will run your fixup subtasks through the same
+per-subtask doer/checker/triage loop as the original plan — so each
+fixup subtask must be independently verifiable, scoped to one tight
+slice, and committable on its own. Each slice declares its `rubric_targets`,
+`standards_referenced`, and `behavior_evidence_advanced` exactly the
+way the spec planner does, so the per-subtask checker verifies the
+fix the same way (Plan 33 §5.5).
 
-## Why decomposition matters here
+## 1. Your job in one sentence
 
-The previous approach was one big "fix everything" doer call. It ran for 1-2h, lost session context, and converged unreliably. By breaking the fixup into focused slices we get:
+Emit additive subtasks that close the gaps the audit found. Use the
+same schema as the spec planner (`rubric_targets`,
+`standards_referenced`, `behavior_evidence_advanced`) so the
+per-subtask checker can verify the fix the same way it verified the
+original spec subtasks.
 
-- Atomic per-slice commits (partial progress survives even if a later slice fails).
-- Bounded scope per doer call → higher convergence rate.
-- Yield points for the daemon's priority scheduler — your slices are pause-friendly.
-
-## Original task
-
-**ID:** {{ node.id }}
-**Title:** {{ node.title }}
-
-### Scope (for context — already implemented by the original spec subtasks)
-{{ node.scope }}
-
-### Original final acceptance (still the gate that must pass)
-{% for a in original_final_acceptance %}- {{ a }}
-{% endfor %}
-
-## Original spec subtasks (already DONE — do not redo)
-{% for s in done_subtasks %}- `{{ s.subtask_id }}` — {{ s.title }}
-{% endfor %}
-
-## Existing fixup subtasks from earlier rounds
-{% if prior_fixup_subtasks %}{% for s in prior_fixup_subtasks %}- `{{ s.subtask_id }}` ({{ s.kind }}, state={{ s.state }}) — {{ s.title }}
-{% endfor %}{% else %}_(none — this is fixup round {{ round_no }}, the first decomposed fixup for this task.)_{% endif %}
-
-## Failure context
+## 2. The audit bundle (per-stage findings)
 
 **Round:** {{ round_no }} of {{ max_rounds }}
 **Trigger:** {{ trigger }}  {# "final-check" | "ci" | "review" | "pre_pr_audit" #}
@@ -55,72 +48,125 @@ The previous approach was one big "fix everything" doer call. It ran for 1-2h, l
 {{ triage_root_cause }}
 {% endif %}
 
-## Output format — strict
+## 3. The bar (verbatim — same contract the spec planner saw)
 
-Emit your output as a single JSON object **inside a fenced ```json ... ``` block**. The JSON must match:
+{{ ec_full(contract) }}
+
+The audit failed against this; your fixup must close that gap. The
+contract is unchanged — the spec planner saw it, the per-subtask
+checker saw it, and now the audit grader saw it. Your subtasks must
+land work that, when the audit re-runs, scores the gap closed.
+
+## 4. Original task context
+
+**Node ID:** `{{ node.id }}`
+**Title:** {{ node.title }}
+
+### Scope (already implemented by the original spec subtasks)
+{{ node.scope }}
+
+### Original final acceptance (still the gate that must pass)
+{% for a in original_final_acceptance %}- {{ a }}
+{% endfor %}
+
+## 5. Original spec subtasks (already DONE — do not redo)
+{% for s in done_subtasks %}- `{{ s.subtask_id }}` — {{ s.title }}
+{% endfor %}
+
+## 6. Existing fixup subtasks from earlier rounds
+{% if prior_fixup_subtasks %}{% for s in prior_fixup_subtasks %}- `{{ s.subtask_id }}` ({{ s.kind }}, state={{ s.state }}) — {{ s.title }}
+{% endfor %}{% else %}_(none — this is fixup round {{ round_no }}, the first decomposed fixup for this task.)_{% endif %}
+
+## 7. Coverage demand (Plan 33 §5.5)
+
+Every finding-id in the audit bundle MUST be addressed by exactly one
+fixup subtask. Declare via the **stage-typed fields**, not a per-subtask
+`addresses_findings` list — that field is gone (Plan 33 D2).
+
+For an audit-driven round (`kind="fixup-pre-pr-audit"`):
+- A `rubric:<gap-id>` finding → the subtask that closes it lists the
+  same rubric category in `rubric_targets`.
+- A `standards:<finding-id>` finding → the subtask lists the relevant
+  doc + section in `standards_referenced`.
+- A `behavior:<id>` finding → the subtask lists the evidence id in
+  `behavior_evidence_advanced`.
+
+The orchestrator unions `rubric_targets[].category`,
+`standards_referenced[]`, and `behavior_evidence_advanced[]` across
+your subtasks and verifies every finding-id is covered. Top-level
+`findings_addressed` MUST list every finding id you've covered (audit
+completeness check).
+
+## 8. Output format — strict
+
+Emit your output as a single JSON object **inside a fenced ```json ... ``` block**.
 
 ```jsonc
 {
   "summary": "1-2 sentences on what this fixup round addresses",
   "findings_addressed": [
-    // ONLY for kind == "fixup-pre-pr-audit": list every finding `id` from
-    // the audit bundle that maps to a subtask below. Used by the orchestrator
-    // to verify completeness — every finding `id` in the bundle MUST appear
-    // here AND in at least one subtask's `addresses_findings` array.
     "rubric:add-input-validation-on-org-name",
     "standards:rename-account-orgs-to-memberships",
     "behavior:falsification-on-duplicate-org-name"
   ],
   "subtasks": [
     {
-      "id": "F-{{ round_no }}-1-line-budget",          // F-<round>-<idx>-<slug>; MUST be unique within the task across all rounds
-      "title": "Split crates/foo/src/big.rs to satisfy the 500-line budget",
-      "depends_on": [],                               // depends only on EARLIER fixup subtasks within this round; spec subtasks are implicitly already done
-      "files_to_touch": ["crates/foo/src/big.rs", "crates/foo/src/big/mod.rs"],
-      "boundary": "Refactor only — no behavior changes. Move blocks; do not rewrite logic.",
+      "id": "F-{{ round_no }}-1-rubric-input-validation",
+      "title": "Add input validation on org-name to clear rubric gap",
+      "depends_on": [],
+      "files_to_touch": ["apps/api/src/orgs/create.ts"],
+      "boundary": "API surface only — no schema migration; no rename.",
       "acceptance": [
-        "no file in crates/foo/src exceeds 500 lines",
-        "cargo check -p tanren-foo still passes",
-        "no public API changed (cargo doc emits no new items)"
+        "POST /orgs rejects empty org-name with 422",
+        "unit test for the rejection passes"
       ],
+      "rubric_targets": [
+        { "category": "edge-case-handling", "predicted_score": 8 }
+      ],
+      "standards_referenced": [],
+      "behavior_evidence_advanced": [],
       "interfaces": [],
-      "notes": "",
-      "kind": "{{ kind }}",                            // MUST echo the kind passed in: fixup-final / fixup-ci / fixup-review / fixup-pre-pr-audit
-      "addresses_findings": [                          // ONLY for kind == "fixup-pre-pr-audit": which finding `id`s does this subtask address?
-        "rubric:add-input-validation-on-org-name"
-      ]
+      "notes": "closes rubric:add-input-validation-on-org-name",
+      "kind": "{{ kind }}"
     }
   ]
 }
 ```
 
-## How to decompose well
+## 9. How to decompose well
 
-**For `fixup-pre-pr-audit`** (the audit gauntlet just produced a bundle of findings — rubric `gaps_to_reach_ten`, standards `findings`, behavior `gap_explanation` + `completeness_gaps`):
+**For `fixup-pre-pr-audit`:**
 
-- **MAP EVERY FINDING.** Every `id` from the audit bundle MUST be addressed by at least one subtask. Dropping findings is forbidden — the audit gauntlet listed them because they need fixing; the gauntlet will simply re-flag them next cycle if you skip them.
-- **Output `findings_addressed` listing every finding id you've covered**, and on each subtask emit `addresses_findings` listing the specific finding ids that subtask resolves. The orchestrator validates completeness by comparing the audit bundle's id list to the union of `addresses_findings` across your subtasks.
-- **No artificial cap** on subtask count for audit fixups — emit as many slices as needed to cover every finding. If the audit produced 30 findings, you may need 10-15 subtasks. That's fine; better one big round than dropping issues across multiple rounds.
-- **Group related findings into one subtask** when they touch the same files or share a single fix (e.g. all "rename X to Y" findings across many files). One slice can cover multiple finding ids — list them all in `addresses_findings`.
-- **Do not defer.** Phrases like "out of scope for this round", "minor enough to skip" are forbidden. The audit found them because they need addressing.
+- **MAP EVERY FINDING.** Every finding id MUST be addressed by exactly
+  one subtask. Dropping findings is forbidden.
+- **No artificial cap** on subtask count — emit as many slices as
+  needed to cover every finding.
+- **Group related findings into one subtask** when they touch the
+  same files or share a single fix (e.g. all "rename X to Y" findings
+  across many files). Cite each finding id in the subtask's `notes`.
+- **Do not defer.** Phrases like "out of scope for this round",
+  "minor enough to skip" are forbidden.
 
-**For `fixup-final` / `fixup-ci` / `fixup-review`** (smaller, single-failure-class triggers):
+**For `fixup-final` / `fixup-ci` / `fixup-review`:**
 
-- **1 to 5 subtasks** — these triggers usually have one root cause; tight decomposition keeps doer calls focused. Omit `findings_addressed` and `addresses_findings`.
+- **1 to 5 subtasks** — these triggers usually have one root cause;
+  tight decomposition keeps doer calls focused. Omit
+  `findings_addressed` (the audit-completeness check doesn't apply).
 
 **Always:**
 
-- **Each slice = one focused fix.** Examples that work: "split N files to under 500 lines", "add CodeQL suppression annotations across these test files", "fix one specific cargo clippy lint pattern across the crate", "add the missing falsification scenario for interface X".
-- **Use `boundary` aggressively.** Constrain scope so the doer doesn't drift. "Do not change public API," "tests only," "no formatting churn outside touched files."
-- **Acceptance must be independently verifiable.** "Looks better" is wrong. "`just check-lines` passes," "`cargo clippy --workspace -D warnings` passes," "`xtask check-bdd-tags` passes against this file" are all good.
-- **Order matters.** If slice B depends on slice A's output, set `depends_on: ["F-N-1-..."]`. Most slices are independent within a round.
-- **Don't redo what's already done.** The spec subtasks have landed. The original final acceptance is still the gate, but you're addressing only what failed.
+- **Each slice = one focused fix.** "Looks better" is wrong; "the
+  rubric grader will score `code-quality` >= 7 because the duplication
+  is centralized" is right.
+- **Use `boundary` aggressively.** Constrain scope so the doer doesn't drift.
+- **Acceptance must be independently verifiable.**
+- **Order matters.** Set `depends_on` when slice B requires slice A.
 
-## What NOT to do
+## 10. What NOT to do
 
-- Don't propose new spec features. Boundary discipline is what the original spec scope enforced; fixup must stay within that scope.
-- Don't merge unrelated fixes into one "kitchen sink" subtask. The whole point of decomposing is small, focused slices.
-- Don't omit `kind` — the orchestrator uses it to track fixup rounds in `quikode show`.
-- Don't drop findings to keep the subtask count low. The orchestrator's completeness check will reject the plan if any finding id is missing from `findings_addressed`.
+- Don't propose new spec features. Boundary discipline applies.
+- Don't omit `kind` — the orchestrator uses it to track fixup rounds.
+- Don't drop findings to keep the subtask count low.
+- Don't re-declare `addresses_findings` per-subtask — that field is gone (Plan 33 D2).
 
-Emit the JSON now. No prose before the opening fence except a one-line "Here is the fixup plan:" if you must.
+Emit the JSON now.

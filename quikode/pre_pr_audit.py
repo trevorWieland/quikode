@@ -48,6 +48,7 @@ from typing import Literal
 from . import prompts as prompts_mod
 from .agents import build_agent
 from .config import AgentRole, Config
+from .evaluation_contract import EvaluationContract
 from .execution import ExecutionSandbox, exec_in
 
 log = logging.getLogger("quikode.pre_pr_audit")
@@ -252,10 +253,18 @@ def _parse_rubric_envelope(text: str) -> dict | None:
 # ----- Stage 2: standards audit -----
 
 
-def collect_standards_text(cfg: Config) -> str:
-    """Glob the configured standards profile docs and concatenate them.
+def collect_standards_text(cfg: Config, *, contract: EvaluationContract | None = None) -> str:
+    """Plan 33 PR-B: when a per-task `EvaluationContract` is available,
+    use its already-collected `standards.source_text` instead of
+    re-reading the standards docs from disk. Falls back to the on-disk
+    glob path when no contract is supplied (e.g. tests that exercise
+    the audit module in isolation, or callers that haven't migrated).
+
     Files outside the repo are silently dropped; missing globs are fine
     (the agent simply has less context). Truncated to 60k chars total."""
+    if contract is not None:
+        text = contract.standards.source_text or ""
+        return text[:60000]
     parts: list[str] = []
     seen: set[Path] = set()
     for pat in cfg.pre_pr_standards_profile_globs:

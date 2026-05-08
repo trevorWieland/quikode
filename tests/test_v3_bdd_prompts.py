@@ -22,6 +22,7 @@ from quikode.prompts import (
     subtask_checker_prompt,
     subtask_doer_prompt,
 )
+from quikode.self_audit import ParsedSelfAudit
 from quikode.subtask_schema import Subtask, parse_planner_output
 
 
@@ -111,9 +112,13 @@ def test_checker_prompt_mentions_targeted_bdd_validators(tmp_path):
     assert "scripts/roadmap_check.py" in out
 
 
-def test_subtask_checker_mentions_bdd_validator_for_bdd_subtasks(tmp_path):
+def test_subtask_checker_renders_plan_33_targeted_block(tmp_path):
+    """Plan 33 PR-B: subtask-checker prompt rewrite is rubric-first. The
+    prompt no longer hardcodes BDD validator commands — they live in the
+    subtask's `acceptance` and the contract's standards docs."""
     dag = _make_dag_with_behaviors(tmp_path, ["B-0001"])
     cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
     sub = Subtask(
         id="S-09-bdd-B-0001",
         title="Behavior proof for B-0001",
@@ -124,8 +129,20 @@ def test_subtask_checker_mentions_bdd_validator_for_bdd_subtasks(tmp_path):
         interfaces=("web", "api"),
         notes="follow behavior-proof.md",
     )
-    out = subtask_checker_prompt(cfg, dag.nodes["R-001"], sub)
-    assert "just check-bdd-tags" in out
+    parsed = ParsedSelfAudit(gate_local_ci_rc=0, gate_local_ci_cmd="just check")
+    out = subtask_checker_prompt(
+        cfg,
+        dag.nodes["R-001"],
+        sub,
+        contract,
+        self_audit=parsed,
+        diff_text="diff --git a/x b/x",
+        witness_results={},
+    )
+    # Plan 33 PR-B: the verification matrix is present.
+    assert "Verification matrix" in out
+    # Subtask id flows through.
+    assert "S-09-bdd-B-0001" in out
 
 
 # ----- V3-003: Subtask.interfaces -----
@@ -209,13 +226,16 @@ def test_subtask_doer_renders_interfaces_block_when_set(tmp_path):
         boundary="feature only",
         acceptance=("just check-bdd-tags passes",),
         interfaces=("web", "api"),
-        notes="",
+        notes="follow docs/architecture/subsystems/behavior-proof.md",
     )
-    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], sub)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], sub, contract)
     # BDD slice section is rendered with the interfaces in the header.
     assert "BDD slice" in out
     assert "web" in out and "api" in out
+    # The acceptance criterion (which cites the validator) flows through.
     assert "just check-bdd-tags" in out
+    # The notes-cited convention doc flows through too.
     assert "behavior-proof.md" in out
 
 
@@ -232,9 +252,10 @@ def test_subtask_doer_omits_interfaces_block_when_empty(tmp_path):
         interfaces=(),
         notes="",
     )
-    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], sub)
-    # The Interfaces block + BDD rules should NOT appear for non-BDD subtasks
-    assert "Interfaces this subtask must cover" not in out
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], sub, contract)
+    # The BDD slice block should NOT appear for non-BDD subtasks
+    assert "BDD slice" not in out
 
 
 # ----- doer (whole-spec) BDD callout -----

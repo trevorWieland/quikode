@@ -18,6 +18,7 @@ from quikode.prompts import (
     subtask_triage_prompt,
     triage_prompt,
 )
+from quikode.self_audit import ParsedSelfAudit, RubricRow
 from quikode.subtask_schema import Subtask
 
 
@@ -150,39 +151,80 @@ def _subtask():
 def test_subtask_doer_prompt_includes_acceptance_and_files(tmp_path):
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
-    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], _subtask())
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], _subtask(), contract)
     assert "S-01-domain" in out
     assert "Add account domain types" in out
     assert "crates/foo/src/account.rs" in out
     assert "cargo check passes" in out
     assert "Domain crate only." in out
-    assert "Triage feedback" not in out
+    # Plan 33: §6 SELF_AUDIT block is mandatory output.
+    assert "SELF_AUDIT:" in out
+    assert "gate_local_ci" in out
 
 
 def test_subtask_doer_renders_triage_as_context(tmp_path):
-    """Plan 17 reframed triage feedback as context (not authoritative
-    fix-recipe) so the doer applies its own judgment guided by the
-    invariants. The prompt must still surface the triage body verbatim."""
+    """Plan 17 + Plan 33: triage feedback flows as context, not a fix recipe."""
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
     out = subtask_doer_prompt(
         cfg,
         dag.nodes["R-001"],
         _subtask(),
-        triage_notes="ROOT_CAUSE: missing field. WHAT_TO_DO_DIFFERENTLY: add foo.",
+        contract,
+        triage_notes="ROOT_CAUSE: missing field.",
     )
-    assert "Triage from prior attempt" in out
     assert "context, not a fix recipe" in out
     assert "missing field" in out
+
+
+def test_subtask_doer_renders_prior_self_audit_when_present(tmp_path):
+    """Plan 33 D14: structured `prior_self_audit` flows in instead of loose stdout."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    prior = ParsedSelfAudit(
+        gate_local_ci_rc=0,
+        gate_local_ci_cmd="just check",
+        gate_rubric={
+            "code_quality": RubricRow(
+                category="code_quality",
+                predicted_score=5,
+                rationale="weak filter logic",
+                evidence="src/list.tsx:4",
+            )
+        },
+    )
+    out = subtask_doer_prompt(
+        cfg,
+        dag.nodes["R-001"],
+        _subtask(),
+        contract,
+        prior_self_audit=prior,
+    )
+    assert "Prior attempt" in out
+    assert "code_quality" in out
+    assert "predicted_score=5" in out
 
 
 def test_subtask_checker_prompt_format(tmp_path):
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
-    out = subtask_checker_prompt(cfg, dag.nodes["R-001"], _subtask())
-    assert "VERDICT: PASS | FAIL" in out
-    assert "Account struct exported" in out
-    assert "FAIL" in out and "PASS" in out
+    contract = build_for(dag.nodes["R-001"], cfg)
+    parsed = ParsedSelfAudit(gate_local_ci_rc=0, gate_local_ci_cmd="just check")
+    out = subtask_checker_prompt(
+        cfg,
+        dag.nodes["R-001"],
+        _subtask(),
+        contract,
+        self_audit=parsed,
+        diff_text="diff --git a/x b/x",
+        witness_results={},
+    )
+    assert "S-01-domain" in out
+    assert "VERDICT:" in out  # backwards-compat verdict line stays in the prompt
+    assert "Plan 14 preserved" in out
 
 
 def test_conflict_resolver_prompt_renders_diffs(tmp_path):
@@ -205,27 +247,26 @@ def test_conflict_resolver_prompt_renders_diffs(tmp_path):
     assert "GIVE_UP" in out
 
 
-def test_subtask_triage_prompt_root_cause_only(tmp_path):
-    """Plan 17 redesigned triage as a pure root-cause investigator. The
-    prompt must surface subtask id + checker output + doer summary, declare
-    the ROOT_CAUSE/CONFIDENCE schema, and explicitly forbid prescription
-    (the WHAT_TO_DO_DIFFERENTLY section is removed)."""
+def test_subtask_triage_prompt_senior_engineer_framing(tmp_path):
+    """Plan 33 PR-B: triage rewrite — senior-engineer-tutoring-junior. The
+    prompt surfaces the targeted contract slice, parsed SELF_AUDIT, the
+    checker's verdict, and the unified diff."""
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    parsed = ParsedSelfAudit(gate_local_ci_rc=0, gate_local_ci_cmd="just check")
     out = subtask_triage_prompt(
         cfg,
         dag.nodes["R-001"],
         _subtask(),
-        retry_count=2,
-        retry_budget=3,
-        checker_output="VERDICT: FAIL\n[FAIL] foo",
-        recent_doer_summary="Tried but missed X",
+        contract,
+        self_audit=parsed,
+        checker_verdict="VERDICT: FAIL\n[FAIL] foo",
+        diff_text="diff --git a/x b/x",
     )
     assert "S-01-domain" in out
     assert "VERDICT: FAIL" in out
-    assert "Tried but missed X" in out
-    assert "ROOT_CAUSE:" in out
-    assert "CONFIDENCE:" in out
-    # WHAT_TO_DO_DIFFERENTLY is intentionally absent (forbidden by plan 17).
-    assert "WHAT_TO_DO_DIFFERENTLY" in out  # mentioned only in the "Forbidden" block
-    assert "Forbidden in your output" in out
+    assert "senior engineer" in out.lower()
+    assert "Plan 14 preserved" in out
+    # Plan 33: failure_layer set is fixed.
+    assert "self_audit_mismatch" in out
