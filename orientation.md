@@ -291,9 +291,9 @@ Persistent memory at `/home/trevor/.claude/projects/-home-trevor-github-quikode/
 
 ---
 
-## 9. Quick state-of-the-world (as of mid-sweep, 2026-05-08 PM)
+## 9. Quick state-of-the-world (sweep complete, 2026-05-08 PM)
 
-A coordinated sweep of plans 35 + 38 is in progress to ship the JSON-mode agent layer + role-MODEL binding + standards/architecture dual-bucket. The daemon is STOPPED until the sweep lands and the workspace is re-seeded. Read this section if you're picking up mid-sweep — it tells you what's shipped, what's in flight, and how to resume.
+The plan-35 + plan-38 sweep landed. Every queued PR shipped. Pipeline is now: JSON-mode agent layer + role-MODEL binding + SELF_AUDIT retired + dual-bucket standards/architecture + 5-stage pre-PR gauntlet + TUI live-state correctness + config audit log. Read this section if you're picking up post-sweep — it tells you what's shipped, the operational state, and the deploy sequence.
 
 ### 9.1 Plans index
 
@@ -315,22 +315,20 @@ Shipped (in chronological order):
 - **Plan 38 PR-B.5** (commit `683e641`): SELF_AUDIT retired entirely. `quikode/self_audit.py` deleted (543 LoC), `tests/test_self_audit.py` deleted, `tests/test_subtask_loop_integration.py` deleted. `subtask_execution.py` rewritten on the JsonAgent layer (doer→diff→witness→checker→triage on fail, no SELF_AUDIT). Prompts rewritten: `subtask-doer.md` strips SELF_AUDIT requirements + adds `DoerEnvelope` JSON output; `subtask-checker.md` grades the diff directly; `subtask-triage.md` failure_layer enum drops `self_audit_mismatch`, adds `parse_failure` + `architecture`; `progress.md` `flatlined`→`flatline`; `fixup-planner.md` + `merge-planner.md` add `architecture_referenced[]`. Plan 36's carve-out gone with `self_audit.py`.
 - **Plan 38 PR-B.6** (commit `0fb20ca`): `quikode/json_extract.py` deleted (was unreferenced after PR-B.4).
 
-In flight (as of this writing):
-- **Plan 38 PR-B.7**: migrating the three remaining `build_agent` call sites (`workers/rebase_conflicts.py` conflict_resolver, `workers/pr_lifecycle.py` intent_reviewer, `workers/pr_lifecycle.py` replan-planner) onto `make_agent`, then deleting the legacy modules (`agents/opencode.py`, `agents/codex.py`, `agents/claude.py`, `parse_tokens` + token regexes from `agents/base.py`, `types.AgentResult` if dead, `agents/__init__.py:build_agent` + `AgentRole`, `task_worker.py:_PATCH_EXPORTS` if dead). Adds `ConflictResolverEnvelope` + `IntentReviewVerdict` schemas + `replan_planner` role registration. The completeness contract for this agent is "do all of it, no deferring to a future PR-B.8."
-
-Queued:
-- **Plan 35 PR-B**: architecture-alignment auditor — adds 5th gauntlet stage `architecture` between `standards` and `behavior`. New `prompts/pre-pr-architecture.md`. New `cfg.architecture_path_map` knob for the `unreferenced-applicable-architecture` finding type.
-- **Plan 38 PR-C**: TUI live-state correctness + config audit log. The TUI must reflect agent_call liveness independently of FSM state (no more "running per-subtask doer" when the call has already returned). `config_loader.py` emits `log.info` when toml overrides Field default at daemon-start. `config_template.py` seeds bumped to match all int Field defaults. New regression test asserting template-vs-default invariant.
+All sweep PRs shipped:
+- **Plan 38 PR-B.7** (commit `278e7d6`): three remaining `build_agent` call sites migrated (`workers/rebase_conflicts.py` conflict_resolver, `workers/pr_lifecycle.py` intent_reviewer, `workers/pr_lifecycle.py` replan-planner) onto `make_agent`. Six legacy modules deleted: `agents/base.py`, `agents/opencode.py`, `agents/codex.py`, `agents/claude.py`. New schemas `ConflictResolverEnvelope` + `IntentReviewVerdict`. New `replan_planner` role. `cfg.<role>_cli` / `AgentRole` / `AgentCli` types deleted. New `quikode/agents/transient_quota.py` (extracted shared retry/quota helpers).
+- **Plan 38 PR-C** (commit `794ac56`): TUI live-state correctness + config audit log + template-vs-default invariant. `agent_calls` schema gains `started_at`; new `record_agent_call_started` / `record_agent_call_finished` pair. New `Store.agent_in_flight_status(task_id)` returns `("running", phase, ago) | ("idle", phase, ago, rc) | ("never", None, None)`. TUI + briefing read this directly — no more synthesized "running per-subtask doer". `config_loader._log_int_overrides` emits `INFO` for every TOML override of an int Field default at daemon-start. New regression test asserts template seeds match Field defaults.
+- **Plan 35 PR-B** (commit `c6d2670`): architecture-alignment auditor. New 5th gauntlet stage `architecture` between `standards` and `behavior`. New `prompts/pre-pr-architecture.md`; `prompts/pre-pr-standards.md` retargeted to profile catalog + cited section bodies. New audit modules `quikode/pre_pr_audit_architecture.py`, `pre_pr_audit_standards.py`, `pre_pr_audit_refs.py` (shared helpers). `unreferenced-applicable-{standard,architecture}` detectors added — fire when the diff touches a profile's `applies_to` glob (or `architecture_path_map`'s entry) but no subtask cited the corresponding doc. `pre_pr_architecture` role + `cfg.pre_pr_architecture_model` knob. `SubtaskTriageFailureLayer` enum gains `"architecture"`. `_GAUNTLET_STAGES` in TUI grew to five.
 
 Plans `01–27` and `29` are pre-`optimizations`-branch context; see `plans/00-INDEX.md` for the full historical list.
 
-### 9.2 Workspace state (mid-sweep checkpoint)
+### 9.2 Workspace state
 
-- **Daemon: STOPPED.** Per the sweep plan; will restart only after all PRs land + reinstall + re-seed.
-- **Workspace: WIPED clean.** `qk reset --yes --close-prs` ran cleanly. SQLite DB dropped, all `qk-*` containers removed, all `quikode/*` branches purged (local + remote), worktrees cleaned, residual per-task `<state_dir>/<task_id>/` directories cleaned manually.
+- **Daemon: STOPPED.** Will restart only after the §9.3 deploy sequence runs (re-seed + start).
+- **Workspace: WIPED clean.** `qk reset --yes --close-prs` ran cleanly. SQLite DB dropped, all `qk-*` containers removed, all `quikode/*` branches purged (local + remote), worktrees cleaned.
 - **LiteLLM proxy: RUNNING** in docker as `litellm-bridge` on `127.0.0.1:4000`, with `ZAI_API_KEY` and `WAFER_API_KEY` from `~/.codex/.env` mounted via `-e`. Health probe returns `status: healthy`. `--add-host=host.docker.internal:host-gateway` is wired into tanren container provisioning so containers can reach the proxy via `host.docker.internal:4000`.
 - **Codex profiles:** 7 in `~/.codex/config.toml`. Direct OpenAI: `gpt5` (gpt-5.5), `codex` (gpt-5.3-codex). Proxy-routed (via `together_ai/<MODEL>` litellm prefix): `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen`. All seven verified via hello-world `--output-schema` test. CLI-native enforcement on the two direct profiles; client-side pydantic validation on the five proxy-routed profiles.
-- **z.ai** is currently rate-limited (5-hour usage window) until ~2026-05-08 21:20 UTC — doesn't block sweep code work, just z.ai-specific runtime tests. Wafer is unaffected.
+- **z.ai** has a 5-hour usage window; if a `glm-zai` model returns 429 with "Usage limit reached for 5 hour", swap to `glm-wafer` until the window resets (Beijing-time reset stamp in the error message).
 - **API keys:** `~/.codex/.env` (mode 600) + `~/.bashrc` sources via `set -a; . ~/.codex/.env; set +a`. NEVER commit these or echo them.
 
 ### 9.3 Resume sequence (when sweep is fully done)
