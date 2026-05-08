@@ -199,7 +199,21 @@ def conflict_resolver_prompt(
     conflicted_files: list[dict],
     rebase_target_kind: str = "main",
     parent_branch: str = "",
+    parent_contexts: list[dict] | None = None,
 ) -> str:
+    """Render the conflict-resolver prompt.
+
+    `rebase_target_kind` selects the prompt's framing:
+      * `"main"` — the task's PR was rebased onto a fresh main (L1).
+      * `"parent_tip"` — task is stacked on a parent whose tip just
+        moved (L2). `parent_branch` names the parent.
+      * `"merge_node"` — invoked under a merge-node worker integrating
+        N parents into one branch (plan 32 PR-B). `parent_contexts`
+        supplies per-parent diff context so the resolver can attribute
+        conflict regions to specific parents and decide which side
+        wins (or honestly GIVE_UP on cross-parent semantic conflicts
+        that need the merge-doer-subloop to resolve).
+    """
     return render(
         cfg,
         "conflict-resolver.md",
@@ -210,6 +224,54 @@ def conflict_resolver_prompt(
         conflicted_files=conflicted_files,
         rebase_target_kind=rebase_target_kind,
         parent_branch=parent_branch,
+        parent_contexts=parent_contexts or [],
+    )
+
+
+# ----- Plan 32 PR-B: merge-node planner -----
+
+
+def merge_planner_prompt(
+    cfg: Config,
+    merge_node_id: str,
+    parent_contexts: list[dict],
+) -> str:
+    """Render the merge-planner prompt for plan 32 PR-B's doer-subloop.
+
+    `parent_contexts` is a list of per-parent dicts with keys:
+      * `task_id` — source parent's task id (e.g. `R-0042`)
+      * `branch` — parent's PR branch
+      * `title` — parent's DAG node title (or fallback)
+      * `summary` — short intent description (1-2 sentences); empty if
+        no DAG node available
+      * `diff_excerpt` — parent's diff against `cfg.base_branch`
+        truncated to ~3000 chars
+
+    The output JSON shape matches `planner.md` (see `Plan` /
+    `parse_planner_output` for the contract). Subtasks are scoped to
+    the integration work; typical pattern is 1 subtask per file with
+    a cross-parent conflict, plus a final "verify both parents still
+    pass" subtask.
+    """
+    diff_cap = 3000
+    capped: list[dict] = []
+    for p in parent_contexts:
+        capped.append(
+            {
+                "task_id": p.get("task_id", ""),
+                "branch": p.get("branch", ""),
+                "title": p.get("title", ""),
+                "summary": p.get("summary", ""),
+                "diff_excerpt": (p.get("diff_excerpt", "") or "")[:diff_cap],
+            }
+        )
+    return render(
+        cfg,
+        "merge-planner.md",
+        merge_node_id=merge_node_id,
+        parent_contexts=capped,
+        base_branch=cfg.base_branch,
+        local_ci_command=(cfg.local_ci_command or "just ci"),
     )
 
 

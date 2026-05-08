@@ -285,15 +285,9 @@ class PrePrWorkerMixin:
             return None
 
     def _run_manual_probes(self: Any) -> str:
-        """Scan the node's `expected_evidence` for `kind="manual"` items,
-        run them through `ManualProbeRunner`, and return a pre-rendered
-        block to inject into the checker prompt.
-
-        Defensive: NEVER raises. Parse errors, runner failures, container
-        glitches all degrade to "no manual probes ran" — the checker
-        agent then judges PASS/FAIL on `just ci` + acceptance alone, the
-        same as the pre-runner behavior.
-        """
+        """Run `kind="manual"` items from `expected_evidence` and return
+        a rendered block for the checker prompt. Never raises — any
+        runner failure degrades to "no manual probes ran"."""
         try:
             probes = _tw.manual_probe.collect_probes_from_evidence(list(self.node.expected_evidence))
         except Exception as e:
@@ -371,21 +365,18 @@ class PrePrWorkerMixin:
             raise RuntimeError(f"push failed: {out[:1000]}")
         return None
 
-    def _run_pre_pr_pipeline(self: Any) -> WorkerOutcome | None:
-        """4-stage gate before opening a PR. Returns:
+    def _run_pre_pr_pipeline(self: Any, *, merge_node_mode: bool = False) -> WorkerOutcome | None:
+        """4-stage gate before opening a PR. Returns None on pass,
+        WorkerOutcome(BLOCKED) after `cfg.pre_pr_audit_max_cycles` fails.
+        Each cycle runs all stages, merges failed-stage findings into a
+        triage bundle, hands them to the fixup planner
+        (`kind="fixup-pre-pr-audit"`), and re-runs from the top.
 
-          - `None` on full pass (caller proceeds to `_open_pr`).
-          - `WorkerOutcome(BLOCKED)` when `cfg.pre_pr_audit_max_cycles`
-            cycles all fail — operator decides next steps via the
-            BLOCK-forensics report.
-
-        Each cycle runs all four stages (local-CI, rubric, standards,
-        behavior) regardless of failure along the way — we want a single
-        consolidated report rather than serial fail-fast that misses
-        downstream issues. Failures merge into a triage bundle, the fixup
-        planner emits subtasks (`kind="fixup-pre-pr-audit"`), the
-        per-subtask loop addresses them, then we re-enter the pipeline
-        from the top.
+        Plan 32 PR-B: `merge_node_mode=True` adapts for a merge-node —
+        `local_ci` + `behavior` always run; `rubric` + `standards` are
+        skipped unless the cycle's subtasks include `kind="merge-integration"`
+        (the merge-doer emitted real new code). The `behavior` audit's
+        `expected_evidence` is the union of source parents' `expected_evidence`.
         """
         for cycle in range(1, self.cfg.pre_pr_audit_max_cycles + 1):
             _tw.log.info(
@@ -406,86 +397,13 @@ class PrePrWorkerMixin:
             diff_excerpt = self._compute_branch_diff_excerpt()
             plan_text = str(self._row().get("plan_text") or "")
 
-            # Stage 0: local CI gate (inside dev container).
-            local_ci = _tw.pre_pr_audit.run_local_ci_gate(
-                cfg=self.cfg,
-                handle=self._h,
-                log_path=self.log_path,
-            )
-            self.store.update_pre_pr_audit_stage(
-                self.node.id,
+            stages = self._execute_audit_stages(
                 cycle=cycle,
-                stage_name="local_ci",
-                passed=local_ci.passed,
-                summary=local_ci.summary,
-            )
-
-            # Stages 1-3: audit agents — each transitions PRE_PR_AUDITING
-            # with a stage-specific note so the TUI can show "rubric
-            # audit" rather than the opaque "auditing" umbrella state.
-            standards_text = _tw.pre_pr_audit.collect_standards_text(self.cfg)
-
-            fsm_runtime.enter_pre_pr_auditing(
-                self.store, self.node.id, note=f"pre-pr cycle {cycle}: rubric audit"
-            )
-            rubric = _tw.pre_pr_audit.run_rubric_audit(
-                cfg=self.cfg,
-                handle=self._h,
                 diff_excerpt=diff_excerpt,
                 plan_text=plan_text,
-                log_path=self.log_path,
+                merge_node_mode=merge_node_mode,
             )
-            self.store.update_pre_pr_audit_stage(
-                self.node.id,
-                cycle=cycle,
-                stage_name="rubric",
-                passed=rubric.passed,
-                summary=rubric.summary,
-            )
-
-            fsm_runtime.enter_pre_pr_auditing(
-                self.store,
-                self.node.id,
-                note=f"pre-pr cycle {cycle}: standards audit",
-            )
-            standards = _tw.pre_pr_audit.run_standards_audit(
-                cfg=self.cfg,
-                handle=self._h,
-                diff_excerpt=diff_excerpt,
-                standards_text=standards_text,
-                log_path=self.log_path,
-            )
-            self.store.update_pre_pr_audit_stage(
-                self.node.id,
-                cycle=cycle,
-                stage_name="standards",
-                passed=standards.passed,
-                summary=standards.summary,
-            )
-
-            fsm_runtime.enter_pre_pr_auditing(
-                self.store, self.node.id, note=f"pre-pr cycle {cycle}: behavior audit"
-            )
-            behavior = _tw.pre_pr_audit.run_behavior_audit(
-                cfg=self.cfg,
-                handle=self._h,
-                expected_evidence=list(self.node.expected_evidence or []),
-                diff_excerpt=diff_excerpt,
-                plan_text=plan_text,
-                log_path=self.log_path,
-            )
-            self.store.update_pre_pr_audit_stage(
-                self.node.id,
-                cycle=cycle,
-                stage_name="behavior",
-                passed=behavior.passed,
-                summary=behavior.summary,
-            )
-
-            cycle_result = _tw.pre_pr_audit.PipelineCycleResult(
-                cycle=cycle,
-                stages=[local_ci, rubric, standards, behavior],
-            )
+            cycle_result = _tw.pre_pr_audit.PipelineCycleResult(cycle=cycle, stages=stages)
             for s in cycle_result.stages:
                 _tw.log.info(
                     "task %s pre-pr cycle %d stage `%s`: %s",
@@ -597,3 +515,83 @@ class PrePrWorkerMixin:
             head.append(f"... (diff truncated; {len(lines) - max_lines} more lines)")
             return "\n".join(head)
         return out
+
+    def _execute_audit_stages(
+        self: Any, *, cycle: int, diff_excerpt: str, plan_text: str, merge_node_mode: bool
+    ) -> list[Any]:
+        """Run the audit stages in order. On a merge-node cycle without
+        `kind="merge-integration"` subtasks, rubric + standards skip."""
+
+        def rec(name: str, oc: Any) -> None:
+            self.store.update_pre_pr_audit_stage(
+                self.node.id, cycle=cycle, stage_name=name, passed=oc.passed, summary=oc.summary
+            )
+
+        def enter(label: str) -> None:
+            fsm_runtime.enter_pre_pr_auditing(self.store, self.node.id, note=f"pre-pr cycle {cycle}: {label}")
+
+        local_ci = _tw.pre_pr_audit.run_local_ci_gate(cfg=self.cfg, handle=self._h, log_path=self.log_path)
+        rec("local_ci", local_ci)
+        stages: list[Any] = [local_ci]
+        if (not merge_node_mode) or self._merge_integration_subtasks_present():
+            standards_text = _tw.pre_pr_audit.collect_standards_text(self.cfg)
+            enter("rubric audit")
+            rubric = _tw.pre_pr_audit.run_rubric_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                diff_excerpt=diff_excerpt,
+                plan_text=plan_text,
+                log_path=self.log_path,
+            )
+            rec("rubric", rubric)
+            enter("standards audit")
+            standards = _tw.pre_pr_audit.run_standards_audit(
+                cfg=self.cfg,
+                handle=self._h,
+                diff_excerpt=diff_excerpt,
+                standards_text=standards_text,
+                log_path=self.log_path,
+            )
+            rec("standards", standards)
+            stages.extend([rubric, standards])
+        enter("behavior audit")
+        behavior = _tw.pre_pr_audit.run_behavior_audit(
+            cfg=self.cfg,
+            handle=self._h,
+            expected_evidence=self._behavior_audit_expected_evidence(merge_node_mode=merge_node_mode),
+            diff_excerpt=diff_excerpt,
+            plan_text=plan_text,
+            log_path=self.log_path,
+        )
+        rec("behavior", behavior)
+        stages.append(behavior)
+        return stages
+
+    def _merge_integration_subtasks_present(self: Any) -> bool:
+        """True iff any of the merge-node's subtasks carry
+        kind='merge-integration'. Plan 32 PR-B: re-enables rubric +
+        standards on cycles where the merge-doer emitted real code."""
+        return any(
+            (r.get("kind") or "") == "merge-integration" for r in self.store.list_subtasks(self.node.id)
+        )
+
+    def _behavior_audit_expected_evidence(self: Any, *, merge_node_mode: bool) -> list[dict]:
+        """Spec task: `node.expected_evidence`. Merge-node: union of
+        every source parent's `expected_evidence` from the DAG, deduped.
+        The merge-node has no DAG node — parents come from
+        `store.get_parent_task_ids`."""
+        if not merge_node_mode:
+            return list(self.node.expected_evidence or [])
+        seen: list[dict] = []
+        keys: set[str] = set()
+        for pid in self.store.get_parent_task_ids(self.node.id):
+            pnode = self.dag.nodes.get(pid)
+            if pnode is None:
+                continue
+            for ev in pnode.expected_evidence or ():
+                k = _tw.json.dumps(ev, sort_keys=True) if isinstance(ev, dict) else str(ev)
+                if k in keys:
+                    continue
+                keys.add(k)
+                seen.append(dict(ev) if isinstance(ev, dict) else ev)
+        return seen

@@ -1,34 +1,22 @@
-"""Plan 32 PR-A 3/3: minimal merge-node worker.
+"""Plan 32: merge-node worker (PR-A 3/3 + PR-B doer-subloop + audit gauntlet).
 
 A merge-node is a synthetic `kind="merge"` task that integrates N source
 spec parents into one stable branch. Multiple downstream children sharing
 the same parent set fork off this branch — multi-parent dependency reduces
 to single-parent dependency on the merge-node.
 
-This worker drives the deterministic-merge slice of the lifecycle:
+Lifecycle:
 
     PENDING → PROVISIONING (worktree off cfg.base_branch) →
-    PLANNING (synthesize a single integrate subtask, no agent involvement) →
-    DOING_SUBTASK (octopus merge first; on octopus failure, sequential by
-    sorted parent_task_ids; on sequential failure, BLOCK pointing at PR-B's
-    doer-subloop fallback) → CHECKING_SUBTASK → COMMITTING → PUSHING
-    (force-with-lease so the stable merge-node branch refreshes across
-    re-merges) → LOCAL_CI_CHECKING (cfg.local_ci_command on the merged
-    tree) → PRE_PR_AUDITING (deferred to PR-B; for PR-A we fast-forward
-    via MERGE_NODE_BUILT) → MERGE_NODE_READY.
-
-PR-A 3/3 deliberately skips the audit gauntlet (rubric/standards/behavior).
-PR-B will plug in:
-
-  - the `merge-planner` prompt for non-trivial integrations,
-  - the conflict-resolver subloop for unresolvable textual conflicts, and
-  - the audit gauntlet (local-CI + behavior always; rubric/standards when
-    integration subtasks ran).
-
-Until then, semantic conflicts BLOCK with a forensic note. The user has
-accepted this tradeoff: PR-A unblocks plan 31's clean BLOCK on multi-parent
-children for the trivial-merge case (which is the majority); PR-B handles
-the long tail.
+    PLANNING (deterministic-merge first: octopus → sequential) →
+    DOING_SUBTASK (clean merge: single seeded subtask;
+                  conflict: merge-planner emits N integration subtasks,
+                  doer/checker drives them through the standard loop) →
+    CHECKING_SUBTASK → COMMITTING → PUSHING (force-with-lease) →
+    LOCAL_CI_CHECKING + PRE_PR_AUDITING (gauntlet runs with
+    merge_node_mode=True: local_ci + behavior always; rubric + standards
+    only when `kind="merge-integration"` subtasks ran) →
+    MERGE_NODE_READY.
 """
 
 from __future__ import annotations
@@ -38,9 +26,15 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from quikode import fsm_runtime, pre_pr_audit, worktree
+from quikode import fsm_runtime, prompts, worktree
+from quikode.agents import build_agent
 from quikode.execution import exec_in
 from quikode.fsm import Event, State
+from quikode.subtask_schema import (
+    Plan,
+    PlanValidationError,
+    parse_planner_output,
+)
 from quikode.workers.outcomes import WorkerOutcome
 from quikode.workers.task_worker import TaskWorker
 
@@ -69,19 +63,13 @@ class MergeNodeWorker(TaskWorker):
             outcome = self._push_merge_branch()
             if outcome:
                 return outcome
-            outcome = self._run_local_ci_gate()
+            outcome = self._run_audit_gauntlet()
             if outcome:
                 return outcome
-            # PR-A 3/3: skip the audit gauntlet (PR-B adds it). Fire
-            # MERGE_NODE_BUILT directly so multi-parent children unblock now.
-            # TODO(plan 32 PR-B): wire `_run_pre_pr_pipeline` with
-            # `merge_node_mode=True` (local_ci + behavior gauntlet, rubric +
-            # standards only when integration subtasks ran). Replace this
-            # direct event with the gauntlet's pass/fail handoff.
             fsm_runtime.merge_node_built(
                 self.store,
                 self.node.id,
-                note="PR-A 3/3: deterministic merge integrated; audit gauntlet deferred to PR-B",
+                note="merge-node audit gauntlet passed; ready as integration base",
             )
             return WorkerOutcome(State.MERGE_NODE_READY, "merge-node integrated")
         except Exception as e:
@@ -187,7 +175,8 @@ class MergeNodeWorker(TaskWorker):
     def _merge_octopus_or_sequential(
         self, parent_ids: list[str], parent_branches: list[str]
     ) -> WorkerOutcome | None:
-        """Try octopus first; on failure, abort+reset+sequential."""
+        """Try octopus first; on failure, abort+reset+sequential. On
+        sequential conflict, drop into the merge-planner doer-subloop."""
         if self._try_octopus(parent_branches):
             log.info("merge-node %s: octopus merge succeeded", self.node.id)
             return self._finish_integration_subtask("octopus")
@@ -195,11 +184,20 @@ class MergeNodeWorker(TaskWorker):
         reset_outcome = self._reset_to_base("reset before sequential merge")
         if reset_outcome is not None:
             return reset_outcome
-        seq_outcome = self._try_sequential(parent_ids, parent_branches)
-        if seq_outcome is not None:
-            return seq_outcome
-        log.info("merge-node %s: sequential merge succeeded", self.node.id)
-        return self._finish_integration_subtask("sequential")
+        seq_clean, conflict_parent = self._try_sequential(parent_ids, parent_branches)
+        if seq_clean:
+            log.info("merge-node %s: sequential merge succeeded", self.node.id)
+            return self._finish_integration_subtask("sequential")
+        # Sequential merge stopped on a conflict. Worktree carries the
+        # partial merge. Spawn the merge-planner doer-subloop to plan
+        # integration subtasks; the existing per-subtask doer/checker
+        # loop drives them and resolves the conflicts.
+        log.info(
+            "merge-node %s: sequential merge conflict on parent %s — invoking merge-planner subloop",
+            self.node.id,
+            conflict_parent,
+        )
+        return self._run_merge_planner_subloop(parent_ids, parent_branches)
 
     def _block(self, short: str, note: str) -> WorkerOutcome:
         """Helper: stamp BLOCKED with a forensic note + return the outcome."""
@@ -275,23 +273,22 @@ class MergeNodeWorker(TaskWorker):
         )
         return rc == 0
 
-    def _try_sequential(self, parent_ids: list[str], parent_branches: list[str]) -> WorkerOutcome | None:
-        """Sequential merge — `git merge` each parent in `parent_task_ids` order.
-        Returns a BLOCKED outcome on the first conflict."""
+    def _try_sequential(self, parent_ids: list[str], parent_branches: list[str]) -> tuple[bool, str | None]:
+        """Sequential merge — `git merge` each parent in `parent_task_ids`
+        order. Returns `(True, None)` on clean merge, `(False, conflict_parent_id)`
+        on first conflict (worktree left with conflict markers; the caller
+        runs the merge-planner subloop to resolve)."""
         for parent_id, parent_branch in zip(parent_ids, parent_branches, strict=False):
             remote_ref = f"{self.cfg.pr_remote}/{parent_branch}"
             rc, _ = self._git_in_workspace(
                 ["-c", "core.editor=true", "merge", "--no-ff", "--no-edit", remote_ref]
             )
             if rc != 0:
-                self._git_in_workspace(["merge", "--abort"])
-                return self._block(
-                    "sequential merge conflict",
-                    f"merge-node sequential merge conflict on parent "
-                    f"{parent_id} ({parent_branch}); PR-B will add the "
-                    f"doer-subloop fallback",
-                )
-        return None
+                # Leave the worktree in its conflicted state — the
+                # merge-planner subloop reads the conflict markers and
+                # plans integration subtasks against them.
+                return False, parent_id
+        return True, None
 
     def _finish_integration_subtask(self, strategy: str) -> WorkerOutcome | None:
         """Move the integration subtask through CHECKING → COMMITTING. The
@@ -317,7 +314,10 @@ class MergeNodeWorker(TaskWorker):
         catches the case where a parallel merge-node attempt raced ahead
         of us — better to surface than silently overwrite.
         """
-        fsm_runtime.enter_pushing(self.store, self.node.id)
+        # Idempotent: when the per-subtask loop ran (planner subloop
+        # path), it already transitioned through COMMITTING → PUSHING.
+        if fsm_runtime.current_state(self.store, self.node.id) is not State.PUSHING:
+            fsm_runtime.enter_pushing(self.store, self.node.id)
         branch = str(self._row()["branch"])
         rc, out = self._git_in_workspace(["push", "--force-with-lease", "-u", self.cfg.pr_remote, branch])
         if rc != 0:
@@ -326,39 +326,142 @@ class MergeNodeWorker(TaskWorker):
             return WorkerOutcome(State.BLOCKED, "merge-node push failed")
         return None
 
-    # ----- local CI gate -----
+    # ----- audit gauntlet (plan 32 PR-B) -----
 
-    def _run_local_ci_gate(self) -> WorkerOutcome | None:
-        """Run `cfg.local_ci_command` against the merged worktree. The full
-        audit gauntlet is deferred to PR-B; this is the only gate before
-        firing MERGE_NODE_BUILT.
-        """
-        # Subtask loop is conceptually done — the integration subtask landed.
-        # Transition to LOCAL_CI_CHECKING via ALL_SUBTASKS_DONE.
-        # Transition PUSHING → LOCAL_CI_CHECKING via ALL_SUBTASKS_DONE; the
-        # merge integration subtask is conceptually done at this point.
+    def _run_audit_gauntlet(self) -> WorkerOutcome | None:
+        """Run the pre-PR pipeline in `merge_node_mode=True`. local_ci +
+        behavior always run; rubric + standards run only when the cycle
+        included `kind="merge-integration"` subtasks (the merge-doer
+        emitted real new code). On failure the inherited pipeline runs
+        the standard fixup-decomposition loop and may BLOCK after
+        `cfg.pre_pr_audit_max_cycles` cycles."""
         self.store.apply_event(
             self.node.id,
             Event.ALL_SUBTASKS_DONE,
-            note="merge integration committed; entering local CI",
+            note="merge integration pushed; entering merge-node audit gauntlet",
         )
-        outcome = pre_pr_audit.run_local_ci_gate(cfg=self.cfg, handle=self._h, log_path=self.log_path)
-        if not outcome.passed:
-            note = (
-                f"merge-node local CI failed: {outcome.summary[:200]}; "
-                "the merge integrates but the merged tree doesn't build/test clean"
+        return self._run_pre_pr_pipeline(merge_node_mode=True)
+
+    # ----- merge-planner doer-subloop -----
+
+    def _run_merge_planner_subloop(
+        self, parent_ids: list[str], parent_branches: list[str]
+    ) -> WorkerOutcome | None:
+        """When deterministic merge fails, plan integration subtasks via
+        the merge-planner agent and run them through the standard doer/
+        checker loop. The worktree is in a partial-merge state with
+        conflict markers; the doer subtasks resolve them."""
+        # Replace the seeded "S-01-integrate" placeholder with the
+        # planner-emitted slices. Subtasks carry kind="merge-integration"
+        # so the audit gauntlet can detect they ran (rubric + standards
+        # re-enable in that case per plan 32 PR-B).
+        plan = self._invoke_merge_planner(parent_ids, parent_branches)
+        if plan is None:
+            return self._block(
+                "merge-planner failed",
+                f"merge-node {self.node.id}: merge-planner agent did not produce a "
+                f"valid plan after sequential conflict; BLOCKing for operator review",
             )
-            self.store.add_artifact(self.node.id, "merge_node_local_ci_failure", outcome.raw_output or "")
-            fsm_runtime.block_current(self.store, self.node.id, note=note, last_error=note[:1000])
-            return WorkerOutcome(State.BLOCKED, "merge-node local CI failed")
-        # Move to PRE_PR_AUDITING so the canonical (PRE_PR_AUDITING,
-        # MERGE_NODE_BUILT) → MERGE_NODE_READY transition can fire.
-        fsm_runtime.enter_pre_pr_auditing(
-            self.store,
+        self.store.upsert_subtasks(
             self.node.id,
-            note="merge-node local CI passed; PR-B will add audit gauntlet here",
+            [
+                {
+                    "subtask_id": s.id,
+                    "title": s.title,
+                    "depends_on": list(s.depends_on),
+                    "files_to_touch": list(s.files_to_touch),
+                    "boundary": s.boundary,
+                    "acceptance": list(s.acceptance),
+                    "notes": s.notes,
+                    "kind": "merge-integration",
+                }
+                for s in plan.subtasks
+            ],
         )
+        # Make the parsed plan visible to the inherited subtask loop
+        # helpers that read self.plan / self.plan_text.
+        self.plan = plan
+        self.plan_text = plan.model_dump_json()
+        self.store.set_field(self.node.id, plan_text=self.plan_text)
+        log.info(
+            "merge-node %s: merge-planner emitted %d integration subtask(s): %s",
+            self.node.id,
+            len(plan.subtasks),
+            ", ".join(s.id for s in plan.subtasks),
+        )
+        # Drive the standard subtask loop. This handles doer + checker +
+        # triage + commit + push for each subtask. The doer's first move
+        # will be `git status` showing the conflict markers — it edits
+        # the files, runs `git add`, and the per-subtask commit lands the
+        # resolution as a discrete commit on the merge-node branch.
+        outcome = self._run_subtask_set(list(plan.topo_order()))
+        if outcome is not None:
+            return outcome
+        # Loop completed cleanly. The integration subtask commits already
+        # landed on the worktree branch (per-subtask commits via the doer
+        # loop); fall through to push.
         return None
+
+    def _invoke_merge_planner(self, parent_ids: list[str], parent_branches: list[str]) -> Plan | None:
+        """Build per-parent context from the runtime DAG (when present)
+        and the worktree git state, then run the merge-planner agent.
+        Returns the parsed Plan or None on agent / parse failure."""
+        parent_contexts = self._build_parent_contexts(parent_ids, parent_branches)
+        prompt = prompts.merge_planner_prompt(self.cfg, self.node.id, parent_contexts)
+        self._write_log_header("MERGE PLANNER", prompt)
+        agent = build_agent(self.cfg.planner)
+        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
+        self.store.record_agent_call(
+            self.node.id,
+            phase="merge_planner",
+            cli=self.cfg.planner.cli,
+            model=self.cfg.planner.model,
+            rc=result.rc,
+            duration_s=result.duration_s or 0,
+            tokens_used=result.tokens_used,
+            tokens_input=result.tokens_input,
+            tokens_output=result.tokens_output,
+            tokens_cached_read=result.tokens_cached_read,
+            tokens_cached_creation=result.tokens_cached_creation,
+            cost_usd=result.cost_usd,
+        )
+        self.store.add_artifact(self.node.id, "merge_planner_output", result.stdout)
+        if not result.ok:
+            log.warning("merge-planner agent rc=%d for %s", result.rc, self.node.id)
+            return None
+        try:
+            return parse_planner_output(result.stdout, expected_node_id=self.node.id)
+        except PlanValidationError as e:
+            log.warning("merge-planner output failed validation for %s: %s", self.node.id, e)
+            return None
+
+    def _build_parent_contexts(self, parent_ids: list[str], parent_branches: list[str]) -> list[dict]:
+        """Per-parent dicts for the merge-planner prompt. Title + summary
+        come from the runtime DAG (when the parent has a node); diff is
+        computed from `<base>...<remote>/<parent_branch>` in the
+        worktree."""
+        out: list[dict] = []
+        for pid, branch in zip(parent_ids, parent_branches, strict=False):
+            node = self.dag.nodes.get(pid)
+            title = node.title if node is not None else f"parent task {pid}"
+            summary = (node.scope[:300] if node is not None else "") or ""
+            _, diff = self._git_in_workspace(
+                [
+                    "diff",
+                    f"{self.cfg.pr_remote}/{self.cfg.base_branch}...{self.cfg.pr_remote}/{branch}",
+                    "--no-color",
+                ]
+            )
+            out.append(
+                {
+                    "task_id": pid,
+                    "branch": branch,
+                    "title": title,
+                    "summary": summary,
+                    "diff_excerpt": diff,
+                }
+            )
+        return out
 
     # ----- helpers (override row narrowing for type happiness) -----
 

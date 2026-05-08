@@ -73,6 +73,7 @@ class RebaseConflictMixin:
         *,
         rebase_target_kind: str = "main",
         parent_branch: str = "",
+        parent_contexts: list[dict] | None = None,
     ) -> WorkerOutcome | None:
         fsm_runtime.enter_conflict_resolving(self.store, self.node.id)
         max_iterations = self.cfg.conflict_resolver_max_iterations
@@ -81,6 +82,7 @@ class RebaseConflictMixin:
                 iteration=iteration,
                 rebase_target_kind=rebase_target_kind,
                 parent_branch=parent_branch,
+                parent_contexts=parent_contexts,
             )
             if outcome is not None:
                 return outcome
@@ -145,9 +147,18 @@ class RebaseConflictMixin:
         iteration: int,
         rebase_target_kind: str = "main",
         parent_branch: str = "",
+        parent_contexts: list[dict] | None = None,
     ) -> WorkerOutcome | None:
         row = self._row()
         base_sha = row.get("base_ref_sha") or "HEAD~1"
+        # Plan 32 PR-B: when invoked under a merge-node row, auto-detect
+        # the merge-node context and build per-parent diff context if
+        # the caller didn't supply it. Allows integration subtasks under
+        # the merge-node worker that fall back to the rebase-resolver
+        # path to get attribution context for free.
+        if rebase_target_kind == "main" and (row.get("kind") or "") == "merge" and not parent_contexts:
+            rebase_target_kind = "merge_node"
+            parent_contexts = self._build_merge_node_parent_contexts()
         _, task_diff = self._git_in_workspace(["diff", f"{base_sha}...HEAD", "--no-color"])
         # Plan 31: when rebasing onto a parent's tip (not main), the resolver
         # needs the parent's diff context, not main's. main_diff/main_log are
@@ -205,6 +216,7 @@ class RebaseConflictMixin:
             conflicted_files=conflicted,
             rebase_target_kind=rebase_target_kind,
             parent_branch=parent_branch,
+            parent_contexts=parent_contexts or [],
         )
         self._write_log_header(f"CONFLICT RESOLVER (iter {iteration})", prompt)
         result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
@@ -244,6 +256,30 @@ class RebaseConflictMixin:
             )
             return WorkerOutcome(State.BLOCKED, "rebase --continue failed")
         return None
+
+    def _build_merge_node_parent_contexts(self: Any) -> list[dict]:
+        """Plan 32 PR-B: build per-parent {branch, log, diff} dicts for
+        a merge-node row, sourced from `store.get_parent_branches`."""
+        parent_ids = self.store.get_parent_task_ids(self.node.id)
+        parent_branches = self.store.get_parent_branches(self.node.id)
+        contexts: list[dict] = []
+        for pid, branch in zip(parent_ids, parent_branches, strict=False):
+            _, log_out = self._git_in_workspace(
+                [
+                    "log",
+                    "--oneline",
+                    f"{self.cfg.pr_remote}/{self.cfg.base_branch}..{self.cfg.pr_remote}/{branch}",
+                ]
+            )
+            _, diff = self._git_in_workspace(
+                [
+                    "diff",
+                    f"{self.cfg.pr_remote}/{self.cfg.base_branch}...{self.cfg.pr_remote}/{branch}",
+                    "--no-color",
+                ]
+            )
+            contexts.append({"task_id": pid, "branch": branch, "log": log_out, "diff": diff})
+        return contexts
 
     def _rebase_in_progress(self: Any) -> bool:
         for kind in ("rebase-merge", "rebase-apply"):
