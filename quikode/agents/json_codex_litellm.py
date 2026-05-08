@@ -80,11 +80,7 @@ class CodexLitellmJsonAgent:
             out_path,
             "-",
         ]
-        write_schema = (
-            f"python3 -c 'import sys, os; "
-            f'open({schema_path!r},"w").write(sys.stdin.read())'
-            f"' <<'__QK_SCHEMA_EOF__'\n{schema_text}\n__QK_SCHEMA_EOF__"
-        )
+        write_schema = f"cat > {schema_path} <<'__QK_SCHEMA_EOF__'\n{schema_text}\n__QK_SCHEMA_EOF__"
         shell_cmd = (
             f"set -o pipefail; "
             f"{write_schema}; "

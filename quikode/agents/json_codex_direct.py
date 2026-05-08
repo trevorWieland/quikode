@@ -85,12 +85,11 @@ class CodexDirectJsonAgent:
             out_path,
             "-",
         ]
-        # Use python instead of printf to safely write the schema (escape-free).
-        write_schema = (
-            f"python3 -c 'import sys, os; "
-            f'open({schema_path!r},"w").write(sys.stdin.read())'
-            f"' <<'__QK_SCHEMA_EOF__'\n{schema_text}\n__QK_SCHEMA_EOF__"
-        )
+        # Quoted heredoc straight to the schema path: no shell expansion,
+        # no python wrapper, no nested-quote ambiguity. The single-quoted
+        # delimiter ensures `$`, `\`, etc. inside the JSON schema are taken
+        # literally. tmp paths are token-hex'd so collisions are impossible.
+        write_schema = f"cat > {schema_path} <<'__QK_SCHEMA_EOF__'\n{schema_text}\n__QK_SCHEMA_EOF__"
         shell_cmd = (
             f"set -o pipefail; "
             f"{write_schema}; "
