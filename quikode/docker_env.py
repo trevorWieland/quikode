@@ -106,6 +106,12 @@ def start_postgres(handle: TaskContainer, cfg: Config, label: str | None = None)
         handle.network_name,
         "--network-alias",
         "postgres",
+        # Plan 38 PR-A: containers must reach the host's litellm proxy at
+        # `host.docker.internal:4000`. The `host-gateway` magic value resolves
+        # to the host's loopback so codex profiles' `base_url` can be
+        # written once (`http://host.docker.internal:4000/v1`) and work
+        # from BOTH host (gateway maps back to localhost) and container.
+        "--add-host=host.docker.internal:host-gateway",
         "-e",
         f"POSTGRES_PASSWORD={cfg.postgres_password}",
         "-e",
@@ -241,6 +247,9 @@ def start_dev_container(
         handle.container_name,
         "--network",
         handle.network_name,
+        # Plan 38 PR-A: see start_postgres for rationale. Required for
+        # codex_litellm transport to reach the host's litellm proxy.
+        "--add-host=host.docker.internal:host-gateway",
         "--label",
         workspace_label(cfg),
         "--user",
@@ -318,6 +327,8 @@ def start_warm_cache_container(cfg: Config, *, label_suffix: str = "warm") -> st
         "-d",
         "--name",
         container_name,
+        # Plan 38 PR-A: see start_postgres for rationale.
+        "--add-host=host.docker.internal:host-gateway",
         "--label",
         workspace_label(cfg),
         "--label",

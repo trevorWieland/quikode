@@ -538,6 +538,28 @@ class Config(BaseModel):
         default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.4-mini"),
     )
 
+    # ----- plan 38 PR-A: role → MODEL bindings + per-role timeouts -----
+    # Per-role model resolved via `quikode.model_registry.MODELS`. CLI derived
+    # from the model — no `<role>_cli` knob. Defaults MUST match
+    # `agent_registry.ROLES[*].default_model`.
+    planner_model: str = Field(default="gpt-5.5")
+    subtask_doer_model: str = Field(default="GLM-5.1-zai")
+    subtask_checker_model: str = Field(default="gpt-5.5")
+    subtask_triage_model: str = Field(default="gpt-5.5")
+    pre_pr_rubric_model: str = Field(default="gpt-5.5")
+    pre_pr_standards_model: str = Field(default="gpt-5.5")
+    pre_pr_behavior_model: str = Field(default="gpt-5.5")
+    fixup_planner_model: str = Field(default="gpt-5.5")
+    merge_planner_model: str = Field(default="gpt-5.5")
+    conflict_resolver_model: str = Field(default="GLM-5.1-zai")
+    progress_model: str = Field(default="gpt-5.5")
+    # Per-role timeouts not already declared above (registry `timeout_s_field`).
+    planner_timeout_s: int = Field(default=1200, ge=60, le=14400)
+    subtask_triage_timeout_s: int = Field(default=600, ge=30, le=3600)
+    merge_planner_timeout_s: int = Field(default=1800, ge=120, le=7200)
+    conflict_resolver_timeout_s: int = Field(default=1800, ge=60, le=14400)
+    progress_timeout_s: int = Field(default=180, ge=30, le=1800)
+
     # ----- auth mounts -----
     claude_auth_dir: Path = Field(default_factory=lambda: Path.home() / ".claude")
     claude_json_path: Path = Field(default_factory=lambda: Path.home() / ".claude.json")

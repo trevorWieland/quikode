@@ -119,6 +119,53 @@ def test_start_postgres_uses_configured_database(monkeypatch, tmp_path):
     assert "POSTGRES_PASSWORD=secret" in docker_run
 
 
+def test_start_dev_container_passes_host_gateway_flag(monkeypatch, tmp_path):
+    """Plan 38 PR-A: containers must reach the host's litellm proxy via
+    `host.docker.internal:host-gateway`. Without this, the
+    `CodexLitellmJsonAgent` shim can't reach `127.0.0.1:4000` from inside
+    a task container."""
+    cfg = _cfg(
+        repo_path=tmp_path / "repo",
+        state_dir=tmp_path / ".quikode",
+        sccache_dir=tmp_path / ".quikode" / "sccache",
+    )
+    cfg.repo_path.mkdir()
+    (cfg.repo_path / ".git").mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    handle = TaskContainer("T-1", "qk-t-1", "t-1", "qk-t-1-dev", "qk-t-1-pg", "qk-t-1-net")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check=True, capture=True):
+        calls.append(cmd)
+        stdout = "token" if cmd[:3] == ["gh", "auth", "token"] else "container-id"
+        return SimpleNamespace(returncode=0, stdout=stdout)
+
+    monkeypatch.setattr("quikode.docker_env._run", fake_run)
+
+    start_dev_container(handle, cfg, worktree)
+
+    docker_run = calls[-1]
+    assert "--add-host=host.docker.internal:host-gateway" in docker_run
+
+
+def test_start_postgres_passes_host_gateway_flag(monkeypatch, tmp_path):
+    """Plan 38 PR-A: also flag the postgres sidecar so future probes have
+    consistent host-gateway resolution."""
+    cfg = _cfg()
+    handle = TaskContainer("T-1", "qk-t-1", "t-1", "qk-t-1-dev", "qk-t-1-pg", "qk-t-1-net")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, check=True, capture=True):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr("quikode.docker_env._run", fake_run)
+    start_postgres(handle, cfg, label="qk_workspace=abc123")
+    docker_run = calls[-1]
+    assert "--add-host=host.docker.internal:host-gateway" in docker_run
+
+
 def test_start_dev_container_injects_configured_database_url(monkeypatch, tmp_path):
     cfg = _cfg(
         repo_path=tmp_path / "repo",

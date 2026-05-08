@@ -63,26 +63,89 @@ def abort(
 
 @app.command()
 def retry(
-    task_id: str,
+    task_id: str | None = typer.Argument(
+        None,
+        help="Specific task to retry. Omit and pass --all-non-merged to retry every non-merged task.",
+    ),
     keep_worktree: bool = typer.Option(False, "--keep-worktree", help="Don't delete the prior worktree dir"),
     reason: str | None = typer.Option(
         None, "--reason", "-r", help="Reason for the retry, recorded in state_log."
     ),
+    all_non_merged: bool = typer.Option(
+        False,
+        "--all-non-merged",
+        help=(
+            "Plan 38 §6 deploy: retry EVERY task whose state is not "
+            "merged/merge_node_retired. Used at deploy time when a contract "
+            "change requires re-running every in-flight task under the new "
+            "schema."
+        ),
+    ),
 ):
-    """Reset a BLOCKED/FAILED task back to PENDING and clean up its prior worktree."""
+    """Reset a BLOCKED/FAILED task back to PENDING and clean up its prior worktree.
+
+    With `--all-non-merged`, iterates every task whose state is not
+    `merged` / `merge_node_retired` and applies the same per-task
+    retry. Used at deploy boundaries when a contract change requires
+    re-planning across the whole workspace (Plan 38 §6).
+    """
     cfg = load_config()
     store = _open_store(cfg)
+    if all_non_merged:
+        if task_id:
+            console.print("[red]--all-non-merged is mutually exclusive with a positional task_id[/]")
+            raise typer.Exit(2)
+        _retry_all_non_merged(
+            cfg=cfg,
+            store=store,
+            keep_worktree=keep_worktree,
+            reason=reason,
+        )
+        return
+    if not task_id:
+        console.print("[red]retry: pass a task_id or use --all-non-merged[/]")
+        raise typer.Exit(2)
     row = store.get(task_id)
     if not row:
         raise typer.Exit(1)
-    # Clean up prior worktree + branch so the next provision starts fresh
+    _retry_one(cfg=cfg, store=store, row=row, keep_worktree=keep_worktree, reason=reason)
+    console.print(f"[green]reset {task_id} → pending[/]")
+
+
+# Plan 38 PR-A: states that can transition via the FSM's `retry_task` event.
+# `merged` / `merge_node_retired` excluded (terminal). PENDING excluded
+# (nothing planned yet). Post-PR states (PENDING_CI / AWAITING_REVIEW) require
+# the operator to drain the daemon first, after which abandoned PRs land in
+# BLOCKED/FAILED — caught here.
+_NON_MERGED_RETRY_STATES: tuple[str, ...] = (
+    State.BLOCKED.value,
+    State.FAILED.value,
+    State.ABORTED.value,
+)
+
+
+def _retry_one(
+    *,
+    cfg: Any,
+    store: Store,
+    row: Mapping[str, Any],
+    keep_worktree: bool,
+    reason: str | None,
+) -> None:
+    """Reset one task → pending. Shared by single-task retry and bulk retry."""
+    task_id = row["id"]
     if not keep_worktree:
         wt_path = row.get("worktree_path")
         if wt_path and Path(wt_path).exists():
             worktree.remove_worktree(cfg.repo_path, Path(wt_path), force=True)
         branch = row.get("branch")
         if branch:
-            subprocess.run(["git", "branch", "-D", branch], cwd=cfg.repo_path, capture_output=True, text=True)
+            subprocess.run(
+                ["git", "branch", "-D", branch],
+                cwd=cfg.repo_path,
+                capture_output=True,
+                text=True,
+            )
         worktree.prune(cfg.repo_path)
     note = f"manual retry: {reason}" if reason else "manual retry"
     fsm_runtime.retry_task(
@@ -97,7 +160,36 @@ def retry(
         pr_url=None,
         pr_number=None,
     )
-    console.print(f"[green]reset {task_id} → pending[/]")
+
+
+def _retry_all_non_merged(
+    *,
+    cfg: Any,
+    store: Store,
+    keep_worktree: bool,
+    reason: str | None,
+) -> None:
+    """Bulk reset — every task whose state is not `merged` / `merge_node_retired`.
+
+    Currently-active workers (PROVISIONING, DOING_SUBTASK, ...) are NOT
+    reset by this path; the operator drains the daemon first (per Plan
+    38 §6 deploy procedure).
+    """
+    rows = store.all_tasks()
+    targets = [r for r in rows if r["state"] in _NON_MERGED_RETRY_STATES]
+    if not targets:
+        console.print("[yellow]no non-merged retryable tasks found[/]")
+        return
+    note_reason = reason or "bulk retry: --all-non-merged"
+    for row in targets:
+        _retry_one(
+            cfg=cfg,
+            store=store,
+            row=row,
+            keep_worktree=keep_worktree,
+            reason=note_reason,
+        )
+    console.print(f"[green]reset {len(targets)} task(s) → pending (--all-non-merged)[/]")
 
 
 @app.command()

@@ -207,4 +207,23 @@ def load_config(root: Path | None = None) -> Config:
         opencode_auth_dir=_path(raw.get("opencode_auth_dir"), defaults.opencode_auth_dir),
         opencode_config_dir=_path(raw.get("opencode_config_dir"), defaults.opencode_config_dir),
         github_token_env=raw.get("github_token_env", defaults.github_token_env),
+        # Plan 38 PR-A: role → MODEL bindings + new per-role timeouts.
+        planner_model=str(raw.get("planner_model", defaults.planner_model)),
+        subtask_doer_model=str(raw.get("subtask_doer_model", defaults.subtask_doer_model)),
+        subtask_checker_model=str(raw.get("subtask_checker_model", defaults.subtask_checker_model)),
+        subtask_triage_model=str(raw.get("subtask_triage_model", defaults.subtask_triage_model)),
+        pre_pr_rubric_model=str(raw.get("pre_pr_rubric_model", defaults.pre_pr_rubric_model)),
+        pre_pr_standards_model=str(raw.get("pre_pr_standards_model", defaults.pre_pr_standards_model)),
+        pre_pr_behavior_model=str(raw.get("pre_pr_behavior_model", defaults.pre_pr_behavior_model)),
+        fixup_planner_model=str(raw.get("fixup_planner_model", defaults.fixup_planner_model)),
+        merge_planner_model=str(raw.get("merge_planner_model", defaults.merge_planner_model)),
+        conflict_resolver_model=str(raw.get("conflict_resolver_model", defaults.conflict_resolver_model)),
+        progress_model=str(raw.get("progress_model", defaults.progress_model)),
+        planner_timeout_s=int(raw.get("planner_timeout_s", defaults.planner_timeout_s)),
+        subtask_triage_timeout_s=int(raw.get("subtask_triage_timeout_s", defaults.subtask_triage_timeout_s)),
+        merge_planner_timeout_s=int(raw.get("merge_planner_timeout_s", defaults.merge_planner_timeout_s)),
+        conflict_resolver_timeout_s=int(
+            raw.get("conflict_resolver_timeout_s", defaults.conflict_resolver_timeout_s)
+        ),
+        progress_timeout_s=int(raw.get("progress_timeout_s", defaults.progress_timeout_s)),
     )
