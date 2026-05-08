@@ -87,7 +87,6 @@ def _build_worker(
 
         def _provision_container(self, wt_path) -> None:  # pragma: no cover - trivial
             del wt_path
-            return None
 
         def _teardown(self) -> None:  # pragma: no cover - trivial
             return None
