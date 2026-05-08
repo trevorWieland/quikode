@@ -8,6 +8,7 @@ from jinja2 import ChoiceLoader, Environment, FileSystemLoader, StrictUndefined
 
 from .config import Config
 from .dag import DAG, Node
+from .subtask_schema import STABILIZATION_SUBTASK_ID
 
 # Bundled prompts ship inside the quikode package itself (../prompts at the repo root,
 # i.e. one level up from the package dir). They serve as the default if the user
@@ -105,6 +106,15 @@ def subtask_doer_prompt(
     triage_notes: str | None = None,
     prior_doer_output: str | None = None,
 ) -> str:
+    # Plan 24 fix: Z-99 stabilization subtask runs `just ci` (full CI gate),
+    # not `just check` (the per-subtask fast gate). The per-subtask checker
+    # already ran `just check` on every prior subtask; Z-99 exists precisely
+    # to catch cross-subtask integration failures the per-subtask gate
+    # misses. Detect by id; the subtask record's boundary already references
+    # the right command via `_build_stabilization_subtask`.
+    gate_command = (
+        cfg.local_ci_command if subtask.id == STABILIZATION_SUBTASK_ID else cfg.subtask_check_command
+    )
     return render(
         cfg,
         "subtask-doer.md",
@@ -112,7 +122,7 @@ def subtask_doer_prompt(
         subtask=subtask,
         triage_notes=triage_notes,
         prior_doer_output=prior_doer_output,
-        subtask_check_command=cfg.subtask_check_command,
+        subtask_check_command=gate_command,
     )
 
 

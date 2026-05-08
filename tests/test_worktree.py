@@ -103,14 +103,52 @@ def test_commit_subtask_happy_path_runs_add_commit_push(tmp_path):
     assert set(result.accepted_files) == set(files)
 
 
-def test_commit_subtask_no_files_short_circuits():
+def test_commit_subtask_z99_gate_only_success_no_edits():
+    """Plan 24 fix: Z-99-style stabilization subtask (`files_to_touch=()`).
+
+    When the doer reports the gate already passes and produces no edits,
+    `commit_subtask` must return SUCCESS with no new commit (gate-only
+    success). Pre-fix, this was treated as a permanent failure mode; R-0041
+    looped 16+ times on it before anyone noticed.
+    """
     sub = _stub_subtask(files=())
-    with patch("quikode.worktree.exec_in") as mock_exec:
+
+    def fake_exec(handle, cmd, log_path=None, stdin=None, timeout=None):
+        if "git add -A" in cmd[2]:
+            return 0, "", ""
+        if "git diff --cached --name-only" in cmd[2]:
+            return 0, "", ""  # nothing staged
+        if "git rev-parse HEAD" in cmd[2]:
+            return 0, "abc1234567\n", ""
+        return 0, "", ""
+
+    with patch("quikode.worktree.exec_in", side_effect=fake_exec):
+        result = commit_subtask(_handle(), sub, "msg", branch="b")
+    assert result.success is True
+    assert result.transient is False
+    assert result.commit_sha == "abc1234567"
+    assert "gate-only success" in result.output
+    assert result.accepted_files == []
+
+
+def test_commit_subtask_declared_files_but_no_edits_is_failure():
+    """When the subtask declared specific files_to_touch but the doer
+    produced no edits, that's the real failure case (doer didn't do
+    its job)."""
+    sub = _stub_subtask(files=("foo.py", "bar.py"))
+
+    def fake_exec(handle, cmd, log_path=None, stdin=None, timeout=None):
+        if "git add -A" in cmd[2]:
+            return 0, "", ""
+        if "git diff --cached --name-only" in cmd[2]:
+            return 0, "", ""  # nothing staged despite declared files
+        return 0, "", ""
+
+    with patch("quikode.worktree.exec_in", side_effect=fake_exec):
         result = commit_subtask(_handle(), sub, "msg", branch="b")
     assert result.success is False
     assert result.transient is False
-    assert "no files_to_touch" in result.output
-    assert mock_exec.call_count == 0
+    assert "doer produced no edits" in result.output
 
 
 def test_commit_subtask_commit_failure_is_real(tmp_path):

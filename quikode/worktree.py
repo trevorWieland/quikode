@@ -81,6 +81,40 @@ _TRANSIENT_GIT_PUSH_MARKERS: tuple[str, ...] = (
 )
 
 
+def _classify_empty_staging(
+    handle: ExecutionSandbox,
+    declared: list[str],
+    actually_touched: list[str],
+    log_path: Path | None,
+    timeout: int,
+) -> CommitResult | None:
+    """Plan 24 Z-99 helper: triage the empty-staging cases.
+
+    `declared=[] AND nothing staged` → gate-only stabilization succeeded
+    by definition (doer ran the gate, it passed, no edits needed) →
+    return success with no new commit. `declared=[X] AND nothing staged`
+    → real failure (doer didn't produce expected edits). Pre-fix this
+    branch was a permanent BLOCK; R-0041 looped 16+ times on it.
+    """
+    if actually_touched:
+        return None
+    if declared:
+        return _commit_failure(
+            f"commit_subtask: subtask declared files_to_touch={declared} but doer produced no edits"
+        )
+    rc, head_sha, _ = exec_in(
+        handle, ["bash", "-lc", "cd /workspace && git rev-parse HEAD"], log_path=log_path, timeout=timeout
+    )
+    sha = (head_sha or "").strip().splitlines()[0] if rc == 0 and head_sha else None
+    return CommitResult(
+        success=True,
+        commit_sha=sha,
+        transient=False,
+        output="commit_subtask: gate-only success (declared=[] AND no edits required)",
+        accepted_files=[],
+    )
+
+
 def _is_transient_git_failure(rc: int, output: str) -> bool:
     """Detect transient git failures (network blips, GitHub 5xx, DNS
     weirdness). Conservative: rc=0 is never transient; rc!=0 with no
@@ -106,22 +140,15 @@ def commit_subtask(
     timeout: int = 300,
     lane_review_fn: LaneReviewFn | None = None,
 ) -> CommitResult:
-    """`git add -A && git commit && git push` for one subtask, with optional advisory lane review on drift from `subtask.files_to_touch`. `transient=True` on the result → free retry."""
-    if not subtask.files_to_touch:
-        return _commit_failure("commit_subtask: subtask declared no files_to_touch; nothing to add")
+    """`git add -A && git commit && git push` for one subtask, with advisory lane review on drift. `transient=True` → free retry. Plan 24's Z-99 declares `files_to_touch=[]` by design (lane is "make the gate green"); empty staging there is success, not failure — see `_classify_empty_staging`."""
     declared = list(subtask.files_to_touch)
 
-    # 1. Stage everything the doer + hooks produced.
     rc, out, err = exec_in(
-        handle,
-        ["bash", "-lc", "cd /workspace && git add -A"],
-        log_path=log_path,
-        timeout=timeout,
+        handle, ["bash", "-lc", "cd /workspace && git add -A"], log_path=log_path, timeout=timeout
     )
     if rc != 0:
         return _commit_failure(f"git add -A failed (rc={rc}):\n{out}\n{err}")
 
-    # 2. Compute the actual touched set from the staging area.
     rc, diff_out, _ = exec_in(
         handle,
         ["bash", "-lc", "cd /workspace && git diff --cached --name-only"],
@@ -131,7 +158,10 @@ def commit_subtask(
     actually_touched: list[str] = [str(line) for line in (diff_out or "").splitlines() if line.strip()]
     accepted_files: list[str] = list(actually_touched)
 
-    # 3. Advisory lane review — only when there's drift AND we have a reviewer.
+    early = _classify_empty_staging(handle, declared, actually_touched, log_path, timeout)
+    if early is not None:
+        return early
+
     if lane_review_fn is not None and actually_touched and not (set(actually_touched) <= set(declared)):
         review_outcome = _apply_lane_review(
             handle, subtask, declared, actually_touched, lane_review_fn, log_path
@@ -140,23 +170,15 @@ def commit_subtask(
             return review_outcome
         accepted_files = review_outcome
 
-    # 4. git commit -m <message>. Helper handles the idempotent-re-entry
-    # case where the doer made no diff but a prior attempt already committed
-    # this subtask's work locally.
     commit_outcome = _commit_or_idempotent(handle, message, log_path, timeout)
     if isinstance(commit_outcome, CommitResult):
         return commit_outcome
 
-    # 5. capture the new HEAD sha.
     rc, sha_out, _sha_err = exec_in(
-        handle,
-        ["bash", "-lc", "cd /workspace && git rev-parse HEAD"],
-        log_path=log_path,
-        timeout=30,
+        handle, ["bash", "-lc", "cd /workspace && git rev-parse HEAD"], log_path=log_path, timeout=30
     )
     commit_sha = sha_out.strip() if rc == 0 else None
 
-    # 6. git push (optional).
     if push:
         return git_push_recovery.push_with_recovery(
             handle,
@@ -282,19 +304,10 @@ def commit_response(
     `transient=True` means a free retry is safe.
     """
     rc, out, err = exec_in(
-        handle,
-        ["bash", "-lc", "cd /workspace && git add -A"],
-        log_path=log_path,
-        timeout=timeout,
+        handle, ["bash", "-lc", "cd /workspace && git add -A"], log_path=log_path, timeout=timeout
     )
     if rc != 0:
-        return CommitResult(
-            success=False,
-            commit_sha=None,
-            transient=False,
-            output=f"git add -A failed (rc={rc}):\n{out}\n{err}",
-        )
-
+        return _commit_failure(f"git add -A failed (rc={rc}):\n{out}\n{err}")
     rc, out, err = exec_in(
         handle,
         ["bash", "-lc", f"cd /workspace && git commit -m {shlex.quote(message)}"],
@@ -302,48 +315,26 @@ def commit_response(
         timeout=timeout,
     )
     if rc != 0:
-        combined = (out or "") + "\n" + (err or "")
-        return CommitResult(
-            success=False,
-            commit_sha=None,
-            transient=False,
-            output=f"git commit failed (rc={rc}):\n{combined}",
-        )
-
+        return _commit_failure(f"git commit failed (rc={rc}):\n{(out or '')}\n{(err or '')}")
     rc, sha_out, _sha_err = exec_in(
-        handle,
-        ["bash", "-lc", "cd /workspace && git rev-parse HEAD"],
-        log_path=log_path,
-        timeout=30,
+        handle, ["bash", "-lc", "cd /workspace && git rev-parse HEAD"], log_path=log_path, timeout=30
     )
     commit_sha = sha_out.strip() if rc == 0 else None
-
     if push:
         rc, out, err = exec_in(
             handle,
-            [
-                "bash",
-                "-lc",
-                f"cd /workspace && git push {shlex.quote(remote)} {shlex.quote(branch)}",
-            ],
+            ["bash", "-lc", f"cd /workspace && git push {shlex.quote(remote)} {shlex.quote(branch)}"],
             log_path=log_path,
             timeout=timeout,
         )
         if rc != 0:
             combined = (out or "") + "\n" + (err or "")
-            return CommitResult(
-                success=False,
+            return _commit_failure(
+                f"git push failed (rc={rc}):\n{combined}",
                 commit_sha=commit_sha,
                 transient=_is_transient_git_failure(rc, combined),
-                output=f"git push failed (rc={rc}):\n{combined}",
             )
-
-    return CommitResult(
-        success=True,
-        commit_sha=commit_sha,
-        transient=False,
-        output="ok",
-    )
+    return CommitResult(success=True, commit_sha=commit_sha, transient=False, output="ok")
 
 
 def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:

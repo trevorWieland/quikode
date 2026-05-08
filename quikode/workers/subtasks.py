@@ -57,7 +57,16 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
             # in-flight fixups and burns retries on a gate that can't pass
             # until the fixups land. (Observed on R-0021 after the plan-24
             # ship: Z-99 attempt 2 ran while F-1-11 was still doing.)
-            spec_gate_command = self.cfg.subtask_check_command
+            # Plan 24 fix: Z-99 must run `just ci` (the full CI gate), not
+            # `just check` (the per-subtask fast gate). Z-99's whole purpose
+            # is catching cross-subtask integration failures BEFORE the
+            # pre-PR audit gauntlet — failures that the per-subtask checker
+            # already missed because they only surface when ALL subtasks'
+            # work is on the branch. Running `just check` for Z-99 is a
+            # no-op (the per-subtask checker already ran it). Use
+            # `local_ci_command` for the gate the audit gauntlet's Stage 0
+            # also runs, so Z-99 catches the same class of failures.
+            spec_gate_command = self.cfg.local_ci_command
             if self._has_existing_fixup_subtasks():
                 spec_gate_command = None
             try:
@@ -140,7 +149,7 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
             return _tw.parse_planner_output(
                 stdout,
                 expected_node_id=self.node.id,
-                spec_gate_command=self.cfg.subtask_check_command,
+                spec_gate_command=self.cfg.local_ci_command,
             )
         except PlanValidationError as e:
             # One retry with the validation error fed back as user input
@@ -174,7 +183,7 @@ class SubtaskWorkerMixin(SubtaskProgressMixin, SubtaskExecutionMixin, SubtaskCom
             return _tw.parse_planner_output(
                 result.stdout,
                 expected_node_id=self.node.id,
-                spec_gate_command=self.cfg.subtask_check_command,
+                spec_gate_command=self.cfg.local_ci_command,
             )
 
     def _subtask_loop(self: Any) -> WorkerOutcome | None:
