@@ -52,8 +52,14 @@ After a clean parse, `short_circuit_decision` runs:
 2. Any `gate_rubric[cat].predicted_score < cfg.pre_pr_rubric_min_score`
    → FAIL_FAST(rubric).
 3. Any RISK / STUB / TODO / FIXME / XXX token (case-insensitive,
-   word-boundary regex) in any rubric / standards / behavior row →
-   FAIL_FAST(self_audit_mismatch).
+   word-boundary regex) in any rubric / behavior row, or in any
+   `gate_standards` row whose body is `drifted` → FAIL_FAST(
+   self_audit_mismatch). **Plan 36 carve-out:** `gate_standards` rows
+   with `aligned=True` are skipped because such a row is structurally
+   a denial — the doer typically lists deny-listed tokens to assert
+   absence (e.g. `aligned (no unwrap, no todo, no panic)`). The LLM
+   checker still verifies aligned claims against the diff, so a
+   falsely-aligned row with a real admission still fails downstream.
 4. Else PROCEED to LLM checker.
 
 The parser is structural only — it doesn't verify that
@@ -448,6 +454,12 @@ def _scan_risk_tokens(parsed: ParsedSelfAudit) -> str | None:
             if blob and _RISK_TOKEN_RE.search(blob):
                 return f"gate_rubric[{cat}]: {blob[:120]}"
     for key, srow in parsed.gate_standards.items():
+        if srow.aligned:
+            # Plan 36: aligned standards rows are denials by construction —
+            # the doer lists deny-listed tokens (no unwrap, no todo) to
+            # assert absence. Drifted rows still scan: an admission like
+            # "drifted: still need to remove the TODO" is real signal.
+            continue
         if srow.body and _RISK_TOKEN_RE.search(srow.body):
             return f"gate_standards[{key}]: {srow.body[:120]}"
     for key, brow in parsed.gate_behavior.items():

@@ -317,6 +317,53 @@ def test_short_circuit_risk_token_in_behavior_excerpt(tmp_path: Path) -> None:
     assert decision.failure_layer == "self_audit_mismatch"
 
 
+def test_short_circuit_risk_token_in_aligned_standards_row_is_proceed(tmp_path: Path) -> None:
+    """Plan 36: an aligned standards row may legitimately list deny-listed
+    tokens (no unwrap, no todo, no panic) to assert their absence — that's
+    a denial, not an admission. The risk-token scan must skip aligned rows."""
+    cfg = _cfg(tmp_path)
+    contract = build_for(_node(), cfg)
+    parsed = parse_self_audit(
+        """SELF_AUDIT:
+  gate_local_ci: rc=0 (cmd: just check)
+  gate_rubric:
+    code_quality: predicted_score=8  rationale: ok  evidence: a.rs:1
+  gate_standards:
+    profiles/rust-cargo/rust/error-handling.md§Error Handling: aligned (thiserror in library crate; no unwrap, expect, panic, todo, unimplemented)
+  gate_behavior:
+  diff_reconcile:
+    a.rs: in_lane
+"""
+    )
+    assert parsed.parse_errors == ()
+    assert parsed.gate_standards["profiles/rust-cargo/rust/error-handling.md§Error Handling"].aligned is True
+    decision = short_circuit_decision(parsed, contract=contract, subtask=_subtask(), rubric_min_score=7)
+    assert decision.decision is ShortCircuit.PROCEED
+
+
+def test_short_circuit_risk_token_in_drifted_standards_row_still_fail_fast(tmp_path: Path) -> None:
+    """Plan 36 regression: drifted standards rows still scan for risk tokens.
+    A doer admitting "drifted: still need to remove the TODO" is real signal."""
+    cfg = _cfg(tmp_path)
+    contract = build_for(_node(), cfg)
+    parsed = parse_self_audit(
+        """SELF_AUDIT:
+  gate_local_ci: rc=0 (cmd: just check)
+  gate_rubric:
+    code_quality: predicted_score=8  rationale: ok  evidence: a.rs:1
+  gate_standards:
+    profiles/rust-cargo/rust/error-handling.md§Error Handling: drifted (still need to remove the TODO marker on line 42)
+  gate_behavior:
+  diff_reconcile:
+"""
+    )
+    assert parsed.parse_errors == ()
+    assert parsed.gate_standards["profiles/rust-cargo/rust/error-handling.md§Error Handling"].aligned is False
+    decision = short_circuit_decision(parsed, contract=contract, subtask=_subtask(), rubric_min_score=7)
+    assert decision.decision is ShortCircuit.FAIL_FAST
+    assert decision.failure_layer == "self_audit_mismatch"
+
+
 def test_short_circuit_word_boundary_does_not_match_substring(tmp_path: Path) -> None:
     """`STUB` inside `STUBBORN` is not a STUB token (word boundary)."""
     cfg = _cfg(tmp_path)
