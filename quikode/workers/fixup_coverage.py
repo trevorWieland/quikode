@@ -21,19 +21,20 @@ stays out of `pre_pr.py` to keep that file under budget.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from quikode.planner_validators import (
     PlannerValidationError,
+    validate_architecture_refs,
     validate_evidence_partition,
     validate_finding_coverage,
-    validate_standards_paths,
+    validate_standards_refs,
 )
 from quikode.subtask_schema import FixupPlan, PlanValidationError, parse_fixup_planner_output
 
 if TYPE_CHECKING:
     from quikode.dag import Node
+    from quikode.evaluation_contract import EvaluationContract
 
 
 def collect_stage_coverage(plan: FixupPlan) -> tuple[set[str], set[str], set[str], str]:
@@ -100,7 +101,7 @@ def missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -
 def parse_and_validate_fixup_plan(
     stdout: str,
     *,
-    repo_root: Path,
+    contract: EvaluationContract,
     node: Node,
     audit_findings: list[str] | None,
 ) -> tuple[FixupPlan | None, str | None]:
@@ -119,8 +120,10 @@ def parse_and_validate_fixup_plan(
     * `validate_evidence_partition(plan, node)` — same as the spec
       side; the audit's `behavior:<id>` findings need exactly-once
       coverage so this stays universal.
-    * `validate_standards_paths(plan, repo_root)` — same as the spec
-      side; cited standards docs must exist regardless of plan kind.
+    * `validate_standards_refs(plan, contract)` — Plan 35: cited
+      standards refs must live under a loaded profile.
+    * `validate_architecture_refs(plan, contract)` — Plan 35: cited
+      architecture refs must live under `cfg.architecture_docs_dir`.
 
     `audit_findings` may be None or empty — both short-circuit the
     finding-coverage validator (common for `fixup-final` / `fixup-ci`
@@ -136,12 +139,15 @@ def parse_and_validate_fixup_plan(
             "Re-emit a single fenced ```json ... ``` block that conforms "
             "strictly to the schema. Note specifically: "
             "`standards_referenced` items MUST be objects with "
-            '`{"doc_path": "...", "section": "..."}`, not strings.'
+            '`{"doc_path": "...", "section": "..."}`, not strings; '
+            '`architecture_referenced` items MUST also be `{"doc_path": '
+            '"...", "section": "..."}` objects (plan 35).'
         )
     try:
         validate_finding_coverage(plan, audit_findings or [])
         validate_evidence_partition(plan, node)
-        validate_standards_paths(plan, repo_root)
+        validate_standards_refs(plan, contract)
+        validate_architecture_refs(plan, contract)
     except PlannerValidationError as ve:
         return None, (
             f"Your previous fixup plan failed validator `{ve.which}`. "

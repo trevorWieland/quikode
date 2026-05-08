@@ -260,7 +260,7 @@ class PrePrWorkerMixin:
                 return None
             plan, feedback = parse_and_validate_fixup_plan(
                 result.stdout,
-                repo_root=self.cfg.repo_path,
+                contract=contract,
                 node=self.node,
                 audit_findings=audit_findings,
             )

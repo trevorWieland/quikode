@@ -1,16 +1,17 @@
-{# Plan 33: shared evaluation-context partial used by every prompt that
-   needs to render the four-stage audit rubric verbatim. Three macros:
+{# Plan 33 + Plan 35: shared evaluation-context partial. Five stages now.
 
-   * ec_full(contract)                   — all four stage cards (planner,
+   * ec_full(contract)                   — all five stage cards (planner,
                                             fixup-planner, merge-planner)
    * ec_stage_card(contract, stage_name) — one stage card (subtask-doer
-                                            renders four times in order)
+                                            renders five times in order)
    * ec_targeted(contract, subtask)      — only the rubric_targets,
-                                            standards_referenced, and
+                                            standards_referenced,
+                                            architecture_referenced, and
                                             behavior_evidence_advanced
                                             this subtask owns; plus the
                                             always-on local_ci card
-                                            (subtask-checker + triage)
+                                            (subtask-checker + triage).
+                                            Inlines cited section bodies.
 
    StrictUndefined is enabled in `quikode/prompts.py:25` — missing
    contract fields fail loudly at render time, never silently empty. #}
@@ -33,10 +34,42 @@
 {{ stage.source_text }}
 {%- endmacro %}
 
+{% macro _standards_profile_catalog_block(stage) -%}
+### standards stage
+
+{{ stage.one_line }}
+
+**Threshold:** {{ stage.threshold }}
+
+**Grading template (verbatim — what the audit grader emits):**
+
+{{ stage.grading_template }}
+
+**Profile catalog (cite via `standards_referenced[].doc_path`):**
+
+{{ stage.source_text }}
+{%- endmacro %}
+
+{% macro _architecture_toc_block(stage) -%}
+### architecture stage
+
+{{ stage.one_line }}
+
+**Threshold:** {{ stage.threshold }}
+
+**Grading template (verbatim — what the audit grader emits):**
+
+{{ stage.grading_template }}
+
+**Architecture-doc TOC (cite via `architecture_referenced[].doc_path`):**
+
+{{ stage.source_text }}
+{%- endmacro %}
+
 {# ---- public macros ---- #}
 
 {% macro ec_full(contract) -%}
-## The four-stage audit gauntlet (verbatim)
+## The five-stage audit gauntlet (verbatim)
 
 This is the bar your work will be graded against. Every claim you make
 about your work — every subtask declaration, every doer self-audit,
@@ -44,11 +77,24 @@ every checker verdict — should map back onto these stage cards. The
 audit is the truth-of-record; everything upstream of it that contradicts
 the bar will surface as a failed cycle.
 
+The standards stage and architecture stage are PARALLEL but DISTINCT:
+
+* `standards_referenced` cites only standards profile docs (under
+  `standards_profiles_dir`). Language/framework "how to build it" rules.
+* `architecture_referenced` cites only project-architecture docs (under
+  `architecture_docs_dir`). This project's subsystem boundaries and
+  contracts.
+
+Validators reject wrong-bucket placement with a re-prompt; mis-routing
+on retry-2 BLOCKs the plan.
+
 {{ _stage_block(contract.local_ci) }}
 
 {{ _stage_block(contract.rubric) }}
 
-{{ _stage_block(contract.standards) }}
+{{ _standards_profile_catalog_block(contract.standards) }}
+
+{{ _architecture_toc_block(contract.architecture) }}
 
 {{ _stage_block(contract.behavior) }}
 {%- endmacro %}
@@ -59,7 +105,9 @@ the bar will surface as a failed cycle.
 {%- elif stage_name == "rubric" -%}
 {{ _stage_block(contract.rubric) }}
 {%- elif stage_name == "standards" -%}
-{{ _stage_block(contract.standards) }}
+{{ _standards_profile_catalog_block(contract.standards) }}
+{%- elif stage_name == "architecture" -%}
+{{ _architecture_toc_block(contract.architecture) }}
 {%- elif stage_name == "behavior" -%}
 {{ _stage_block(contract.behavior) }}
 {%- else -%}
@@ -69,13 +117,57 @@ the bar will surface as a failed cycle.
 {%- endif %}
 {%- endmacro %}
 
-{% macro ec_targeted(contract, subtask) -%}
-## Targeted bar for this subtask (scoped from the four-stage audit)
+{# Inlining helper for `ec_targeted`. Walks the contract's loaded
+   profile corpus to find the cited doc + section, then emits its
+   body. Falls through to a placeholder if the section isn't found
+   (the validator should have rejected this earlier; the placeholder
+   protects render from crashing on stale persistence). #}
 
-The stage cards below are filtered to the categories, standards refs,
-and witnesses **this subtask explicitly claims to advance**. The
-local-CI card is always-on (every subtask must keep `rc=0`). For the
-full unfiltered contract see the planner's planning-time render.
+{% macro _inline_standards_section(contract, ref) -%}
+{% set _doc = namespace(found=none) -%}
+{% for profile in contract.standards.profiles -%}
+{% for doc in profile.docs -%}
+{% if doc.repo_relative == ref.doc_path -%}
+{% set _doc.found = doc -%}
+{% endif -%}
+{% endfor -%}
+{% endfor -%}
+{% if _doc.found is not none -%}
+**`{{ ref.doc_path }}` § {{ ref.section }}** (profile: {{ _doc.found.profile }}, importance: {{ _doc.found.importance }})
+
+```
+{{ _doc.found.body[:6000] }}
+```
+{%- else -%}
+**`{{ ref.doc_path }}` § {{ ref.section }}** (doc body unavailable — citation may be stale)
+{%- endif -%}
+{%- endmacro %}
+
+{% macro _inline_architecture_section(contract, ref) -%}
+{% set _doc = namespace(found=none) -%}
+{% for doc in contract.architecture.corpus.docs -%}
+{% if doc.repo_relative == ref.doc_path -%}
+{% set _doc.found = doc -%}
+{% endif -%}
+{% endfor -%}
+{% if _doc.found is not none -%}
+**`{{ ref.doc_path }}` § {{ ref.section }}** (architecture doc, title: {{ _doc.found.title }})
+
+```
+{{ _doc.found.body[:6000] }}
+```
+{%- else -%}
+**`{{ ref.doc_path }}` § {{ ref.section }}** (doc body unavailable — citation may be stale)
+{%- endif -%}
+{%- endmacro %}
+
+{% macro ec_targeted(contract, subtask) -%}
+## Targeted bar for this subtask (scoped from the five-stage audit)
+
+The stage cards below are filtered to the categories, refs, and
+witnesses **this subtask explicitly claims to advance**. The local-CI
+card is always-on (every subtask must keep `rc=0`). For the full
+unfiltered contract see the planner's planning-time render.
 
 {{ _stage_block(contract.local_ci) }}
 
@@ -112,8 +204,9 @@ holistically and Z-99 will sweep any drift)
 
 **Standards passages the planner pinned for this subtask:**
 
-{% for ref in subtask.standards_referenced -%}
-- `{{ ref.doc_path }}` § {{ ref.section }}
+{% for ref in subtask.standards_referenced %}
+{{ _inline_standards_section(contract, ref) }}
+
 {% endfor %}
 
 **Grading template (verbatim):**
@@ -125,6 +218,30 @@ holistically and Z-99 will sweep any drift)
 (no standards refs pinned — typical for behavior-only or
 infrastructure-only subtasks; Z-99 will sweep any drift the
 audit catches holistically)
+{% endif %}
+
+{% if subtask.architecture_referenced -%}
+### architecture stage (scoped to this subtask's pinned passages)
+
+{{ contract.architecture.one_line }}
+
+**Threshold:** {{ contract.architecture.threshold }}
+
+**Architecture passages the planner pinned for this subtask:**
+
+{% for ref in subtask.architecture_referenced %}
+{{ _inline_architecture_section(contract, ref) }}
+
+{% endfor %}
+
+**Grading template (verbatim):**
+
+{{ contract.architecture.grading_template }}
+{%- else %}
+### architecture stage
+
+(no architecture refs pinned — typical for tasks that don't cross a
+subsystem boundary; the audit grades holistically against the corpus)
 {% endif %}
 
 {% if subtask.behavior_evidence_advanced -%}

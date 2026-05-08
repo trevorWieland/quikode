@@ -439,7 +439,12 @@ def _build_pipeline_worker(tmp_path, store, mn_id, parent_ev_lists, monkeypatch)
     dag = DAG(nodes=dag_nodes, milestones={"M-1": {"id": "M-1", "title": "x"}}, raw={"nodes": []})
     node = _node_for_merge(mn_id, parent_ids)
     worker = MergeNodeWorker.__new__(MergeNodeWorker)
-    worker.cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json", local_ci_command="just ci")
+    worker.cfg = Config(
+        repo_path=tmp_path,
+        dag_path=tmp_path / "dag.json",
+        state_dir=tmp_path / ".quikode",
+        local_ci_command="just ci",
+    )
     worker.dag = dag
     worker.store = store
     worker.node = node

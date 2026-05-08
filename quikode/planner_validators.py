@@ -1,7 +1,7 @@
-"""Plan 33: hard validators on planner output.
+"""Plan 33 + Plan 35: hard validators on planner output.
 
 Validators run against every parsed `Plan` / `FixupPlan` before the
-planner's output is accepted. The spec-planner driver runs all four:
+planner's output is accepted. The spec-planner driver runs all five:
 
 * `validate_rubric_coverage(plan, contract)` — every category in the
   contract's rubric appears in at least one subtask's `rubric_targets`.
@@ -14,13 +14,21 @@ planner's output is accepted. The spec-planner driver runs all four:
   to both spec and fixup plans (fixups can only narrow the partition,
   not widen it; the audit's `behavior:<id>` findings need exactly-once
   coverage).
-* `validate_standards_paths(plan, repo_root)` — every cited standards
-  doc path resolves to an existing file under `repo_root`. Applies to
-  both spec and fixup plans.
+* `validate_standards_refs(plan, contract)` — Plan 35: every cited
+  `standards_referenced` entry resolves to a doc under a loaded
+  standards profile (frontmatter `kind: standard`), and the cited
+  section heading exists in that doc. Architecture-doc citations in
+  `standards_referenced` are rejected with a bucket-correction message.
+* `validate_architecture_refs(plan, contract)` — Plan 35 (NEW): every
+  cited `architecture_referenced` entry resolves under
+  `cfg.architecture_docs_dir`, and the cited section heading exists.
+  Standards-profile citations in `architecture_referenced` are rejected
+  with a bucket-correction message.
 * `validate_finding_coverage(plan, audit_findings)` — fixup-only.
   Every audit finding-id is covered by exactly one subtask's
   stage-typed field, with namespace dispatch (`rubric:<cat>` →
   `rubric_targets`, `standards:<doc§section>` → `standards_referenced`,
+  `architecture:<doc§section>` → `architecture_referenced`,
   `behavior:<id>` → `behavior_evidence_advanced`).
 
 On failure, callers re-prompt the planner with the validator's message
@@ -35,10 +43,11 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .architecture_docs import find_arch_doc, find_arch_section
 from .evaluation_contract import EvaluationContract, _evidence_canonical_id
+from .standards_profiles import find_doc, find_section
 from .subtask_schema import STABILIZATION_SUBTASK_ID, FixupPlan, Plan
 
 if TYPE_CHECKING:
@@ -237,34 +246,113 @@ def validate_gauntlet_strategy(plan: Plan) -> None:
         )
 
 
-def validate_standards_paths(plan: Plan | FixupPlan, repo_root: Path) -> None:
-    """Every `standards_referenced[].doc_path` must resolve to an existing
-    file under `repo_root` at planning time.
+def validate_standards_refs(plan: Plan | FixupPlan, contract: EvaluationContract) -> None:
+    """Plan 35: every `standards_referenced[].doc_path` must resolve to a
+    loaded standards-profile doc (frontmatter `kind: standard`), and the
+    cited `section` must be a heading present in that doc.
 
-    Resolution: `(repo_root / doc_path).resolve()` must exist as a file.
-    Absolute paths are rejected (the doc must live inside the repo).
+    Replaces the pre-Plan-35 `validate_standards_paths`. Architecture
+    docs cited in `standards_referenced` get a bucket-correction message
+    pointing the planner at `architecture_referenced`.
     """
+    profiles = contract.standards.profiles
+    profile_names = [p.name for p in profiles]
     bad: list[tuple[str, str, str]] = []
     for s in plan.subtasks:
         for ref in s.standards_referenced:
-            p = ref.doc_path
-            if Path(p).is_absolute():
-                bad.append((s.id, p, "absolute paths are forbidden — use repo-relative"))
+            doc = find_doc(profiles, ref.doc_path)
+            if doc is None:
+                bad.append(
+                    (
+                        s.id,
+                        ref.doc_path,
+                        (
+                            "doc_path does not live under any configured "
+                            f"standards profile (loaded: {profile_names!r}). "
+                            "Standards refs MUST cite profile docs (e.g. "
+                            "profiles/rust-cargo/rust/error-handling.md), "
+                            "not architecture or feature documentation. If "
+                            "you meant to cite a project-architecture doc, "
+                            "use `architecture_referenced` instead."
+                        ),
+                    )
+                )
                 continue
-            target = (repo_root / p).resolve()
-            if not target.exists():
-                bad.append((s.id, p, f"file does not exist at {target}"))
-                continue
-            if not target.is_file():
-                bad.append((s.id, p, f"path resolves to a non-file at {target}"))
+            # Per Plan 35 §2.7: confirm the matched doc is a profile-kind
+            # standard. The loader requires `kind: standard` in frontmatter
+            # but we re-check here defensively.
+            # (The loader stores no `kind` field on the dataclass; profiles
+            # only contain `kind: standard` docs by construction. This is
+            # an invariant assertion shaped into a friendly error.)
+            if not find_section(doc, ref.section):
+                available = ", ".join(doc.sections) or "(no headings parsed)"
+                bad.append(
+                    (
+                        s.id,
+                        f"{ref.doc_path}§{ref.section}",
+                        f"section heading {ref.section!r} not found in doc; available: {available}",
+                    )
+                )
     if bad:
         bullets = "\n".join(
-            f"- subtask {sid!r} cites standards path {p!r}: {reason}" for sid, p, reason in bad
+            f"- subtask {sid!r} cites standards ref {p!r}: {reason}" for sid, p, reason in bad
         )
         raise PlannerValidationError(
-            "standards_paths",
-            f"validate_standards_paths: {len(bad)} standards reference(s) "
-            f"do not resolve to existing files. Fix:\n{bullets}",
+            "standards_refs",
+            f"validate_standards_refs: {len(bad)} standards reference(s) "
+            f"do not resolve to a loaded profile doc + section. Fix:\n{bullets}",
+        )
+
+
+def validate_architecture_refs(plan: Plan | FixupPlan, contract: EvaluationContract) -> None:
+    """Plan 35: every `architecture_referenced[].doc_path` must resolve
+    under `cfg.architecture_docs_dir` (the loaded ArchitectureCorpus),
+    and the cited `section` must be a heading present in that doc.
+
+    Standards-profile docs cited in `architecture_referenced` get a
+    bucket-correction message pointing the planner at
+    `standards_referenced`.
+    """
+    corpus = contract.architecture.corpus
+    bad: list[tuple[str, str, str]] = []
+    for s in plan.subtasks:
+        for ref in s.architecture_referenced:
+            doc = find_arch_doc(corpus, ref.doc_path)
+            if doc is None:
+                bad.append(
+                    (
+                        s.id,
+                        ref.doc_path,
+                        (
+                            "doc_path does not live under the configured "
+                            f"architecture_docs_dir ({corpus.root}). "
+                            "Architecture refs MUST cite project-architecture "
+                            "docs, not standards profiles or feature "
+                            "documentation. If you meant to cite a "
+                            "language/framework standard, use "
+                            "`standards_referenced` instead."
+                        ),
+                    )
+                )
+                continue
+            if not find_arch_section(doc, ref.section):
+                available = ", ".join(doc.sections) or "(no headings parsed)"
+                bad.append(
+                    (
+                        s.id,
+                        f"{ref.doc_path}§{ref.section}",
+                        f"section heading {ref.section!r} not found in doc; available: {available}",
+                    )
+                )
+    if bad:
+        bullets = "\n".join(
+            f"- subtask {sid!r} cites architecture ref {p!r}: {reason}" for sid, p, reason in bad
+        )
+        raise PlannerValidationError(
+            "architecture_refs",
+            f"validate_architecture_refs: {len(bad)} architecture "
+            f"reference(s) do not resolve under the configured "
+            f"architecture_docs_dir. Fix:\n{bullets}",
         )
 
 
@@ -296,6 +384,9 @@ def _classify_finding_coverage(
         for ref in s.standards_referenced:
             holders[f"standards:{ref.doc_path}"].append(s.id)
             holders[f"standards:{ref.doc_path}§{ref.section}"].append(s.id)
+        for arch_ref in s.architecture_referenced:
+            holders[f"architecture:{arch_ref.doc_path}"].append(s.id)
+            holders[f"architecture:{arch_ref.doc_path}§{arch_ref.section}"].append(s.id)
         for evid in s.behavior_evidence_advanced:
             holders[f"behavior:{evid}"].append(s.id)
 
@@ -361,7 +452,9 @@ def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> Non
             + "\nAssign each finding to exactly one subtask: a "
             "`rubric:<cat>` finding goes into `rubric_targets`; "
             "`standards:<doc_path>[§section]` goes into "
-            "`standards_referenced`; `behavior:<id>` goes into "
+            "`standards_referenced`; "
+            "`architecture:<doc_path>[§section]` goes into "
+            "`architecture_referenced`; `behavior:<id>` goes into "
             "`behavior_evidence_advanced`."
         )
     if duplicated:

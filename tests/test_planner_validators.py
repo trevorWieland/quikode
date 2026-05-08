@@ -1,13 +1,13 @@
-"""Plan 33: tests for the planner validators.
+"""Plan 33 + Plan 35: tests for the planner validators.
 
-Three validators run after the planner emits a parsed Plan:
+Validators that run after the planner emits a parsed Plan:
 
 * `validate_rubric_coverage` — every rubric category is claimed by at
   least one subtask.
 * `validate_evidence_partition` — every node.expected_evidence id is
   claimed by EXACTLY ONE subtask (partition, not cover).
-* `validate_standards_paths` — every cited standards doc path resolves
-  to a file under the repo root.
+* Plan 35 split: `validate_standards_refs` and
+  `validate_architecture_refs` live in `test_planner_validators_refs.py`.
 
 Plus `validate_gauntlet_strategy` (length 200-2000 chars).
 """
@@ -18,15 +18,20 @@ from pathlib import Path
 
 import pytest
 
+from quikode.architecture_docs import ArchitectureCorpus
 from quikode.dag import Node
-from quikode.evaluation_contract import EvaluationContract, StageRubric
+from quikode.evaluation_contract import (
+    ArchitectureStageRubric,
+    EvaluationContract,
+    StageRubric,
+    StandardsStageRubric,
+)
 from quikode.planner_validators import (
     PlannerValidationError,
     validate_evidence_partition,
     validate_finding_coverage,
     validate_gauntlet_strategy,
     validate_rubric_coverage,
-    validate_standards_paths,
 )
 from quikode.subtask_schema import (
     STABILIZATION_SUBTASK_ID,
@@ -43,6 +48,7 @@ from quikode.subtask_schema import (
 def _make_contract(categories: list[str] | None = None) -> EvaluationContract:
     cats = categories if categories is not None else ["security", "maintainability"]
     rubric_text = "\n".join(f"- **{c}**" for c in cats)
+
     return EvaluationContract(
         task_id="R-001",
         local_ci=StageRubric(
@@ -59,11 +65,18 @@ def _make_contract(categories: list[str] | None = None) -> EvaluationContract:
             grading_template="",
             source_text=rubric_text,
         ),
-        standards=StageRubric(
-            name="standards",
+        standards=StandardsStageRubric(
             one_line="std",
             threshold="no drift",
             grading_template="",
+            profiles=(),
+            source_text="",
+        ),
+        architecture=ArchitectureStageRubric(
+            one_line="arch",
+            threshold="no drift",
+            grading_template="",
+            corpus=ArchitectureCorpus(root=Path("/tmp"), docs=()),
             source_text="",
         ),
         behavior=StageRubric(
@@ -250,62 +263,6 @@ def test_evidence_partition_z99_exempt_when_other_subtask_owns_id():
         z99,
     )
     validate_evidence_partition(plan, node)  # no raise
-
-
-# ----- validate_standards_paths -----
-
-
-def test_standards_paths_passes_when_all_exist(tmp_path: Path):
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "x.md").write_text("standards body")
-    plan = _plan(
-        _subtask(
-            "S-01",
-            standards_referenced=(StandardsRef(doc_path="docs/x.md", section="intro"),),
-        ),
-    )
-    validate_standards_paths(plan, tmp_path)  # no raise
-
-
-def test_standards_paths_fails_when_path_missing(tmp_path: Path):
-    plan = _plan(
-        _subtask(
-            "S-01",
-            standards_referenced=(StandardsRef(doc_path="docs/missing.md", section="x"),),
-        ),
-    )
-    with pytest.raises(PlannerValidationError) as exc_info:
-        validate_standards_paths(plan, tmp_path)
-    assert "S-01" in exc_info.value.message
-    assert "docs/missing.md" in exc_info.value.message
-    assert "does not exist" in exc_info.value.message
-
-
-def test_standards_paths_rejects_absolute_paths(tmp_path: Path):
-    plan = _plan(
-        _subtask(
-            "S-01",
-            standards_referenced=(StandardsRef(doc_path="/etc/passwd", section="x"),),
-        ),
-    )
-    with pytest.raises(PlannerValidationError) as exc_info:
-        validate_standards_paths(plan, tmp_path)
-    assert "absolute paths are forbidden" in exc_info.value.message
-
-
-def test_standards_paths_fails_when_path_is_dir(tmp_path: Path):
-    docs = tmp_path / "docs" / "subdir"
-    docs.mkdir(parents=True)
-    plan = _plan(
-        _subtask(
-            "S-01",
-            standards_referenced=(StandardsRef(doc_path="docs/subdir", section="x"),),
-        ),
-    )
-    with pytest.raises(PlannerValidationError) as exc_info:
-        validate_standards_paths(plan, tmp_path)
-    assert "non-file" in exc_info.value.message
 
 
 # ----- validate_gauntlet_strategy -----

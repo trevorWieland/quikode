@@ -26,6 +26,14 @@ def load_config(root: Path | None = None) -> Config:
         raise FileNotFoundError(f"no quikode config at {cfg_path}; run `quikode init` first")
     raw = tomllib.loads(cfg_path.read_text())
 
+    # Plan 35 hard cutover: retired key (no backcompat shim).
+    if "pre_pr_standards_profile_globs" in raw:
+        raise ValueError(
+            "`pre_pr_standards_profile_globs` is retired (plan 35). "
+            "Migrate to `standards_profiles_dir` + `standards_profiles` + "
+            "`architecture_docs_dir`. See plans/35-standards-profile-linking.md."
+        )
+
     def _agent(d: dict | None, default: AgentRole) -> AgentRole:
         if not d:
             return default
@@ -174,9 +182,21 @@ def load_config(root: Path | None = None) -> Config:
         subtask_check_timeout_s=int(raw.get("subtask_check_timeout_s", defaults.subtask_check_timeout_s)),
         pre_pr_rubric_categories=list(raw.get("pre_pr_rubric_categories", defaults.pre_pr_rubric_categories)),
         pre_pr_rubric_min_score=int(raw.get("pre_pr_rubric_min_score", defaults.pre_pr_rubric_min_score)),
-        pre_pr_standards_profile_globs=list(
-            raw.get("pre_pr_standards_profile_globs", defaults.pre_pr_standards_profile_globs)
+        standards_profiles_dir=_path(
+            raw.get("standards_profiles_dir"),
+            (root / defaults.standards_profiles_dir).resolve()
+            if not defaults.standards_profiles_dir.is_absolute()
+            else defaults.standards_profiles_dir,
         ),
+        standards_profiles=list(raw.get("standards_profiles", defaults.standards_profiles)),
+        architecture_docs_dir=_path(
+            raw.get("architecture_docs_dir"),
+            (root / defaults.architecture_docs_dir).resolve()
+            if not defaults.architecture_docs_dir.is_absolute()
+            else defaults.architecture_docs_dir,
+        ),
+        architecture_doc_globs=list(raw.get("architecture_doc_globs", defaults.architecture_doc_globs)),
+        architecture_path_map=dict(raw.get("architecture_path_map", defaults.architecture_path_map)),
         pre_pr_audit_max_cycles=int(raw.get("pre_pr_audit_max_cycles", defaults.pre_pr_audit_max_cycles)),
         pre_pr_audit_timeout_s=int(raw.get("pre_pr_audit_timeout_s", defaults.pre_pr_audit_timeout_s)),
         daemon_heartbeat_staleness_s=int(

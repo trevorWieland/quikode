@@ -22,10 +22,11 @@ from typing import Any
 from quikode import fsm_runtime
 from quikode.planner_validators import (
     PlannerValidationError,
+    validate_architecture_refs,
     validate_evidence_partition,
     validate_gauntlet_strategy,
     validate_rubric_coverage,
-    validate_standards_paths,
+    validate_standards_refs,
 )
 from quikode.subtask_schema import Plan, PlanValidationError
 
@@ -66,7 +67,8 @@ class PlannerDriverMixin:
             try:
                 validate_rubric_coverage(plan, contract)
                 validate_evidence_partition(plan, self.node)
-                validate_standards_paths(plan, self.cfg.repo_path)
+                validate_standards_refs(plan, contract)
+                validate_architecture_refs(plan, contract)
                 validate_gauntlet_strategy(plan)
             except PlannerValidationError as ve:
                 if attempt_no >= max_validator_retries:

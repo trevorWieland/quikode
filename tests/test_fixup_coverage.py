@@ -13,13 +13,22 @@ silently re-introduce the cross-validator coupling.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
 
 from quikode import planner_validators
+from quikode.architecture_docs import ArchitectureCorpus, load_architecture
+from quikode.config import Config
 from quikode.dag import Node
-from quikode.evaluation_contract import EvaluationContract, StageRubric
+from quikode.evaluation_contract import (
+    ArchitectureStageRubric,
+    EvaluationContract,
+    StageRubric,
+    StandardsStageRubric,
+)
+from quikode.standards_profiles import load_profiles
 from quikode.subtask_schema import Plan, Subtask
 from quikode.workers import fixup_coverage as fc
 from quikode.workers import planner_driver
@@ -27,6 +36,50 @@ from quikode.workers.fixup_coverage import (
     missing_finding_coverage,
     parse_and_validate_fixup_plan,
 )
+
+_PROFILE_FIX = Path(__file__).resolve().parent / "fixtures" / "standards_profiles"
+_ARCH_FIX = Path(__file__).resolve().parent / "fixtures" / "architecture_docs"
+
+
+def _populated_contract(tmp_path: Path) -> EvaluationContract:
+    """Stand up a contract with the fixture profile + architecture trees
+    so `parse_and_validate_fixup_plan` (which now takes a contract) has
+    real corpora to dispatch against. Tests still only exercise the
+    finding/rubric/evidence routing — the standards/architecture refs
+    they emit must point at fixture docs."""
+    profile_root = tmp_path / "profiles"
+    if not profile_root.exists():
+        profile_root.mkdir()
+        shutil.copytree(_PROFILE_FIX / "rust-cargo", profile_root / "rust-cargo")
+    arch_root = tmp_path / "docs" / "architecture"
+    if not arch_root.exists():
+        arch_root.mkdir(parents=True)
+        shutil.copytree(_ARCH_FIX / "subsystems", arch_root / "subsystems")
+    cfg = Config(
+        repo_path=tmp_path,
+        dag_path=tmp_path / "dag.json",
+        standards_profiles_dir=profile_root,
+        standards_profiles=["rust-cargo"],
+        architecture_docs_dir=arch_root,
+    )
+    profiles = load_profiles(cfg)
+    corpus = load_architecture(cfg)
+    return EvaluationContract(
+        task_id="R-001",
+        local_ci=StageRubric(
+            name="local_ci", one_line="", threshold="rc=0", grading_template="", source_text=""
+        ),
+        rubric=StageRubric(
+            name="rubric",
+            one_line="",
+            threshold="",
+            grading_template="",
+            source_text="- **security**\n- **maintainability**",
+        ),
+        standards=StandardsStageRubric(profiles=profiles, source_text=""),
+        architecture=ArchitectureStageRubric(corpus=corpus, source_text=""),
+        behavior=StageRubric(name="behavior", one_line="", threshold="", grading_template="", source_text=""),
+    )
 
 
 def _node(evidence_ids: list[str] | None = None) -> Node:
@@ -100,7 +153,7 @@ def test_fixup_plan_accepts_empty_rubric_targets_when_only_behavior_finding(
     )
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(["B-0066"]),
         audit_findings=["behavior:B-0066"],
     )
@@ -135,7 +188,7 @@ def test_fixup_plan_rejects_string_standards_referenced(tmp_path: Path):
     text = f"```json\n{json.dumps(bad_payload)}\n```"
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=["rubric:security"],
     )
@@ -145,18 +198,17 @@ def test_fixup_plan_rejects_string_standards_referenced(tmp_path: Path):
 
 
 def test_fixup_plan_passes_when_finding_coverage_complete(tmp_path: Path):
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "x.md").write_text("# A\n")
+    """Plan 35: cite a real fixture profile doc + section so the
+    bucket-routing validator passes."""
     text = _fixup_plan_text(
         findings_addressed=["rubric:security", "behavior:B-0066"],
         rubric_targets=[{"category": "security", "predicted_score": 8}],
-        standards_referenced=[{"doc_path": "docs/x.md", "section": "A"}],
+        standards_referenced=[{"doc_path": "profiles/rust-cargo/rust/error-handling.md", "section": "Rules"}],
         behavior_evidence_advanced=["B-0066"],
     )
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(["B-0066"]),
         audit_findings=["rubric:security", "behavior:B-0066"],
     )
@@ -174,7 +226,7 @@ def test_fixup_plan_fails_on_missing_finding(tmp_path: Path):
     )
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=["rubric:security"],
     )
@@ -184,22 +236,22 @@ def test_fixup_plan_fails_on_missing_finding(tmp_path: Path):
     assert "rubric:security" in feedback
 
 
-def test_fixup_plan_fails_on_missing_standards_doc(tmp_path: Path):
-    """`validate_standards_paths` still applies on the fixup side — a
-    fixup plan can't cite a non-existent doc."""
+def test_fixup_plan_fails_on_unknown_standards_ref(tmp_path: Path):
+    """Plan 35: `validate_standards_refs` rejects citations that don't
+    resolve under any loaded profile (here a fictional `docs/missing.md`)."""
     text = _fixup_plan_text(
         findings_addressed=["standards:docs/missing.md§A"],
         standards_referenced=[{"doc_path": "docs/missing.md", "section": "A"}],
     )
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=["standards:docs/missing.md§A"],
     )
     assert plan is None
     assert feedback is not None
-    assert "standards_paths" in feedback or "does not exist" in feedback
+    assert "standards_refs" in feedback or "standards profile" in feedback
 
 
 def test_fixup_plan_accepts_when_audit_findings_empty(tmp_path: Path):
@@ -209,7 +261,7 @@ def test_fixup_plan_accepts_when_audit_findings_empty(tmp_path: Path):
     text = _fixup_plan_text()
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=None,
     )
@@ -232,7 +284,7 @@ def test_missing_finding_coverage_short_circuits_when_findings_addressed_lists_i
     )
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=["rubric:security"],
     )
@@ -247,7 +299,7 @@ def test_missing_finding_coverage_flags_uncovered_finding(tmp_path: Path):
     )
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(),
         audit_findings=None,  # short-circuit the validator
     )
@@ -279,7 +331,7 @@ def test_fixup_driver_does_not_invoke_validate_rubric_coverage(monkeypatch, tmp_
     )
     plan, feedback = parse_and_validate_fixup_plan(
         text,
-        repo_root=tmp_path,
+        contract=_populated_contract(tmp_path),
         node=_node(["B-0066"]),
         audit_findings=["behavior:B-0066"],
     )
@@ -287,10 +339,10 @@ def test_fixup_driver_does_not_invoke_validate_rubric_coverage(monkeypatch, tmp_
     assert calls == []
 
 
-def test_spec_planner_driver_invokes_all_three_spec_validators(monkeypatch):
-    """Symmetric to the fixup-side routing assertion: the spec-planner
-    driver MUST still call `validate_rubric_coverage`,
-    `validate_evidence_partition`, and `validate_standards_paths`."""
+def test_spec_planner_driver_invokes_all_spec_validators(monkeypatch):
+    """Plan 35: the spec-planner driver MUST call `validate_rubric_coverage`,
+    `validate_evidence_partition`, `validate_standards_refs`, and
+    `validate_architecture_refs`."""
     seen: list[str] = []
 
     def _spy(name: str):
@@ -301,11 +353,9 @@ def test_spec_planner_driver_invokes_all_three_spec_validators(monkeypatch):
 
     monkeypatch.setattr(planner_driver, "validate_rubric_coverage", _spy("rubric_coverage"))
     monkeypatch.setattr(planner_driver, "validate_evidence_partition", _spy("evidence_partition"))
-    monkeypatch.setattr(planner_driver, "validate_standards_paths", _spy("standards_paths"))
+    monkeypatch.setattr(planner_driver, "validate_standards_refs", _spy("standards_refs"))
+    monkeypatch.setattr(planner_driver, "validate_architecture_refs", _spy("architecture_refs"))
 
-    # Build a minimal Plan and exercise the validator-orchestration
-    # method on the driver directly. The driver's run_validators helper
-    # is the spec-side mirror of `parse_and_validate_fixup_plan`.
     contract = EvaluationContract(
         task_id="T-1",
         local_ci=StageRubric(
@@ -322,8 +372,9 @@ def test_spec_planner_driver_invokes_all_three_spec_validators(monkeypatch):
             grading_template="",
             source_text="- **security**",
         ),
-        standards=StageRubric(
-            name="standards", one_line="s", threshold="t", grading_template="", source_text=""
+        standards=StandardsStageRubric(profiles=(), source_text=""),
+        architecture=ArchitectureStageRubric(
+            corpus=ArchitectureCorpus(root=Path("/tmp"), docs=()), source_text=""
         ),
         behavior=StageRubric(
             name="behavior", one_line="b", threshold="t", grading_template="", source_text=""
@@ -339,13 +390,17 @@ def test_spec_planner_driver_invokes_all_three_spec_validators(monkeypatch):
     )
     node = _node()
 
-    # We only exercise the validator triplet the driver runs — the
-    # actual driver pulls in agent invocation; that's tested elsewhere.
     planner_driver.validate_rubric_coverage(plan, contract)
     planner_driver.validate_evidence_partition(plan, node)
-    planner_driver.validate_standards_paths(plan, Path("/tmp"))
+    planner_driver.validate_standards_refs(plan, contract)
+    planner_driver.validate_architecture_refs(plan, contract)
 
-    assert seen == ["rubric_coverage", "evidence_partition", "standards_paths"]
+    assert seen == [
+        "rubric_coverage",
+        "evidence_partition",
+        "standards_refs",
+        "architecture_refs",
+    ]
 
 
 # ----- end of tests -----

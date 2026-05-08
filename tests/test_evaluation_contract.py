@@ -1,12 +1,11 @@
-"""Plan 33: tests for the EvaluationContract abstraction + Jinja partial.
+"""Plan 33 + Plan 35: tests for the EvaluationContract abstraction + Jinja partial.
 
 Coverage:
 
 - Constructor (`build_for`) produces a stable contract for a synthetic
   `(node, cfg)` pair.
-- Persistence round-trip (`persist` → `load`) preserves all four
-  StageRubric instances exactly.
-- Standards-text capping at 60k chars, truncate-with-marker behavior.
+- Persistence round-trip (`persist` → `load`) preserves all five stage
+  rubric instances exactly (Plan 35 added `architecture`).
 - Jinja partial macros render the contract into all three variants
   (full / single stage card / targeted-by-subtask) with the expected
   tokens present.
@@ -17,12 +16,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from quikode.architecture_docs import ArchitectureCorpus
 from quikode.config import Config
 from quikode.dag import Node
 from quikode.evaluation_contract import (
+    ArchitectureStageRubric,
     EvaluationContract,
     StageRubric,
-    _gather_standards_text,
+    StandardsStageRubric,
     build_for,
 )
 from quikode.prompts import render
@@ -67,7 +68,10 @@ def _cfg(tmp_path: Path) -> Config:
         sccache_dir=tmp_path / ".quikode" / "sccache",
         pre_pr_rubric_categories=["security", "maintainability", "test_coverage"],
         pre_pr_rubric_min_score=7,
-        pre_pr_standards_profile_globs=[],
+        standards_profiles_dir=tmp_path / "profiles_missing",
+        standards_profiles=[],
+        architecture_docs_dir=tmp_path / "arch_missing",
+        architecture_doc_globs=["**/*.md"],
     )
 
 
@@ -122,7 +126,7 @@ def test_persist_round_trip_preserves_all_stages(tmp_path):
     assert written.exists()
     raw = json.loads(written.read_text())
     assert raw["task_id"] == "R-001"
-    for stage_name in ("local_ci", "rubric", "standards", "behavior"):
+    for stage_name in ("local_ci", "rubric", "standards", "architecture", "behavior"):
         assert stage_name in raw
 
     loaded = EvaluationContract.load(cfg.state_dir, node.id)
@@ -138,46 +142,6 @@ def test_load_raises_when_artifact_missing(tmp_path):
         assert "evaluation contract not found" in str(e)
     else:
         raise AssertionError("expected FileNotFoundError")
-
-
-# ----- standards-text capping -----
-
-
-def test_gather_standards_text_truncates_at_60k(tmp_path):
-    """Exceeding the 60k cap truncates at a line boundary and appends a marker."""
-    docs_dir = tmp_path / "docs" / "standards"
-    docs_dir.mkdir(parents=True)
-    # Write a single doc that goes well over the 60k cap.
-    big = docs_dir / "big.md"
-    line = "this is line content padding the standards doc.\n"
-    # 61k * 50 chars/line ≈ 3M chars — well over the cap.
-    big.write_text(line * 60_000)
-    cfg = _cfg(tmp_path)
-    cfg = cfg.model_copy(update={"pre_pr_standards_profile_globs": ["docs/standards/*.md"]})
-    body, truncated = _gather_standards_text(cfg)
-    assert truncated is True
-    assert "[STANDARDS DOC TRUNCATED" in body
-    assert len(body) < 65_000  # cap + small marker
-
-
-def test_gather_standards_text_under_cap_no_truncation(tmp_path):
-    docs_dir = tmp_path / "docs" / "standards"
-    docs_dir.mkdir(parents=True)
-    (docs_dir / "small.md").write_text("# small standards\n\nbody.\n")
-    cfg = _cfg(tmp_path)
-    cfg = cfg.model_copy(update={"pre_pr_standards_profile_globs": ["docs/standards/*.md"]})
-    body, truncated = _gather_standards_text(cfg)
-    assert truncated is False
-    assert "TRUNCATED" not in body
-    assert "small standards" in body
-
-
-def test_gather_standards_text_with_no_matching_files(tmp_path):
-    cfg = _cfg(tmp_path)
-    cfg = cfg.model_copy(update={"pre_pr_standards_profile_globs": ["docs/nonexistent/*.md"]})
-    body, truncated = _gather_standards_text(cfg)
-    assert truncated is False
-    assert "no standards documents" in body
 
 
 # ----- Jinja partial render variants -----
@@ -219,12 +183,19 @@ def _make_synthetic_contract() -> EvaluationContract:
             grading_template="rubric grading template body",
             source_text="- **security**\n- **maintainability**\n",
         ),
-        standards=StageRubric(
-            name="standards",
+        standards=StandardsStageRubric(
             one_line="standards stage",
             threshold="no drift",
             grading_template="standards grading template",
+            profiles=(),
             source_text="standards canonical text...",
+        ),
+        architecture=ArchitectureStageRubric(
+            one_line="architecture stage",
+            threshold="no drift",
+            grading_template="architecture grading template",
+            corpus=ArchitectureCorpus(root=Path("/tmp"), docs=()),
+            source_text="architecture canonical text...",
         ),
         behavior=StageRubric(
             name="behavior",
@@ -250,12 +221,13 @@ def _make_subtask_with_targets() -> Subtask:
     )
 
 
-def test_partial_ec_full_renders_all_four_stage_cards(tmp_path):
+def test_partial_ec_full_renders_all_five_stage_cards(tmp_path):
     cfg = _cfg(tmp_path)
     out = _render_macro_call(cfg, "{{ ec_full(contract) }}")
     assert "local_ci stage" in out
     assert "rubric stage" in out
     assert "standards stage" in out
+    assert "architecture stage" in out
     assert "behavior stage" in out
     assert "rc=0" in out
     assert "every category >= 7" in out

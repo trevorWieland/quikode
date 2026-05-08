@@ -57,12 +57,25 @@ class RubricTarget(BaseModel):
 
 
 class StandardsRef(BaseModel):
-    """Plan 33: one pinned standards-doc passage governing this subtask.
+    """Plan 33 / Plan 35: one pinned standards-profile-doc passage
+    governing this subtask.
 
-    `doc_path` is repo-relative and validated to exist at planning time
-    by `validate_standards_paths`. `section` is free-form (heading,
-    anchor, paragraph cite). The per-subtask checker reads the cited
-    passage and verifies the diff aligns with it.
+    `doc_path` is repo-relative and validated by
+    `validate_standards_refs` to live under a loaded standards profile
+    (under `cfg.standards_profiles_dir`). `section` is a heading; the
+    validator confirms the heading exists in the cited doc.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    doc_path: str = Field(min_length=1)
+    section: str = Field(min_length=1)
+
+
+class ArchitectureRef(BaseModel):
+    """Plan 35: one pinned project-architecture-doc passage governing
+    this subtask. Parallel to `StandardsRef` but cites docs under
+    `cfg.architecture_docs_dir`, not under any standards profile.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -130,9 +143,22 @@ class Subtask(BaseModel):
     standards_referenced: tuple[StandardsRef, ...] = Field(
         default=(),
         description=(
-            "Plan 33: standards-doc passages the planner has pinned for this "
-            "subtask. Each `doc_path` must exist at planning time "
-            "(validate_standards_paths)."
+            "Plan 33 / Plan 35: standards-profile-doc passages the planner "
+            "has pinned for this subtask. Each `doc_path` MUST resolve to a "
+            "doc under a loaded standards profile (under "
+            "`cfg.standards_profiles_dir`); `validate_standards_refs` "
+            "rejects architecture-doc citations with a bucket-correction "
+            "re-prompt."
+        ),
+    )
+    architecture_referenced: tuple[ArchitectureRef, ...] = Field(
+        default=(),
+        description=(
+            "Plan 35: project-architecture-doc passages the planner has "
+            "pinned for this subtask. Each `doc_path` MUST resolve under "
+            "`cfg.architecture_docs_dir`; `validate_architecture_refs` "
+            "rejects standards-profile citations with a bucket-correction "
+            "re-prompt."
         ),
     )
     behavior_evidence_advanced: tuple[str, ...] = Field(
@@ -152,6 +178,7 @@ class Subtask(BaseModel):
         "interfaces",
         "rubric_targets",
         "standards_referenced",
+        "architecture_referenced",
         "behavior_evidence_advanced",
         mode="before",
     )
@@ -316,6 +343,7 @@ def _build_stabilization_subtask(
         "kind": "spec",
         "rubric_targets": rubric_targets,
         "standards_referenced": [],
+        "architecture_referenced": [],
         "behavior_evidence_advanced": [],
     }
 

@@ -1,10 +1,12 @@
 """Plan 33: the single shared `EvaluationContract` for a task.
 
 Every upstream agent in the pipeline (planner, doer, checker, triage,
-fixup-planner, merge-planner) needs to see — verbatim — the four-stage
-audit gauntlet they will be graded against. Today they each operate on
-a degraded shadow: they know "there is an audit" but they don't see the
-rubric. This module is the fix.
+fixup-planner, merge-planner) needs to see — verbatim — the audit
+gauntlet they will be graded against. Plan 35 widens this from four
+stages to FIVE: `local_ci`, `rubric`, `standards`, `architecture`,
+`behavior`. The architecture stage grades the diff against this
+project's documented subsystem contracts (parallel to standards which
+grades against language/framework profile docs).
 
 The contract is built once at `PROVISIONING → PLANNING`, persisted to
 the per-task state directory, and loaded by every prompt-render entry
@@ -18,18 +20,22 @@ Lifecycle:
   - `EvaluationContract.load(state_dir, task_id) -> EvaluationContract`
     — reads the JSON back.
 
-The four `StageRubric` instances carry the verbatim grading templates
-lifted from `prompts/pre-pr-{rubric,standards,behavior}.md` so a single
-copy ships into every upstream context window.
+The five `StageRubric` instances carry the verbatim grading templates
+lifted from `prompts/pre-pr-{rubric,standards,architecture,behavior}.md`
+so a single copy ships into every upstream context window.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+
+from . import evaluation_contract_serde as serde
+from .architecture_docs import ArchitectureCorpus, load_architecture, render_architecture_toc
+from .standards_profiles import StandardsProfile, load_profiles, render_profile_catalog
 
 if TYPE_CHECKING:
     from .config import Config
@@ -37,10 +43,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("quikode.evaluation_contract")
 
-StageName = Literal["local_ci", "rubric", "standards", "behavior"]
+StageName = Literal["local_ci", "rubric", "standards", "architecture", "behavior"]
 
-_STANDARDS_CHAR_CAP = 60_000
-_TRUNCATION_MARKER_FMT = "\n[STANDARDS DOC TRUNCATED at line {n} of {m}]\n"
 
 # Verbatim grading-template fragments. Each is the JSON-schema portion
 # of the corresponding `prompts/pre-pr-*.md` agent prompt — the bar an
@@ -78,18 +82,47 @@ For each standards alignment finding, the audit grader emits:
   "file": "<repo-relative path>",
   "line": <integer or null>,
   "severity": "low" | "medium" | "high" | "critical",
-  "standards_doc_ref": "<doc + section>",
+  "profile_doc_ref": "<doc + section>",
   "description": "...",
   "concrete_fix": "..."
 }
 ```
 
 The gate fails when ANY finding has severity >= medium. Every diff hunk
-is checked against every relevant standards section — implementation
-that matches the canonical text wins; implementation that drifts
-generates a finding. Pin standards refs in your subtask declarations
-(`standards_referenced`) so the per-subtask checker can verify alignment
-against the same passages the audit will read.
+is checked against every relevant standards profile section —
+implementation that matches the canonical text wins; implementation
+that drifts generates a finding. Pin standards refs in your subtask
+declarations (`standards_referenced`) so the per-subtask checker can
+verify alignment against the same passages the audit will read.
+Standards refs cite ONLY profile docs (under standards_profiles_dir);
+project-architecture concerns belong on the architecture stage.
+"""
+
+_ARCHITECTURE_GRADING_TEMPLATE = """\
+For each architecture-alignment finding, the audit grader emits:
+
+```json
+{
+  "id": "<kebab-case>",
+  "file": "<repo-relative path>",
+  "line": <integer or null>,
+  "severity": "low" | "medium" | "high" | "critical",
+  "architecture_doc_ref": "<doc + section>",
+  "description": "...",
+  "concrete_fix": "..."
+}
+```
+
+The gate fails when ANY finding has severity >= medium. The architecture
+audit grades the diff against this project's documented subsystem
+contracts: module/subsystem boundaries, undocumented cross-subsystem
+coupling, deviations from documented interface contracts, missing
+telemetry the architecture mandates. Pin architecture refs in your
+subtask declarations (`architecture_referenced`) so the per-subtask
+checker can verify alignment against the same passages the audit will
+read. Architecture refs cite ONLY project-architecture docs (under
+architecture_docs_dir); language/framework standards belong on the
+standards stage.
 """
 
 _BEHAVIOR_GRADING_TEMPLATE = """\
@@ -129,7 +162,7 @@ command; a failure anywhere is the gate's failure.
 
 @dataclass(frozen=True)
 class StageRubric:
-    """One stage of the four-stage audit gauntlet.
+    """One generic stage of the audit gauntlet (local_ci, rubric, behavior).
 
     `name` is the canonical stage id. `one_line` is a humanizing summary
     used at the top of the stage card. `threshold` declares the bar
@@ -137,8 +170,8 @@ class StageRubric:
     is the JSON schema fragment the audit grader produces against;
     upstream agents read it to understand *exactly* the shape they're
     being graded into. `source_text` is the canonical source the stage
-    references (rubric category list with blurbs, standards doc text,
-    or expected_evidence witness list).
+    references (rubric category list with blurbs, expected_evidence
+    witness list).
     """
 
     name: StageName
@@ -149,8 +182,40 @@ class StageRubric:
 
 
 @dataclass(frozen=True)
+class StandardsStageRubric:
+    """The standards stage carries the loaded profile corpus alongside
+    the rendered catalog. `profiles` is consulted by
+    `validate_standards_refs` (membership check). `source_text` is the
+    rendered catalog used in `ec_full` prompt blocks.
+    """
+
+    name: Literal["standards"] = "standards"
+    one_line: str = ""
+    threshold: str = ""
+    grading_template: str = ""
+    profiles: tuple[StandardsProfile, ...] = ()
+    source_text: str = ""
+
+
+@dataclass(frozen=True)
+class ArchitectureStageRubric:
+    """The architecture stage carries the loaded project-architecture
+    corpus alongside the rendered TOC. `corpus` is consulted by
+    `validate_architecture_refs` (membership check). `source_text` is
+    the rendered TOC used in `ec_full` prompt blocks.
+    """
+
+    name: Literal["architecture"] = "architecture"
+    one_line: str = ""
+    threshold: str = ""
+    grading_template: str = ""
+    corpus: ArchitectureCorpus = field(default_factory=lambda: ArchitectureCorpus(root=Path(), docs=()))
+    source_text: str = ""
+
+
+@dataclass(frozen=True)
 class EvaluationContract:
-    """The full four-stage rubric for one task.
+    """The full five-stage rubric for one task.
 
     Built exactly once at PROVISIONING → PLANNING, persisted to the
     per-task state directory, loaded fresh on every prompt-render. The
@@ -162,7 +227,8 @@ class EvaluationContract:
     task_id: str
     local_ci: StageRubric
     rubric: StageRubric
-    standards: StageRubric
+    standards: StandardsStageRubric
+    architecture: ArchitectureStageRubric
     behavior: StageRubric
 
     # ----- persistence -----
@@ -175,8 +241,11 @@ class EvaluationContract:
         target_dir = state_dir / task_id
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / "evaluation_contract.json"
-        target.write_text(json.dumps(_to_jsonable(self), indent=2, sort_keys=True))
+        target.write_text(json.dumps(serde.to_jsonable(self), indent=2, sort_keys=True))
         return target
+
+    # The decoder helpers live as classmethod-adjacent functions below so
+    # `load` can call them without a forward-reference dance.
 
     @classmethod
     def load(cls, state_dir: Path, task_id: str) -> EvaluationContract:
@@ -192,84 +261,89 @@ class EvaluationContract:
                 f"evaluation contract not found at {target}; build_for+persist must run before load"
             )
         raw = json.loads(target.read_text())
-        return _from_jsonable(raw)
-
-
-def _to_jsonable(contract: EvaluationContract) -> dict[str, object]:
-    """Stable dict shape: explicit field ordering for deterministic JSON."""
-    return {
-        "task_id": contract.task_id,
-        "local_ci": asdict(contract.local_ci),
-        "rubric": asdict(contract.rubric),
-        "standards": asdict(contract.standards),
-        "behavior": asdict(contract.behavior),
-    }
-
-
-_VALID_STAGE_NAMES: tuple[StageName, ...] = ("local_ci", "rubric", "standards", "behavior")
-
-
-def _coerce_stage_name(value: object) -> StageName:
-    text = str(value)
-    if text not in _VALID_STAGE_NAMES:
-        raise ValueError(f"unknown stage name {text!r}; expected one of {list(_VALID_STAGE_NAMES)!r}")
-    # Re-cast through the known-literal tuple so the static checker can
-    # narrow the result to the StageName Literal alias without an inline
-    # type-ignore.
-    for known in _VALID_STAGE_NAMES:
-        if known == text:
-            return known
-    raise ValueError(f"unreachable: stage name {text!r} passed allowlist but not matched")
-
-
-def _from_jsonable(raw: dict[str, object]) -> EvaluationContract:
-    def _get_str(blob: dict[str, object], key: str, default: str = "") -> str:
-        v = blob.get(key)
-        if v is None:
-            return default
-        return str(v)
-
-    def _stage(blob: object) -> StageRubric:
-        if not isinstance(blob, dict):
-            raise ValueError(f"expected stage dict, got {type(blob).__name__}")
-        # `blob` here came from json.loads which produces dict[str, Any];
-        # the static checker narrows it to a bare `dict` without value
-        # type info, so we re-typed via the `dict[str, object]` cast below.
-        typed: dict[str, object] = {str(k): v for k, v in blob.items()}
-        return StageRubric(
-            name=_coerce_stage_name(typed.get("name")),
-            one_line=_get_str(typed, "one_line"),
-            threshold=_get_str(typed, "threshold"),
-            grading_template=_get_str(typed, "grading_template"),
-            source_text=_get_str(typed, "source_text"),
+        return cls(
+            task_id=str(raw["task_id"]),
+            local_ci=_decode_stage(raw["local_ci"]),
+            rubric=_decode_stage(raw["rubric"]),
+            standards=_decode_standards(raw["standards"]),
+            architecture=_decode_architecture(raw["architecture"]),
+            behavior=_decode_stage(raw["behavior"]),
         )
 
-    return EvaluationContract(
-        task_id=str(raw["task_id"]),
-        local_ci=_stage(raw["local_ci"]),
-        rubric=_stage(raw["rubric"]),
-        standards=_stage(raw["standards"]),
-        behavior=_stage(raw["behavior"]),
+
+def _decode_stage(blob: object) -> StageRubric:
+    kwargs = serde.stage_kwargs(blob)
+    return StageRubric(
+        name=_narrow_stage_name(kwargs["name"]),
+        one_line=str(kwargs["one_line"]),
+        threshold=str(kwargs["threshold"]),
+        grading_template=str(kwargs["grading_template"]),
+        source_text=str(kwargs["source_text"]),
     )
+
+
+def _decode_standards(blob: object) -> StandardsStageRubric:
+    kwargs = serde.standards_stage_kwargs(blob)
+    profiles_raw = kwargs["profiles"]
+    profiles: tuple[StandardsProfile, ...] = ()
+    if isinstance(profiles_raw, tuple):
+        profiles = tuple(p for p in profiles_raw if isinstance(p, StandardsProfile))
+    return StandardsStageRubric(
+        one_line=str(kwargs["one_line"]),
+        threshold=str(kwargs["threshold"]),
+        grading_template=str(kwargs["grading_template"]),
+        profiles=profiles,
+        source_text=str(kwargs["source_text"]),
+    )
+
+
+def _decode_architecture(blob: object) -> ArchitectureStageRubric:
+    kwargs = serde.architecture_stage_kwargs(blob)
+    corpus = kwargs["corpus"]
+    return ArchitectureStageRubric(
+        one_line=str(kwargs["one_line"]),
+        threshold=str(kwargs["threshold"]),
+        grading_template=str(kwargs["grading_template"]),
+        corpus=corpus if isinstance(corpus, ArchitectureCorpus) else ArchitectureCorpus(root=Path(), docs=()),
+        source_text=str(kwargs["source_text"]),
+    )
+
+
+def _narrow_stage_name(value: object) -> StageName:
+    """Narrow a serde-decoded stage name (typed `object`) to StageName."""
+    text = str(value)
+    if text == "local_ci":
+        return "local_ci"
+    if text == "rubric":
+        return "rubric"
+    if text == "standards":
+        return "standards"
+    if text == "architecture":
+        return "architecture"
+    if text == "behavior":
+        return "behavior"
+    raise ValueError(f"unknown stage name {text!r}")
 
 
 # ----- builder -----
 
 
 def build_for(node: Node, cfg: Config) -> EvaluationContract:
-    """Construct the contract for one task. Pure function: no I/O on
-    cfg/node, but DOES read the standards docs from disk under
-    `cfg.repo_path` matching `cfg.pre_pr_standards_profile_globs`.
+    """Construct the contract for one task. Pure function except for
+    on-disk reads of standards profiles + architecture docs under the
+    configured roots.
 
     Idempotent in shape (same `(node, cfg)` → equal contract), but the
-    standards source_text reflects on-disk state at build time. Per
-    Plan 33 D1, this is called exactly once at PROVISIONING → PLANNING.
+    standards and architecture corpora reflect on-disk state at build
+    time. Per Plan 33 D1, this is called exactly once at
+    PROVISIONING → PLANNING.
     """
     return EvaluationContract(
         task_id=node.id,
         local_ci=_build_local_ci(cfg),
         rubric=_build_rubric(cfg),
         standards=_build_standards(cfg),
+        architecture=_build_architecture(cfg),
         behavior=_build_behavior(node),
     )
 
@@ -310,14 +384,34 @@ def _build_rubric(cfg: Config) -> StageRubric:
     )
 
 
-def _build_standards(cfg: Config) -> StageRubric:
-    body, _truncated = _gather_standards_text(cfg)
-    return StageRubric(
-        name="standards",
-        one_line="Repo-specific architectural alignment with the standards docs (canonical text below).",
-        threshold="no drift from any cited section",
+def _build_standards(cfg: Config) -> StandardsStageRubric:
+    profiles = load_profiles(cfg)
+    source_text = render_profile_catalog(profiles)
+    return StandardsStageRubric(
+        one_line=(
+            "Language/framework standards-profile alignment. Cite passages "
+            "via `standards_referenced` (NOT `architecture_referenced`)."
+        ),
+        threshold="no drift from any cited profile section",
         grading_template=_STANDARDS_GRADING_TEMPLATE,
-        source_text=body,
+        profiles=profiles,
+        source_text=source_text,
+    )
+
+
+def _build_architecture(cfg: Config) -> ArchitectureStageRubric:
+    corpus = load_architecture(cfg)
+    source_text = render_architecture_toc(corpus)
+    return ArchitectureStageRubric(
+        one_line=(
+            "Project-architecture alignment with this repo's documented "
+            "subsystem contracts. Cite via `architecture_referenced` "
+            "(NOT `standards_referenced`)."
+        ),
+        threshold="no drift from any cited architecture section",
+        grading_template=_ARCHITECTURE_GRADING_TEMPLATE,
+        corpus=corpus,
+        source_text=source_text,
     )
 
 
@@ -379,96 +473,3 @@ def _evidence_canonical_id(ev: dict) -> str:
     kind = ev.get("kind", "evidence")
     desc = (ev.get("description") or "")[:32].strip().replace(" ", "-").lower()
     return f"ev-{kind}-{desc}" if desc else f"ev-{kind}"
-
-
-def _resolve_standards_paths(cfg: Config) -> list[Path]:
-    """Resolve every standards doc matching the configured globs, in
-    sorted-path order, deduped. Returns possibly-empty list of files."""
-    repo = Path(cfg.repo_path)
-    globs = list(cfg.pre_pr_standards_profile_globs or [])
-    seen: set[Path] = set()
-    paths: list[Path] = []
-    for pattern in globs:
-        for p in sorted(repo.glob(pattern)):
-            if p.is_file() and p not in seen:
-                seen.add(p)
-                paths.append(p)
-    return paths
-
-
-def _read_path_lines(path: Path) -> tuple[str, list[str]] | None:
-    """Read a file as text + per-line list. Logs and returns None on OSError."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as e:
-        log.warning("standards: cannot read %s: %s", path, e)
-        return None
-    return text, text.splitlines()
-
-
-def _accept_lines_under_budget(lines: list[str], budget: int) -> tuple[str, int]:
-    """Greedily accept lines until adding one more would exceed `budget`.
-    Returns (joined-text, lines-accepted). Newlines re-inserted between
-    lines (one '\n' per joined pair)."""
-    accepted: list[str] = []
-    accepted_len = 0
-    for line in lines:
-        line_len = len(line) + 1  # newline
-        if accepted_len + line_len > budget:
-            break
-        accepted.append(line)
-        accepted_len += line_len
-    return "\n".join(accepted), len(accepted)
-
-
-def _gather_standards_text(cfg: Config) -> tuple[str, bool]:
-    """Read every doc matching `cfg.pre_pr_standards_profile_globs`, in
-    sorted-path order. Cap the combined text at 60k chars; truncate at
-    line boundaries with a marker. Returns (text, truncated).
-    """
-    repo = Path(cfg.repo_path)
-    paths = _resolve_standards_paths(cfg)
-    if not paths:
-        return ("(no standards documents matched the configured globs)", False)
-
-    chunks: list[str] = []
-    total_chars = 0
-    truncated = False
-    total_lines = 0
-    captured_lines = 0
-    for path in paths:
-        read_result = _read_path_lines(path)
-        if read_result is None:
-            continue
-        text, path_lines = read_result
-        total_lines += len(path_lines)
-        if truncated:
-            continue
-        rel = path.relative_to(repo) if path.is_relative_to(repo) else path
-        header = f"\n\n=== {rel} ===\n\n"
-        budget = _STANDARDS_CHAR_CAP - total_chars - len(header)
-        if budget <= 0:
-            truncated = True
-            continue
-        if len(text) <= budget:
-            chunks.append(header)
-            chunks.append(text)
-            total_chars += len(header) + len(text)
-            captured_lines += len(path_lines)
-            continue
-        accepted_text, accepted_count = _accept_lines_under_budget(path_lines, budget)
-        chunks.append(header)
-        chunks.append(accepted_text)
-        total_chars += len(header) + len(accepted_text) + 1
-        captured_lines += accepted_count
-        truncated = True
-
-    body = "".join(chunks).strip("\n")
-    if truncated:
-        log.warning(
-            "evaluation_contract: standards corpus truncated at %d/%d lines (60k char cap)",
-            captured_lines,
-            total_lines,
-        )
-        body += _TRUNCATION_MARKER_FMT.format(n=captured_lines, m=total_lines)
-    return body, truncated

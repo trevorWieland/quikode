@@ -16,7 +16,14 @@ from __future__ import annotations
 from pathlib import Path
 
 from quikode import pre_pr_audit
+from quikode.architecture_docs import ArchitectureCorpus
 from quikode.config import Config
+from quikode.evaluation_contract import (
+    ArchitectureStageRubric,
+    EvaluationContract,
+    StageRubric,
+    StandardsStageRubric,
+)
 
 # ----- Rubric envelope parsing -----
 
@@ -218,33 +225,25 @@ def test_collect_finding_ids_dedupes_across_stages():
 # ----- collect_standards_text -----
 
 
-def test_collect_standards_text_reads_globbed_docs(tmp_path: Path):
-    (tmp_path / "docs" / "standards").mkdir(parents=True)
-    (tmp_path / "docs" / "standards" / "rust.md").write_text("# Rust standards\n\nUse `?` not `unwrap`.\n")
-    (tmp_path / "docs" / "standards" / "tests.md").write_text("# Test standards\n\nNo `assert_eq!(x, x)`.\n")
-    (tmp_path / "AGENTS.md").write_text("# Agents\n\nFollow the spec.\n")
-    (tmp_path / "README.md").write_text("Top-level README — should NOT be picked up by default globs.\n")
-
-    cfg = Config(
-        repo_path=tmp_path,
-        dag_path=tmp_path / "dag.json",
-        pre_pr_standards_profile_globs=[
-            "docs/standards/**/*.md",
-            "AGENTS.md",
-        ],
+def test_collect_standards_text_returns_contract_source_text(tmp_path: Path):
+    """Plan 35 PR-A: collect_standards_text now reads the contract's
+    pre-rendered `standards.source_text`. The legacy on-disk-glob fallback
+    was retired alongside `pre_pr_standards_profile_globs`.
+    """
+    cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json")
+    contract = EvaluationContract(
+        task_id="R-T",
+        local_ci=StageRubric(name="local_ci", one_line="", threshold="", grading_template="", source_text=""),
+        rubric=StageRubric(name="rubric", one_line="", threshold="", grading_template="", source_text=""),
+        standards=StandardsStageRubric(source_text="rendered profile catalog"),
+        architecture=ArchitectureStageRubric(corpus=ArchitectureCorpus(root=tmp_path, docs=())),
+        behavior=StageRubric(name="behavior", one_line="", threshold="", grading_template="", source_text=""),
     )
-    text = pre_pr_audit.collect_standards_text(cfg)
-    assert "Rust standards" in text
-    assert "Test standards" in text
-    assert "Agents" in text
-    assert "Top-level README" not in text
+    text = pre_pr_audit.collect_standards_text(cfg, contract=contract)
+    assert text == "rendered profile catalog"
 
 
-def test_collect_standards_text_missing_dir_returns_empty(tmp_path: Path):
-    cfg = Config(
-        repo_path=tmp_path,
-        dag_path=tmp_path / "dag.json",
-        pre_pr_standards_profile_globs=["docs/standards/**/*.md"],
-    )
+def test_collect_standards_text_no_contract_returns_empty(tmp_path: Path):
+    cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json")
     text = pre_pr_audit.collect_standards_text(cfg)
     assert text == ""

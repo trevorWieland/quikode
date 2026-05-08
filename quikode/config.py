@@ -442,14 +442,12 @@ class Config(BaseModel):
         ge=1,
         le=10,
     )
-    pre_pr_standards_profile_globs: list[str] = Field(
-        default_factory=lambda: [
-            "docs/standards/**/*.md",
-            "docs/architecture/**/*.md",
-            "AGENTS.md",
-            "CONTRIBUTING.md",
-        ],
-    )
+    # plan 35: standards profile + architecture-doc roots
+    standards_profiles_dir: Path = Field(Path("profiles"), description="Standards profile root.")
+    standards_profiles: list[str] = Field(default_factory=list, description="Profile names that apply.")
+    architecture_docs_dir: Path = Field(Path("docs/architecture"), description="Architecture-docs root.")
+    architecture_doc_globs: list[str] = Field(default_factory=lambda: ["**/*.md"], description="Doc globs.")
+    architecture_path_map: dict[str, str] = Field(default_factory=dict, description="Path→doc map (PR-B).")
     pre_pr_audit_max_cycles: int = Field(
         default=10,
         ge=1,

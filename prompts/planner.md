@@ -8,22 +8,39 @@ The orchestrator drives a per-subtask doer/checker loop in topological
 order. Each subtask becomes one focused doer invocation with its own
 checker pass; they should be small enough that an agent can do one in a
 single session without losing context. After the spec subtasks land,
-the four-stage audit gauntlet runs — your plan must be positioned to
+the five-stage audit gauntlet runs — your plan must be positioned to
 pass that audit on cycle 1.
 
 ## 1. Your job in one sentence
 
 Decompose this node into 4-8 subtasks that, executed in order, will
-**pass the four-stage audit on cycle 1**. Every subtask declares
-which rubric categories it advances, which standards passages it
-honors, and which behavior witnesses it delivers — so the per-subtask
-doer/checker loop can verify the same bar the audit will use.
+**pass the five-stage audit on cycle 1**. Every subtask declares which
+rubric categories it advances, which standards passages it honors,
+which architecture passages it honors, and which behavior witnesses it
+delivers — so the per-subtask doer/checker loop can verify the same
+bar the audit will use.
 
 ## 2. The bar you are studying for (verbatim)
 
 {{ ec_full(contract) }}
 
 This is the test. Write subtasks that pass it.
+
+## 2.5 The two-bucket distinction (HARD rule)
+
+`standards_referenced` cites only **standards profile docs** under
+`standards_profiles_dir`. These describe how to build code in this
+language/framework regardless of project (e.g. Rust+Cargo error
+handling, React+TS hook conventions).
+
+`architecture_referenced` cites only **project-architecture docs**
+under `architecture_docs_dir`. These describe THIS project's subsystem
+boundaries, interface contracts, and cross-subsystem constraints.
+
+**The validators reject the wrong-bucket placement with a re-prompt; if
+you mis-route on retry-2, the plan BLOCKs.** Read the source-text
+sections of both stages above before citing — every cited path appears
+in the catalog/TOC.
 
 ## 3. The DAG node
 
@@ -69,13 +86,14 @@ This is the test. Write subtasks that pass it.
 
 The orchestrator parses your plan into the schema below. Every subtask
 carries the standard descriptive fields (id, title, depends_on,
-acceptance, files_to_touch, ...), PLUS three Plan 33 stage-typed fields:
+acceptance, files_to_touch, ...), PLUS the stage-typed fields:
 
 - `rubric_targets: [{ "category": "<must be in the contract's rubric category list>", "predicted_score": <int 1-10> }, ...]`
-- `standards_referenced: [{ "doc_path": "<repo-relative path to a standards doc that exists at planning time>", "section": "<heading or anchor>" }, ...]`
+- `standards_referenced: [{ "doc_path": "<repo-relative path UNDER standards_profiles_dir>", "section": "<heading>" }, ...]`
+- `architecture_referenced: [{ "doc_path": "<repo-relative path UNDER architecture_docs_dir>", "section": "<heading>" }, ...]`
 - `behavior_evidence_advanced: ["<canonical id from node.expected_evidence>", ...]`
 
-A worked micro-example (reflects a hypothetical archival-feature subtask):
+A worked micro-example demonstrating the two-bucket distinction:
 
 ```jsonc
 {
@@ -94,7 +112,10 @@ A worked micro-example (reflects a hypothetical archival-feature subtask):
     { "category": "edge-case-handling", "predicted_score": 8 }
   ],
   "standards_referenced": [
-    { "doc_path": "docs/standards/web.md", "section": "list-views" }
+    { "doc_path": "profiles/rust-cargo/rust/error-handling.md", "section": "Rules" }
+  ],
+  "architecture_referenced": [
+    { "doc_path": "docs/architecture/subsystems/identity-policy.md", "section": "Permissions" }
   ],
   "behavior_evidence_advanced": ["B-0061-web-positive", "B-0061-web-falsification"],
   "interfaces": [],
@@ -102,10 +123,14 @@ A worked micro-example (reflects a hypothetical archival-feature subtask):
 }
 ```
 
+Note how the two ref buckets cite from DIFFERENT trees. Standards refs
+live under `profiles/<profile-name>/...`; architecture refs live under
+`docs/architecture/...`. The two are NOT interchangeable.
+
 ## 5. Coverage demands (positive framing)
 
-Three hard rules — the orchestrator validates each on parse and
-re-prompts you if any fails:
+Hard rules — the orchestrator validates each on parse and re-prompts
+you if any fails:
 
 1. **Every rubric category** in the contract above must appear in **at
    least one** subtask's `rubric_targets`. Z-99 (the system-injected
@@ -116,9 +141,20 @@ re-prompts you if any fails:
 2. **Every behavior evidence id** in `node.expected_evidence` must
    appear in **exactly one** subtask's `behavior_evidence_advanced`.
    This is a partition, not a cover — duplicates are an error.
-3. **Every cited standards doc path** must exist in the repo at
-   planning time. Use repo-relative paths (`docs/standards/web.md`,
-   not `/home/...`).
+3. **Every cited `standards_referenced[]`** must resolve to a doc
+   loaded from a configured standards profile (under
+   `standards_profiles_dir`); the cited section must be a heading in
+   that doc. Architecture docs cited here will be REJECTED with a
+   bucket-correction re-prompt.
+4. **Every cited `architecture_referenced[]`** must resolve to a doc
+   under `architecture_docs_dir`; the cited section must be a heading
+   in that doc. Standards-profile docs cited here will be REJECTED
+   with a bucket-correction re-prompt.
+
+`architecture_referenced` is NOT required on every subtask — many
+subtasks (test-only, infrastructure, generic refactor) legitimately
+cite none. But when the work touches a subsystem boundary, cite the
+governing architecture doc + section.
 
 ## 6. The `gauntlet_strategy` field (200-2000 chars)
 
@@ -128,8 +164,10 @@ cycle 1. Specifically address:
 
 - Which subtasks carry the rubric weight, and why those subtasks'
   predicted scores will hold under adversarial review.
-- How standards alignment is preserved (which standards docs you
+- How standards alignment is preserved (which profile docs you
   consulted and how each subtask's diff respects them).
+- How architecture alignment is preserved (which subsystem contracts
+  the diff touches and how each subtask's slice respects them).
 - Where each behavior witness comes from (which subtask owns each
   evidence id) and how it will produce substantive — not stub — output.
 - What local-CI risks exist (migration ordering? line-budget? BDD-tag
@@ -148,7 +186,7 @@ the fenced block is parsed.
 {
   "node_id": "{{ node.id }}",
   "summary": "1-3 sentence overview of the approach",
-  "gauntlet_strategy": "200-2000 char prose section explaining how the plan passes each of the four audit stages on cycle 1...",
+  "gauntlet_strategy": "200-2000 char prose section explaining how the plan passes each of the five audit stages on cycle 1...",
   "subtasks": [
     {
       "id": "S-01-domain",
@@ -161,7 +199,10 @@ the fenced block is parsed.
         { "category": "<one of the contract's rubric categories>", "predicted_score": 8 }
       ],
       "standards_referenced": [
-        { "doc_path": "docs/.../path.md", "section": "<section heading>" }
+        { "doc_path": "profiles/<profile>/<category>/<name>.md", "section": "<section heading>" }
+      ],
+      "architecture_referenced": [
+        { "doc_path": "docs/architecture/subsystems/<subsystem>.md", "section": "<section heading>" }
       ],
       "behavior_evidence_advanced": [],
       "interfaces": [],
@@ -174,6 +215,7 @@ the fenced block is parsed.
     "{{ contract.local_ci.threshold }} for `{{ contract.local_ci.name }}`",
     "every rubric category clears `{{ contract.rubric.threshold }}`",
     "every cited standards passage stays aligned",
+    "every cited architecture passage stays aligned",
     "every behavior_evidence_advanced id witnessed by passing test"
   ]
 }
@@ -187,13 +229,15 @@ the fenced block is parsed.
   with strict `extra="forbid"` Pydantic — extra fields are rejected.
 - Every category in `rubric_targets[].category` MUST be a member of
   the contract's rubric category list. Typos won't pass coverage.
-- Every `standards_referenced[].doc_path` MUST exist at the path you
-  give. The validator runs `os.path.exists` against
-  `{{ repo_root }}/<doc_path>`.
+- `standards_referenced` cites ONLY profile docs (under
+  `standards_profiles_dir`). `architecture_referenced` cites ONLY
+  project-architecture docs (under `architecture_docs_dir`). The
+  validators reject wrong-bucket placement with a re-prompt; if you
+  mis-route on retry-2, the plan BLOCKs.
 - The orchestrator appends Z-99 to your plan automatically — DO NOT
   emit it yourself. Your last spec subtask will end before Z-99.
 
 Repository conventions: investigate `/workspace`, read the relevant
-standards docs cited in the contract, check the `justfile`,
-pre-commit hooks, and any `AGENTS.md`/`CONTRIBUTING.md` files. Then
-emit the JSON.
+profile docs in the standards stage's catalog and the architecture
+docs in the architecture stage's TOC, check the `justfile`, pre-commit
+hooks, and any `AGENTS.md`/`CONTRIBUTING.md` files. Then emit the JSON.

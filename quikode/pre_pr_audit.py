@@ -254,35 +254,15 @@ def _parse_rubric_envelope(text: str) -> dict | None:
 
 
 def collect_standards_text(cfg: Config, *, contract: EvaluationContract | None = None) -> str:
-    """Plan 33 PR-B: when a per-task `EvaluationContract` is available,
-    use its already-collected `standards.source_text` instead of
-    re-reading the standards docs from disk. Falls back to the on-disk
-    glob path when no contract is supplied (e.g. tests that exercise
-    the audit module in isolation, or callers that haven't migrated).
-
-    Files outside the repo are silently dropped; missing globs are fine
-    (the agent simply has less context). Truncated to 60k chars total."""
-    if contract is not None:
-        text = contract.standards.source_text or ""
-        return text[:60000]
-    parts: list[str] = []
-    seen: set[Path] = set()
-    for pat in cfg.pre_pr_standards_profile_globs:
-        for path in cfg.repo_path.glob(pat):
-            if not path.is_file() or path in seen:
-                continue
-            seen.add(path)
-            try:
-                rel = path.relative_to(cfg.repo_path)
-            except ValueError:
-                rel = path
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            parts.append(f"## {rel}\n\n{content[:8000]}")
-    blob = "\n\n---\n\n".join(parts)
-    return blob[:60000]
+    """Plan 33 PR-B / Plan 35 PR-A: returns the contract's already-built
+    `standards.source_text` (the rendered profile catalog). Returns an
+    empty string when no contract is supplied (the prior on-disk glob
+    fallback path was retired in plan 35 along with
+    `pre_pr_standards_profile_globs`). Truncated to 60k chars."""
+    if contract is None:
+        return ""
+    text = contract.standards.source_text or ""
+    return text[:60000]
 
 
 def run_standards_audit(
@@ -303,15 +283,16 @@ def run_standards_audit(
             name="standards",
             passed=False,
             summary=(
-                "cfg.pre_pr_standards_profile_globs matched no readable docs — "
-                "configure standards docs to enable the gate"
+                "no standards profile docs loaded — configure "
+                "`standards_profiles_dir` + `standards_profiles` to enable the gate"
             ),
             findings=[
                 {
                     "kind": "config_error",
                     "message": (
-                        "No standards profile docs found. Add docs at one of "
-                        f"{list(cfg.pre_pr_standards_profile_globs)}."
+                        "No standards profile docs loaded. Set "
+                        "`standards_profiles_dir` and `standards_profiles` "
+                        "in quikode config (plan 35)."
                     ),
                 }
             ],
