@@ -19,11 +19,13 @@ from quikode.config import Config
 from quikode.dag import DAG
 from quikode.github_graphql import ReviewThread
 from quikode.orchestration import scheduler
+from quikode.orchestration.candidates import CandidatesMixin
 from quikode.orchestration.merge_watch import MergeWatchMixin
 from quikode.orchestration.rebase_watch import RebaseWatchMixin
 from quikode.orchestration.review_watch import ReviewWatchMixin
 from quikode.orchestration.supervision import SupervisionMixin
 from quikode.state import State, Store, TaskRow
+from quikode.workers.factory import build_task_worker
 from quikode.workers.task_worker import TaskWorker
 
 log = logging.getLogger("quikode.orchestrator")
@@ -34,6 +36,7 @@ __all__ = [
     "TaskRow",
     "TaskWorker",
     "_worktree_mtime",
+    "build_task_worker",
     "cast",
     "docker_env",
     "github",
@@ -75,7 +78,7 @@ def _worktree_mtime(path: Path) -> float | None:
     return latest if latest > 0 else None
 
 
-class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWatchMixin):
+class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWatchMixin, CandidatesMixin):
     def __init__(
         self,
         cfg: Config,
@@ -226,79 +229,6 @@ class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWa
         self._apply_pick_side_effects(best)
         return str(best["task_id"])
 
-    def _collect_pick_candidates(self, scope: set[str], in_flight: set[str]) -> list[dict]:
-        """Enumerate all tasks currently eligible for scheduling. No side
-        effects. Each candidate carries the metadata `_apply_pick_side_effects`
-        and `_score_candidate` need so they can act without re-deriving.
-
-        Stacking eligibility honors `cfg.stacking_readiness` via
-        `scheduler.is_parent_stack_ready`. Resume signals (has_open_pr,
-        subtask done/total) are pulled per candidate via
-        `scheduler._resume_signals` and consumed by `_score_candidate`.
-        """
-        completed = self.store.completed_ids() & scope
-        active = self.store.active_ids() & scope
-        candidates: list[dict] = []
-        for nid in sorted(scope):
-            if nid in completed or nid in active or nid in in_flight:
-                continue
-            n = self.dag.nodes.get(nid)
-            if n is None:
-                continue
-            row = self.store.get(nid)
-            if row and row["state"] not in (State.PENDING.value,):
-                continue
-            in_scope_deps = [d for d in n.depends_on if d in self.dag.nodes]
-            unmet = [d for d in in_scope_deps if d not in completed]
-            has_open_pr, sub_done, sub_total = scheduler._resume_signals(row, self.store)
-            base_meta = {
-                "row": row,
-                "has_open_pr": has_open_pr,
-                "subtask_done": sub_done,
-                "subtask_total": sub_total,
-            }
-            if not unmet:
-                candidates.append({"task_id": nid, "is_stacked": False, "unmet": [], **base_meta})
-                continue
-            if self.cfg.stacking_strategy == "off":
-                continue
-            unmet_states = {d: (self.store.get(d) or {}).get("state") for d in unmet}
-            if not all(
-                scheduler.is_parent_stack_ready(
-                    cfg=self.cfg,
-                    parent_state=s,
-                    parent_id=d,
-                    store=self.store,
-                )
-                for d, s in unmet_states.items()
-            ):
-                continue
-            if self.cfg.stacking_strategy == "within-milestone" and not all(
-                self.dag.nodes[d].milestone == n.milestone for d in unmet
-            ):
-                continue
-            depth = self._stack_depth(unmet[0])
-            if depth >= self.cfg.stacking_max_depth:
-                continue
-            if self._would_form_cycle(nid, unmet[0]):
-                log.warning(
-                    "refusing to stack %s on %s — would form parent_task_id cycle",
-                    nid,
-                    unmet[0],
-                )
-                continue
-            root = self._stack_root(unmet[0])
-            if self._stack_size_under_root(root) >= self.cfg.stacking_max_breadth_per_root:
-                log.warning(
-                    "task %s would exceed stacking_max_breadth_per_root (%d) under root %s",
-                    nid,
-                    self.cfg.stacking_max_breadth_per_root,
-                    root,
-                )
-                continue
-            candidates.append({"task_id": nid, "is_stacked": True, "unmet": unmet, **base_meta})
-        return candidates
-
     def _score_candidate(self, c: dict, scope: set[str]) -> int:
         """Delegate to the shared scorer in `scheduler.py` so workers see
         the same priority signal at yield time."""
@@ -317,18 +247,23 @@ class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWa
 
         For stacked children, stamp the full parent chain (v3.5 Phase 2):
         `parent_task_ids` / `parent_branches` / `parent_pr_branches` JSON
-        arrays carry every unmet stack-ready parent. Single-parent code paths
-        (rebase-to-main, parent_branch lookups) read the same chain data.
-        For multi-parent picks (>1 unmet) the worker's provisioning step
-        constructs a synthetic merge-base branch off this list.
+        arrays carry every unmet stack-ready parent. For plan-32 multi-parent
+        picks (`unmet=[merge_node_id]` after reduction), the chain is
+        single-element-merge-node — single-parent code paths apply.
 
         For fresh roots, clear any stale parent linkage left over from a
-        prior stacking that no longer applies.
+        prior stacking that no longer applies. Plan 32: never clear linkage
+        for `kind="merge"` rows (their parent_task_ids hold the source
+        parent set, which propagation logic depends on).
         """
         nid = c["task_id"]
+        row = c.get("row") or self.store.get(nid) or {}
+        is_merge_node = (row.get("kind") or "spec") == "merge"
         if not c["is_stacked"]:
-            # Clear any stale parent linkage from a prior stacking round.
-            if self.store.get_parent_task_ids(nid):
+            # Clear any stale parent linkage from a prior stacking round —
+            # but never for merge-nodes, whose parent_task_ids carry the
+            # source parent set used by propagate_parent_* hooks.
+            if not is_merge_node and self.store.get_parent_task_ids(nid):
                 self.store.clear_parent_branch(nid)
                 self.store.set_parent_merge_base(nid, branch=None, sha=None)
             return
@@ -490,8 +425,14 @@ class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWa
         return True
 
     def _run_one(self, task_id: str):
-        node = self.dag.nodes[task_id]
-        worker = TaskWorker(self.cfg, self.dag, self.store, node)
+        # Plan 32: pick worker class by `kind`. Spec tasks have a DAG node;
+        # merge-nodes don't (runtime-created), so pass the id and let the
+        # factory synthesize a Node from the store row.
+        if task_id in self.dag.nodes:
+            node: Any = self.dag.nodes[task_id]
+        else:
+            node = task_id
+        worker = build_task_worker(self.cfg, self.dag, self.store, node)
         return worker.run()
 
     # ----- v3 Phase B: review-watcher pass -----

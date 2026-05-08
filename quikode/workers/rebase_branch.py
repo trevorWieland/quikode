@@ -209,19 +209,15 @@ class RebaseBranchMixin:
         which always targeted main; now picks `--onto main parent.sha` (target=main,
         un-stack semantic) vs `git rebase origin/parent.branch` (target=parent_tip,
         stay-stacked semantic).
+
+        Plan 32: multi-parent children reduce to a single merge-node parent
+        at provision/scheduling time, so `parent_branches` is always a
+        single-element list here (the merge-node's branch). The previous
+        multi-parent BLOCK is deleted.
         """
         row = self._row()
         branch = str(row["branch"])
         parent_branches = self.store.get_parent_branches(self.node.id)
-        # Plan 31: multi-parent rebase deferred to plan 32 (merge-node).
-        if target_kind == "parent_tip" and len(parent_branches) > 1:
-            note = (
-                f"inline parent_tip rebase requested for {self.node.id} with "
-                f"parents={parent_branches}; deferred to plan 32 (merge-node "
-                f"first-class entity)"
-            )
-            fsm_runtime.block_current(self.store, self.node.id, note=note, last_error=note[:1000])
-            return False
         if target_kind == "parent_tip":
             return self._rebase_inline_to_parent_tip(branch, parent_branches[0])
         return self._rebase_inline_to_main(branch, parent_branches)
@@ -245,14 +241,14 @@ class RebaseBranchMixin:
         return push_rc == 0
 
     def _rebase_inline_to_main(self: Any, branch: str, parent_branches: list[str]) -> bool:
-        row = self._row()
+        # Plan 32: parent_branches is always 0 or 1 entries (multi-parent
+        # reduces to a single merge-node parent at provision time). The
+        # pre-plan-32 multi-parent merge-base sha lookup is deleted.
         parent_sha = ""
         if len(parent_branches) == 1:
             rc_ps, ps_out = self._git_in_workspace(["rev-parse", "--verify", parent_branches[0]])
             if rc_ps == 0:
                 parent_sha = ps_out.strip().splitlines()[-1] if ps_out.strip() else ""
-        elif len(parent_branches) > 1:
-            parent_sha = str(row.get("parent_merge_base_sha") or "")
         self._git_in_workspace(["fetch", self.cfg.pr_remote, self.cfg.base_branch])
         if parent_sha:
             rc, _out = self._git_in_workspace(

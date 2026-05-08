@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from quikode import merge_node as merge_node_mod
 from quikode import stacking
 from quikode.config import Config, StackingStrategy
 from quikode.dag import DAG
@@ -212,9 +213,10 @@ def _make_dag(tmp_path: Path, edges: list[tuple[str, list[str]]]) -> DAG:
     return DAG.load(p)
 
 
-def test_picker_stamps_multi_parent_chain(tmp_path):
-    """When a child has 2 stack-ready parents, the picker writes both to
-    parent_task_ids. The old scalar column gets the FIRST sorted id."""
+def test_picker_creates_merge_node_for_multi_parent_child(tmp_path):
+    """Plan 32: when a child has 2 stack-ready source parents, the picker
+    creates a merge-node and picks it FIRST. The child stays deferred until
+    the merge-node reaches MERGE_NODE_READY."""
     edges = [
         ("R-001", []),
         ("R-002", []),
@@ -234,12 +236,15 @@ def test_picker_stamps_multi_parent_chain(tmp_path):
     store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-aaa")
     store.transition("R-002", State.PENDING_CI, branch="quikode/r-002-bbb")
 
+    # Plan 32: picker creates merge-node, picks IT first (child waits).
     nxt = o._pick_next({"R-001", "R-002", "R-099"}, set())
-    assert nxt == "R-099"
-    # Multi-parent stamping landed.
-    assert store.get_parent_task_ids("R-099") == ["R-001", "R-002"]
-    branches = store.get_parent_branches("R-099")
-    assert "quikode/r-001-aaa" in branches and "quikode/r-002-bbb" in branches
+    expected_mn = merge_node_mod.compute_merge_node_id(["R-001", "R-002"])
+    assert nxt == expected_mn
+    # Merge-node was materialized with both source parents.
+    mn_row = store.get(expected_mn)
+    assert mn_row is not None
+    assert mn_row["kind"] == "merge"
+    assert store.get_parent_task_ids(expected_mn) == ["R-001", "R-002"]
 
 
 def test_picker_clears_parent_chain_on_fresh_root(tmp_path):

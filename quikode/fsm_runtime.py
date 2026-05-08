@@ -201,3 +201,13 @@ def retry_task(store: Any, task_id: str, *, note: str | None = None, **fields: A
 
 def resume_task(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
     return store.apply_event(task_id, Event.RESUME_TASK, note=note, **fields)
+
+
+def merge_node_built(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+    """Plan 32: PRE_PR_AUDITING → MERGE_NODE_READY for `kind="merge"` rows.
+
+    Spec tasks fire AUDIT_PASSED → PR_OPENING; merge-nodes never open a PR,
+    so they fire MERGE_NODE_BUILT and become an integration artifact that
+    serves as the effective base for downstream multi-parent children.
+    """
+    return store.apply_event(task_id, Event.MERGE_NODE_BUILT, note=note, **fields)

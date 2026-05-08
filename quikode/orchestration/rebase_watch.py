@@ -214,9 +214,7 @@ class RebaseWatchMixin:
         Used to translate cascade triggers (keyed on branch) into the
         task-id-keyed propagate_parent_* APIs."""
         with self.store._tx_lock:
-            r = self.store.conn.execute(
-                "SELECT id FROM tasks WHERE branch = ? LIMIT 1", (branch,)
-            ).fetchone()
+            r = self.store.conn.execute("SELECT id FROM tasks WHERE branch = ? LIMIT 1", (branch,)).fetchone()
         return str(r["id"]) if r else None
 
     def _remote_branch_exists(self: Any, branch: str) -> bool:
@@ -330,11 +328,20 @@ class RebaseWatchMixin:
         return True
 
     def _run_rebase_to_main_one(self: Any, task_id: str):
-        node = self.dag.nodes[task_id]
-        worker = _rt.TaskWorker(self.cfg, self.dag, self.store, node)
+        # Plan 32: rebase entries only fire on spec tasks (merge-nodes aren't
+        # rebased — they're rebuilt). Use the factory so `kind` dispatch
+        # routes correctly even if a future caller invokes it for a merge-node.
+        if task_id in self.dag.nodes:
+            node: Any = self.dag.nodes[task_id]
+        else:
+            node = task_id
+        worker = _rt.build_task_worker(self.cfg, self.dag, self.store, node)
         return worker.run_rebase_to_main()
 
     def _run_rebase_to_parent_tip_one(self: Any, task_id: str):
-        node = self.dag.nodes[task_id]
-        worker = _rt.TaskWorker(self.cfg, self.dag, self.store, node)
+        if task_id in self.dag.nodes:
+            node: Any = self.dag.nodes[task_id]
+        else:
+            node = task_id
+        worker = _rt.build_task_worker(self.cfg, self.dag, self.store, node)
         return worker.run_rebase_to_parent_tip()

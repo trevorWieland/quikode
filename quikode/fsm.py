@@ -209,9 +209,7 @@ POST_PR_STATES = frozenset({State.PENDING_CI, State.AWAITING_REVIEW})
 RETRYABLE_STATES = frozenset({State.BLOCKED, State.FAILED, State.ABORTED})
 # Plan 32: MERGE_NODE_READY joins STACK_READY_STATES — children depending on a
 # merge-node fork off it once it's built + audited.
-STACK_READY_STATES = frozenset(
-    {State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_NODE_READY}
-)
+STACK_READY_STATES = frozenset({State.PENDING_CI, State.AWAITING_REVIEW, State.MERGE_NODE_READY})
 
 
 def _coerce_state(state: State | str) -> State:

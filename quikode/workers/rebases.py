@@ -114,16 +114,12 @@ class RebaseWorkerMixin(RebaseBranchMixin, RebaseConflictMixin):
     def _prepare_rebase_plan(
         self: Any, row: dict[str, Any], pre_state: State, target_kind: TargetKind
     ) -> _RebasePlan | WorkerOutcome:
+        # Plan 32: multi-parent children reduce to a single merge-node parent
+        # at provision/scheduling time, so by the time we're rebasing the
+        # child, `parent_branches` is always a single-element list. The
+        # plan-31 multi-parent BLOCK is deleted — the merge-node IS the
+        # effective single parent.
         parent_branches = self.store.get_parent_branches(self.node.id)
-        # Plan 31 multi-parent: deferred to plan 32. BLOCK with a clear note.
-        if target_kind == "parent_tip" and len(parent_branches) > 1:
-            note = (
-                f"multi-parent stack-on-parent rebase requested for {self.node.id} "
-                f"with parents={parent_branches}; deferred to plan 32 "
-                f"(merge-node first-class entity). BLOCKING."
-            )
-            fsm_runtime.block_current(self.store, self.node.id, note=note, last_error=note[:1000])
-            return WorkerOutcome(State.BLOCKED, "multi-parent rebase deferred to plan 32")
         if target_kind == "parent_tip":
             return self._prepare_parent_tip_plan(parent_branches, pre_state)
         return self._prepare_main_plan(row, parent_branches, pre_state)

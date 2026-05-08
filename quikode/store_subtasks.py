@@ -341,8 +341,7 @@ class StoreSubtaskMixin:
         """
         with self.tx() as c:
             r = c.execute(
-                "SELECT parent_task_ids, parent_branches, parent_pr_branches "
-                "FROM tasks WHERE id = ?",
+                "SELECT parent_task_ids, parent_branches, parent_pr_branches FROM tasks WHERE id = ?",
                 (merge_node_id,),
             ).fetchone()
             if r is None:

@@ -17,12 +17,12 @@ from quikode import (
     github,
     github_graphql,
     manual_probe,
+    merge_node,
     pre_pr_audit,
     prompts,
     retry_classify,
     scope_review,
     sound,
-    stacking,
     worktree,
 )
 from quikode.agents import build_agent
@@ -70,12 +70,12 @@ _PATCH_EXPORTS = (
     github,
     github_graphql,
     manual_probe,
+    merge_node,
     pre_pr_audit,
     prompts,
     retry_classify,
     scope_review,
     sound,
-    stacking,
     worktree,
     build_agent,
     ProgressAttempt,
@@ -232,35 +232,19 @@ class TaskWorker(
         wt_dir = docker_env.slugify(self.node.id) + (f"-{suffix}" if suffix else "")
         wt_path = (self.cfg.worktree_root / wt_dir).resolve()
 
-        # Multi-parent stacking. The orchestrator stamps the full parent
-        # chain into `parent_task_ids` / `parent_branches` JSON arrays.
-        # When > 1 parent, build a synthetic merge-base branch
-        # (`quikode/<id>-base-<6hex>`) off `git merge` of the parent tips
-        # and fork the worktree from there. When == 1 parent, branch off
-        # that parent's branch directly. When 0, branch off the configured base.
+        # Plan 32: multi-parent children resolve to a merge-node. The
+        # orchestrator stamps `parent_task_ids` / `parent_branches` from the
+        # source DAG parents; at provisioning time, when `len(parent_task_ids)
+        # > 1` we look up the merge-node, assert it's MERGE_NODE_READY (the
+        # scheduler refuses to schedule the child until then), and rewrite
+        # parent_branches/parent_pr_branches to a single-element list of the
+        # merge-node's branch. From this point the child sees a single
+        # effective parent — all single-parent code paths apply.
+        source_parent_ids = self.store.get_parent_task_ids(self.node.id)
+        if len(source_parent_ids) > 1:
+            self._reduce_multi_parent_to_merge_node(source_parent_ids)
         parent_branches = self.store.get_parent_branches(self.node.id)
-        parent_branch: str | None = None
-        if len(parent_branches) > 1:
-            # Build the merge-base branch off the configured base + every parent's tip.
-            worktree.fetch_base(self.cfg.repo_path, self.cfg.pr_remote, self.cfg.base_branch)
-            mb_name = stacking.compute_merge_base_branch_name(self.node.id, parent_branches)
-            mb_sha = stacking.construct_merge_base(
-                repo_path=self.cfg.repo_path,
-                parent_branches=parent_branches,
-                branch_name=mb_name,
-                base_branch=self.cfg.base_branch,
-            )
-            if not mb_sha:
-                note = (
-                    f"multi-parent merge-base construction failed for "
-                    f"{parent_branches}; cannot provision worktree"
-                )
-                self._safe_crash_current(note)
-                raise RuntimeError(note)
-            self.store.set_parent_merge_base(self.node.id, branch=mb_name, sha=mb_sha)
-            parent_branch = mb_name
-        elif len(parent_branches) == 1:
-            parent_branch = parent_branches[0]
+        parent_branch: str | None = parent_branches[0] if parent_branches else None
         worktree.fetch_base(self.cfg.repo_path, self.cfg.pr_remote, self.cfg.base_branch)
         # Capture the base SHA at branch creation. Used by Phase A's
         # conflict resolver to compute "what landed since" and by Phase B's
@@ -293,6 +277,61 @@ class TaskWorker(
             worktree_path=str(wt_path),
             base_ref_sha=base_ref_sha,
             last_synced_main_sha=base_ref_sha,
+        )
+
+    def _reduce_multi_parent_to_merge_node(self, source_parent_ids: list[str]) -> None:
+        """Plan 32: rewrite a multi-parent child's parent_branches to a
+        single-element list pointing at its merge-node.
+
+        Pre-condition: the scheduler refuses to schedule a multi-parent
+        child until its merge-node is `MERGE_NODE_READY`. If we encounter
+        a non-ready merge-node here, that's a scheduler bug — crash so the
+        operator sees the misordering rather than silently provisioning
+        against the wrong base.
+
+        Post-condition: `parent_branches` and `parent_pr_branches` on the
+        child's row contain exactly one entry — the merge-node's branch.
+        Single-parent code paths (cascade-on-push, rebase-to-parent-tip)
+        operate on this single effective parent. The merge-node itself
+        carries the original multi-parent JSON for forensics + propagation.
+        """
+        sorted_ids = sorted(source_parent_ids)
+        mn_id = merge_node.compute_merge_node_id(sorted_ids)
+        mn_row = self.store.get(mn_id)
+        if mn_row is None:
+            note = (
+                f"task {self.node.id} has {len(sorted_ids)} parents but no "
+                f"merge-node {mn_id} exists; scheduler should have created it. "
+                f"Refusing to provision against an undefined effective base."
+            )
+            self._safe_crash_current(note)
+            raise RuntimeError(note)
+        mn_state = str(mn_row.get("state") or "")
+        if mn_state != State.MERGE_NODE_READY.value:
+            note = (
+                f"task {self.node.id} merge-node {mn_id} is {mn_state!r}, "
+                f"not {State.MERGE_NODE_READY.value!r}; scheduler should have "
+                f"deferred provisioning until ready."
+            )
+            self._safe_crash_current(note)
+            raise RuntimeError(note)
+        mn_branch = str(mn_row.get("branch") or "")
+        if not mn_branch:
+            note = f"merge-node {mn_id} is READY but has no branch; data corruption?"
+            self._safe_crash_current(note)
+            raise RuntimeError(note)
+        log.info(
+            "task %s: reducing multi-parent (%s) to merge-node %s (branch=%s)",
+            self.node.id,
+            ",".join(sorted_ids),
+            mn_id,
+            mn_branch,
+        )
+        self.store.set_parent_chain(
+            self.node.id,
+            parent_task_ids=[mn_id],
+            parent_branches=[mn_branch],
+            parent_pr_branches=[mn_branch],
         )
 
     def _existing_worktree_path(self) -> Path:
@@ -429,6 +468,32 @@ def _parse_intent_verdict(text: str) -> IntentReviewOutcome:
 def _last_lines(s: str, n: int) -> str:
     lines = s.splitlines()
     return "\n".join(lines[-n:])
+
+
+def synthesize_node_for_runtime_task(store: Store, task_id: str) -> Node:
+    """Build a minimal `Node` object for a runtime-created task (merge-node)
+    that has no DAG entry. Most fields are blank; the worker only really
+    reads `id` and `title`. `expected_evidence` and `depends_on` come from
+    the store row's parent_task_ids (sorted) so audit/scheduler stays sane.
+    """
+    row = store.get(task_id) or {}
+    parent_ids = store.get_parent_task_ids(task_id) if row else []
+    return Node(
+        id=task_id,
+        kind=str(row.get("kind") or "merge"),
+        milestone="",
+        title=f"merge-node integrating {','.join(parent_ids)}",
+        scope="",
+        depends_on=tuple(parent_ids),
+        completes_behaviors=(),
+        supports_behaviors=(),
+        boundary_with_neighbors="",
+        expected_evidence=(),
+        playbook=(),
+        rationale="",
+        risks=(),
+        raw={},
+    )
 
 
 def _extract_root_cause(checker_output: str) -> str:
