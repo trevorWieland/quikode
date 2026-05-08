@@ -36,18 +36,29 @@ Diff:
 
 ## How to decide
 
-- **NO_DRIFT** — main's changes are unrelated to this task. The implementation as-is still satisfies the intent. Most reviews land here; default to this when uncertain in either direction.
-- **MINOR_DRIFT** — there are surface-level adjustments needed (a renamed function call, a small API shape change, a moved file) but the task's intent is intact. A clean rebase + small fix-up will resolve.
-- **INTENT_CONFLICT** — main introduced something this task was supposed to add, removed something this task depended on, or added new instances of a pattern this task was supposed to apply universally (e.g., this task adds `bar` to every `foo`; main added a new `foo` without `bar`). The plan needs updating.
+- **no_drift** — main's changes are unrelated to this task. The implementation as-is still satisfies the intent. Most reviews land here; default to this when uncertain in either direction.
+- **minor_drift** — there are surface-level adjustments needed (a renamed function call, a small API shape change, a moved file) but the task's intent is intact. A clean rebase + small fix-up will resolve.
+- **intent_conflict** — main introduced something this task was supposed to add, removed something this task depended on, or added new instances of a pattern this task was supposed to apply universally (e.g., this task adds `bar` to every `foo`; main added a new `foo` without `bar`). The plan needs updating.
 
 ## Output format — strict
 
+Return a single JSON object matching the `IntentReviewVerdict` schema
+(no surrounding prose, no markdown fences):
+
+```json
+{
+  "verdict": "no_drift",
+  "affected_areas": ["path/or/symbol1"],
+  "explanation": "<2-4 sentences. Cite specific commits/files. If intent_conflict, say what concretely needs replanning.>",
+  "next_actions": []
+}
 ```
-VERDICT: NO_DRIFT | MINOR_DRIFT | INTENT_CONFLICT
 
-AFFECTED_AREAS: <comma-separated file paths or symbols, or "none">
+`verdict` must be one of `no_drift`, `minor_drift`, `intent_conflict`.
+`affected_areas` is a list of paths/symbols (empty list when nothing is
+affected). `next_actions` lists optional follow-up steps the worker
+should consider; leave it empty when the verdict is `no_drift`.
 
-EXPLANATION: <2-4 sentences. Cite specific commits/files. If INTENT_CONFLICT, say what concretely needs replanning.>
-```
-
-Keep it short — this review fires after every dep merge so it must be cheap. If the diff against main is empty or trivial, just emit NO_DRIFT immediately.
+Keep it short — this review fires after every dep merge so it must be
+cheap. If the diff against main is empty or trivial, just emit
+`no_drift` with empty `affected_areas` and `next_actions`.

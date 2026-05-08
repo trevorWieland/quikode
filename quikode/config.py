@@ -17,36 +17,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .profiles import ProfileName
 
 
-class AgentCli(StrEnum):
-    """Which agent CLI to invoke."""
-
-    CLAUDE = "claude"
-    CODEX = "codex"
-    OPENCODE = "opencode"
-
-
 class StackingStrategy(StrEnum):
     """Phase C stacking — how aggressively child PRs stack on uncommitted parents."""
 
     OFF = "off"
     WITHIN_MILESTONE = "within-milestone"
     AGGRESSIVE = "aggressive"
-
-
-class AgentRole(BaseModel):
-    """Per-phase agent assignment (which CLI, which model)."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    cli: AgentCli = Field(description="Which agent CLI to invoke for this phase.")
-    model: str | None = Field(
-        default=None,
-        description="Model id passed to the CLI's --model flag. None = CLI default.",
-    )
-    extra_args: list[str] = Field(
-        default_factory=list,
-        description="Extra args appended verbatim to the CLI invocation.",
-    )
 
 
 class Config(BaseModel):
@@ -503,39 +479,6 @@ class Config(BaseModel):
         description="Shared rust build cache mounted into all containers.",
     )
 
-    # ----- agent role assignments -----
-    # Heavy reasoning roles run on codex gpt-5.5; lightweight verdict roles
-    # run on codex gpt-5.4-mini. Claude was retired from default config due
-    # to subscription token-expiry issues — every claude call risked a 401
-    # mid-run, which surfaced as cascading "fixup planner returned empty"
-    # BLOCKs across the workspace.
-    planner: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.5"),
-        description="Planner agent — emits structured plan JSON.",
-    )
-    doer: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.OPENCODE, model="zai-coding-plan/glm-5.1"),
-        description="Doer agent — implements subtasks.",
-    )
-    checker: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.3-codex"),
-        description="Checker agent — runs the playbook + acceptance.",
-    )
-    triage: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.5"),
-        description="Triage agent — root-causes failures.",
-    )
-    conflict_resolver: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.5"),
-        description="Resolves rebase conflicts via the agent's full reasoning budget.",
-    )
-    intent_reviewer: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.4-mini"),
-    )
-    progress: AgentRole = Field(
-        default_factory=lambda: AgentRole(cli=AgentCli.CODEX, model="gpt-5.4-mini"),
-    )
-
     # ----- plan 38 PR-A: role → MODEL bindings + per-role timeouts -----
     # Per-role model resolved via `quikode.model_registry.MODELS`. CLI derived
     # from the model — no `<role>_cli` knob. Defaults MUST match
@@ -557,6 +500,12 @@ class Config(BaseModel):
     merge_planner_timeout_s: int = Field(default=1800, ge=120, le=7200)
     conflict_resolver_timeout_s: int = Field(default=1800, ge=60, le=14400)
     progress_timeout_s: int = Field(default=180, ge=30, le=1800)
+    # Plan 38 PR-B.7: intent reviewer + replan planner roles migrated off
+    # the retired `cfg.<role>: AgentRole` accessors onto the JsonAgent layer.
+    intent_reviewer_model: str = Field(default="gpt-5.5")
+    intent_reviewer_timeout_s: int = Field(default=600, ge=60, le=3600)
+    replan_planner_model: str = Field(default="gpt-5.5")
+    replan_planner_timeout_s: int = Field(default=1800, ge=60, le=14400)
 
     # ----- auth mounts -----
     claude_auth_dir: Path = Field(default_factory=lambda: Path.home() / ".claude")
@@ -591,8 +540,6 @@ class Config(BaseModel):
 
 
 __all__ = [
-    "AgentCli",
-    "AgentRole",
     "Config",
     "StackingStrategy",
 ]

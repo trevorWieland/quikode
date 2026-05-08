@@ -25,21 +25,12 @@ triage_budget_per_phase = 3
 [execution]
 # Reserved for future remote backends ("ssh-docker", "vm-sandbox").
 
-[agents.planner]
-cli = "codex"
-model = "gpt-5.5"
-
-[agents.doer]
-cli = "opencode"
-model = "zai-coding-plan/glm-5.1"
-
-[agents.checker]
-cli = "codex"
-model = "gpt-5.3-codex"
-
-[agents.triage]
-cli = "codex"
-model = "gpt-5.5"
+# Plan 38 PR-B.7: per-role MODEL bindings. The CLI is derived from the
+# model via quikode.model_registry — no [agents.<phase>] sections.
+planner_model = "gpt-5.5"
+subtask_doer_model = "GLM-5.1-zai"
+subtask_checker_model = "gpt-5.5"
+subtask_triage_model = "gpt-5.5"
 """
 
 
@@ -88,21 +79,12 @@ host_reserved_cpu = {int(resources.get("host_reserved_cpu", 4))}
 host_reserved_mem_gb = {int(resources.get("host_reserved_mem_gb", 16))}
 max_parallel_auto = {_toml_bool(bool(resources.get("max_parallel_auto", False)))}
 
-[agents.planner]
-cli = "codex"
-model = "gpt-5.5"
-
-[agents.doer]
-cli = "opencode"
-model = "zai-coding-plan/glm-5.1"
-
-[agents.checker]
-cli = "codex"
-model = "gpt-5.3-codex"
-
-[agents.triage]
-cli = "codex"
-model = "gpt-5.5"
+# Plan 38 PR-B.7: per-role MODEL bindings. The CLI is derived from the
+# model via quikode.model_registry — no [agents.<phase>] sections.
+planner_model = "gpt-5.5"
+subtask_doer_model = "GLM-5.1-zai"
+subtask_checker_model = "gpt-5.5"
+subtask_triage_model = "gpt-5.5"
 """
 
 

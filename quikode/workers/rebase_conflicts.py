@@ -6,6 +6,8 @@ import sys
 from typing import Any
 
 from quikode import fsm_runtime
+from quikode.agent_registry import make_agent
+from quikode.agent_schemas import ConflictResolverEnvelope
 from quikode.state import State
 from quikode.workers.outcomes import WorkerOutcome
 
@@ -206,7 +208,7 @@ class RebaseConflictMixin:
             )
             return WorkerOutcome(State.BLOCKED, "rebase abort")
 
-        agent = _tw.build_agent(self.cfg.conflict_resolver)
+        agent = make_agent("conflict_resolver", self.cfg)
         prompt = _tw.prompts.conflict_resolver_prompt(
             self.cfg,
             self.node,
@@ -219,29 +221,58 @@ class RebaseConflictMixin:
             parent_contexts=parent_contexts or [],
         )
         self._write_log_header(f"CONFLICT RESOLVER (iter {iteration})", prompt)
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
+        result = agent.invoke(
+            prompt,
+            handle=self._h,
+            log_path=self.log_path,
+            timeout=self.cfg.conflict_resolver_timeout_s,
+        )
         self.store.record_agent_call(
             self.node.id,
             phase="conflict_resolver",
-            cli=self.cfg.conflict_resolver.cli,
-            model=self.cfg.conflict_resolver.model,
+            cli="json_agent",
+            model=self.cfg.conflict_resolver_model,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
+            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
+            tokens_cached_read=None,
+            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
-        self.store.add_artifact(self.node.id, f"conflict_resolver_output_iter{iteration}", result.stdout)
+        envelope_text = (
+            result.structured.model_dump_json()
+            if isinstance(result.structured, ConflictResolverEnvelope)
+            else (result.raw_text or "")
+        )
+        self.store.add_artifact(self.node.id, f"conflict_resolver_output_iter{iteration}", envelope_text)
 
-        if "GIVE_UP:" in result.stdout:
+        if (
+            result.rc != 0
+            or result.parse_errors
+            or not isinstance(result.structured, ConflictResolverEnvelope)
+        ):
             self._git_in_workspace(["rebase", "--abort"])
+            errs = "; ".join(result.parse_errors) if result.parse_errors else f"rc={result.rc}"
             fsm_runtime.block_current(
                 self.store,
                 self.node.id,
-                note=f"conflict resolver gave up at iter {iteration}; needs human resolution",
+                note=(f"conflict resolver call failed at iter {iteration}: {errs}; treating as unresolvable"),
+                last_error=errs[:1000],
+            )
+            return WorkerOutcome(State.BLOCKED, "conflict resolver call failed")
+
+        envelope = result.structured
+        if envelope.gave_up:
+            self._git_in_workspace(["rebase", "--abort"])
+            reason = envelope.give_up_reason.strip() or "(no reason given)"
+            fsm_runtime.block_current(
+                self.store,
+                self.node.id,
+                note=(
+                    f"conflict resolver gave up at iter {iteration}: {reason[:500]}; needs human resolution"
+                ),
             )
             return WorkerOutcome(State.BLOCKED, "conflict resolver gave up")
 

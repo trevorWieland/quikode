@@ -12,7 +12,6 @@ from quikode.workers.task_worker import (
     _CheckerOutcome,
     _extract_root_cause,
     _last_lines,
-    _parse_intent_verdict,
     _parse_verdict,
     _SubtaskPassOutcome,
 )
@@ -24,7 +23,6 @@ __all__ = [
     "_SubtaskPassOutcome",
     "_extract_root_cause",
     "_last_lines",
-    "_parse_intent_verdict",
     "_parse_verdict",
     "github",
 ]

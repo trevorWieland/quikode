@@ -353,8 +353,9 @@ def _state_long_description(state: str) -> str | None:
 # operator sees the full pipeline shape rather than just "what's done so far."
 # Labels describe the stage's purpose, not the implementation. The CLI/model
 # that actually ran each stage is visible per-call in the agent_calls tab,
-# and is configurable via `cfg.checker` / `cfg.triage`; baking concrete CLI
-# names into these labels lies whenever the operator overrides those roles.
+# and is configurable via the per-role `cfg.<role>_model` knobs (see
+# `quikode.agent_registry.ROLES`); baking concrete CLI names into these
+# labels lies whenever the operator overrides those roles.
 _GAUNTLET_STAGES = [
     ("local_ci", "local CI gate (just ci)"),
     ("rubric", "rubric audit (6 categories)"),

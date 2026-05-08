@@ -83,14 +83,29 @@ Edit each conflicted file in place to remove all `<<<<<<<` / `=======` / `>>>>>>
 
 ## Output
 
-Emit a short summary (<= 150 words) of the resolutions. If you cannot resolve, end with:
+After editing, return a single JSON object matching the
+`ConflictResolverEnvelope` schema (no surrounding prose, no fences):
 
+```json
+{
+  "summary": "<= 150 words describing each file's resolution",
+  "files_touched": ["path/to/file1", "path/to/file2"],
+  "gave_up": false,
+  "give_up_reason": "",
+  "notes": ""
+}
 ```
-GIVE_UP: <2-3 sentences explaining why; quikode will mark this task BLOCKED for human resolution>
-```
+
+If you cannot resolve the conflict, set `gave_up: true` and put a 2-3
+sentence explanation in `give_up_reason`. quikode will mark the task
+BLOCKED for human resolution.
 
 {% if rebase_target_kind == "merge_node" -%}
-For merge-node conflicts, GIVE_UP is the honest signal that this conflict is genuinely cross-parent semantic — the merge-node's planner-subloop will then plan a real integration via the standard subtask doer/checker loop.
+For merge-node conflicts, `gave_up: true` is the honest signal that
+this conflict is genuinely cross-parent semantic — the merge-node's
+planner-subloop will then plan a real integration via the standard
+subtask doer/checker loop.
 {%- endif %}
 
-Otherwise, end normally. The orchestrator will run the checker and decide whether to commit + force-push.
+Otherwise, set `gave_up: false`. The orchestrator will run the checker
+and decide whether to commit + force-push.

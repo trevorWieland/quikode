@@ -1,10 +1,14 @@
-"""Pydantic schema for Config + AgentRole + types models.
+"""Pydantic schema for Config + types models.
 
 These tests pin the contract that the TUI settings modal relies on:
 - All numeric Config fields carry bounds (`ge`/`le`).
 - All fields carry a description (so the modal can render labels).
 - StrEnum-valued fields parse old plain-string values from older configs.
-- AgentResult/IntentReviewOutcome/CheckerOutcome are frozen + JSON-serializable.
+
+Plan 38 PR-B.7: the legacy `AgentRole` / `AgentCli` / `AgentResult` /
+`IntentReviewOutcome` shapes were retired. Roles bind to MODELS via
+`cfg.<role>_model`; the JsonAgent layer's `JsonAgentResult` carries
+the per-call shape.
 """
 
 from __future__ import annotations
@@ -15,14 +19,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from quikode.config import AgentCli, AgentRole, Config, StackingStrategy
-from quikode.types import (
-    AgentResult,
-    CheckerOutcome,
-    IntentReviewOutcome,
-    IntentVerdict,
-    Verdict,
-)
+from quikode.config import Config, StackingStrategy
 
 
 def _cfg(**kw: Any) -> Config:
@@ -72,17 +69,6 @@ def test_stacking_strategy_rejects_unknown():
         _cfg(stacking_strategy="bogus")
 
 
-def test_agent_role_cli_must_be_known():
-    with pytest.raises(ValidationError):
-        AgentRole.model_validate({"cli": "aider"})
-
-
-def test_agent_role_known_cli():
-    r = AgentRole(cli=AgentCli.CLAUDE, model="claude-opus-4-7")
-    assert r.cli == "claude"
-    assert r.model == "claude-opus-4-7"
-
-
 # ----- descriptions present (modal-renderable) -----
 
 
@@ -101,25 +87,6 @@ def test_all_config_fields_have_descriptions():
     }
     missing = [name for name, p in props.items() if name not in exempt and not p.get("description")]
     assert not missing, f"Config fields without description: {missing}"
-
-
-def test_all_types_models_round_trip_through_json():
-    """JSON-serializable so future TUI/IPC can pass them across processes."""
-    a = AgentResult(rc=0, stdout="ok", stderr="", tokens_used=42, duration_s=1.5)
-    assert AgentResult.model_validate_json(a.model_dump_json()) == a
-
-    iv = IntentReviewOutcome(
-        verdict=IntentVerdict.MINOR_DRIFT, affected_areas="src/lib.rs", explanation="rename"
-    )
-    assert IntentReviewOutcome.model_validate_json(iv.model_dump_json()) == iv
-
-    co = CheckerOutcome(verdict=Verdict.PASS, raw="VERDICT: PASS")
-    assert CheckerOutcome.model_validate_json(co.model_dump_json()) == co
-
-
-def test_agent_result_rejects_negative_tokens():
-    with pytest.raises(ValidationError):
-        AgentResult(rc=0, stdout="", stderr="", tokens_used=-1)
 
 
 def test_config_extra_fields_forbidden():

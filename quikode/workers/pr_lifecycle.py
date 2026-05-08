@@ -6,9 +6,12 @@ import sys
 from typing import Any
 
 from quikode import fsm_runtime
+from quikode.agent_registry import make_agent
+from quikode.agent_schemas import IntentReviewVerdict, PlannerOutput
 from quikode.state import State, SubtaskState
-from quikode.types import IntentVerdict
+from quikode.subtask_schema import PlanValidationError
 from quikode.workers.outcomes import WorkerOutcome
+from quikode.workers.planner_driver import _wire_to_runtime_plan
 
 
 class _TaskWorkerGlobals:
@@ -275,8 +278,8 @@ class PrLifecycleWorkerMixin:
         task_diff: str,
         main_log: str,
         main_diff: str,
-    ) -> Any:
-        agent = _tw.build_agent(self.cfg.intent_reviewer)
+    ) -> IntentReviewVerdict:
+        agent = make_agent("intent_reviewer", self.cfg)
         prompt = _tw.prompts.intent_reviewer_prompt(
             self.cfg,
             self.node,
@@ -285,43 +288,82 @@ class PrLifecycleWorkerMixin:
             main_diff_excerpt=main_diff,
         )
         self._write_log_header("INTENT REVIEW", prompt)
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=600)
+        result = agent.invoke(
+            prompt,
+            handle=self._h,
+            log_path=self.log_path,
+            timeout=self.cfg.intent_reviewer_timeout_s,
+        )
         self.store.record_agent_call(
             self.node.id,
             phase="intent_reviewer",
-            cli=self.cfg.intent_reviewer.cli,
-            model=self.cfg.intent_reviewer.model,
+            cli="json_agent",
+            model=self.cfg.intent_reviewer_model,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
+            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
+            tokens_cached_read=None,
+            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
-        outcome = _tw._parse_intent_verdict(result.stdout)
+        if result.rc != 0 or result.parse_errors or not isinstance(result.structured, IntentReviewVerdict):
+            # Plan 38 PR-B.7: a parse failure or transport error here is the
+            # safe-no-op equivalent of the prior `default → NO_DRIFT` path —
+            # the reviewer is advisory; we surface a synthetic no_drift
+            # verdict so the worker continues polling instead of BLOCKing.
+            errs = "; ".join(result.parse_errors) if result.parse_errors else f"rc={result.rc}"
+            _tw.log.warning(
+                "task %s: intent reviewer call failed (%s); defaulting to no_drift",
+                self.node.id,
+                errs[:300],
+            )
+            synthetic = IntentReviewVerdict(
+                verdict="no_drift",
+                affected_areas=[],
+                explanation=f"intent reviewer call failed: {errs[:500]}",
+                next_actions=[],
+            )
+            self.store.record_intent_review(
+                self.node.id,
+                triggered_by_merge_of=None,
+                main_sha_before=str(base) if base else None,
+                main_sha_after=current_main,
+                verdict=synthetic.verdict,
+                explanation=synthetic.explanation,
+                affected_areas=", ".join(synthetic.affected_areas),
+                raw_output=result.raw_text or "",
+            )
+            return synthetic
+        verdict = result.structured
         self.store.record_intent_review(
             self.node.id,
             triggered_by_merge_of=None,
             main_sha_before=str(base) if base else None,
             main_sha_after=current_main,
-            verdict=outcome.verdict.value,
-            explanation=outcome.explanation,
-            affected_areas=outcome.affected_areas,
-            raw_output=result.stdout,
+            verdict=verdict.verdict,
+            explanation=verdict.explanation,
+            affected_areas=", ".join(verdict.affected_areas),
+            raw_output=result.raw_text or verdict.model_dump_json(),
         )
-        return outcome
+        return verdict
 
-    def _handle_intent_review_outcome(self: Any, outcome: Any) -> WorkerOutcome | None:
-        if outcome.verdict is IntentVerdict.NO_DRIFT:
+    def _handle_intent_review_outcome(self: Any, outcome: IntentReviewVerdict) -> WorkerOutcome | None:
+        if outcome.verdict == "no_drift":
             fsm_runtime.enter_pending_ci(self.store, self.node.id, note="intent review: NO_DRIFT")
             return None
-        if outcome.verdict is IntentVerdict.MINOR_DRIFT:
-            _tw.log.info("task %s intent review: MINOR_DRIFT — %s", self.node.id, outcome.explanation[:200])
+        if outcome.verdict == "minor_drift":
+            _tw.log.info(
+                "task %s intent review: MINOR_DRIFT — %s",
+                self.node.id,
+                outcome.explanation[:200],
+            )
             return self._rebase_or_resolve()
         _tw.log.warning(
-            "task %s intent review: INTENT_CONFLICT — %s", self.node.id, outcome.explanation[:200]
+            "task %s intent review: INTENT_CONFLICT — %s",
+            self.node.id,
+            outcome.explanation[:200],
         )
         replan_count = (self.store.get(self.node.id) or {}).get("replan_count") or 0
         if replan_count >= self.cfg.intent_max_replans:
@@ -332,19 +374,28 @@ class PrLifecycleWorkerMixin:
                 last_error=f"INTENT_CONFLICT: {outcome.explanation[:500]}",
             )
             return WorkerOutcome(State.BLOCKED, "intent conflict; replan budget exhausted")
-        return self._replan_and_resume(outcome.explanation, outcome.affected_areas)
+        affected = ", ".join(outcome.affected_areas)
+        return self._replan_and_resume(outcome.explanation, affected)
 
     def _replan_and_resume(self: Any, prior_explanation: str, affected: str) -> WorkerOutcome | None:
         """Phase B.5: re-run the planner with augmented context (prior plan +
         what landed on main), update subtasks, then restart the subtask loop
-        from any pending/blocked subtasks."""
+        from any pending/blocked subtasks.
+
+        Plan 38 PR-B.7: migrated onto the JsonAgent layer via the dedicated
+        `replan_planner` role. The same `PlannerOutput` wire schema is
+        emitted and translated through `_wire_to_runtime_plan` (the same
+        helper the spec planner uses), so the runtime `Plan` carries the
+        Z-99 stabilization injection + topo validators uniformly.
+        """
         fsm_runtime.enter_addressing_feedback(
             self.store,
             self.node.id,
             note=f"replan triggered by intent conflict: {affected[:120]}",
         )
-        agent = _tw.build_agent(self.cfg.planner)
-        prompt = _tw.prompts.planner_prompt(self.cfg, self.dag, self.node)
+        agent = make_agent("replan_planner", self.cfg)
+        contract = self._evaluation_contract()
+        prompt = _tw.prompts.planner_prompt(self.cfg, self.dag, self.node, contract)
         # Augment with replan context
         existing_subtasks = self.store.list_subtasks(self.node.id)
         done_summary = "\n".join(
@@ -360,34 +411,60 @@ class PrLifecycleWorkerMixin:
             "1. **Preserves DONE subtasks** — list them again with their existing IDs and acceptance, so we don't redo them.\n"
             "2. **Replaces or removes** subtasks that are no longer needed because main supplied them.\n"
             "3. **Adds new subtasks** for anything the world-shift now requires (e.g., main added a new instance of a pattern; this task must apply the new pattern there too).\n\n"
-            "Use the same JSON schema as before. Return only the fenced ```json``` block."
+            "Emit the SAME structured JSON schema as the spec planner."
         )
         self._write_log_header("PLANNER (replan)", prompt)
-        result = agent.run(prompt, handle=self._h, log_path=self.log_path, timeout=1800)
+        result = agent.invoke(
+            prompt,
+            handle=self._h,
+            log_path=self.log_path,
+            timeout=self.cfg.replan_planner_timeout_s,
+        )
         self.store.record_agent_call(
             self.node.id,
             phase="planner_replan",
-            cli=self.cfg.planner.cli,
-            model=self.cfg.planner.model,
+            cli="json_agent",
+            model=self.cfg.replan_planner_model,
             rc=result.rc,
             duration_s=result.duration_s or 0,
-            tokens_used=result.tokens_used,
+            tokens_used=None,
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
-            tokens_cached_read=result.tokens_cached_read,
-            tokens_cached_creation=result.tokens_cached_creation,
+            tokens_cached_read=None,
+            tokens_cached_creation=None,
             cost_usd=result.cost_usd,
         )
-        if not result.ok:
+        plan_text = result.raw_text or (
+            result.structured.model_dump_json() if result.structured is not None else ""
+        )
+        if plan_text:
+            self.store.add_artifact(self.node.id, "planner_replan_output", plan_text)
+        if result.rc != 0:
             fsm_runtime.block_current(
-                self.store, self.node.id, note=f"replan agent exited {result.rc}: {result.stderr[:300]}"
+                self.store,
+                self.node.id,
+                note=f"replan agent exited rc={result.rc}: {(result.stderr_excerpt or '')[:300]}",
             )
             return WorkerOutcome(State.BLOCKED, "replan failed")
-        self.plan_text = result.stdout
-        self.store.add_artifact(self.node.id, "planner_replan_output", result.stdout)
+        if result.parse_errors or not isinstance(result.structured, PlannerOutput):
+            errs = "; ".join(result.parse_errors) if result.parse_errors else "no structured output"
+            fsm_runtime.block_current(
+                self.store,
+                self.node.id,
+                note=f"replan parse failed: {errs[:500]}",
+            )
+            return WorkerOutcome(State.BLOCKED, "replan output unparseable")
+        self.plan_text = plan_text
+        self.store.set_field(self.node.id, plan_text=self.plan_text)
         try:
-            new_plan = self._parse_or_retry_plan(result.stdout)
-        except Exception as e:
+            new_plan = _wire_to_runtime_plan(
+                result.structured,
+                expected_node_id=self.node.id,
+                spec_gate_command=self.cfg.local_ci_command,
+                rubric_categories=list(self.cfg.pre_pr_rubric_categories or []),
+                rubric_min_score=int(self.cfg.pre_pr_rubric_min_score),
+            )
+        except PlanValidationError as e:
             fsm_runtime.block_current(self.store, self.node.id, note=f"replan parse failed: {e}")
             return WorkerOutcome(State.BLOCKED, "replan output unparseable")
 

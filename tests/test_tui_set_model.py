@@ -1,4 +1,8 @@
-"""`/set-model <phase> <cli>:<model>` writes [agents.<phase>] in TOML.
+"""`/set-model <role> <model>` writes `<role>_model = "..."` keys in TOML.
+
+Plan 38 PR-B.7: the legacy `[agents.<phase>] cli=... model=...` shape
+was retired. Roles bind to models via `cfg.<role>_model` (the CLI is
+derived from the model via the model registry).
 
 Also covers the other two TUI bugs that landed in the same patch:
 - activity feed reverses order so newest is at the bottom (tail -f feel)
@@ -33,33 +37,31 @@ def _bootstrap(tmp_path: Path) -> Path:
 # ----- /set-model TOML writer -----
 
 
-def test_set_model_replaces_existing_agent_section(tmp_path):
+def test_set_model_replaces_existing_role_key(tmp_path):
     p = _bootstrap(tmp_path) / ".quikode" / "config.toml"
-    _set_agent_role_in_toml(p, "doer", "claude", "claude-opus-4-7")
+    _set_agent_role_in_toml(p, "subtask_doer", "claude-opus-4-7")
     cfg = load_config(tmp_path)
-    assert cfg.doer.cli.value == "claude"
-    assert cfg.doer.model == "claude-opus-4-7"
-    # Other agents preserved
-    assert cfg.planner.cli.value == "codex"
-    assert cfg.checker.cli.value == "codex"
+    assert cfg.subtask_doer_model == "claude-opus-4-7"
+    # Other role models preserved at their defaults from template
+    assert cfg.planner_model == "gpt-5.5"
+    assert cfg.subtask_checker_model == "gpt-5.5"
 
 
-def test_set_model_appends_section_when_absent(tmp_path):
+def test_set_model_appends_key_when_absent(tmp_path):
     qkdir = tmp_path / ".quikode"
     qkdir.mkdir()
     p = qkdir / "config.toml"
     p.write_text(f'repo_path = "{tmp_path}"\ndag_path = "{tmp_path / "dag.json"}"\n')
-    _set_agent_role_in_toml(p, "intent_reviewer", "claude", "claude-sonnet-4-6")
+    _set_agent_role_in_toml(p, "intent_reviewer", "claude-opus-4-7")
     parsed = tomllib.loads(p.read_text())
-    assert parsed["agents"]["intent_reviewer"]["cli"] == "claude"
-    assert parsed["agents"]["intent_reviewer"]["model"] == "claude-sonnet-4-6"
+    assert parsed["intent_reviewer_model"] == "claude-opus-4-7"
 
 
 def test_set_model_idempotent(tmp_path):
     p = _bootstrap(tmp_path) / ".quikode" / "config.toml"
-    _set_agent_role_in_toml(p, "triage", "codex", "gpt-5.3-codex")
+    _set_agent_role_in_toml(p, "subtask_triage", "gpt-5.5")
     first = p.read_text()
-    _set_agent_role_in_toml(p, "triage", "codex", "gpt-5.3-codex")
+    _set_agent_role_in_toml(p, "subtask_triage", "gpt-5.5")
     assert p.read_text() == first
 
 
@@ -73,11 +75,10 @@ async def test_dispatch_set_model_happy_path(tmp_path):
     app = QuikodeTUI(workspace=tmp_path, poll_interval_s=0.05)
     async with app.run_test() as pilot:
         await pilot.pause()
-        app._dispatch_slash("/set-model planner claude:claude-sonnet-4-6")
+        app._dispatch_slash("/set-model planner claude-opus-4-7")
         await pilot.pause()
         cfg = load_config(tmp_path)
-        assert cfg.planner.model == "claude-sonnet-4-6"
-        assert cfg.planner.cli.value == "claude"
+        assert cfg.planner_model == "claude-opus-4-7"
 
 
 @pytest.mark.asyncio
@@ -88,24 +89,24 @@ async def test_dispatch_set_model_rejects_unknown_phase(tmp_path):
     async with app.run_test() as pilot:
         await pilot.pause()
         # No-op: should not crash, should not modify config
-        app._dispatch_slash("/set-model bogus claude:foo")
+        app._dispatch_slash("/set-model bogus claude-opus-4-7")
         await pilot.pause()
         cfg = load_config(tmp_path)
-        # planner stays at default
-        assert cfg.planner.cli.value == "codex"
+        # planner stays at template default
+        assert cfg.planner_model == "gpt-5.5"
 
 
 @pytest.mark.asyncio
-async def test_dispatch_set_model_rejects_unknown_cli(tmp_path):
+async def test_dispatch_set_model_rejects_unknown_model(tmp_path):
     _bootstrap(tmp_path)
     Store(tmp_path / ".quikode" / "quikode.db")
     app = QuikodeTUI(workspace=tmp_path, poll_interval_s=0.05)
     async with app.run_test() as pilot:
         await pilot.pause()
-        app._dispatch_slash("/set-model planner aider:bogus")
+        app._dispatch_slash("/set-model planner totally-bogus-model")
         await pilot.pause()
         cfg = load_config(tmp_path)
-        assert cfg.planner.cli.value == "codex"  # unchanged
+        assert cfg.planner_model == "gpt-5.5"  # unchanged
 
 
 @pytest.mark.asyncio

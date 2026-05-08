@@ -46,7 +46,7 @@ from quikode.agent_schemas import (
     SubtaskCheckerOutput,
     SubtaskTriageOutput,
 )
-from quikode.agents.base import _is_transient_container_failure
+from quikode.agents.transient_quota import _is_transient_container_failure
 from quikode.state import SubtaskState
 from quikode.subtask_schema import Subtask
 from quikode.types import Verdict

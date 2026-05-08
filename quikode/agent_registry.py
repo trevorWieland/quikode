@@ -25,8 +25,10 @@ from dataclasses import dataclass
 from pydantic import BaseModel
 
 from .agent_schemas import (
+    ConflictResolverEnvelope,
     DoerEnvelope,
     FixupPlannerOutput,
+    IntentReviewVerdict,
     MergePlannerOutput,
     PlannerOutput,
     PrePRBehaviorAuditOutput,
@@ -137,10 +139,29 @@ ROLES: dict[str, RoleSpec] = {
     ),
     "conflict_resolver": RoleSpec(
         name="conflict_resolver",
-        output_schema=DoerEnvelope,
+        output_schema=ConflictResolverEnvelope,
         writes_files=True,
         default_model="GLM-5.1-zai",
         timeout_s_field="conflict_resolver_timeout_s",
+    ),
+    "intent_reviewer": RoleSpec(
+        name="intent_reviewer",
+        output_schema=IntentReviewVerdict,
+        writes_files=False,
+        default_model="gpt-5.5",
+        timeout_s_field="intent_reviewer_timeout_s",
+    ),
+    "replan_planner": RoleSpec(
+        # Plan 38 PR-B.7: separate role from `planner` so the operator can
+        # point post-PR replans at a different model than the spec planner.
+        # Same `PlannerOutput` schema and same wire→runtime translation;
+        # the cfg knob is `cfg.replan_planner_model` with the same default
+        # as `planner`.
+        name="replan_planner",
+        output_schema=PlannerOutput,
+        writes_files=False,
+        default_model="gpt-5.5",
+        timeout_s_field="replan_planner_timeout_s",
     ),
     "progress": RoleSpec(
         name="progress",

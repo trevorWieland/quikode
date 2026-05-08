@@ -26,7 +26,6 @@ from quikode import (
     sound,
     worktree,
 )
-from quikode.agents import build_agent
 from quikode.agents.progress import (
     ProgressAttempt,
     ProgressVerdict,
@@ -39,7 +38,7 @@ from quikode.fsm import TERMINAL_STATES
 from quikode.orchestration import scheduler
 from quikode.state import State, Store, TaskRow
 from quikode.subtask_schema import Plan
-from quikode.types import IntentReviewOutcome, IntentVerdict, Verdict
+from quikode.types import Verdict
 from quikode.workers.feedback import FeedbackWorkerMixin
 from quikode.workers.outcomes import (
     CheckerOutcome,
@@ -75,7 +74,6 @@ _PATCH_EXPORTS = (
     retry_classify,
     sound,
     worktree,
-    build_agent,
     ProgressAttempt,
     ProgressVerdict,
     build_progress_agent,
@@ -474,22 +472,6 @@ def _parse_verdict(checker_text: str) -> Verdict:
     if not m:
         return Verdict.FAIL
     return Verdict.PASS if m.group(1).upper() == "PASS" else Verdict.FAIL
-
-
-def _parse_intent_verdict(text: str) -> IntentReviewOutcome:
-    """Pull the intent-reviewer's structured output. Defaults to NO_DRIFT on
-    parse failure since that's the safe no-op choice."""
-    m = re.search(r"VERDICT:\s*(NO_DRIFT|MINOR_DRIFT|INTENT_CONFLICT)", text, re.IGNORECASE)
-    verdict = IntentVerdict(m.group(1).upper()) if m else IntentVerdict.NO_DRIFT
-    am = re.search(r"AFFECTED_AREAS:\s*(.+)", text, re.IGNORECASE)
-    affected = am.group(1).strip() if am else ""
-    em = re.search(r"EXPLANATION:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
-    explanation = em.group(1).strip()[:1000] if em else ""
-    return IntentReviewOutcome(
-        verdict=verdict,
-        affected_areas=affected,
-        explanation=explanation,
-    )
 
 
 def _last_lines(s: str, n: int) -> str:

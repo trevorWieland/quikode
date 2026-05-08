@@ -30,7 +30,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, ValidationError
 
 from ..execution import exec_in
-from .base import _is_quota_exhausted, _is_transient_container_failure
+from .transient_quota import _is_quota_exhausted, _is_transient_container_failure
 
 log = logging.getLogger("quikode.agents.json")
 

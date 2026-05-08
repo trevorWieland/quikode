@@ -23,8 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from quikode.config import AgentCli
+from quikode.agent_registry import ROLES
 from quikode.config_loader import load_config
+from quikode.model_registry import MODELS
 
 from ..widgets.activity_feed import ActivityFeed
 from ..widgets.confirm_modal import ConfirmModal
@@ -33,7 +34,9 @@ from ..widgets.tasks_table import TasksTable
 from . import orchestrator_control
 from .slash_catalog import SLASH_CATALOG
 
-_AGENT_PHASES = {"planner", "doer", "checker", "triage", "conflict_resolver", "intent_reviewer"}
+# Plan 38 PR-B.7: roles bind to models, not CLIs. The list of mutable phases
+# is the role registry (each `RoleSpec` gets a `cfg.<role>_model` knob).
+_AGENT_PHASES = set(ROLES.keys())
 
 if TYPE_CHECKING:
     from ..app import QuikodeTUI
@@ -365,69 +368,87 @@ def _handle_config(app: QuikodeTUI, _parsed: ParsedCommand) -> None:
 
 
 def _handle_set_model(app: QuikodeTUI, parsed: ParsedCommand) -> None:
-    """`/set-model <phase> <cli>:<model>` — change which CLI+model runs a phase.
+    """`/set-model <role> <model>` — change which MODEL drives a role.
+
+    Plan 38 PR-B.7: roles bind to models, not CLIs. The CLI is derived
+    from the model via `quikode.model_registry`. The TUI writes a
+    top-level `<role>_model = "<model>"` key into config.toml; the
+    orchestrator picks it up on next restart.
 
     Examples:
-      /set-model planner claude:claude-opus-4-7
-      /set-model doer opencode:zai-coding-plan/glm-5.1
-      /set-model triage claude:claude-sonnet-4-6
+      /set-model planner gpt-5.5
+      /set-model subtask_doer GLM-5.1-zai
+      /set-model intent_reviewer claude-opus-4-7
     """
     if len(parsed.args) != 2:
         _toast(
             app,
-            f"[yellow]usage:[/] /set-model <phase> <cli>:<model>  phases: {', '.join(sorted(_AGENT_PHASES))}",
+            f"[yellow]usage:[/] /set-model <role> <model>  roles: {', '.join(sorted(_AGENT_PHASES))}",
         )
         return
-    phase, spec = parsed.args
+    phase, model = parsed.args
     if phase not in _AGENT_PHASES:
-        _toast(app, f"[red]unknown phase '{phase}'.[/] valid: {', '.join(sorted(_AGENT_PHASES))}")
-        return
-    if ":" not in spec:
-        _toast(app, "[red]model spec must be `<cli>:<model>` (e.g. claude:claude-opus-4-7)[/]")
-        return
-    cli_name, model = spec.split(":", 1)
-    if cli_name not in {c.value for c in AgentCli}:
-        _toast(
-            app,
-            f"[red]unknown cli '{cli_name}'.[/] valid: {', '.join(c.value for c in AgentCli)}",
-        )
+        _toast(app, f"[red]unknown role '{phase}'.[/] valid: {', '.join(sorted(_AGENT_PHASES))}")
         return
     if not model.strip():
         _toast(app, "[red]model id must not be empty[/]")
         return
+    if model not in MODELS:
+        _toast(
+            app,
+            f"[red]unknown model '{model}'.[/] valid: {', '.join(sorted(MODELS.keys()))}",
+        )
+        return
     toml_path = app.workspace / ".quikode" / "config.toml"
     try:
-        _set_agent_role_in_toml(toml_path, phase, cli_name, model)
+        _set_agent_role_in_toml(toml_path, phase, model)
     except OSError as e:
         _toast(app, f"[red]write failed: {e}[/]")
         return
     _toast(
         app,
-        f"[green]✓[/] {phase} → {cli_name}:{model} "
+        f"[green]✓[/] {phase} → {model} "
         "(saved; in-flight tasks keep prior model — restart orchestrator to apply)",
     )
 
 
-def _set_agent_role_in_toml(toml_path: Path, phase: str, cli_name: str, model: str) -> None:
-    """Write or replace [agents.<phase>] in config.toml. Idempotent."""
+def _set_agent_role_in_toml(toml_path: Path, phase: str, model: str) -> None:
+    """Write or replace `<phase>_model = "<model>"` in config.toml. Idempotent.
+
+    Plan 38 PR-B.7: replaces the prior `[agents.<phase>]` section
+    writer. We write a top-level scalar (not under `[agents]`) because
+    the role registry is the single source of truth for role→model
+    binding; there is no nested table.
+    """
     if not toml_path.exists():
         toml_path.parent.mkdir(parents=True, exist_ok=True)
         toml_path.write_text("# quikode config\n")
     text = toml_path.read_text()
     lines = text.splitlines()
-    header = f"[agents.{phase}]"
-    sec_start = next((i for i, ln in enumerate(lines) if ln.strip() == header), -1)
-    new_block = [header, f'cli = "{cli_name}"', f'model = "{model}"']
-    if sec_start < 0:
-        sep = [""] if lines and lines[-1].strip() != "" else []
-        lines.extend(sep + new_block)
+    key = f"{phase}_model"
+    new_line = f'{key} = "{model}"'
+    # Find the existing key in the top-level (pre-first-table) region.
+    first_table = next(
+        (i for i, ln in enumerate(lines) if ln.lstrip().startswith("[")),
+        len(lines),
+    )
+    key_idx = next(
+        (i for i in range(first_table) if lines[i].split("=", 1)[0].strip() == key),
+        -1,
+    )
+    if key_idx >= 0:
+        lines[key_idx] = new_line
     else:
-        # Replace through end-of-section (next [header] or EOF)
-        sec_end = next(
-            (i for i in range(sec_start + 1, len(lines)) if lines[i].lstrip().startswith("[")),
-            len(lines),
-        )
-        lines = lines[:sec_start] + new_block + lines[sec_end:]
+        # Insert just before the first table header (or append).
+        insert_at = first_table
+        prefix = lines[:insert_at]
+        suffix = lines[insert_at:]
+        if prefix and prefix[-1].strip() != "":
+            prefix.append("")
+        prefix.append(new_line)
+        if suffix and suffix[0].strip() != "":
+            prefix.append("")
+        lines = prefix + suffix
     toml_path.write_text("\n".join(lines) + "\n")
 
 

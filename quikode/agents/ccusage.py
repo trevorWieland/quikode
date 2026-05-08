@@ -46,7 +46,6 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from ..execution import exec_in
-from ..types import AgentResult
 
 log = logging.getLogger("quikode.ccusage")
 
@@ -160,28 +159,6 @@ def fetch_session_stats(
     if raw is None:
         return None
     return _parse_session_json(cli, raw)
-
-
-def merge_into_result(result: object, stats: CCUsageStats) -> AgentResult:
-    """Return a copy of `result` (an AgentResult) with token + cost fields
-    overridden by `stats`. Preserves `rc`, `stdout`, `stderr`, `transient`,
-    `duration_s`.
-
-    Defined here (rather than each agent wrapper) so the merge policy is
-    consistent across all three CLIs.
-    """
-    if not isinstance(result, AgentResult):
-        raise TypeError("merge_into_result expects AgentResult")
-    return result.model_copy(
-        update={
-            "tokens_used": stats.total_tokens,
-            "tokens_input": stats.tokens_input,
-            "tokens_output": stats.tokens_output,
-            "tokens_cached_read": stats.tokens_cached_read,
-            "tokens_cached_creation": stats.tokens_cached_creation,
-            "cost_usd": stats.cost_usd,
-        }
-    )
 
 
 # Sanity cap on per-call cost. ccusage's session-aggregate occasionally

@@ -1,17 +1,9 @@
-from ..config import AgentRole
-from .base import Agent, AgentResult
-from .claude import ClaudeAgent
-from .codex import CodexAgent
-from .opencode import OpencodeAgent
+"""Plan 38 PR-B.7: package marker.
 
-__all__ = ["Agent", "AgentResult", "ClaudeAgent", "CodexAgent", "OpencodeAgent", "build_agent"]
-
-
-def build_agent(role: AgentRole) -> Agent:
-    if role.cli == "claude":
-        return ClaudeAgent(model=role.model, extra_args=role.extra_args)
-    if role.cli == "codex":
-        return CodexAgent(model=role.model, extra_args=role.extra_args)
-    if role.cli == "opencode":
-        return OpencodeAgent(model=role.model, extra_args=role.extra_args)
-    raise ValueError(f"unknown agent cli: {role.cli}")
+The prior CLI shims (`Agent.run` against `OpencodeAgent` / `CodexAgent` /
+`ClaudeAgent`) and the `build_agent(role)` factory were retired together
+with the `AgentRole` config struct and the prose-parsing call sites.
+The live transport surface is now `quikode.agents.json_protocol` +
+the per-CLI JSON shims (`json_codex_direct`, `json_codex_litellm`,
+`json_claude`); roles bind to schemas via `quikode.agent_registry`.
+"""

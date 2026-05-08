@@ -6,7 +6,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal, cast
 
-from quikode.config import AgentCli, AgentRole, Config, StackingStrategy
+from quikode.config import Config, StackingStrategy
 from quikode.profiles import get_profile
 
 
@@ -34,13 +34,17 @@ def load_config(root: Path | None = None) -> Config:
             "`architecture_docs_dir`. See plans/35-standards-profile-linking.md."
         )
 
-    def _agent(d: dict | None, default: AgentRole) -> AgentRole:
-        if not d:
-            return default
-        return AgentRole(
-            cli=AgentCli(d.get("cli", default.cli.value)),
-            model=d.get("model", default.model),
-            extra_args=list(d.get("extra_args", default.extra_args)),
+    # Plan 38 PR-B.7 hard cutover: prior `[agents.<phase>]` TOML sections
+    # (with `cli` + `model`) are retired. The role layer (`make_agent`)
+    # binds roles to MODELS via `cfg.<role>_model`, not CLIs. Reject the
+    # prior sections explicitly so a stale config surfaces immediately
+    # instead of silently no-op'ing.
+    if "agents" in raw:
+        raise ValueError(
+            "[agents.<phase>] TOML sections are retired (plan 38 PR-B.7). "
+            'Migrate to `<role>_model = "<model_name>"` keys; the CLI is '
+            "derived from the model via quikode.model_registry. See "
+            "plans/38-json-schema-agent-layer.md."
         )
 
     def _path(s: str | None, default: Path) -> Path:
@@ -49,7 +53,6 @@ def load_config(root: Path | None = None) -> Config:
         p = Path(s).expanduser()
         return p if p.is_absolute() else (root / p).resolve()
 
-    agents = raw.get("agents", {})
     resources = raw.get("resources", {})
     conflicts = raw.get("conflicts", {})
 
@@ -214,13 +217,6 @@ def load_config(root: Path | None = None) -> Config:
         log_dir=_path(raw.get("log_dir"), root / ".quikode" / "logs"),
         prompts_dir=_path(raw.get("prompts_dir"), root / "prompts"),
         sccache_dir=_path(raw.get("sccache_dir"), root / ".quikode" / "sccache"),
-        planner=_agent(agents.get("planner"), defaults.planner),
-        doer=_agent(agents.get("doer"), defaults.doer),
-        checker=_agent(agents.get("checker"), defaults.checker),
-        triage=_agent(agents.get("triage"), defaults.triage),
-        conflict_resolver=_agent(agents.get("conflict_resolver"), defaults.conflict_resolver),
-        intent_reviewer=_agent(agents.get("intent_reviewer"), defaults.intent_reviewer),
-        progress=_agent(agents.get("progress"), defaults.progress),
         claude_auth_dir=_path(raw.get("claude_auth_dir"), defaults.claude_auth_dir),
         claude_json_path=_path(raw.get("claude_json_path"), defaults.claude_json_path),
         codex_auth_dir=_path(raw.get("codex_auth_dir"), defaults.codex_auth_dir),
@@ -246,4 +242,10 @@ def load_config(root: Path | None = None) -> Config:
             raw.get("conflict_resolver_timeout_s", defaults.conflict_resolver_timeout_s)
         ),
         progress_timeout_s=int(raw.get("progress_timeout_s", defaults.progress_timeout_s)),
+        intent_reviewer_model=str(raw.get("intent_reviewer_model", defaults.intent_reviewer_model)),
+        intent_reviewer_timeout_s=int(
+            raw.get("intent_reviewer_timeout_s", defaults.intent_reviewer_timeout_s)
+        ),
+        replan_planner_model=str(raw.get("replan_planner_model", defaults.replan_planner_model)),
+        replan_planner_timeout_s=int(raw.get("replan_planner_timeout_s", defaults.replan_planner_timeout_s)),
     )

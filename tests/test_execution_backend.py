@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from quikode import docker_env, execution, pre_pr_audit, worktree
-from quikode.agents import base as agent_base
 from quikode.config import Config
 from quikode.dag import DAG, Node
 from quikode.execution import (
@@ -108,25 +106,6 @@ def test_fake_backend_records_postgres_disabled_without_sidecar_request(tmp_path
     provision = backend.calls[0]
     assert provision.name == "provision"
     assert provision.postgres_requested is False
-
-
-def test_agent_timeout_and_transient_classification_use_backend_exec(tmp_path):
-    worker = _worker(tmp_path)
-    backend = worker.execution_backend
-    assert isinstance(backend, FakeExecutionBackend)
-    wt = tmp_path / "wt"
-    wt.mkdir()
-    worker._provision_container(wt)
-
-    backend.simulate_transient_exec_failure()
-    transient = agent_base._exec(worker._h, ["agent"])
-    assert transient.rc == 124
-    assert transient.transient is True
-
-    backend.exec_responses.append(subprocess.TimeoutExpired(cmd=["agent"], timeout=3))
-    timed_out = agent_base._exec(worker._h, ["agent"], timeout=3)
-    assert timed_out.rc == 124
-    assert timed_out.transient is True
 
 
 def test_helpers_import_backend_exec_interface():

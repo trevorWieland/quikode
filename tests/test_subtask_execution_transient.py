@@ -16,7 +16,7 @@ incremented the attempt counter; the gate failed in <1s; ceiling reached in
 
 from __future__ import annotations
 
-from quikode.agents.base import _is_transient_container_failure
+from quikode.agents.transient_quota import _is_transient_container_failure
 
 
 def test_no_such_container_is_transient():

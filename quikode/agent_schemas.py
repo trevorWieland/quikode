@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ---------- shared sub-models ----------
 
@@ -156,6 +156,76 @@ class DoerEnvelope(BaseModel):
     files_touched: list[str] = Field(default_factory=list)
     witness_commands_run: list[str] = Field(default_factory=list)
     notes: str = Field(default="")
+
+
+# ---------- conflict resolver ----------
+
+
+class ConflictResolverEnvelope(BaseModel):
+    """Bookkeeping envelope emitted by the conflict-resolver writes-files role.
+
+    Plan 38 PR-B.7: replaces the prior `"GIVE_UP:"` substring match in
+    the resolver's free-text stdout with a structured `gave_up: bool`
+    flag. The diff is still the evidence — the resolver edits files in
+    the worktree and the worker validates via `git -C` primitives. This
+    envelope only carries the bookkeeping the worker needs to branch on
+    (give-up vs. continue) plus the human-readable summary surfaced to
+    the briefing / TUI.
+
+    `give_up_reason` is required to be non-empty when `gave_up=True`
+    (cross-validated by `_validate_give_up_reason`); otherwise the
+    BLOCK note would be uninformative to the human triaging it.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    summary: str = Field(default="")
+    files_touched: list[str] = Field(default_factory=list)
+    gave_up: bool = Field(
+        default=False,
+        description=(
+            "True iff the resolver could not produce a valid resolution and "
+            "is surrendering the conflict for human triage. Worker BLOCKs "
+            "on this without inspecting the diff."
+        ),
+    )
+    give_up_reason: str = Field(
+        default="",
+        description="Why the resolver gave up; required (non-empty) when gave_up=True.",
+    )
+    notes: str = Field(default="")
+
+    @model_validator(mode="after")
+    def _validate_give_up_reason(self) -> ConflictResolverEnvelope:
+        if self.gave_up and not self.give_up_reason.strip():
+            raise ValueError("give_up_reason must be non-empty when gave_up=True")
+        return self
+
+
+# ---------- intent reviewer ----------
+
+
+IntentReviewVerdictValue = Literal["no_drift", "minor_drift", "intent_conflict"]
+
+
+class IntentReviewVerdict(BaseModel):
+    """Top-level shape from the post-PR intent reviewer.
+
+    Plan 38 PR-B.7: replaces the prose `_parse_intent_verdict` regex with
+    a closed-enum verdict. `affected_areas` is a structured `list[str]`
+    of paths/symbols (the prior free-text comma-separated string split
+    on the worker side); `explanation` is the human-readable rationale
+    surfaced to the briefing / replan prompt context. `next_actions`
+    carries optional follow-up steps the reviewer recommends — empty
+    when verdict is `no_drift`.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    verdict: IntentReviewVerdictValue
+    affected_areas: list[str] = Field(default_factory=list)
+    explanation: str = Field(default="")
+    next_actions: list[str] = Field(default_factory=list)
 
 
 # ---------- subtask checker ----------
@@ -360,8 +430,11 @@ __all__ = [
     "ArchitectureRefSchema",
     "BehaviorCompletenessGap",
     "BehaviorVerification",
+    "ConflictResolverEnvelope",
     "DoerEnvelope",
     "FixupPlannerOutput",
+    "IntentReviewVerdict",
+    "IntentReviewVerdictValue",
     "MergePlannerOutput",
     "PerRowVerdict",
     "PlannerOutput",
