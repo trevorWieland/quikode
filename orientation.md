@@ -128,6 +128,20 @@ qk daemon stop
 qk daemon start --detach --max-parallel 12 --retry-failed
 ```
 
+**LiteLLM proxy (plan 38).** Codex 0.128+ only speaks the OpenAI Responses API. For non-OpenAI providers (z.ai, Wafer Pass, etc.) a local LiteLLM proxy bridges Responses → Chat Completions on `127.0.0.1:4000`. Codex provider configs at `~/.codex/config.toml` use `base_url = "http://host.docker.internal:4000/v1"` so both the host shell AND tanren task containers reach the proxy (containers via the `--add-host=host.docker.internal:host-gateway` flag plan-38 PR-A added to `quikode/docker_env.py`). API keys live in `~/.codex/.env` (mode 600), sourced by `~/.bashrc` for every interactive shell. Litellm config at `~/.codex/litellm_config.yaml`. Start:
+
+```bash
+set -a; . ~/.codex/.env; set +a
+docker run -d --name litellm-bridge \
+  -p 127.0.0.1:4000:4000 \
+  -v "$HOME/.codex/litellm_config.yaml:/app/config.yaml" \
+  -e ZAI_API_KEY -e WAFER_API_KEY \
+  ghcr.io/berriai/litellm:main-stable \
+  --config /app/config.yaml --host 0.0.0.0 --port 4000
+```
+
+Health probe: `curl -sS http://127.0.0.1:4000/health/readiness` returns `status: healthy`. Codex profiles configured: `gpt5` (gpt-5.5 direct OpenAI), `codex` (gpt-5.3-codex direct OpenAI), `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen` (proxy-routed). Direct-OpenAI profiles bypass the proxy entirely. Schema enforcement is **CLI-native** for direct-OpenAI + claude profiles; **client-side via pydantic** for proxy-routed profiles (litellm 1.83 drops `output_schema` during Responses → Chat translation AND most upstream providers don't honor `response_format: json_schema` either — verified directly against wafer/GLM-5.1 on 2026-05-08). Use `together_ai/<MODEL>` (NOT `openai/<MODEL>`) as the litellm prefix to force the translation; `openai/` passes through.
+
 **Restart cost model.** Restarting the daemon kills every in-flight agent subprocess inside its container. Orphan recovery cleanly resets each affected task to PENDING + a resume marker; the next worker run picks up from the nearest non-DONE subtask. The cost is **per-task, bounded by one in-flight agent call (10–30 min), not cumulative task runtime.** Subtask-level commits are preserved on the branch. Don't hesitate to restart for a meaningful fix; do consider clustering several pending fixes into one restart.
 
 **Prompt-only changes** (`prompts/*.md`) are loaded fresh per render via Jinja's `FileSystemLoader`; a reinstall is enough — no daemon restart needed. Python code changes do require a restart.
@@ -161,16 +175,32 @@ Code-writing work for non-trivial plans should be **delegated to subagents**, no
 
 ### 5.5 Mode of influence
 
-The agent's mode of influence on tanren is the **state machine** and the **prompts** — and quikode's worker / orchestrator code that drives both. Never edit tanren application code directly; if a tanren symptom suggests a fix, the fix lives in:
+The agent's mode of influence on tanren is the **state machine**, the **prompts**, and the **agent layer** — and quikode's worker / orchestrator code that drives all three. Never edit tanren application code directly; if a tanren symptom suggests a fix, the fix lives in:
 
 - `quikode/fsm.py` / `fsm_runtime.py` — FSM events, transitions, recovery semantics.
 - `quikode/workers/*.py` / `quikode/orchestration/*.py` — worker phases, scheduler, supervisor.
 - `prompts/*.md` — planner / doer / checker / triage / progress / fixup-planner / merge-planner / audit / evaluation-context partial.
-- `quikode/evaluation_contract.py` (plan 33: single-source-of-truth audit rubric per task), `quikode/self_audit.py` (plan 33: doer SELF_AUDIT block parser + deterministic short-circuit), `quikode/planner_validators.py` (plan 33: rubric_coverage / evidence_partition / standards_paths / finding_coverage).
+- **Agent layer (plan 38)**:
+  - `quikode/agent_schemas.py` — pydantic `BaseModel` per role (PlannerOutput, DoerEnvelope, SubtaskCheckerOutput, SubtaskTriageOutput, PrePR{Rubric,Standards,Behavior}AuditOutput, FixupPlannerOutput, MergePlannerOutput, ProgressVerdict, ConflictResolverEnvelope, IntentReviewVerdict). All `frozen=True, extra="forbid"`, closed `Literal` enums.
+  - `quikode/model_registry.py` — `MODELS` dict mapping model name → transport (`codex_direct` | `codex_litellm` | `claude`) and `schema_enforcement` tier (`cli_native` | `client_side`). Adding a new model = one-line edit.
+  - `quikode/agent_registry.py` — `ROLES` dict + `make_agent(role, cfg)` dispatcher. Roles bind to MODELS only — never to a CLI by name. `cfg.<role>_model` selects.
+  - `quikode/agents/json_protocol.py` — `JsonAgentTransport` Protocol, `JsonOutputAgent`, `WritesFilesAgent`, `JsonAgentResult`. CLI-native enforcement for cli_native transports; pydantic validate + structured re-prompt-once for client_side transports.
+  - `quikode/agents/json_codex_direct.py`, `json_codex_litellm.py`, `json_claude.py` — three transport shims.
+- **Contract layer (plan 33 + plan 35)**:
+  - `quikode/evaluation_contract.py` — single-source-of-truth audit rubric per task; five-stage rubric (`local_ci`, `rubric`, `standards`, `architecture`, `behavior`).
+  - `quikode/evaluation_contract_serde.py` — five-stage encode/decode helpers (kept evaluation_contract.py under the line budget).
+  - `quikode/standards_profiles.py` — frontmatter-aware profile loader (no PyYAML dep).
+  - `quikode/architecture_docs.py` — free-form architecture-doc loader.
+  - `quikode/planner_validators.py` — `validate_rubric_coverage`, `validate_evidence_partition`, `validate_standards_refs`, `validate_architecture_refs`, `validate_finding_coverage`.
 - `quikode/daemon_shutdown.py` / `quikode/process_tree.py` (plan 34: child-tree-aware shutdown; orphan detection).
+- `quikode/cli_monitor.py` (plan 37: `qk monitor` state-log poller), `quikode/cli_standards.py` (plan 35: `qk standards seed` to copy starter standards profiles into a workspace).
 - `quikode/net_retry.py`, `quikode/git_push_recovery.py`, etc.
 
-**Retired in plan 33:** `quikode/scope_review.py` and `prompts/scope-review.md` (scope review entirely retired — the new structure of `rubric_targets` + `behavior_evidence_advanced` + planner `gauntlet_strategy` makes "is this file in lane" moot; every file advances some category or fixes some gate, verified per-subtask by the checker against the doer's SELF_AUDIT). Don't reintroduce scope-review-as-gating-layer.
+**Retired in plan 33:** `quikode/scope_review.py` and `prompts/scope-review.md` (scope review entirely retired — the new structure of `rubric_targets` + `behavior_evidence_advanced` + planner `gauntlet_strategy` makes "is this file in lane" moot). Don't reintroduce scope-review-as-gating-layer.
+
+**Retired in plan 38:** `quikode/self_audit.py` (deleted — SELF_AUDIT block + parser + deterministic short-circuit + plan-36's risk-token carve-out all gone). The doer no longer self-grades; the diff is the evidence and a separate JSON-mode LLM checker grades it. `subtask_schema.extract_json` deleted. `pre_pr_audit.py` heuristic JSON extracts deleted. `agents/progress.py:_JSON_OBJECT_RE` deleted. `agents/base.py:parse_tokens` + `_CODEX_TOKENS_RE` + `_GENERIC_TOKENS_RE` deleted (when PR-B.7 lands the legacy CLI shim deletes). `agents/opencode.py` deleted; `agents/codex.py` and `agents/claude.py` legacy modules deleted (PR-B.7). Don't reintroduce SELF_AUDIT-as-contract or any prose-parsing of agent stdout.
+
+**Architectural rule (plan 38):** Every structured-output agent runs in JSON output mode. NO regex on agent stdout. NO `extract_json`-shaped heuristics. Either CLI-native schema enforcement (claude `--json-schema`, codex `--output-schema`) or pydantic `model_validate_json` + structured re-prompt-once. That is the only allowed path. The role-binding axis is MODEL only — `cfg.<role>_cli` does not exist; the CLI is invisible to the role.
 
 Operator-mediated worktree fixes (open the file, write the correct content, `qk resume`) are rare and explicitly authorized — they do NOT generalize to feature work.
 
@@ -204,10 +234,13 @@ Operator-mediated worktree fixes (open the file, write the correct content, `qk 
 These live in the bundled prompts and are the contract every agent role honors. If a prompt change weakens any of them, you're regressing the system.
 
 - **No CI failure leaks to main.** Every panic, test failure, type error, lint error, or migration error encountered on a quikode branch is the task's responsibility to fix in this attempt — there is no "upstream owner," no "out-of-scope," no "pre-existing." (`subtask-doer.md`, `subtask-triage.md`, `subtask-checker.md`, `planner.md`, `progress.md`.)
-- **Every upstream agent sees the audit's actual rubric (plan 33).** A single `EvaluationContract` is built at PROVISIONING and persisted at `<workspace>/state/<task_id>/evaluation_contract.json`. Planner / doer / checker / triage / fixup-planner / merge-planner all load it and render scoped excerpts via `prompts/_evaluation_context.md.j2` (`ec_full` / `ec_stage_card` / `ec_targeted` macros). Replaces "don't do X" prompting with "here's the rubric you're being graded against." The audit gauntlet (`local_ci`, `rubric`, `standards`, `behavior`) is now usually pass-on-cycle-1.
-- **Doer SELF_AUDIT is mandatory and structured (plan 33).** Every doer output ends with a `SELF_AUDIT:` block (`gate_local_ci`, `gate_rubric`, `gate_standards`, `gate_behavior`, `diff_reconcile`). Hand-rolled parser at `quikode/self_audit.py`. Deterministic short-circuit on `rc != 0` / `predicted_score < min` / RISK/STUB tokens — fails fast without invoking the LLM checker. Otherwise the LLM checker runs adversarially (different model) regardless. The "pre-existing failure trap" anti-pattern from plan 28 is structurally prevented: a doer can't fill `gate_local_ci: rc=0` without actually running the gate. (`subtask-doer.md`, `quikode/self_audit.py`.)
-- **Triage tutors, doesn't prescribe (plan 33).** Senior-engineer-tutoring-junior framing: concrete file:line cites, teach the concept the doer missed, leave the next attempt's autonomy intact. Failure-layer enum: `{local_ci, rubric, standards, behavior, self_audit_mismatch, transport}`. Plan 14 preserved. (`subtask-triage.md`.)
-- **Checker never fabricates (plan 14, preserved).** No synthetic acceptance criteria the planner didn't write. Verifies SELF_AUDIT claims against diff + scoped witness commands run by the worker. (`subtask-checker.md`.)
+- **Every upstream agent sees the audit's actual rubric (plan 33 + plan 35).** A single `EvaluationContract` is built at PROVISIONING and persisted at `<workspace>/state/<task_id>/evaluation_contract.json`. Planner / doer / checker / triage / fixup-planner / merge-planner all load it and render scoped excerpts via `prompts/_evaluation_context.md.j2` (`ec_full` / `ec_stage_card` / `ec_targeted` macros). The contract has five stages: `local_ci`, `rubric`, `standards`, `architecture`, `behavior` (plan 35 split standards into language/framework profile docs vs. project-architecture docs). The standards rubric carries the loaded profile catalog; the architecture rubric carries the loaded architecture-doc corpus. `ec_targeted` inlines cited section bodies for both `standards_referenced[]` and `architecture_referenced[]` so doer/checker/triage see the actual rule prose, not just the citations.
+- **Every structured-output agent runs in JSON output mode (plan 38).** The `JsonAgent` layer (`quikode/agents/json_protocol.py` + three transport shims) is the SOLE agent path. Schema enforcement: cli-native (claude `--json-schema`, codex `--output-schema`) for direct-OpenAI / claude transports; client-side pydantic `model_validate_json` + structured re-prompt-once for proxy-routed transports. NO regex parsing of agent stdout. Every prose-parsing call site retired: `extract_json`, `parse_self_audit`, three pre_pr_audit heuristic JSON extracts, `progress.py`'s `_JSON_OBJECT_RE`, the codex/generic token regexes — all gone.
+- **Role-MODEL binding only (plan 38).** The role-binding axis is MODEL, never CLI. `cfg.<role>_model` selects from `MODELS` (in `model_registry.py`); the CLI is derived from `MODELS[<model>].transport`. Adding a new model is a one-line edit to `MODELS`. Adding a new provider is: register upstream in `~/.codex/litellm_config.yaml`, add codex profile in `~/.codex/config.toml`, add `MODELS` entry. NO ROLE EVER REFERENCES A CLI BY NAME.
+- **Doer emits a `DoerEnvelope` JSON envelope (plan 38).** Bookkeeping only — never graded. The diff is the evidence. The checker reads `git -C <worktree> status --porcelain` + `git diff HEAD --stat` and grades the diff against the contract; the envelope is shown for context only, labeled "doer's self-report — informational only." Plan 22 carry-forward preserved (prior envelope feeds next attempt's prompt). NO SELF_AUDIT — `quikode/self_audit.py` is deleted.
+- **Triage tutors, doesn't prescribe (plan 33 / 38).** Senior-engineer-tutoring-junior framing: concrete file:line cites, teach the concept the doer missed, leave the next attempt's autonomy intact. Failure-layer enum: `{local_ci, rubric, standards, architecture, behavior, parse_failure, transport}`. NO `self_audit_mismatch` (gone with SELF_AUDIT); NEW `parse_failure` (when the JsonAgent's structured re-prompt-once also fails); NEW `architecture` (plan 35 dual-bucket). (`subtask-triage.md`.)
+- **Checker grades the diff (plan 38).** Output: `SubtaskCheckerOutput` (verdict pass|fail + findings + overall_assessment) — pydantic-validated. Plan-12/14 invariants preserved: no fabrication, no out-of-scope findings; verdict is structured, not regex-extracted from prose. (`subtask-checker.md`.)
+- **Standards / architecture dual-bucket (plan 35).** `standards_referenced` cites only standards-profile docs (under `cfg.standards_profiles_dir`, validated via `validate_standards_refs`). `architecture_referenced` cites only project-architecture docs (under `cfg.architecture_docs_dir`, validated via `validate_architecture_refs`). Wrong-bucket placement triggers a planner re-prompt with a structured bucket-correction message; second mis-route → BLOCK. Adding a new project profile = `qk standards seed --to <path>` to copy starter content + edit the workspace's `quikode.yaml` to point at it.
 - **Behavior witnesses run per-subtask (plan 33).** When a subtask claims to advance `behavior_evidence_advanced` ids, the worker runs each id's witness command in the worktree's container before invoking the LLM checker. Per-witness 15s cap, per-subtask 30s cap (configurable via `cfg.subtask_witness_timeout_seconds`). Catches stub-shaped diffs that look right to a code reader but produce empty/error witness output.
 - **Doer never rewrites git history.** No `git reset`, `git rebase`, `git commit --amend`, `git checkout <ref>`, `git cherry-pick`. The orchestrator owns commits. (`subtask-doer.md`.)
 - **Format violations get the formatter, not hand-edits.** `cargo fmt --all`, `taplo fmt`, `just markdown-fmt-fix`, `prettier --write`. (`subtask-doer.md`.)
@@ -258,15 +291,90 @@ Persistent memory at `/home/trevor/.claude/projects/-home-trevor-github-quikode/
 
 ---
 
-## 9. Quick state-of-the-world (as of plan 34 fully shipped, 2026-05-08)
+## 9. Quick state-of-the-world (as of mid-sweep, 2026-05-08 PM)
 
-- **Plan 33 shipped** (rubric-first information architecture): scope review retired entirely. Single-source-of-truth `EvaluationContract` built at PROVISIONING, persisted per-task, loaded by every prompt-render entry point. New schema fields on `Subtask` (`rubric_targets`, `standards_referenced`, `behavior_evidence_advanced`); on `Plan` (`gauntlet_strategy`); `addresses_findings` retired; `files_to_touch` demoted to advisory (no commit-time enforcement, no multiplier cap). Three planner validators (`validate_rubric_coverage` / `validate_evidence_partition` / `validate_standards_paths` for spec; `validate_finding_coverage` for fixup) with re-prompt loop (max 2 → BLOCK). Per-subtask loop: doer codes → mandatory `SELF_AUDIT` block (parsed by `quikode/self_audit.py`, deterministic short-circuit on `rc!=0` / score-below-min / RISK/STUB tokens) → witness commands run for `behavior_evidence_advanced` ids → LLM checker (different model, adversarial) verifies SELF_AUDIT against diff + witness output → on FAIL, LLM triage in senior-engineer-tutoring-junior framing → next attempt receives structured prior SELF_AUDIT (plan 22 evolved). Doer/checker/fixup-planner timeouts bumped (1200→1800 / 600→900 / 1200→1800) per the May 8 calibration commit. Hard cutover, zero backwards-compat: validator rejects pre-plan-33 plans by construction.
-- **Plan 34 shipped** (daemon stop reliability): `qk daemon stop` walks the supervisor's full child tree, SIGTERMs every descendant, waits 30s with countdown, SIGKILLs survivors in supervisor→ordinary→docker-exec order, unconditionally removes `orchestrator.pid` + `orchestrator.heartbeat`. `qk daemon status` warns + exits nonzero when an orphaned `quikode.cli run` child is alive without a live supervisor. `qk reset` refuses to run with a live orphan (`--force` to override). Closes the May 8 incident where the orphaned child kept ticking 12 min after `daemon stop` reported success.
-- **Plan 28 shipped** (post-PR FSM streamlined): three post-PR states (`PENDING_CI`, `AWAITING_REVIEW`, `ADDRESSING_FEEDBACK`); `MERGE_READY` and `TRIAGING_FEEDBACK` retired; settle window retired; per-thread review classifier deleted. Bot/AI comments bundle as fixup-planner context only. Auto-merge triggers on observed `APPROVED` review when `auto_merge_when_clean=True`. Plan 28's "pre-existing failure trap" doer-prompt section retired by plan 33 (SELF_AUDIT structurally prevents the disclaim).
-- **Plan 30 shipped** (review-ready unified signal): `cfg.review_ready_settle_s` (default 900s = 15min) gates two things: ntfy push to operator's phone AND stacked-diff dependent kickoff. Scheduler bumped to **primary-first hard tier**. Tanren workspace flipped to `stacking_strategy="aggressive"` + `stacking_readiness="settled"` for cross-milestone chaining.
-- **Plan 31 shipped** (stacked-diff rebase model): children always stay stacked on parent's evolving tip (PR base = parent.branch); never un-stack onto main on parent push. Worker entry split into `run_rebase_to_parent_tip` (cascade-on-push) vs `run_rebase_to_main` (parent merged / sibling conflict). Cascade-walk-level coalesce. Resolver iteration cap is `cfg.conflict_resolver_max_iterations`; outer rebase budget is `cfg.rebase_max_attempts` (split from the legacy `conflict_max_resolve_attempts` knob — old key explicitly fails on load, no silent acceptance). Multi-parent rebase BLOCKs cleanly with note pointing at plan 32.
-- **Plan 32 shipped** (merge-node first-class entity): synthetic `kind="merge"` task per unique parent set; deterministic octopus → sequential merge → semantic-conflict doer-subloop (merge-planner emits integration subtasks → existing per-subtask doer/checker loop drives them). Audit gauntlet runs in `merge_node_mode`: local_ci + behavior always; rubric/standards re-enabled when `kind="merge-integration"` subtasks ran. Behavior audit's `expected_evidence` is the union of source parents'. Cascade: parent push → `propagate_parent_advanced` → re-merge; parent merge → `propagate_parent_merged` → drop the merged source, retire when empty. Tanren's 64 multi-parent nodes (27% of DAG) now have a real integration path.
-- **Codex agent** catches `TimeoutExpired` and returns `transient=True` instead of crashing the worker (R-0007 / R-0024 incident). Local CI gate passes the full raw `just ci` output to the fixup planner instead of regex-extracted findings (R-0021 incident).
-- **Validation ladder** stays green (922 tests as of plan 34). Tanren workspace runs `max_parallel=12, mem_per_task_gb=10`.
-- **Current run state**: fresh seed under the new schema. F-0001, F-0002, R-0001 pre-marked-merged; 230 PENDING tasks ready to plan under the rubric-first flow. Daemon was started ~minutes ago and is the first long-haul calibration run for plan 33. Watch the first 5-10 plans land — read each `gauntlet_strategy` + cycle-1 audit outcome — and tune `cfg.pre_pr_rubric_min_score` / `cfg.subtask_doer_timeout_seconds` if the bar needs softening or the doers are still hitting the ceiling.
-- **First-wave ramp**: under plan 30's settle gate, expect ~8-of-12 slots filled until the first parent reaches review-ready-settled (~15-30 min cold start), then the funnel widens as single-parent dependents unlock. Multi-parent dependents wait for plan 32 completion.
+A coordinated sweep of plans 35 + 38 is in progress to ship the JSON-mode agent layer + role-MODEL binding + standards/architecture dual-bucket. The daemon is STOPPED until the sweep lands and the workspace is re-seeded. Read this section if you're picking up mid-sweep — it tells you what's shipped, what's in flight, and how to resume.
+
+### 9.1 Plans index
+
+Shipped (in chronological order):
+- **Plan 28** (post-PR FSM streamlined): three post-PR states (`PENDING_CI`, `AWAITING_REVIEW`, `ADDRESSING_FEEDBACK`). Auto-merge on observed APPROVED review when `auto_merge_when_clean=True`.
+- **Plan 30** (review-ready unified signal): `cfg.review_ready_settle_s` gates ntfy push + stacked-diff dependent kickoff.
+- **Plan 31** (stacked-diff rebase model): children stay stacked on parent's evolving tip; `cfg.conflict_resolver_max_iterations` + `cfg.rebase_max_attempts` knobs.
+- **Plan 32** (merge-node first-class): synthetic `kind="merge"` task per parent set; integration subtasks via the per-subtask doer/checker loop.
+- **Plan 33** (rubric-first information architecture): `EvaluationContract` per task, persisted at `<workspace>/state/<task_id>/evaluation_contract.json`. SELF_AUDIT block on the doer was the *original* contract — RETIRED by plan 38.
+- **Plan 34** (daemon stop reliability): full child-tree SIGTERM/SIGKILL, orphan detection, `qk reset` refuses with live orphan.
+- **Plan 35 PR-A** (commit `4c92f83`): standards-profile + architecture-doc loaders, dual-bucket schema (`standards_referenced` + `architecture_referenced`), validators (`validate_standards_refs` + `validate_architecture_refs`), `prompts/_evaluation_context.md.j2` five-stage `ec_full` + profile catalog block + arch TOC block + cited-section-body inlining in `ec_targeted`, planner prompt §2.5 hard rule + dual-bucket worked example, seed profiles at `quikode/standards_profiles_seed/{rust-cargo,react-ts}/...`, `qk standards seed --to <path>` CLI.
+- **Plan 36** (commit `72e5d39`): SELF_AUDIT short-circuit `aligned=True` carve-out — DEAD CODE since plan 38 PR-B.5 deleted `quikode/self_audit.py` entirely.
+- **Plan 37** (commit `630fa10`): `qk monitor` built-in CLI subcommand (replaces the old `/tmp/qk-monitor.py`).
+- **Plan 38 PR-A** (commit `e896511`): JsonAgent layer — `quikode/agent_schemas.py` (pydantic per role) + `quikode/model_registry.py` (`MODELS` dict, transport + schema_enforcement tier) + `quikode/agent_registry.py` (`ROLES` + `make_agent` dispatcher) + `quikode/agents/json_protocol.py` + three transport shims (`json_codex_direct.py`, `json_codex_litellm.py`, `json_claude.py`). `cfg.<role>_model` knobs added; `qk retry --all-non-merged` flag added; `quikode/docker_env.py` adds `--add-host=host.docker.internal:host-gateway` to all containers.
+- **Plan 38 PR-B.1** (commit `3e78050`): `ArchitectureRefSchema` on `SubtaskSpec` — wire schema peer of plan 35's runtime `ArchitectureRef`.
+- **Plan 38 PR-B.2** (commit `5e92240`): `quikode/agents/progress.py` rewritten on the JsonAgent layer; `_JSON_OBJECT_RE` + `json.loads(snippet)` heuristic deleted.
+- **Plan 38 PR-B.3** (commit `ab86614`): `quikode/pre_pr_audit.py` three audit roles on the JsonAgent layer; three near-duplicate heuristic JSON extracts deleted.
+- **Plan 38 PR-B.4** (commit `5e54004`): planner / fixup / merge planner on the JsonAgent layer. `subtask_schema.extract_json` deleted. Wire-vs-runtime `Plan` translation in three module-level helpers (`planner_driver._wire_to_runtime_plan`, `fixup_coverage._wire_to_runtime_fixup_plan`, `merge_node_worker._wire_to_runtime_merge_plan`).
+- **Plan 38 PR-B.5** (commit `683e641`): SELF_AUDIT retired entirely. `quikode/self_audit.py` deleted (543 LoC), `tests/test_self_audit.py` deleted, `tests/test_subtask_loop_integration.py` deleted. `subtask_execution.py` rewritten on the JsonAgent layer (doer→diff→witness→checker→triage on fail, no SELF_AUDIT). Prompts rewritten: `subtask-doer.md` strips SELF_AUDIT requirements + adds `DoerEnvelope` JSON output; `subtask-checker.md` grades the diff directly; `subtask-triage.md` failure_layer enum drops `self_audit_mismatch`, adds `parse_failure` + `architecture`; `progress.md` `flatlined`→`flatline`; `fixup-planner.md` + `merge-planner.md` add `architecture_referenced[]`. Plan 36's carve-out gone with `self_audit.py`.
+- **Plan 38 PR-B.6** (commit `0fb20ca`): `quikode/json_extract.py` deleted (was unreferenced after PR-B.4).
+
+In flight (as of this writing):
+- **Plan 38 PR-B.7**: migrating the three remaining `build_agent` call sites (`workers/rebase_conflicts.py` conflict_resolver, `workers/pr_lifecycle.py` intent_reviewer, `workers/pr_lifecycle.py` replan-planner) onto `make_agent`, then deleting the legacy modules (`agents/opencode.py`, `agents/codex.py`, `agents/claude.py`, `parse_tokens` + token regexes from `agents/base.py`, `types.AgentResult` if dead, `agents/__init__.py:build_agent` + `AgentRole`, `task_worker.py:_PATCH_EXPORTS` if dead). Adds `ConflictResolverEnvelope` + `IntentReviewVerdict` schemas + `replan_planner` role registration. The completeness contract for this agent is "do all of it, no deferring to a future PR-B.8."
+
+Queued:
+- **Plan 35 PR-B**: architecture-alignment auditor — adds 5th gauntlet stage `architecture` between `standards` and `behavior`. New `prompts/pre-pr-architecture.md`. New `cfg.architecture_path_map` knob for the `unreferenced-applicable-architecture` finding type.
+- **Plan 38 PR-C**: TUI live-state correctness + config audit log. The TUI must reflect agent_call liveness independently of FSM state (no more "running per-subtask doer" when the call has already returned). `config_loader.py` emits `log.info` when toml overrides Field default at daemon-start. `config_template.py` seeds bumped to match all int Field defaults. New regression test asserting template-vs-default invariant.
+
+Plans `01–27` and `29` are pre-`optimizations`-branch context; see `plans/00-INDEX.md` for the full historical list.
+
+### 9.2 Workspace state (mid-sweep checkpoint)
+
+- **Daemon: STOPPED.** Per the sweep plan; will restart only after all PRs land + reinstall + re-seed.
+- **Workspace: WIPED clean.** `qk reset --yes --close-prs` ran cleanly. SQLite DB dropped, all `qk-*` containers removed, all `quikode/*` branches purged (local + remote), worktrees cleaned, residual per-task `<state_dir>/<task_id>/` directories cleaned manually.
+- **LiteLLM proxy: RUNNING** in docker as `litellm-bridge` on `127.0.0.1:4000`, with `ZAI_API_KEY` and `WAFER_API_KEY` from `~/.codex/.env` mounted via `-e`. Health probe returns `status: healthy`. `--add-host=host.docker.internal:host-gateway` is wired into tanren container provisioning so containers can reach the proxy via `host.docker.internal:4000`.
+- **Codex profiles:** 7 in `~/.codex/config.toml`. Direct OpenAI: `gpt5` (gpt-5.5), `codex` (gpt-5.3-codex). Proxy-routed (via `together_ai/<MODEL>` litellm prefix): `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen`. All seven verified via hello-world `--output-schema` test. CLI-native enforcement on the two direct profiles; client-side pydantic validation on the five proxy-routed profiles.
+- **z.ai** is currently rate-limited (5-hour usage window) until ~2026-05-08 21:20 UTC — doesn't block sweep code work, just z.ai-specific runtime tests. Wafer is unaffected.
+- **API keys:** `~/.codex/.env` (mode 600) + `~/.bashrc` sources via `set -a; . ~/.codex/.env; set +a`. NEVER commit these or echo them.
+
+### 9.3 Resume sequence (when sweep is fully done)
+
+When PR-B.7 + Plan 35 PR-B + Plan 38 PR-C all land:
+
+```bash
+# 1. Verify ladder green at HEAD.
+cd /home/trevor/github/quikode
+uv run ruff check quikode tests
+uv run ruff format --check quikode tests
+uv run ty check quikode tests
+uv run pytest tests/ -q
+
+# 2. Reinstall.
+bash scripts/reinstall.sh --skip-tests
+
+# 3. Verify proxy health.
+curl -sS http://127.0.0.1:4000/health/readiness
+# expect status: healthy
+
+# 4. Re-seed the workspace.
+cd /home/trevor/github/quikode-runs/tanren
+cat > /tmp/merged.json <<'EOF'
+[{"node_id": "F-0001"}, {"node_id": "F-0002"}, {"node_id": "R-0001"}]
+EOF
+qk seed-from-base --merged-nodes-file /tmp/merged.json
+
+# 5. Restart daemon.
+qk daemon start --detach --max-parallel 12 --retry-failed
+
+# 6. Watch first wave.
+qk monitor --keywords "attempt 4,attempt 5"
+```
+
+The first 5–10 spec plans landing under the new flow are the calibration window. Watch:
+- Whether the JsonAgent client-side re-prompt-once fires (parse-fail + retry). Frequent fires = a prompt/schema mismatch worth investigating.
+- Whether validators are rejecting plans for bucket-routing mistakes (`standards_referenced` vs `architecture_referenced`). Frequent rejections = the planner prompt's hard rule needs tightening.
+- Whether the architecture stage (when plan 35 PR-B lands) over-fires or under-fires findings. Calibrate `architecture_path_map` and finding severity in early cycles.
+
+### 9.4 Operational invariants under the sweep
+
+- **Validation ladder** stays green at every commit. As of HEAD `0fb20ca`: 1014 tests passing.
+- **No CLI hardcoded to a role.** Every place that today resolved a CLI by role uses `make_agent(role, cfg)` instead. Operator overrides per-role via `cfg.<role>_model = "gpt-5.5"` / `"GLM-5.1-zai"` / `"claude-opus-4-7"` / etc.
+- **No prose parsing of agent stdout.** The grep `parse_self_audit\|extract_json\|_JSON_OBJECT_RE\|parse_tokens\|_CODEX_TOKENS_RE\|_GENERIC_TOKENS_RE` returns ZERO production-code hits at the end of PR-B.7. Plan files (historical) and test docstrings asserting absence are fine.
+- **Tanren workspace** runs `max_parallel=12, mem_per_task_gb=10` (capped by coding-agent subscription, not host capacity).
+- **Restart cost** is unchanged from plan 34: per-task ~10–30 min lost (one in-flight agent call); subtask-level commits preserved on the branch.

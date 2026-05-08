@@ -3,6 +3,28 @@
 Plans written while the long-haul daemon does its thing. Each is sized to be a single
 PR's worth of work; sequencing notes call out dependencies. Order = priority.
 
+## Active sweep — plans 35 + 38 (status as of HEAD `0fb20ca`, 2026-05-08 PM)
+
+A coordinated sweep is shipping the JsonAgent layer (plan 38) and the standards / architecture
+dual-bucket (plan 35) under one mass `qk retry`. Daemon is STOPPED until the sweep lands.
+Workspace is wiped clean. See `orientation.md` §9 for the full state-of-world + resume sequence.
+
+| Plan | Sub-PR | Commit | Status |
+|---|---|---|---|
+| 35 | PR-A — loaders, dual-bucket schema, validators, planner prompt, seed profiles, `qk standards seed` | `4c92f83` | ✅ shipped |
+| 35 | PR-B — architecture-alignment auditor (5th gauntlet stage) | — | ⏳ queued |
+| 36 | SELF_AUDIT short-circuit aligned-row carve-out | `72e5d39` | ✅ shipped (DEAD CODE — `self_audit.py` deleted by 38 PR-B.5) |
+| 37 | `qk monitor` built-in CLI subcommand | `630fa10` | ✅ shipped |
+| 38 | PR-A — JsonAgent layer + role-MODEL binding + `cfg.<role>_model` knobs + `qk retry --all-non-merged` + docker `--add-host` | `e896511` | ✅ shipped |
+| 38 | PR-B.1 — `ArchitectureRefSchema` on `SubtaskSpec` | `3e78050` | ✅ shipped |
+| 38 | PR-B.2 — `progress.py` on JsonAgent layer | `5e92240` | ✅ shipped |
+| 38 | PR-B.3 — `pre_pr_audit.py` three roles on JsonAgent layer | `ab86614` | ✅ shipped |
+| 38 | PR-B.4 — planner / fixup / merge planner on JsonAgent layer; `extract_json` deleted | `5e54004` | ✅ shipped |
+| 38 | PR-B.5 — SELF_AUDIT retired; subtask_execution rewritten; prompts rewritten | `683e641` | ✅ shipped |
+| 38 | PR-B.6 — `quikode/json_extract.py` deleted | `0fb20ca` | ✅ shipped |
+| 38 | PR-B.7 — three remaining `build_agent` call sites migrated; legacy modules deleted (opencode/codex/claude/parse_tokens/AgentResult) | — | 🔄 in flight |
+| 38 | PR-C — TUI live-state correctness + config audit log + template-vs-default invariant | — | ⏳ queued |
+
 | # | Title | Why it matters | Depends on |
 |---|---|---|---|
 | 01 | retry-landscape | Landscape map. Read first. | — |
