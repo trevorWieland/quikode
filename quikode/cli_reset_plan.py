@@ -13,6 +13,7 @@ from .cli_context import (
     _open_store,
     app,
     console,
+    daemon_mod,
     docker_env,
     json,
     load_config,
@@ -27,11 +28,17 @@ def reset(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
     keep_db: bool = typer.Option(False, "--keep-db", help="Don't drop the SQLite store"),
     close_prs: bool = typer.Option(False, "--close-prs", help="Close any open PRs from quikode/* branches"),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Skip the live-daemon/orphan check (last-resort recovery; use only after manual `kill -9 <pid>`)",
+    ),
 ):
     """Reset the workspace to a clean slate: tear down containers, drop SQLite state,
     remove worktrees, delete quikode/* branches (local + remote). Use between smoke-test
     runs."""
     cfg = load_config()
+    _refuse_if_daemon_or_orphan_alive(cfg, force=force)
     _confirm_reset(cfg, yes=yes, keep_db=keep_db, close_prs=close_prs)
     n = docker_env.cleanup_all_quikode(cfg)
     console.print(f"[green]✓[/] removed {n} containers")
@@ -40,6 +47,35 @@ def reset(
         _close_quikode_prs(cfg)
     _reset_db_and_logs(cfg, keep_db=keep_db)
     console.print("[bold green]reset complete[/]")
+
+
+def _refuse_if_daemon_or_orphan_alive(cfg: Config, *, force: bool) -> None:
+    """Refuse reset when a supervisor or orphaned `quikode.cli run` is alive.
+
+    Background: `qk reset` deletes containers, worktrees, branches, and the
+    SQLite store. Doing that under a still-running orchestrator (whether a
+    healthy daemon or an orphaned child of init) leaves the workspace in an
+    inconsistent partial state — orphan keeps spawning containers behind us.
+    Caller must `qk daemon stop` (or manual `kill -9` for orphans) first;
+    `--force` is the explicit escape hatch.
+    """
+    if force:
+        return
+    sup, orphans = daemon_mod.detect_orphan_quikode_runs(cfg)
+    if sup is None and not orphans:
+        return
+    console.print("[red]refusing to reset: live quikode process(es) detected[/]")
+    if sup is not None:
+        console.print(f"  [red]daemon supervisor[/] pid={sup.pid} cmdline={sup.short_cmdline()!r}")
+        console.print("  → run `qk daemon stop` first")
+    for o in orphans:
+        console.print(f"  [red]orphaned child[/]   pid={o.pid} cmdline={o.short_cmdline()!r}")
+    if orphans:
+        console.print(
+            "  → run `qk daemon stop` (it now walks the full child tree); if any "
+            "stragglers remain, `kill -9 <pid>` and retry. Bypass with `--force`."
+        )
+    raise typer.Exit(2)
 
 
 def _confirm_reset(cfg: Config, *, yes: bool, keep_db: bool, close_prs: bool) -> None:

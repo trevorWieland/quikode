@@ -18,10 +18,33 @@ from typing import IO, Protocol
 from . import worktree
 from .config import Config
 
+# Stop / orphan-detection helpers live in `daemon_shutdown.py` to keep this
+# file under the architecture line-budget. Re-exported here for backward
+# compatibility with callers that imported from `quikode.daemon`.
+from .daemon_shutdown import (
+    SIGKILL_GRACE_S,
+    _sigkill_order,
+    _signal_pid,
+    detect_orphan_quikode_runs,
+    stop_daemon,
+)
+from .daemon_shutdown import (
+    cleanup_lifecycle_files as _cleanup_lifecycle_files,
+)
+
 log = logging.getLogger(__name__)
 
 CHILD_TERM_TIMEOUT_S = 30
 TERM_POLL_INTERVAL_S = 0.5
+
+__all__ = [
+    "SIGKILL_GRACE_S",
+    "_cleanup_lifecycle_files",
+    "_sigkill_order",
+    "_signal_pid",
+    "detect_orphan_quikode_runs",
+    "stop_daemon",
+]
 
 
 class ChildProcess(Protocol):
@@ -546,33 +569,3 @@ def _supervisor_backoff(
     log.info("supervisor sleeping %ds before restart", backoff)
     sleep_fn(backoff)
     return state.shutdown
-
-
-def stop_daemon(cfg: Config, *, timeout_s: int = CHILD_TERM_TIMEOUT_S) -> bool:
-    """Send SIGTERM to a running daemon. SIGKILL after timeout. Return True if stopped."""
-    pid, _ = read_daemon_pid(cfg)
-    if pid is None or not _pid_alive(pid):
-        # Best-effort cleanup if pid file is stale
-        if pid is not None:
-            _cleanup_pid_file(daemon_pid_file(cfg))
-        return False
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        _cleanup_pid_file(daemon_pid_file(cfg))
-        return True
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if not _pid_alive(pid):
-            _cleanup_pid_file(daemon_pid_file(cfg))
-            return True
-        time.sleep(TERM_POLL_INTERVAL_S)
-    # Fall back to SIGKILL
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    # Final tiny grace
-    time.sleep(0.5)
-    _cleanup_pid_file(daemon_pid_file(cfg))
-    return not _pid_alive(pid)

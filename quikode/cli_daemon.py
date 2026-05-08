@@ -122,12 +122,27 @@ def _daemon_start_impl(
 def daemon_stop(
     timeout_s: int = typer.Option(30, "--timeout-s", help="SIGTERM grace period before SIGKILL"),
 ):
-    """Send SIGTERM to a running daemon supervisor; SIGKILL if it doesn't exit in time."""
+    """Stop the daemon supervisor + every descendant.
+
+    SIGTERMs the supervisor and every child process it (or its children)
+    forked, waits up to `--timeout-s` seconds for clean exit, then SIGKILLs
+    anything still alive. Removes the pid + heartbeat files unconditionally
+    on exit so `qk daemon status` and `qk reset` see a clean slate.
+    """
 
     _setup_logging("WARNING")
     cfg = load_config()
     pid, _ = daemon_mod.read_daemon_pid(cfg)
     if pid is None:
+        # No pid file — but a child may still be orphaned from a previous
+        # crashed supervisor. Surface it loudly rather than exit 0/1 silently.
+        _, orphans = daemon_mod.detect_orphan_quikode_runs(cfg)
+        if orphans:
+            console.print("[red]no daemon.pid, but orphaned quikode.cli run children detected:[/]")
+            for o in orphans:
+                console.print(f"  pid={o.pid} cmdline={o.short_cmdline()!r}")
+            console.print("[yellow]run `kill -9 <pid>` for each, then retry[/]")
+            raise typer.Exit(2)
         console.print("[yellow]no daemon running (no daemon.pid)[/]")
         raise typer.Exit(1)
     if not daemon_mod._pid_alive(pid):
@@ -136,13 +151,29 @@ def daemon_stop(
             daemon_mod.daemon_pid_file(cfg).unlink()
         except OSError:
             pass
+        try:
+            daemon_mod.heartbeat_file(cfg).unlink()
+        except OSError:
+            pass
+        # Same orphan check: pid file pointed somewhere dead, but child may
+        # be reparented elsewhere.
+        _, orphans = daemon_mod.detect_orphan_quikode_runs(cfg)
+        if orphans:
+            console.print("[red]orphaned quikode.cli run children still alive:[/]")
+            for o in orphans:
+                console.print(f"  pid={o.pid} cmdline={o.short_cmdline()!r}")
+            raise typer.Exit(2)
         raise typer.Exit(1)
-    console.print(f"[cyan]sending SIGTERM to daemon pid={pid}, waiting up to {timeout_s}s...[/]")
-    ok = daemon_mod.stop_daemon(cfg, timeout_s=timeout_s)
+    console.print(f"[cyan]stopping daemon pid={pid} (timeout {timeout_s}s)...[/]")
+
+    def _emit(msg: str) -> None:
+        console.print(msg)
+
+    ok = daemon_mod.stop_daemon(cfg, timeout_s=timeout_s, log_fn=_emit)
     if ok:
         console.print("[green]daemon stopped[/]")
         raise typer.Exit(0)
-    console.print("[red]daemon did not stop cleanly — investigate[/]")
+    console.print("[red]daemon did not stop cleanly — see ERROR log lines above for surviving pids[/]")
     raise typer.Exit(1)
 
 
@@ -150,19 +181,25 @@ def daemon_stop(
 def daemon_status(
     output_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON instead of a summary"),
 ):
-    """Report daemon liveness + heartbeat freshness.
+    """Report daemon liveness + heartbeat freshness + orphan detection.
 
     Exit codes:
       0 — daemon alive AND heartbeat fresh
       1 — daemon not running
-      2 — daemon alive but heartbeat is stale (or missing)
+      2 — daemon alive but heartbeat is stale, OR
+          orphan `quikode.cli run` detected (supervisor dead, child kept ticking)
     """
 
     _setup_logging("WARNING")
     cfg = load_config()
     s = daemon_mod.get_status(cfg)
+    sup_proc, orphans = daemon_mod.detect_orphan_quikode_runs(cfg)
     if output_json:
-        print(json.dumps(s.to_json_dict(), indent=2))
+        payload = s.to_json_dict()
+        payload["orphan_quikode_runs"] = [
+            {"pid": o.pid, "ppid": o.ppid, "cmdline": o.cmdline} for o in orphans
+        ]
+        print(json.dumps(payload, indent=2))
     else:
         if s.daemon_alive:
             uptime = s.daemon_uptime_s or 0.0
@@ -181,7 +218,30 @@ def daemon_status(
                 f"pending_ci={hb.get('pending_ci')} "
                 f"addressing_feedback={hb.get('addressing_feedback')}"
             )
+        # Orphan warnings — when supervisor is dead but child ticks on, OR
+        # when the pid file is missing but heartbeat is fresh (same disease,
+        # different symptom). Either way the operator needs to act.
+        if orphans and not s.daemon_alive:
+            console.print(
+                f"[bold red]WARNING:[/] orphaned quikode child detected "
+                f"({len(orphans)} pid(s)) — daemon supervisor is dead but child(ren) "
+                f"still running. `kill -9 <pid>` to clean up:"
+            )
+            for o in orphans:
+                console.print(f"  [red]pid={o.pid}[/] cmdline={o.short_cmdline()!r}")
+        elif not s.daemon_alive and s.heartbeat_data is not None and not s.heartbeat_stale:
+            console.print(
+                "[bold red]WARNING:[/] heartbeat fresh but no supervisor in pid file — "
+                "orphaned child likely. Re-check `ps -eo pid,ppid,cmd | grep quikode.cli`."
+            )
+        # When supervisor is healthy, sup_proc is non-None — used only to
+        # silence pyright "unused"; no message needed for the OK path.
+        del sup_proc
     if not s.daemon_alive:
+        # Supervisor dead AND a fresh-looking heartbeat or orphan child:
+        # signal "something is wrong" via exit 2 so scripts can detect.
+        if orphans or (s.heartbeat_data is not None and not s.heartbeat_stale):
+            raise typer.Exit(2)
         raise typer.Exit(1)
     if s.heartbeat_data is None or s.heartbeat_stale:
         raise typer.Exit(2)
