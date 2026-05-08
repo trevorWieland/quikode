@@ -23,7 +23,7 @@ import sys
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
-from quikode import fsm_runtime
+from quikode import fsm_runtime, merge_node
 from quikode.state import State, TaskRow
 
 
@@ -49,6 +49,12 @@ class RebaseWatchMixin:
         Smart-skip: if a child's PR is still MERGEABLE against the base
         branch AND its base ref still exists, no rebase is required.
         """
+        # Plan 32: parent merged → propagate to merge-nodes BEFORE walking
+        # spec-task descendants. Affected merge-nodes drop the merged source;
+        # if the parent set becomes empty, retire; otherwise re-merge.
+        parent_id = self._task_id_for_branch(parent_branch)
+        if parent_id:
+            merge_node.propagate_parent_merged(self.store, parent_id)
         children = self.store.children_of_parent_branch(parent_branch)
         if not children:
             return
@@ -135,6 +141,14 @@ class RebaseWatchMixin:
         """
         if not self._cascade_walk_should_proceed(parent_branch):
             return
+        # Plan 32: when the advancing parent is a source of any merge-node,
+        # propagate the advance — affected merge-nodes go back to PENDING
+        # for a re-merge cycle. This fires BEFORE the descendant walk so
+        # downstream children of the merge-node see the new tip after the
+        # re-merge completes.
+        parent_id = self._task_id_for_branch(parent_branch)
+        if parent_id:
+            merge_node.propagate_parent_advanced(self.store, parent_id)
         children = self.store.children_of_parent_branch(parent_branch)
         if not children:
             return
@@ -194,6 +208,16 @@ class RebaseWatchMixin:
             return False
         self._last_cascade_walk_ts[parent_branch] = now
         return True
+
+    def _task_id_for_branch(self: Any, branch: str) -> str | None:
+        """Plan 32 helper: reverse-lookup a task id from its branch name.
+        Used to translate cascade triggers (keyed on branch) into the
+        task-id-keyed propagate_parent_* APIs."""
+        with self.store._tx_lock:
+            r = self.store.conn.execute(
+                "SELECT id FROM tasks WHERE branch = ? LIMIT 1", (branch,)
+            ).fetchone()
+        return str(r["id"]) if r else None
 
     def _remote_branch_exists(self: Any, branch: str) -> bool:
         try:
