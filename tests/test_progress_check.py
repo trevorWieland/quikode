@@ -26,17 +26,18 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from quikode.agent_schemas import ProgressVerdict as _PydanticProgressVerdict
+from quikode.agents.json_protocol import JsonAgentResult
 from quikode.agents.progress import (
     ProgressAgent,
     ProgressAttempt,
     ProgressVerdict,
-    _parse_progress_output,
 )
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.state import State, Store, SubtaskState
 from quikode.subtask_schema import Plan, Subtask
-from quikode.types import AgentResult, Verdict
+from quikode.types import Verdict
 from quikode.worker import (
     TaskWorker,
     _CheckerOutcome,
@@ -150,58 +151,7 @@ def _build_worker(
     return worker
 
 
-# ----- _parse_progress_output -----
-
-
-def test_parse_clean_json():
-    raw = json.dumps({"verdict": "progressing", "rationale": "root cause shifted"})
-    v = _parse_progress_output(raw)
-    assert v.verdict == "progressing"
-    assert "shifted" in v.rationale
-
-
-def test_parse_flatlined():
-    raw = json.dumps({"verdict": "flatlined", "rationale": "same error 3x"})
-    v = _parse_progress_output(raw)
-    assert v.verdict == "flatlined"
-
-
-def test_parse_uncertain():
-    raw = json.dumps({"verdict": "uncertain", "rationale": "too few attempts"})
-    v = _parse_progress_output(raw)
-    assert v.verdict == "uncertain"
-
-
-def test_parse_extracts_object_from_preamble():
-    """Agent occasionally includes prose preamble despite the prompt."""
-    raw = (
-        "Sure, here is the verdict:\n\n"
-        + json.dumps({"verdict": "flatlined", "rationale": "X"})
-        + "\n\nLet me know if you want more."
-    )
-    v = _parse_progress_output(raw)
-    assert v.verdict == "flatlined"
-
-
-def test_parse_garbage_falls_back_to_uncertain():
-    v = _parse_progress_output("this is not json at all")
-    assert v.verdict == "uncertain"
-    assert "failed to parse" in v.rationale
-
-
-def test_parse_empty_falls_back_to_uncertain():
-    v = _parse_progress_output("")
-    assert v.verdict == "uncertain"
-
-
-def test_parse_unknown_verdict_value_falls_back():
-    raw = json.dumps({"verdict": "weird-state", "rationale": "x"})
-    v = _parse_progress_output(raw)
-    assert v.verdict == "uncertain"
-    assert "unknown verdict" in v.rationale
-
-
-# ----- ProgressAgent.check -----
+# ----- ProgressAgent.check (Plan 38 PR-B.2: JsonAgent layer) -----
 
 
 def _stub_handle():
@@ -210,7 +160,7 @@ def _stub_handle():
     return h
 
 
-def test_progress_agent_happy_path(tmp_path):
+def _build_progress_cfg(tmp_path: Path) -> Config:
     cfg = Config(
         repo_path=tmp_path,
         dag_path=tmp_path / "dag.json",
@@ -221,18 +171,34 @@ def test_progress_agent_happy_path(tmp_path):
         sccache_dir=tmp_path / ".quikode" / "sccache",
     )
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    return cfg
 
-    fake_result = AgentResult(
-        rc=0,
-        stdout=json.dumps({"verdict": "progressing", "rationale": "narrowed area"}),
-        stderr="",
+
+def _make_json_result(
+    *,
+    structured: _PydanticProgressVerdict | None = None,
+    rc: int = 0,
+    parse_errors: tuple[str, ...] = (),
+    transient: bool = False,
+) -> JsonAgentResult:
+    return JsonAgentResult(
+        structured=structured,
+        rc=rc,
+        transient=transient,
+        duration_s=0.1,
+        parse_errors=parse_errors,
     )
-    fake_agent = MagicMock()
-    fake_agent.run.return_value = fake_result
 
+
+def test_progress_agent_happy_path_progressing(tmp_path):
+    cfg = _build_progress_cfg(tmp_path)
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(
+        structured=_PydanticProgressVerdict(verdict="progressing", rationale="narrowed area"),
+    )
     subtask = Subtask(id="S-01", title="x", acceptance=("a",), files_to_touch=("foo.rs",))
     pa = ProgressAgent(cfg)
-    with patch("quikode.agents.progress.build_agent", return_value=fake_agent):
+    with patch("quikode.agents.progress.make_agent", return_value=fake_agent):
         outcome = pa.check(
             subtask=subtask,
             attempts=[ProgressAttempt(attempt_no=1, checker_root_cause="a", triage_notes="b")],
@@ -243,25 +209,36 @@ def test_progress_agent_happy_path(tmp_path):
     assert "narrowed" in outcome.rationale
 
 
-def test_progress_agent_parse_failure_returns_uncertain(tmp_path):
-    cfg = Config(
-        repo_path=tmp_path,
-        dag_path=tmp_path / "dag.json",
-        state_dir=tmp_path / ".quikode",
-        log_dir=tmp_path / ".quikode" / "logs",
-        prompts_dir=tmp_path / "missing-prompts",
-        worktree_root=tmp_path / ".quikode" / "worktrees",
-        sccache_dir=tmp_path / ".quikode" / "sccache",
-    )
-    cfg.state_dir.mkdir(parents=True, exist_ok=True)
-
-    fake_result = AgentResult(rc=0, stdout="not json at all sorry", stderr="")
+def test_progress_agent_flatline_pydantic_maps_to_legacy_flatlined(tmp_path):
+    """Bridge regression: pydantic schema's `flatline` → legacy `flatlined`."""
+    cfg = _build_progress_cfg(tmp_path)
     fake_agent = MagicMock()
-    fake_agent.run.return_value = fake_result
-
+    fake_agent.invoke.return_value = _make_json_result(
+        structured=_PydanticProgressVerdict(verdict="flatline", rationale="same root cause"),
+    )
     subtask = Subtask(id="S-01", title="x", acceptance=("a",), files_to_touch=("foo.rs",))
     pa = ProgressAgent(cfg)
-    with patch("quikode.agents.progress.build_agent", return_value=fake_agent):
+    with patch("quikode.agents.progress.make_agent", return_value=fake_agent):
+        outcome = pa.check(
+            subtask=subtask,
+            attempts=[ProgressAttempt(attempt_no=1, checker_root_cause="x", triage_notes="y")],
+            acceptance=("a",),
+            handle=_stub_handle(),
+        )
+    assert outcome.verdict == "flatlined"
+    assert "same root cause" in outcome.rationale
+
+
+def test_progress_agent_parse_errors_returns_uncertain(tmp_path):
+    cfg = _build_progress_cfg(tmp_path)
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(
+        structured=None,
+        parse_errors=("verdict: unexpected literal 'bogus'",),
+    )
+    subtask = Subtask(id="S-01", title="x", acceptance=("a",), files_to_touch=("foo.rs",))
+    pa = ProgressAgent(cfg)
+    with patch("quikode.agents.progress.make_agent", return_value=fake_agent):
         outcome = pa.check(
             subtask=subtask,
             attempts=[ProgressAttempt(attempt_no=1, checker_root_cause="x", triage_notes="y")],
@@ -269,30 +246,36 @@ def test_progress_agent_parse_failure_returns_uncertain(tmp_path):
             handle=_stub_handle(),
         )
     assert outcome.verdict == "uncertain"
-    assert "failed to parse" in outcome.rationale
+    assert "unexpected literal" in outcome.rationale
+
+
+def test_progress_agent_no_structured_output_returns_uncertain(tmp_path):
+    cfg = _build_progress_cfg(tmp_path)
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=None, parse_errors=())
+    subtask = Subtask(id="S-01", title="x", acceptance=("a",), files_to_touch=("foo.rs",))
+    pa = ProgressAgent(cfg)
+    with patch("quikode.agents.progress.make_agent", return_value=fake_agent):
+        outcome = pa.check(
+            subtask=subtask,
+            attempts=[ProgressAttempt(attempt_no=1, checker_root_cause="x", triage_notes="y")],
+            acceptance=("a",),
+            handle=_stub_handle(),
+        )
+    assert outcome.verdict == "uncertain"
+    assert "no structured output" in outcome.rationale
 
 
 def test_progress_agent_invocation_raises_returns_uncertain(tmp_path):
     """Agent timeout/transient — exception caught, verdict=uncertain.
     The progress check is advisory; a crash here must not crash the
     worker's subtask loop."""
-    cfg = Config(
-        repo_path=tmp_path,
-        dag_path=tmp_path / "dag.json",
-        state_dir=tmp_path / ".quikode",
-        log_dir=tmp_path / ".quikode" / "logs",
-        prompts_dir=tmp_path / "missing-prompts",
-        worktree_root=tmp_path / ".quikode" / "worktrees",
-        sccache_dir=tmp_path / ".quikode" / "sccache",
-    )
-    cfg.state_dir.mkdir(parents=True, exist_ok=True)
-
+    cfg = _build_progress_cfg(tmp_path)
     fake_agent = MagicMock()
-    fake_agent.run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=10)
-
+    fake_agent.invoke.side_effect = subprocess.TimeoutExpired(cmd="codex", timeout=10)
     subtask = Subtask(id="S-01", title="x", acceptance=("a",), files_to_touch=("foo.rs",))
     pa = ProgressAgent(cfg)
-    with patch("quikode.agents.progress.build_agent", return_value=fake_agent):
+    with patch("quikode.agents.progress.make_agent", return_value=fake_agent):
         outcome = pa.check(
             subtask=subtask,
             attempts=[ProgressAttempt(attempt_no=1, checker_root_cause="x", triage_notes="y")],
@@ -304,24 +287,12 @@ def test_progress_agent_invocation_raises_returns_uncertain(tmp_path):
 
 
 def test_progress_agent_nonzero_rc_returns_uncertain(tmp_path):
-    cfg = Config(
-        repo_path=tmp_path,
-        dag_path=tmp_path / "dag.json",
-        state_dir=tmp_path / ".quikode",
-        log_dir=tmp_path / ".quikode" / "logs",
-        prompts_dir=tmp_path / "missing-prompts",
-        worktree_root=tmp_path / ".quikode" / "worktrees",
-        sccache_dir=tmp_path / ".quikode" / "sccache",
-    )
-    cfg.state_dir.mkdir(parents=True, exist_ok=True)
-
-    fake_result = AgentResult(rc=2, stdout="", stderr="boom")
+    cfg = _build_progress_cfg(tmp_path)
     fake_agent = MagicMock()
-    fake_agent.run.return_value = fake_result
-
+    fake_agent.invoke.return_value = _make_json_result(structured=None, rc=2)
     subtask = Subtask(id="S-01", title="x", acceptance=("a",), files_to_touch=("foo.rs",))
     pa = ProgressAgent(cfg)
-    with patch("quikode.agents.progress.build_agent", return_value=fake_agent):
+    with patch("quikode.agents.progress.make_agent", return_value=fake_agent):
         outcome = pa.check(
             subtask=subtask,
             attempts=[],
@@ -330,6 +301,37 @@ def test_progress_agent_nonzero_rc_returns_uncertain(tmp_path):
         )
     assert outcome.verdict == "uncertain"
     assert "rc=2" in outcome.rationale
+
+
+def test_progress_agent_uses_cfg_progress_timeout_s(tmp_path):
+    """Default `timeout=None` → effective timeout = cfg.progress_timeout_s."""
+    cfg = _build_progress_cfg(tmp_path)
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(
+        structured=_PydanticProgressVerdict(verdict="uncertain", rationale="x"),
+    )
+    subtask = Subtask(id="S-01", title="x", acceptance=("a",), files_to_touch=("foo.rs",))
+    pa = ProgressAgent(cfg)
+    with patch("quikode.agents.progress.make_agent", return_value=fake_agent):
+        pa.check(
+            subtask=subtask,
+            attempts=[],
+            acceptance=("a",),
+            handle=_stub_handle(),
+        )
+    fake_agent.invoke.assert_called_once()
+    call_kwargs = fake_agent.invoke.call_args.kwargs
+    assert call_kwargs["timeout"] == cfg.progress_timeout_s
+
+
+def test_progress_agent_source_has_no_regex_or_json_loads():
+    """Plan 38 PR-B.2 regression: progress.py must not re-introduce the
+    heuristic JSON-extract path. The JsonAgent layer owns parsing."""
+    src = Path("quikode/agents/progress.py").read_text()
+    assert "_JSON_OBJECT_RE" not in src, "regex extraction must be gone"
+    assert "json.loads" not in src, "json.loads heuristic must be gone"
+    assert "import re" not in src, "re module no longer needed"
+    assert "import json" not in src, "json module no longer needed"
 
 
 # ----- progress check cadence seeded from retries (regression #24) -----

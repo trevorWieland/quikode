@@ -1,4 +1,4 @@
-"""v3 Phase A: progress-check agent.
+"""Plan 38 PR-B.2: progress-check agent on the JsonAgent layer.
 
 The progress-check agent is invoked periodically inside `_subtask_loop`
 when the doer/checker pair has been retrying without converging. Given
@@ -17,27 +17,34 @@ parse error, transient container glitch) collapses to `uncertain`, never
 propagates as an exception. Worse than a missing signal is a crashed
 worker.
 
-Defaults to codex gpt-5.4-mini (configurable via `cfg.progress.cli/model`).
-A lightweight verdict role — the input is short (last few attempts'
-checker root-causes + triage notes) and the decision is shallow.
+PR-B.2: prose parsing (heuristic JSON extraction) is gone. The
+agent runs through `make_agent("progress", cfg)`, which validates the
+JSON envelope against the `ProgressVerdict` pydantic schema in the
+JsonAgent layer. A schema-validation failure (`parse_errors` non-empty)
+collapses to `uncertain` — preserving the existing fallback semantic at
+the worker layer without re-introducing heuristics here.
+
+The worker-facing public surface (`ProgressAgent.check(...)`,
+`build_progress_agent(...)`, `ProgressAttempt`, `ProgressVerdict`) is
+preserved verbatim so callers in `quikode.workers.task_worker` /
+`quikode.workers.subtask_progress` need no change. The bridge between
+the new pydantic `ProgressVerdict` (closed enum: `flatline`) and the
+worker-facing dataclass (closed enum: `flatlined`) lives in `_to_worker_dataclass`.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
-
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
 
 from .. import prompts
-from ..config import AgentRole, Config
+from ..agent_registry import make_agent
+from ..agent_schemas import ProgressVerdict as _PydanticProgressVerdict
+from ..config import Config
 from ..execution import ExecutionSandbox
 from ..subtask_schema import Subtask
-from . import build_agent
 
 log = logging.getLogger("quikode.agents.progress")
 
@@ -52,30 +59,48 @@ class ProgressAttempt:
     commit_sha_before: str | None = None
 
 
-class ProgressVerdict(BaseModel):
-    """Structured output of one progress-check invocation."""
+@dataclass(frozen=True)
+class ProgressVerdict:
+    """Worker-facing progress-check verdict.
 
-    model_config = ConfigDict(frozen=True)
+    Distinct from `quikode.agent_schemas.ProgressVerdict` (the wire-level
+    pydantic schema). The worker-facing dataclass keeps the closed-enum value
+    `"flatlined"` because `quikode.workers.subtasks._maybe_record_progress_block`
+    branches on that exact string. Plan 38's pydantic schema normalizes
+    to `"flatline"`; `_to_worker_dataclass` bridges the two so the worker sees the
+    worker-facing spelling without leaking the pydantic enum upward. Plan 38
+    PR-B.5 will rewrite `prompts/progress.md` and reconcile the worker's
+    consumer with the pydantic spelling — until then, the bridge is the
+    single conversion site.
+    """
 
-    verdict: Literal["progressing", "flatlined", "uncertain"] = Field(
-        description="Whether the subtask is converging, repeating, or unclear."
-    )
-    rationale: str = Field(
-        default="",
-        description="One-line explanation; surfaces in the progress_checks audit row.",
-    )
+    verdict: Literal["progressing", "flatlined", "uncertain"]
+    rationale: str = ""
+
+
+def _to_worker_dataclass(pyd: _PydanticProgressVerdict) -> ProgressVerdict:
+    """Convert the pydantic schema instance to the worker-facing dataclass.
+
+    The two are field-compatible except for the `"flatline"` ↔ `"flatlined"`
+    spelling. `"progressing"` and `"uncertain"` map straight through. Any
+    other value would have failed pydantic validation upstream, so this
+    function only sees the closed enum.
+    """
+    if pyd.verdict == "flatline":
+        return ProgressVerdict(verdict="flatlined", rationale=pyd.rationale)
+    # "progressing" | "uncertain"
+    return ProgressVerdict(verdict=pyd.verdict, rationale=pyd.rationale)
 
 
 class ProgressAgent:
-    """Wraps the configured agent CLI for progress-check invocations.
+    """Wraps the JsonAgent layer for progress-check invocations.
 
-    The agent is built lazily on each `check()` so swapping
-    `cfg.progress` between calls is honored. Cheap models, short inputs.
+    Built lazily on each `check()` (cheap; the JsonAgent layer also caches
+    nothing), so swapping `cfg.progress_model` between calls is honored.
     """
 
-    def __init__(self, cfg: Config, role: AgentRole | None = None):
+    def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.role = role or cfg.progress
 
     def check(
         self,
@@ -85,13 +110,17 @@ class ProgressAgent:
         acceptance: tuple[str, ...],
         handle: ExecutionSandbox,
         log_path: Path | None = None,
-        timeout: int = 180,
+        timeout: int | None = None,
     ) -> ProgressVerdict:
-        """Run the agent and return a parsed verdict.
+        """Run the progress agent and return a parsed verdict.
 
-        Failures (agent rc != 0, timeout, parse failure) collapse to
-        `uncertain` so the worker can keep going. The progress check is
-        advisory — a crash here must not break the subtask loop.
+        Failures (agent rc != 0, timeout, schema-validation parse error)
+        collapse to `uncertain` so the worker can keep going. The progress
+        check is advisory — a crash here must not break the subtask loop.
+
+        `timeout` defaults to `cfg.progress_timeout_s`; callers may
+        override (existing worker call passes `timeout=180`, which is
+        also the cfg default).
         """
         try:
             prompt = prompts.progress_prompt(
@@ -107,9 +136,15 @@ class ProgressAgent:
                 rationale=f"prompt render failed: {str(e)[:200]}",
             )
 
+        effective_timeout = timeout if timeout is not None else self.cfg.progress_timeout_s
         try:
-            agent = build_agent(self.role)
-            result = agent.run(prompt, handle=handle, log_path=log_path, timeout=timeout)
+            agent = make_agent("progress", self.cfg)
+            result = agent.invoke(
+                prompt,
+                handle=handle,
+                log_path=log_path,
+                timeout=effective_timeout,
+            )
         except Exception as e:  # agent transient (docker died, etc.) → don't propagate
             log.warning("progress agent invocation raised: %s", e)
             return ProgressVerdict(
@@ -117,69 +152,35 @@ class ProgressAgent:
                 rationale=f"agent transient failure: {str(e)[:200]}",
             )
 
-        if not result.ok:
+        if result.rc != 0:
             return ProgressVerdict(
                 verdict="uncertain",
                 rationale=f"agent rc={result.rc}; treating as uncertain",
             )
 
-        return _parse_progress_output(result.stdout)
+        if result.parse_errors or result.structured is None:
+            rationale = (
+                "; ".join(result.parse_errors)[:500]
+                if result.parse_errors
+                else "agent returned no structured output"
+            )
+            return ProgressVerdict(verdict="uncertain", rationale=rationale)
+
+        if not isinstance(result.structured, _PydanticProgressVerdict):
+            # Defensive: registry binds "progress" to ProgressVerdict, so this
+            # branch only fires if the registry is misconfigured. Treat as
+            # uncertain; surface enough context for an operator to debug.
+            return ProgressVerdict(
+                verdict="uncertain",
+                rationale=(
+                    "progress agent returned unexpected schema "
+                    f"{type(result.structured).__name__}; expected ProgressVerdict"
+                ),
+            )
+
+        return _to_worker_dataclass(result.structured)
 
 
 def build_progress_agent(cfg: Config) -> ProgressAgent:
     """Factory mirror of `build_agent(role)` for the other phases."""
     return ProgressAgent(cfg)
-
-
-# JSON object regex — claude-code envelopes occasionally include leading
-# preamble lines despite the prompt; we extract the first balanced JSON
-# object found in the output.
-_JSON_OBJECT_RE = re.compile(r"\{[^{}]*\"verdict\"[^{}]*\}", re.DOTALL)
-
-
-def _parse_progress_output(text: str) -> ProgressVerdict:
-    """Parse the agent's JSON envelope into a typed verdict.
-
-    On any parse failure, fall back to `uncertain` with a rationale citing
-    the first 200 chars of the raw output. This includes the case where
-    the agent ignored the JSON instruction and emitted prose, or
-    truncated mid-token.
-    """
-    if not text or not text.strip():
-        return ProgressVerdict(verdict="uncertain", rationale="failed to parse: empty output")
-
-    snippet = text.strip()
-    # Try direct parse first (cheapest path).
-    try:
-        data = json.loads(snippet)
-    except json.JSONDecodeError:
-        m = _JSON_OBJECT_RE.search(snippet)
-        if not m:
-            return ProgressVerdict(
-                verdict="uncertain",
-                rationale=f"failed to parse: {snippet[:200]}",
-            )
-        try:
-            data = json.loads(m.group(0))
-        except json.JSONDecodeError:
-            return ProgressVerdict(
-                verdict="uncertain",
-                rationale=f"failed to parse: {snippet[:200]}",
-            )
-
-    if not isinstance(data, dict):
-        return ProgressVerdict(
-            verdict="uncertain",
-            rationale=f"failed to parse: not an object: {snippet[:200]}",
-        )
-
-    verdict_raw = str(data.get("verdict", "")).strip().lower()
-    if verdict_raw not in {"progressing", "flatlined", "uncertain"}:
-        return ProgressVerdict(
-            verdict="uncertain",
-            rationale=f"unknown verdict {verdict_raw!r}; raw: {snippet[:200]}",
-        )
-
-    rationale = str(data.get("rationale") or "")[:500]
-    verdict = cast(Literal["progressing", "flatlined", "uncertain"], verdict_raw)
-    return ProgressVerdict(verdict=verdict, rationale=rationale)
