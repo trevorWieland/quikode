@@ -43,6 +43,21 @@ class StandardsRefSchema(BaseModel):
     section: str = Field(min_length=1)
 
 
+class ArchitectureRefSchema(BaseModel):
+    """One pinned project-architecture-doc passage for a subtask.
+
+    Plan 35: architecture refs cite docs under `cfg.architecture_docs_dir`,
+    distinct from standards-profile docs. The planner declares which
+    architecture passages a subtask aligns with; `validate_architecture_refs`
+    rejects standards-profile citations with a bucket-correction re-prompt.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    doc_path: str = Field(min_length=1)
+    section: str = Field(min_length=1)
+
+
 class SubtaskSpec(BaseModel):
     """One independently-verifiable slice of a node's implementation.
 
@@ -65,6 +80,7 @@ class SubtaskSpec(BaseModel):
     kind: str = Field(default="spec")
     rubric_targets: list[RubricTargetSchema] = Field(default_factory=list)
     standards_referenced: list[StandardsRefSchema] = Field(default_factory=list)
+    architecture_referenced: list[ArchitectureRefSchema] = Field(default_factory=list)
     behavior_evidence_advanced: list[str] = Field(default_factory=list)
 
 
@@ -341,6 +357,7 @@ class ProgressVerdict(BaseModel):
 
 
 __all__ = [
+    "ArchitectureRefSchema",
     "BehaviorCompletenessGap",
     "BehaviorVerification",
     "DoerEnvelope",
