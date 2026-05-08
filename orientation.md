@@ -132,7 +132,34 @@ qk daemon start --detach --max-parallel 12 --retry-failed
 
 **Prompt-only changes** (`prompts/*.md`) are loaded fresh per render via Jinja's `FileSystemLoader`; a reinstall is enough — no daemon restart needed. Python code changes do require a restart.
 
-### 5.4 Mode of influence
+### 5.4 Delegate implementation — you are an orchestrator, not an implementer
+
+Code-writing work for non-trivial plans should be **delegated to subagents**, not done in the manager's session directly. The pattern:
+
+1. **Plan agent** for design — produces the plan/spec, identifies files, surfaces open questions. (Already standard in this codebase; see plans 28, 32 for examples generated via Plan agent.)
+2. User resolves open questions inline.
+3. **Fresh general-purpose agent** for execution. Brief it with:
+   - The plan file path (`plans/NN-name.md`) — the agent reads it as its source of truth.
+   - The validation ladder (ruff check + ruff format check + ty check + pytest) and the requirement that all four pass before committing.
+   - The no-backcompat directive when applicable: "treat current implementation as suspect; remove pre-existing code paths rather than preserve them with flags."
+   - Specific instructions on what the manager will do with the result (e.g. "commit when ladder is green; don't push or restart the daemon").
+4. Manager **reviews the agent's diff** before committing. Spot-check that:
+   - The plan was followed (file list matches, no unexpected scope creep).
+   - The validation ladder actually passed (don't trust the agent's "all green" — re-run if uncertain).
+   - No backwards-compat shims slipped in (explicit fail on retired keys vs silent acceptance, retired code paths actually removed not flag-gated).
+5. Manager owns the commit, push, reinstall, daemon restart, and any post-deploy intervention.
+
+**When to skip delegation:**
+
+- Trivial single-file edits (a config rename, a one-line bug fix, a doc tweak).
+- Investigation / triage where the manager needs to understand the current state directly (use Explore agent for read-only research; not for writing).
+- Operational interventions (`qk retry`, `qk rewind`, daemon restart, fruit-of-rotten-tree wipes) — those are the manager's job and don't compose well with an agent's session.
+
+**Why this matters:** the manager's context window is the constraint. Loading large code files, reading multi-file diffs, working through dozens of edits all consume the same budget that's needed for situational awareness (monitor events, intervention decisions, plan sequencing). Delegating execution keeps the manager's view clean — the manager sees "agent shipped plan 32 PR-A 3/3 via patch X, ladder green," not the 800 LoC of merge-node-worker internals. Quality of judgement on the next decision is preserved.
+
+**The trap to avoid:** doing the work yourself "because it's faster than briefing an agent." It's not — you can brief an agent in 60 seconds and check its output in 90 more, vs. spending 30+ minutes on context-laden implementation. Even if the agent gets it 80% right and needs a follow-up, that's still cheaper than the manager doing it solo.
+
+### 5.5 Mode of influence
 
 The agent's mode of influence on tanren is the **state machine** and the **prompts** — and quikode's worker / orchestrator code that drives both. Never edit tanren application code directly; if a tanren symptom suggests a fix, the fix lives in:
 
@@ -219,12 +246,13 @@ Persistent memory at `/home/trevor/.claude/projects/-home-trevor-github-quikode/
 
 ---
 
-## 9. Quick state-of-the-world (as of plan 30 ship)
+## 9. Quick state-of-the-world (as of plan 31 ship + plan 32 PR-A 2/3)
 
 - **Plan 28 shipped** (post-PR FSM streamlined): three post-PR states (`PENDING_CI`, `AWAITING_REVIEW`, `ADDRESSING_FEEDBACK`); `MERGE_READY` and `TRIAGING_FEEDBACK` retired; settle window retired; per-thread review classifier deleted. Bot/AI comments bundle as fixup-planner context only. Auto-merge triggers on observed `APPROVED` review when `auto_merge_when_clean=True`.
-- **Plan 30 shipped** (review-ready unified signal): `cfg.review_ready_settle_s` (default 900s = 15min) gates two things: ntfy push to operator's phone AND stacked-diff dependent kickoff. ntfy.sh delivery resurrected (ntfy-only, no slack). Scheduler bumped to **primary-first hard tier** — stacked candidates only pick up when no primary is pickable. Tanren workspace flipped to `stacking_strategy="aggressive"` + `stacking_readiness="settled"` for cross-milestone chaining with the new safety property.
+- **Plan 30 shipped** (review-ready unified signal): `cfg.review_ready_settle_s` (default 900s = 15min) gates two things: ntfy push to operator's phone AND stacked-diff dependent kickoff. Scheduler bumped to **primary-first hard tier**. Tanren workspace flipped to `stacking_strategy="aggressive"` + `stacking_readiness="settled"` for cross-milestone chaining.
+- **Plan 31 shipped** (stacked-diff rebase model): children always stay stacked on parent's evolving tip (PR base = parent.branch); never un-stack onto main on parent push. Worker entry split into `run_rebase_to_parent_tip` (cascade-on-push) vs `run_rebase_to_main` (parent merged / sibling conflict). Cascade-walk-level coalesce. Resolver iteration cap is `cfg.conflict_resolver_max_iterations`; outer rebase budget is `cfg.rebase_max_attempts` (split from the legacy `conflict_max_resolve_attempts` knob — old key explicitly fails on load, no silent acceptance). Multi-parent rebase BLOCKs cleanly with note pointing at plan 32.
+- **Plan 32 partial** (merge-node first-class entity): PR-A 1/3 (FSM + storage + helpers) + 2/3 (cascade hooks) shipped. PR-A 3/3 (worker dispatch + minimal merge-node worker) and PR-B (merge-planner prompt + audit gauntlet adaptation) **not yet shipped**. Multi-parent children currently BLOCK at rebase time per plan 31's clean BLOCK; they'll be re-runnable via `qk retry` once plan 32 completes. Tanren has 64 multi-parent nodes (27% of DAG); the BLOCK is expected for those during the rollout window.
 - **Doer prompt** has explicit "pre-existing failure trap" anti-disclaim section (plan 28 driveby; R-0010 / S-07 incident).
-- **Codex agent** catches `TimeoutExpired` and returns `transient=True` instead of crashing the worker (R-0007 / R-0024 incident). Local CI gate (`run_local_ci_gate`) passes the full raw `just ci` output to the fixup planner instead of regex-extracted findings (R-0021 incident).
+- **Codex agent** catches `TimeoutExpired` and returns `transient=True` instead of crashing the worker (R-0007 / R-0024 incident). Local CI gate passes the full raw `just ci` output to the fixup planner instead of regex-extracted findings (R-0021 incident).
 - **Validation ladder** stays green (825 tests). Tanren workspace runs `max_parallel=12, mem_per_task_gb=10`.
-- **Active failure mode under investigation**: planner over-scoping in subtasks that span > 1 interface surface (api/cli/mcp/web). When this drives a same-signature stop-loss BLOCK, the right move is `qk retry` (per §3.2). A planner-prompt fix to forbid cross-surface subtasks is a candidate follow-up plan.
-- **First-wave ramp**: under plan 30's settle gate, expect ~8-of-12 slots filled until the first parent reaches review-ready-settled (~15-30 min cold start), then the funnel widens as dependents unlock.
+- **First-wave ramp**: under plan 30's settle gate, expect ~8-of-12 slots filled until the first parent reaches review-ready-settled (~15-30 min cold start), then the funnel widens as single-parent dependents unlock. Multi-parent dependents wait for plan 32 completion.
