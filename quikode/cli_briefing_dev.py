@@ -364,6 +364,7 @@ def _print_briefing_hints() -> None:
     console.print("  [dim]quikode export <id>    — bundle for review[/]")
     console.print("  [dim]quikode dag-stats      — per-milestone breakdown[/]")
     console.print("  [dim]quikode watch          — live-updating table[/]")
+    console.print("  [dim]quikode monitor          — tail high-signal state transitions[/]")
 
 
 @app.command("dev-test")

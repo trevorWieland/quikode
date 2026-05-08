@@ -8,6 +8,7 @@ quikode briefing
 quikode show <task-id>
 quikode subtasks <task-id>
 quikode tail <task-id>
+quikode monitor --since 1h
 ```
 
 ## Invalid Transition

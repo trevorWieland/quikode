@@ -63,7 +63,7 @@ uv run pytest tests/ -q
 ## Commands
 
 Lifecycle: `run`, `plan`, `retry`, `resume`, `reset-retries`, `abort`.
-Inspection: `status`, `watch`, `briefing`, `show`, `subtasks`, `explain`, `tail`, `logs`.
+Inspection: `status`, `watch`, `briefing`, `show`, `subtasks`, `explain`, `tail`, `logs`, `monitor`.
 Workspace: `init`, `doctor`, `seed-from-base`, `seed-from-main`, `reset`, `prune`, `disk-usage`.
 Daemon: `daemon start`, `daemon stop`, `daemon status`.
 TUI: `tui`.

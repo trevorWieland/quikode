@@ -19,9 +19,10 @@ quikode briefing
 quikode show <task-id>
 quikode subtasks <task-id>
 quikode tail <task-id>
+quikode monitor
 ```
 
-For long-running watch loops, poll the SQLite `state_log` directly (a small Python poller); avoid `tail -F daemon.log | grep` (flaky on log rotation, ANSI escapes, pipe buffering — the WSL filesystem in particular drops the file handle on daemon restart). See `orientation.md` §6.
+For long-running watch loops, use `quikode monitor` — it polls the SQLite `state_log` directly (read-only) and emits one stdout line per high-signal transition. Avoid `tail -F daemon.log | grep` (flaky on log rotation, ANSI escapes, pipe buffering — the WSL filesystem in particular drops the file handle on daemon restart). See `orientation.md` §6.
 
 ## Post-PR state meanings
 
