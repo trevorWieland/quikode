@@ -18,6 +18,7 @@ from quikode.evaluation_contract import (
     ArchitectureStageRubric,
     EvaluationContract,
     StandardsStageRubric,
+    audit_corpora_need_refresh,
     build_for,
 )
 
@@ -116,3 +117,27 @@ def test_build_for_with_no_profiles_still_round_trips(tmp_path: Path):
     contract.persist(cfg.state_dir, "R-FIVE")
     loaded = EvaluationContract.load(cfg.state_dir, "R-FIVE")
     assert loaded == contract
+
+
+def test_persisted_empty_audit_corpora_refresh_when_config_now_loads_docs(tmp_path: Path):
+    stale_cfg = Config(
+        repo_path=tmp_path,
+        dag_path=tmp_path / "dag.json",
+        state_dir=tmp_path / ".quikode",
+        prompts_dir=tmp_path / "prompts-missing",
+        worktree_root=tmp_path / ".quikode" / "worktrees",
+        log_dir=tmp_path / ".quikode" / "logs",
+        sccache_dir=tmp_path / ".quikode" / "sccache",
+        pre_pr_rubric_categories=["security"],
+        pre_pr_rubric_min_score=7,
+        standards_profiles_dir=tmp_path / "profiles",
+        standards_profiles=[],
+        architecture_docs_dir=tmp_path / "docs" / "architecture",
+    )
+    stale = build_for(_node(), stale_cfg)
+
+    fresh_cfg = _populated_cfg(tmp_path)
+
+    assert audit_corpora_need_refresh(stale, fresh_cfg)
+    refreshed = build_for(_node(), fresh_cfg)
+    assert not audit_corpora_need_refresh(refreshed, fresh_cfg)

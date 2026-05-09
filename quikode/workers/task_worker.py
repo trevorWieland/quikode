@@ -148,6 +148,14 @@ class TaskWorker(
         except FileNotFoundError:
             self._contract = evaluation_contract.build_for(self.node, self.cfg)
             self._contract.persist(self.cfg.state_dir, self.node.id)
+        else:
+            if evaluation_contract.audit_corpora_need_refresh(self._contract, self.cfg):
+                log.warning(
+                    "task %s: refreshing stale evaluation contract audit corpora from launch config",
+                    self.node.id,
+                )
+                self._contract = evaluation_contract.build_for(self.node, self.cfg)
+                self._contract.persist(self.cfg.state_dir, self.node.id)
         return self._contract
 
     # ----- top-level lifecycle -----

@@ -128,7 +128,10 @@ validates launch-critical config: repo/DAG paths, non-empty local CI, loaded
 standards profiles, and loaded architecture docs. For tanren, verify
 `standards_profiles_dir = "<repo>/profiles"`,
 `standards_profiles = ["rust-cargo"]`, and
-`architecture_docs_dir = "<repo>/docs/architecture"` before starting. Also
+`architecture_docs_dir = "<repo>/docs/architecture"` before starting. Existing
+tasks may have persisted `evaluation_contract.json` files from an earlier bad
+config; current workers refresh stale empty audit corpora from launch config
+before pre-PR audit instead of letting them fail at runtime. Also
 ensure the Playwright cache configured by `playwright_cache_dir` has Chromium
 installed; otherwise fresh containers can fail `web-storybook-test` even after
 Z-99 passed in an older container. Start the tmux monitor hooks above and

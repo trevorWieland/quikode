@@ -348,6 +348,33 @@ def build_for(node: Node, cfg: Config) -> EvaluationContract:
     )
 
 
+def audit_corpora_need_refresh(contract: EvaluationContract, cfg: Config) -> bool:
+    """Return true when a persisted contract has empty audit corpora but
+    current launch config can load them.
+
+    Contracts are persisted at planning time so every worker phase sees a
+    stable rubric. That stability is harmful after an operator fixes missing
+    standards/architecture configuration: without this guard, old tasks keep
+    failing audits from stale empty corpora even though daemon launch config is
+    now valid.
+    """
+    standards_empty = not contract.standards.profiles or not any(
+        profile.docs for profile in contract.standards.profiles
+    )
+    architecture_empty = not contract.architecture.corpus.docs
+    if not standards_empty and not architecture_empty:
+        return False
+    if standards_empty:
+        profiles = load_profiles(cfg)
+        if any(profile.docs for profile in profiles):
+            return True
+    if architecture_empty:
+        corpus = load_architecture(cfg)
+        if corpus.docs:
+            return True
+    return False
+
+
 def _build_local_ci(cfg: Config) -> StageRubric:
     cmd = cfg.local_ci_command or "(unset)"
     return StageRubric(
