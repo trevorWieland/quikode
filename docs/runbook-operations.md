@@ -136,6 +136,9 @@ ensure the Playwright cache configured by `playwright_cache_dir` has Chromium
 installed and that the quikode dev image has been rebuilt with Playwright's
 Chromium OS dependencies. Missing browser binaries and missing shared libraries
 are both environment failures; a warmed Z-99 container can mask either one.
+When pre-PR audits fail, confirm the fixup planner maps architecture findings
+through `architecture_referenced` rather than treating them as standards refs or
+as uncovered findings.
 Start the tmux monitor hooks above and
 check `quikode briefing` once after the first 10-15 minutes. Expect a slot-fill
 ramp over the first ~30 min as the first wave of primaries reaches

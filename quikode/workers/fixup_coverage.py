@@ -4,9 +4,9 @@ Used by `quikode.workers.pre_pr.PrePrWorkerMixin._run_fixup_round` to
 verify the fixup planner's `FixupPlan` covers every audit finding id.
 The retired `addresses_findings` per-subtask field (Plan 33 D2) is
 replaced by a union over `rubric_targets`, `standards_referenced`,
-`behavior_evidence_advanced`, plus the plan-level `findings_addressed`
-array, plus a `notes`-text fallback for finding ids the planner
-groups into one subtask.
+`architecture_referenced`, `behavior_evidence_advanced`, plus the
+plan-level `findings_addressed` array, plus a `notes`-text fallback
+for finding ids the planner groups into one subtask.
 
 Lives in its own module to keep `pre_pr.py` under the 600-line budget.
 
@@ -47,13 +47,14 @@ if TYPE_CHECKING:
     from quikode.evaluation_contract import EvaluationContract
 
 
-def collect_stage_coverage(plan: FixupPlan) -> tuple[set[str], set[str], set[str], str]:
+def collect_stage_coverage(plan: FixupPlan) -> tuple[set[str], set[str], set[str], set[str], str]:
     """Build the (rubric_cats, standards_paths, behavior_evids, notes_text)
     coverage union over the plan's subtasks. Plan 33 PR-B: the audit-
     completeness check unions across these fields instead of the retired
     per-subtask `addresses_findings`."""
     rubric_cats: set[str] = set()
     standards_paths: set[str] = set()
+    architecture_paths: set[str] = set()
     behavior_evids: set[str] = set()
     notes_blob: list[str] = []
     for s in plan.subtasks:
@@ -61,11 +62,13 @@ def collect_stage_coverage(plan: FixupPlan) -> tuple[set[str], set[str], set[str
             rubric_cats.add(tgt.category)
         for ref in s.standards_referenced:
             standards_paths.add(ref.doc_path)
+        for ref in s.architecture_referenced:
+            architecture_paths.add(ref.doc_path)
         for evid in s.behavior_evidence_advanced:
             behavior_evids.add(evid)
         if s.notes:
             notes_blob.append(s.notes)
-    return rubric_cats, standards_paths, behavior_evids, "\n".join(notes_blob)
+    return rubric_cats, standards_paths, architecture_paths, behavior_evids, "\n".join(notes_blob)
 
 
 def missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -> set[str]:
@@ -82,6 +85,8 @@ def missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -
       id in its `notes`.
     * Stage prefix `standards:` → covered when ANY subtask declares any
       `standards_referenced` OR cites the finding id in `notes`.
+    * Stage prefix `architecture:` → covered when ANY subtask declares any
+      `architecture_referenced` OR cites the finding id in `notes`.
     * Stage prefix `behavior:` → covered when the corresponding
       evidence id appears in some subtask's
       `behavior_evidence_advanced` OR the finding id is cited in `notes`.
@@ -90,7 +95,9 @@ def missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -
     """
     expected = set(expected_finding_ids)
     covered: set[str] = set(plan.findings_addressed)
-    rubric_cats, standards_paths, behavior_evids, notes_text = collect_stage_coverage(plan)
+    rubric_cats, standards_paths, architecture_paths, behavior_evids, notes_text = collect_stage_coverage(
+        plan
+    )
     for fid in expected - covered:
         if fid in notes_text:
             covered.add(fid)
@@ -104,6 +111,8 @@ def missing_finding_coverage(plan: FixupPlan, expected_finding_ids: list[str]) -
             covered.add(fid)
             continue
         if fid.startswith("standards:") and standards_paths:
+            covered.add(fid)
+        if fid.startswith("architecture:") and architecture_paths:
             covered.add(fid)
     return expected - covered
 
@@ -261,8 +270,9 @@ def build_coverage_gap_addendum(missing: set[str], triage_root_cause: str | None
         "Your previous plan missed the following finding ids. "
         "Include each one in `findings_addressed` AND in at least "
         "one subtask's stage-typed coverage (`rubric_targets`, "
-        "`standards_referenced`, or `behavior_evidence_advanced` "
-        f"matching the finding's namespace):\n\n{bullets}\n\n"
+        "`standards_referenced`, `architecture_referenced`, or "
+        "`behavior_evidence_advanced` matching the finding's "
+        f"namespace):\n\n{bullets}\n\n"
         "Re-emit the COMPLETE plan (do not emit only the deltas)."
     )
     return (addendum + "\n\n---\n\n" + (triage_root_cause or ""))[:16000]

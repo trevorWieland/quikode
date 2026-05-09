@@ -358,6 +358,33 @@ def test_missing_finding_coverage_flags_uncovered_finding(tmp_path: Path):
     assert missing_finding_coverage(plan, ["behavior:B-0066"]) == {"behavior:B-0066"}
 
 
+def test_missing_finding_coverage_accepts_architecture_reference(tmp_path: Path):
+    """The wrapper-level completeness check must mirror
+    `validate_finding_coverage` for architecture findings. Otherwise an
+    architecture-heavy audit can pass the primary validator and still get
+    re-prompted as if no subtask covered it."""
+    fixup_output = _fixup_planner_output(
+        findings_addressed=[],
+        architecture_referenced=[
+            {"doc_path": "docs/architecture/subsystems/identity-policy.md", "section": "Permissions"}
+        ],
+    )
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
+        contract=_populated_contract(tmp_path),
+        node=_node(),
+        audit_findings=None,  # isolate the wrapper-level check
+    )
+    assert plan is not None, feedback
+    assert (
+        missing_finding_coverage(
+            plan,
+            ["architecture:architecture-api-auth-guard-duplication-001"],
+        )
+        == set()
+    )
+
+
 # ----- routing assertion: fixup driver does NOT call validate_rubric_coverage -----
 
 
