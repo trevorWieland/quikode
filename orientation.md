@@ -376,7 +376,8 @@ qk monitor --keywords "attempt 4,attempt 5"
 
 ### 9.4 Deploy lessons (calibration findings, 2026-05-08 PM)
 
-Three issues surfaced during first deploy; one is fixed in code, two are operational:
+Several issues surfaced during first deploy; the schema/write-path issues are
+fixed in code, while provider routing remains operationally constrained:
 
 - **Codex shim schema-write hotfix (commit `9240255`).** The original
   `CodexDirectJsonAgent` / `CodexLitellmJsonAgent` shim wrote the schema
@@ -394,6 +395,27 @@ Three issues surfaced during first deploy; one is fixed in code, two are operati
   have at least one integration test that actually invokes `bash -lc`
   against the constructed command. Mocking `exec_in` is fine for
   contract tests but doesn't catch shell-level mistakes.
+
+- **Task failure schema hotfix (commit `035d743`).** Plan 38's planner
+  failure path started recording `failure_reason`, but the SQLite `tasks`
+  table did not have that column yet. Symptom: all initial tasks failed
+  while trying to fail, with `OperationalError: no such column:
+  failure_reason`. The fix adds `tasks.failure_reason`, a migration,
+  `TaskRow` typing, and clears the field on recovery flows (`retry`,
+  `resume`, `rewind`, orphan recovery). **Lesson:** any new FSM field
+  written by generic transition code needs a schema migration before the
+  daemon is allowed back onto a clean store.
+
+- **Codex strict JSON schema normalization (commit `035d743`).** OpenAI's
+  Responses strict schema path rejected raw pydantic schemas when fields had
+  defaults: `invalid_json_schema ... Missing 'title'`. Pydantic marks defaulted
+  fields optional in JSON Schema, but strict Responses schemas require every
+  object property to appear in `required` and reject `default`. The fix added
+  `codex_output_schema()` so both Codex transports normalize schemas before
+  writing `--output-schema`: strip `default`, set
+  `additionalProperties: false`, and require all object properties
+  recursively. **Lesson:** treat the CLI schema file as an OpenAI strict-schema
+  artifact, not a raw pydantic dump.
 
 - **`[agents.<phase>]` config migration is operator-driven.** Plan 38
   PR-B.7's hard cutover means workspaces with the legacy
@@ -416,12 +438,22 @@ Three issues surfaced during first deploy; one is fixed in code, two are operati
   expectation; the diff is fixture nodes that need explicit
   `mark-merged` follow-up.
 
+- **Proxy-routed z.ai/Wafer profiles are not yet safe for write-heavy roles.**
+  Small schema probes and read-only JSON roles work through LiteLLM, but live
+  `WritesFilesAgent` runs on `glm-zai` / `glm-wafer` repeatedly returned
+  `doer_output_invalid` with an empty diff; raw logs showed
+  `stream disconnected before completion: error sending request for url
+  (http://host.docker.internal:4000/v1/responses)`. Operational mitigation for
+  overnight runs: keep `subtask_doer_model` and `conflict_resolver_model` on
+  direct `gpt-5.3-codex`; use proxy-routed profiles only for lower-risk JSON
+  or read-only roles until the LiteLLM/write-role transport is fixed.
+
 After hotfix + reinstall, daemon stable at pid (varies per restart);
 8 tasks in PROVISIONING, first wave running fresh under the new
 contract. Remaining calibration windows: cycle-1 audit pass rate,
-client-side schema validation re-prompt frequency on glm-zai/glm-wafer
-proxy-routed roles, behavior of the new architecture stage on real
-diffs.
+client-side schema validation re-prompt frequency on proxy-routed JSON/read-only
+roles, write-role provider transport reliability, behavior of the new
+architecture stage on real diffs.
 
 The first 5–10 spec plans landing under the new flow are the calibration window. Watch:
 - Whether the JsonAgent client-side re-prompt-once fires (parse-fail + retry). Frequent fires = a prompt/schema mismatch worth investigating.

@@ -24,6 +24,42 @@ quikode monitor
 
 For long-running watch loops, use `quikode monitor` — it polls the SQLite `state_log` directly (read-only) and emits one stdout line per high-signal transition. Avoid `tail -F daemon.log | grep` (flaky on log rotation, ANSI escapes, pipe buffering — the WSL filesystem in particular drops the file handle on daemon restart). See `orientation.md` §6.
 
+Useful overnight tmux hooks:
+
+```bash
+tmux new-session -d -s qk-state-monitor \
+  'cd /path/to/workspace && quikode monitor --keywords "attempt 4,attempt 5,no such column,parse_failure,planner_validator,container_vanished,doer_output_invalid,stream disconnected,rate_limit,failed,blocked"'
+tmux new-session -d -s qk-health-loop \
+  'cd /path/to/workspace && while true; do date; quikode daemon status; quikode briefing; sleep 300; done'
+```
+
+## Provider routing
+
+Direct OpenAI profiles are currently the safe choice for write-heavy roles.
+Keep `subtask_doer_model` and `conflict_resolver_model` on `gpt-5.3-codex`
+during unattended runs.
+
+Proxy-routed z.ai/Wafer profiles through LiteLLM are useful for lower-risk
+JSON/read-only roles, but they are not yet reliable for `WritesFilesAgent`
+runs. Failure signature:
+
+- `quikode show <task-id>` shows repeated `doer_output_invalid` retries.
+- The doer produced an empty diff.
+- Raw task logs include `stream disconnected before completion: error sending request for url (http://host.docker.internal:4000/v1/responses)`.
+
+Immediate mitigation:
+
+```bash
+quikode daemon stop
+$EDITOR .quikode/config.toml   # set subtask_doer_model/conflict_resolver_model to "gpt-5.3-codex"
+quikode reset-retries <task-id> <subtask-id>
+quikode resume <task-id> --reason 'switch write roles to direct codex after LiteLLM transport failures'
+quikode daemon start --detach --max-parallel <N>
+```
+
+If many tasks are affected, switch the config first, restart once, then
+reset/resume the blocked tasks.
+
 ## Post-PR state meanings
 
 Plan 28 streamlined the post-PR slice to three states:
@@ -76,4 +112,11 @@ Test the wiring by waiting for the first task to settle, or — for synthetic ve
 
 ## Overnight Checklist
 
-Run the validation ladder, initialize a fresh workspace, run `seed-from-base`, confirm already-landed nodes are `merged`, then start the daemon with the intended `--max-parallel`. Verify ntfy is wired (config has `notify_ntfy_topic`, app subscribed). Expect a slot-fill ramp over the first ~30 min as the first wave of primaries reaches review-ready-settled.
+Run the validation ladder, initialize a fresh workspace, run `seed-from-base`,
+confirm already-landed nodes are `merged`, then start the daemon with the
+intended `--max-parallel`. Verify ntfy is wired (config has
+`notify_ntfy_topic`, app subscribed). Confirm write-heavy roles are on direct
+Codex before leaving the daemon unattended. Start the tmux monitor hooks above
+and check `quikode briefing` once after the first 10-15 minutes. Expect a
+slot-fill ramp over the first ~30 min as the first wave of primaries reaches
+review-ready-settled.
