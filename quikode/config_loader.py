@@ -293,6 +293,9 @@ def load_config(root: Path | None = None) -> Config:
         ),
         architecture_doc_globs=list(raw.get("architecture_doc_globs", defaults.architecture_doc_globs)),
         architecture_path_map=dict(raw.get("architecture_path_map", defaults.architecture_path_map)),
+        playwright_cache_dir=_path(
+            raw.get("playwright_cache_dir"), defaults.playwright_cache_dir.expanduser()
+        ),
         pre_pr_audit_max_cycles=int(raw.get("pre_pr_audit_max_cycles", defaults.pre_pr_audit_max_cycles)),
         pre_pr_audit_timeout_s=int(raw.get("pre_pr_audit_timeout_s", defaults.pre_pr_audit_timeout_s)),
         daemon_heartbeat_staleness_s=int(

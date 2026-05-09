@@ -12,6 +12,7 @@ from .cli_context import (
     os,
     typer,
 )
+from .config_validation import ConfigValidationError, validate_launch_config
 
 
 def _daemon_default(
@@ -76,6 +77,11 @@ def _daemon_start_impl(
     cfg = load_config()
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        validate_launch_config(cfg)
+    except ConfigValidationError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
 
     pid_path = daemon_mod.daemon_pid_file(cfg)
     existing_pid, _ = daemon_mod.read_daemon_pid(cfg)

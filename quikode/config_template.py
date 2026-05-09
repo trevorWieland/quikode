@@ -68,6 +68,11 @@ triage_budget_per_phase = 3
 local_ci_command = "{profile_def.local_ci_command}"
 subtask_check_command = "{profile_def.subtask_check_command}"
 pre_commit_runner = "{profile_def.pre_commit_runner}"
+standards_profiles_dir = "profiles"
+standards_profiles = ["rust-cargo"]
+architecture_docs_dir = "docs/architecture"
+architecture_doc_globs = ["**/*.md"]
+playwright_cache_dir = "~/.cache/ms-playwright"
 
 [execution]
 # Reserved for future remote backends ("ssh-docker", "vm-sandbox").

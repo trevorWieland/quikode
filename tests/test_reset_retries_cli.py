@@ -3,7 +3,7 @@
 Pinned contract:
 - Refuses (exit 2) on tasks not in BLOCKED or FAILED.
 - Without subtask_id: zeroes retries on every blocked subtask + flips state
-  to pending; clears last_error/transient_retries/flatline_count.
+  to pending; clears last_error/transient_retries/flatline_count/retry_reasons.
 - With subtask_id: targets only that subtask (must exist).
 - Unknown task → exit 1.
 - Unknown subtask on a known task → exit 1.
@@ -73,6 +73,17 @@ def _put_task_in_blocked(tmp_path, retries: int = 50):
         state="blocked",
         retries=retries,
         last_error="container vanished",
+        retry_reasons=json.dumps(
+            [
+                {
+                    "attempt": 1,
+                    "category": "doer_output_invalid",
+                    "signature": "rc=0",
+                    "transient": False,
+                }
+            ]
+        ),
+        progress_check_count=3,
     )
     store.conn.close()
 
@@ -93,6 +104,8 @@ def test_resets_all_blocked_subtasks_by_default(tmp_path, monkeypatch):
     assert s2["retries"] == 0
     assert s2["state"] == "pending"
     assert s2["last_error"] is None
+    assert s2["retry_reasons"] is None
+    assert s2["progress_check_count"] == 0
     s1 = store.get_subtask("R-001", "S-01")
     assert s1["state"] == "done"  # untouched
     assert s1["retries"] == 2  # untouched

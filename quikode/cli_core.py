@@ -32,6 +32,7 @@ from .cli_context import (
     workspace_mod,
     worktree,
 )
+from .config_validation import ConfigValidationError, validate_launch_config
 
 
 @app.command()
@@ -115,6 +116,11 @@ def doctor():
     check("gh authenticated", r.returncode == 0, r.stderr.strip().splitlines()[-1] if r.stderr else "")
     check("repo path exists", cfg.repo_path.exists(), str(cfg.repo_path))
     check("dag path exists", cfg.dag_path.exists(), str(cfg.dag_path))
+    try:
+        validate_launch_config(cfg)
+        check("launch config", True)
+    except ConfigValidationError as e:
+        check("launch config", False, str(e))
     check("claude auth dir", cfg.claude_auth_dir.exists(), str(cfg.claude_auth_dir))
     check("codex auth dir", cfg.codex_auth_dir.exists(), str(cfg.codex_auth_dir))
     check("opencode auth dir", cfg.opencode_auth_dir.exists(), str(cfg.opencode_auth_dir))
@@ -177,6 +183,11 @@ def run(
     cfg = load_config()
     if max_parallel is not None:
         cfg.max_parallel = max_parallel
+    try:
+        validate_launch_config(cfg)
+    except ConfigValidationError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(2) from exc
     dag = DAG.load(cfg.dag_path)
     scope = _resolve_run_scope(dag, only, milestone)
     _prepare_run_workspace(cfg, max_parallel=max_parallel)

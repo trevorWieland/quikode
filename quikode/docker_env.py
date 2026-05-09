@@ -180,8 +180,9 @@ def start_dev_container(
     """Start the dev container detached. Returns container ID."""
     token_env = credential_bundle.github_env_name() if credential_bundle is not None else cfg.github_token_env
     token = gh_token(token_env)
-    # Ensure the sccache dir exists on the host
+    # Ensure host-backed caches exist before Docker bind-mounts them.
     cfg.sccache_dir.mkdir(parents=True, exist_ok=True)
+    cfg.playwright_cache_dir.mkdir(parents=True, exist_ok=True)
     # Mount host auth dirs at /host-auth/* read-only; the entrypoint copies them
     # into writable container locations so each agent CLI can mutate its own
     # session/history state without contention.
@@ -198,6 +199,10 @@ def start_dev_container(
         ("type=bind", f"src={repo_git_dir}", f"dst={repo_git_dir}"),
         # Shared sccache across all tasks — sccache handles concurrent access safely.
         ("type=bind", f"src={cfg.sccache_dir}", "dst=/sccache"),
+        # Playwright browser downloads are large and container-local by default.
+        # Persist them so Z-99 passing in one container remains true after a
+        # daemon restart provisions fresh task containers.
+        ("type=bind", f"src={cfg.playwright_cache_dir}", "dst=/home/dev/.cache/ms-playwright"),
     ]
     mounts.extend(_credential_mounts(cfg, credential_bundle))
     mount_args: list[str] = []

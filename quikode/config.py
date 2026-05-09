@@ -424,6 +424,10 @@ class Config(BaseModel):
     architecture_docs_dir: Path = Field(Path("docs/architecture"), description="Architecture-docs root.")
     architecture_doc_globs: list[str] = Field(default_factory=lambda: ["**/*.md"], description="Doc globs.")
     architecture_path_map: dict[str, str] = Field(default_factory=dict, description="Path→doc map (PR-B).")
+    playwright_cache_dir: Path = Field(
+        Path("~/.cache/ms-playwright"),
+        description="Host cache mounted at /home/dev/.cache/ms-playwright in task containers.",
+    )
     pre_pr_audit_max_cycles: int = Field(
         default=10,
         ge=1,

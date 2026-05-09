@@ -123,7 +123,15 @@ Run the validation ladder, initialize a fresh workspace, run `seed-from-base`,
 confirm already-landed nodes are `merged`, then start the daemon with the
 intended `--max-parallel`. Verify ntfy is wired (config has
 `notify_ntfy_topic`, app subscribed). Confirm write-heavy roles are on direct
-Codex before leaving the daemon unattended. Start the tmux monitor hooks above
-and check `quikode briefing` once after the first 10-15 minutes. Expect a
-slot-fill ramp over the first ~30 min as the first wave of primaries reaches
+Codex before leaving the daemon unattended. `qk daemon start` fail-fast
+validates launch-critical config: repo/DAG paths, non-empty local CI, loaded
+standards profiles, and loaded architecture docs. For tanren, verify
+`standards_profiles_dir = "<repo>/profiles"`,
+`standards_profiles = ["rust-cargo"]`, and
+`architecture_docs_dir = "<repo>/docs/architecture"` before starting. Also
+ensure the Playwright cache configured by `playwright_cache_dir` has Chromium
+installed; otherwise fresh containers can fail `web-storybook-test` even after
+Z-99 passed in an older container. Start the tmux monitor hooks above and
+check `quikode briefing` once after the first 10-15 minutes. Expect a slot-fill
+ramp over the first ~30 min as the first wave of primaries reaches
 review-ready-settled.

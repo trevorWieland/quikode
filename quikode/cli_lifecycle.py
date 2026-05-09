@@ -279,13 +279,10 @@ def reset_retries(
     command rolls the counters back to zero so a follow-up `qk resume`
     gives the subtask a clean budget.
 
-    Behavior:
     - Refuses (exit 2) on any task not currently in BLOCKED or FAILED.
     - Without `subtask_id`: targets every subtask whose state is `blocked`.
     - With `subtask_id`: targets that subtask exactly (must exist).
-    - Per target, zeroes `retries`, `transient_retries`, `flatline_count`,
-      clears `last_error`, and (if previously `blocked`) flips the subtask
-      state back to `pending`.
+    - Per target, clears retry counters/history; blocked targets go pending.
     - Does NOT fire FSM events on the task row itself; follow up with
       `qk resume <task_id>` to drive the task back to PENDING.
     """
@@ -323,6 +320,8 @@ def reset_retries(
             retries=0,
             transient_retries=0,
             flatline_count=0,
+            retry_reasons=None,
+            progress_check_count=0,
             last_error=None,
             state=new_state,
         )
