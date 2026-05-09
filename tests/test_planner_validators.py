@@ -345,6 +345,18 @@ def test_finding_coverage_fails_when_finding_missing():
     assert "missing" in exc_info.value.message
 
 
+def test_finding_coverage_accepts_plan_level_findings_addressed():
+    """Fixup planners may group granular audit findings in one subtask and
+    list the exact ids in `findings_addressed`. That is enough for the
+    validator; the driver-side wrapper performs the final completeness pass."""
+    plan = FixupPlan(
+        summary="x",
+        findings_addressed=("rubric:security",),
+        subtasks=(_subtask("F-01"),),
+    )
+    validate_finding_coverage(plan, ["rubric:security"])  # no raise
+
+
 def test_finding_coverage_fails_on_duplicate_coverage():
     """Two subtasks both claim `rubric:security` — partition discipline
     requires exactly-one ownership."""

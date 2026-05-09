@@ -37,7 +37,6 @@ from quikode.agent_schemas import FixupPlannerOutput, SubtaskSpec
 from quikode.planner_validators import (
     PlannerValidationError,
     validate_architecture_refs,
-    validate_evidence_partition,
     validate_finding_coverage,
     validate_standards_refs,
 )
@@ -208,7 +207,11 @@ def validate_fixup_plan(
         )
     try:
         validate_finding_coverage(plan, audit_findings or [])
-        validate_evidence_partition(plan, node)
+        # A fixup plan is additive and scoped to failed audit findings; it is
+        # not a replacement spec plan. Do not require it to repartition every
+        # original behavior witness on the node, especially when the behavior
+        # stage already passed. `validate_finding_coverage` covers any failed
+        # `behavior:<id>` audit findings that genuinely need a fixup slice.
         validate_standards_refs(plan, contract)
         validate_architecture_refs(plan, contract)
     except PlannerValidationError as ve:

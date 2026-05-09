@@ -44,6 +44,7 @@ checker prompt is wired to surface TIMEOUT as a soft signal.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import time
@@ -129,6 +130,51 @@ def _evidence_id_to_command(
     return None, None
 
 
+def _load_workspace_expected_evidence(
+    *,
+    handle: Any,
+    exec_in: ExecFn,
+    log_path: Path | None,
+) -> list[dict[str, Any]]:
+    """Best-effort reload of evidence metadata from the current worktree.
+
+    Doers may add `witness_command` to `docs/roadmap/dag.json` while a
+    subtask is running. The in-memory DAG node was loaded before those
+    edits, so it can legitimately lack the command even though the
+    current worktree now has it. This fallback keeps the witness runner
+    aligned with the diff it is grading.
+    """
+    try:
+        rc, stdout, _stderr = exec_in(
+            handle,
+            [
+                "bash",
+                "-lc",
+                "cd /workspace && test -f docs/roadmap/dag.json && cat docs/roadmap/dag.json || true",
+            ],
+            log_path=log_path,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.debug("workspace evidence reload failed: %s", e)
+        return []
+    if rc != 0 or not stdout.strip():
+        return []
+    try:
+        dag = json.loads(stdout)
+    except json.JSONDecodeError as e:
+        log.debug("workspace evidence reload JSON parse failed: %s", e)
+        return []
+    rows: list[dict[str, Any]] = []
+    for node in dag.get("nodes", []) if isinstance(dag, dict) else []:
+        if not isinstance(node, dict):
+            continue
+        for ev in node.get("expected_evidence") or []:
+            if isinstance(ev, dict):
+                rows.append(ev)
+    return rows
+
+
 def run_scoped_witnesses(
     *,
     handle: Any,
@@ -151,8 +197,17 @@ def run_scoped_witnesses(
     total_budget_s = max(2 * len(evidence_ids) * per_witness_timeout_s, per_witness_timeout_s)
     deadline = time.monotonic() + total_budget_s
     results: dict[str, dict[str, Any]] = {}
+    workspace_expected_evidence: list[dict[str, Any]] | None = None
     for evidence_id in evidence_ids:
         cmd, _row = _evidence_id_to_command(expected_evidence, evidence_id)
+        if cmd is None:
+            if workspace_expected_evidence is None:
+                workspace_expected_evidence = _load_workspace_expected_evidence(
+                    handle=handle,
+                    exec_in=exec_in,
+                    log_path=log_path,
+                )
+            cmd, _row = _evidence_id_to_command(workspace_expected_evidence, evidence_id)
         if cmd is None:
             results[evidence_id] = {
                 "rc": None,

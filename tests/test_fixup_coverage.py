@@ -10,8 +10,10 @@ Plan 38 PR-B.4 retired the prose-parsing path: `validate_fixup_plan`
 now consumes a pre-validated `FixupPlannerOutput` (wire schema) instead
 of free text. These tests build the wire pydantic instance directly
 from a dict and feed it to the validator function. Behavior of the
-validators themselves (finding coverage, evidence partition, standards/
-architecture refs) is unchanged.
+validators themselves (finding coverage, standards/architecture refs) is
+unchanged. Fixup plans intentionally do not run the full spec-plan evidence
+partition validator because they are additive slices for failed audit findings,
+not replacements for the original spec plan.
 
 These tests pin the routing decision so a future refactor can't
 silently re-introduce the cross-validator coupling.
@@ -232,7 +234,7 @@ def test_fixup_plan_fails_on_missing_finding(tmp_path: Path):
     that category, the validator surfaces a `finding_coverage` failure
     so the driver can re-prompt with the gap."""
     fixup_output = _fixup_planner_output(
-        findings_addressed=["rubric:security"],
+        findings_addressed=[],
         rubric_targets=[{"category": "maintainability", "predicted_score": 7}],
     )
     plan, feedback = validate_fixup_plan(
@@ -245,6 +247,42 @@ def test_fixup_plan_fails_on_missing_finding(tmp_path: Path):
     assert feedback is not None
     assert "finding_coverage" in feedback
     assert "rubric:security" in feedback
+
+
+def test_fixup_plan_does_not_require_full_node_evidence_partition(tmp_path: Path):
+    """A pre-PR fixup plan only owns the failed audit findings. If the
+    behavior stage passed, a rubric-only fixup must not be rejected because it
+    does not re-claim the node's original behavior evidence."""
+    fixup_output = _fixup_planner_output(
+        findings_addressed=["rubric:security"],
+        rubric_targets=[{"category": "security", "predicted_score": 8}],
+    )
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
+        contract=_populated_contract(tmp_path),
+        node=_node(["B-0066"]),
+        audit_findings=["rubric:security"],
+    )
+    assert plan is not None, feedback
+    assert feedback is None
+
+
+def test_fixup_plan_accepts_plan_level_finding_addressed_without_exact_stage_field(tmp_path: Path):
+    """The driver-side completeness wrapper already trusts
+    `findings_addressed` so one fixup subtask can group several granular audit
+    findings. The validator should not throw away that otherwise actionable
+    plan before the wrapper runs."""
+    fixup_output = _fixup_planner_output(
+        findings_addressed=["behavior:B-0066"],
+    )
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
+        contract=_populated_contract(tmp_path),
+        node=_node(["B-0066"]),
+        audit_findings=["behavior:B-0066"],
+    )
+    assert plan is not None, feedback
+    assert feedback is None
 
 
 def test_fixup_plan_fails_on_unknown_standards_ref(tmp_path: Path):

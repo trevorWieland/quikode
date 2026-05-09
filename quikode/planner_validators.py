@@ -370,6 +370,25 @@ def _is_parse_failure_finding(finding_id: str) -> bool:
     return tail == "parse_failure"
 
 
+def _unknown_finding_claims(
+    holders: dict[str, list[str]],
+    expected_set: set[str],
+) -> list[tuple[str, str]]:
+    unknown: list[tuple[str, str]] = []
+    for fid_key, owners in holders.items():
+        # Don't flag standards-doc-only keys that we synthesize as a fallback
+        # for finding ids that lack an explicit `§section` part.
+        if fid_key in expected_set:
+            continue
+        # Skip the synthetic doc-only standards key — only flag stage-typed
+        # claims that don't map to any expected finding when the namespace is
+        # rubric: or behavior: (those are unambiguous).
+        if fid_key.startswith(("rubric:", "behavior:")):
+            for owner in owners:
+                unknown.append((owner, fid_key))
+    return unknown
+
+
 def _classify_finding_coverage(
     plan: FixupPlan, expected: list[str]
 ) -> tuple[list[str], list[tuple[str, list[str]]], list[tuple[str, str]]]:
@@ -404,29 +423,20 @@ def _classify_finding_coverage(
         for evid in s.behavior_evidence_advanced:
             holders[f"behavior:{evid}"].append(s.id)
 
+    addressed = set(plan.findings_addressed)
     missing: list[str] = []
     duplicated: list[tuple[str, list[str]]] = []
     for fid in expected:
         owners = holders.get(fid, [])
+        if not owners and fid in addressed:
+            continue
         if not owners:
             missing.append(fid)
         elif len(set(owners)) > 1:
             duplicated.append((fid, sorted(set(owners))))
 
     expected_set = set(expected)
-    unknown: list[tuple[str, str]] = []
-    for fid_key, owners in holders.items():
-        # Don't flag standards-doc-only keys that we synthesize as a fallback
-        # for finding ids that lack an explicit `§section` part.
-        if fid_key in expected_set:
-            continue
-        # Skip the synthetic doc-only standards key — only flag stage-typed
-        # claims that don't map to any expected finding when the namespace is
-        # rubric: or behavior: (those are unambiguous).
-        if fid_key.startswith(("rubric:", "behavior:")):
-            for owner in owners:
-                unknown.append((owner, fid_key))
-    return missing, duplicated, unknown
+    return missing, duplicated, _unknown_finding_claims(holders, expected_set)
 
 
 def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> None:

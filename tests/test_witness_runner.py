@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -182,6 +183,51 @@ def test_run_scoped_witnesses_no_command_classification() -> None:
     )
     assert results["B-001-manual"]["classification"] == "NO_COMMAND"
     assert results["B-001-manual"]["rc"] is None
+
+
+def test_run_scoped_witnesses_uses_current_worktree_dag_when_node_metadata_is_stale() -> None:
+    """A doer may add `witness_command` to docs/roadmap/dag.json after the
+    worker loaded the in-memory node. The runner should recover that command
+    from the current worktree before declaring NO_COMMAND."""
+    calls: list[list[str]] = []
+    dag = {
+        "nodes": [
+            {
+                "id": "R-001",
+                "expected_evidence": [
+                    {
+                        "behavior_id": "B-001",
+                        "kind": "bdd",
+                        "witnesses": ["positive", "falsification"],
+                        "witness_command": "just tests",
+                    }
+                ],
+            }
+        ]
+    }
+
+    def fake_exec(handle: Any, cmd: list[str], **_: Any) -> tuple[int, str, str]:
+        calls.append(cmd)
+        if "cat docs/roadmap/dag.json" in cmd[-1]:
+            return 0, json.dumps(dag), ""
+        return 0, "PASS recovered witness", ""
+
+    results = run_scoped_witnesses(
+        handle=object(),
+        expected_evidence=[
+            {
+                "behavior_id": "B-001",
+                "kind": "bdd",
+                "witnesses": ["positive", "falsification"],
+                "description": "stale row without command",
+            }
+        ],
+        evidence_ids=["B-001-bdd-positive-falsification"],
+        per_witness_timeout_s=15,
+        exec_in=fake_exec,
+    )
+    assert results["B-001-bdd-positive-falsification"]["classification"] == "OK"
+    assert calls[-1] == [["bash", "-lc", "cd /workspace && just tests"]][0]
 
 
 def test_run_scoped_witnesses_unknown_id_is_no_command() -> None:
