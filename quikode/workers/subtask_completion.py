@@ -191,16 +191,16 @@ class SubtaskCompletionMixin:
         except (_tw.subprocess.SubprocessError, OSError) as e:
             _tw.log.warning("gh pr edit add-label failed for #%d: %s", pr_number_int, e)
 
-    def _mark_subtask_skipped(self: Any, subtask: Subtask, reason: str) -> None:
+    def _mark_subtask_pending_after_block(self: Any, subtask: Subtask, reason: str) -> None:
         self.store.update_subtask(
             self.node.id,
             subtask.id,
-            state=SubtaskState.SKIPPED.value,
+            state=SubtaskState.PENDING.value,
             last_error=reason,
         )
-        _tw.log.info("subtask %s/%s skipped: %s", self.node.id, subtask.id, reason)
+        _tw.log.info("subtask %s/%s held pending: %s", self.node.id, subtask.id, reason)
 
-    def _mark_remaining_pending_as_skipped(
+    def _mark_remaining_pending_after_block(
         self: Any, *, after: str, subtasks: list[Subtask] | None = None
     ) -> None:
         if subtasks is None:
@@ -215,4 +215,4 @@ class SubtaskCompletionMixin:
                 continue
             existing = self.store.get_subtask(self.node.id, subtask.id)
             if existing and existing["state"] == SubtaskState.PENDING.value:
-                self._mark_subtask_skipped(subtask, f"upstream subtask {after} blocked")
+                self._mark_subtask_pending_after_block(subtask, f"upstream subtask {after} blocked")

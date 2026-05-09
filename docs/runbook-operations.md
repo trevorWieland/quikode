@@ -133,8 +133,10 @@ tasks may have persisted `evaluation_contract.json` files from an earlier bad
 config; current workers refresh stale empty audit corpora from launch config
 before pre-PR audit instead of letting them fail at runtime. Also
 ensure the Playwright cache configured by `playwright_cache_dir` has Chromium
-installed; otherwise fresh containers can fail `web-storybook-test` even after
-Z-99 passed in an older container. Start the tmux monitor hooks above and
+installed and that the quikode dev image has been rebuilt with Playwright's
+Chromium OS dependencies. Missing browser binaries and missing shared libraries
+are both environment failures; a warmed Z-99 container can mask either one.
+Start the tmux monitor hooks above and
 check `quikode briefing` once after the first 10-15 minutes. Expect a slot-fill
 ramp over the first ~30 min as the first wave of primaries reaches
 review-ready-settled.

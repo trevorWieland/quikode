@@ -1,20 +1,4 @@
-"""Plan 38 PR-A: JSON-mode agent protocol + shared retry/quota helper.
-
-Three transport shims (codex_direct, codex_litellm, claude) each return
-a `RawTransportResult` carrying either a CLI-validated structured dict
-(Tier 1: `cli_native`) or free text awaiting client-side validation
-(Tier 2: `client_side`). The two wrapper classes (`JsonOutputAgent`,
-`WritesFilesAgent`) consume that raw result, run pydantic validation
-when needed, re-prompt once on `ValidationError` for `client_side`,
-and surface `JsonAgentResult` to the role.
-
-The shared helper `_run_with_retry` runs a transport callable inside
-the same retry/quota/transient loop as the existing `agents.base._exec`,
-but returns `RawTransportResult` instead of `AgentResult` — the existing
-loop is too coupled to `AgentResult` (token-regex, ccusage merge baked
-in) to share without breaking the existing call sites that PR-B will
-later retire. Same retry semantics, fresh return shape.
-"""
+"""JSON-mode agent protocol, schema validation, and retry/quota helpers."""
 
 from __future__ import annotations
 
@@ -40,17 +24,7 @@ log = logging.getLogger("quikode.agents.json")
 
 @dataclass(frozen=True)
 class RawTransportResult:
-    """One transport-shim invocation result, before pydantic validation.
-
-    `raw_text` carries free-text output for `client_side` enforcement
-    (the agent layer parses with `model_validate_json`). `structured`
-    carries an already-parsed dict for `cli_native` enforcement (the
-    CLI guaranteed schema conformance — the agent layer only needs to
-    `model_validate(structured)`).
-
-    Exactly one of `raw_text` / `structured` is non-None on a successful
-    call. Both can be None on a transport failure (rc != 0).
-    """
+    """One transport invocation result before pydantic validation."""
 
     raw_text: str | None
     structured: dict[str, Any] | None
@@ -65,13 +39,7 @@ class RawTransportResult:
 
 @dataclass(frozen=True)
 class JsonAgentResult:
-    """One role-layer invocation result.
-
-    `structured` is the validated pydantic instance. `parse_errors` is
-    non-empty iff schema validation failed twice (after a re-prompt on
-    `client_side` enforcement). `transient=True` triggers the worker's
-    free-retry path (timeout, container OOM, docker glitch).
-    """
+    """One role-layer invocation result."""
 
     structured: BaseModel | None
     rc: int
@@ -90,20 +58,7 @@ class JsonAgentResult:
 
 @runtime_checkable
 class JsonAgentTransport(Protocol):
-    """The CLI-shim contract.
-
-    Each shim wraps one CLI binary and one transport flavor (codex direct
-    OpenAI, codex-via-litellm, claude). The shim writes the JSON Schema
-    to a temp file (or inlines it on the command line, depending on the
-    CLI), invokes the CLI via `execution.exec_in`, captures the output,
-    cleans up tmp artifacts, and returns a `RawTransportResult`.
-
-    `schema_enforcement` is widened to `str` here so concrete shims can
-    each declare a tighter `Literal["cli_native"]` / `Literal["client_side"]`
-    on their own attribute (matching the `ModelSpec.schema_enforcement`
-    Literal in the registry) without breaking protocol structural
-    subtyping. The wrapper layer reads the value via equality.
-    """
+    """The CLI-shim contract."""
 
     name: str
     schema_enforcement: str
@@ -309,19 +264,7 @@ def _normalize_object_required(value: Any) -> None:
 
 
 class JsonOutputAgent:
-    """Wraps a `JsonAgentTransport` for non-writes-files roles.
-
-    For `cli_native` enforcement: validates the transport's already-parsed
-    `structured` dict via `output_schema.model_validate`. A validation
-    failure here is unexpected (the CLI promised conformance) — we
-    surface `parse_errors` without re-prompting.
-
-    For `client_side` enforcement: parses `raw_text` via
-    `output_schema.model_validate_json`. On `ValidationError`, re-prompts
-    ONCE with `build_reprompt` and tries again. A second failure
-    surfaces `parse_errors` non-empty so the worker can surface
-    `parse_failure` to triage.
-    """
+    """Wraps a `JsonAgentTransport` for non-writes-files roles."""
 
     def __init__(self, transport: JsonAgentTransport, output_schema: type[BaseModel]):
         self.transport = transport
@@ -346,13 +289,7 @@ class JsonOutputAgent:
 
 
 class WritesFilesAgent:
-    """Wraps a `JsonAgentTransport` for writes-files roles (doer / conflict-resolver).
-
-    Same retry-on-validation semantics as `JsonOutputAgent`, but the
-    structured output is the lightweight `DoerEnvelope` (or any envelope
-    schema the role declares). The diff is the actual evidence — read
-    separately by the worker via git, not extracted from this envelope.
-    """
+    """Wraps a `JsonAgentTransport` for writes-files roles."""
 
     def __init__(
         self,
@@ -386,12 +323,7 @@ def _result_from_raw(
     structured: BaseModel | None,
     parse_errors: tuple[str, ...],
 ) -> JsonAgentResult:
-    """Build a `JsonAgentResult` from a single transport result.
-
-    Used by `_invoke_with_validation` to keep its branching shallow —
-    every successful or failing path inside the cli_native branch and
-    the first-try client_side branch funnels through here.
-    """
+    """Build a `JsonAgentResult` from a single transport result."""
     return JsonAgentResult(
         structured=structured,
         rc=raw.rc,
@@ -413,12 +345,7 @@ def _result_from_two_raw(
     structured: BaseModel | None,
     parse_errors: tuple[str, ...],
 ) -> JsonAgentResult:
-    """Build a `JsonAgentResult` after a re-prompt round.
-
-    Tokens / cost are summed across the two attempts; rc / transient /
-    raw_text reflect the SECOND attempt (the one whose verdict the
-    worker reads).
-    """
+    """Build a `JsonAgentResult` after a re-prompt round."""
     return JsonAgentResult(
         structured=structured,
         rc=second.rc,
@@ -435,9 +362,15 @@ def _result_from_two_raw(
 
 def _validate_cli_native(
     raw: RawTransportResult,
+    transport: JsonAgentTransport,
+    prompt: str,
     output_schema: type[BaseModel],
+    *,
+    handle: Any,
+    log_path: Path | None,
+    timeout: int,
 ) -> JsonAgentResult:
-    """cli_native enforcement — validate the already-parsed dict, no retry."""
+    """cli_native enforcement with one repair prompt on Pydantic failure."""
     if raw.structured is None:
         return _result_from_raw(
             raw,
@@ -450,12 +383,58 @@ def _validate_cli_native(
     try:
         instance = output_schema.model_validate(raw.structured)
     except ValidationError as e:
-        return _result_from_raw(
+        return _retry_after_cli_native_validation_error(
+            transport,
+            prompt,
             raw,
-            structured=None,
-            parse_errors=tuple(_format_validation_errors(e)),
+            first_err=e,
+            output_schema=output_schema,
+            handle=handle,
+            log_path=log_path,
+            timeout=timeout,
         )
     return _result_from_raw(raw, structured=instance, parse_errors=())
+
+
+def _retry_after_cli_native_validation_error(
+    transport: JsonAgentTransport,
+    prompt: str,
+    first: RawTransportResult,
+    *,
+    first_err: ValidationError,
+    output_schema: type[BaseModel],
+    handle: Any,
+    log_path: Path | None,
+    timeout: int,
+) -> JsonAgentResult:
+    """Re-prompt once when a cli_native structured payload fails Pydantic."""
+    first_errors = tuple(_format_validation_errors(first_err))
+    reprompt_text = build_reprompt(prompt, first_err, output_schema)
+    second = transport.invoke(
+        reprompt_text,
+        output_schema=output_schema,
+        handle=handle,
+        log_path=log_path,
+        timeout=timeout,
+    )
+    if second.rc != 0 or second.structured is None:
+        return _result_from_two_raw(
+            first,
+            second,
+            structured=None,
+            parse_errors=first_errors,
+        )
+    try:
+        instance = output_schema.model_validate(second.structured)
+    except ValidationError as second_err:
+        second_errors = tuple(_format_validation_errors(second_err))
+        return _result_from_two_raw(
+            first,
+            second,
+            structured=None,
+            parse_errors=first_errors + second_errors,
+        )
+    return _result_from_two_raw(first, second, structured=instance, parse_errors=())
 
 
 def _validate_client_side(
@@ -497,8 +476,7 @@ def _retry_after_validation_error(
     log_path: Path | None,
     timeout: int,
 ) -> JsonAgentResult:
-    """Re-prompt once after the first parse failure, parse the second
-    response. Surface parse_errors non-empty if the second also fails."""
+    """Re-prompt once after the first client-side parse failure."""
     first_errors = tuple(_format_validation_errors(first_err))
     reprompt_text = build_reprompt(prompt, first_err, output_schema)
     second = transport.invoke(
@@ -537,12 +515,7 @@ def _invoke_with_validation(
     log_path: Path | None,
     timeout: int,
 ) -> JsonAgentResult:
-    """Shared body for both `JsonOutputAgent` and `WritesFilesAgent`.
-
-    Identical retry-on-validation semantics; the only difference between
-    the two wrapper classes is the schema role and downstream usage of
-    the diff.
-    """
+    """Shared body for both `JsonOutputAgent` and `WritesFilesAgent`."""
     raw = transport.invoke(
         prompt,
         output_schema=output_schema,
@@ -553,7 +526,15 @@ def _invoke_with_validation(
     if raw.rc != 0 or (raw.raw_text is None and raw.structured is None):
         return _result_from_raw(raw, structured=None, parse_errors=())
     if transport.schema_enforcement == "cli_native":
-        return _validate_cli_native(raw, output_schema)
+        return _validate_cli_native(
+            raw,
+            transport,
+            prompt,
+            output_schema,
+            handle=handle,
+            log_path=log_path,
+            timeout=timeout,
+        )
     return _validate_client_side(
         transport,
         prompt,

@@ -6,9 +6,9 @@ subtasks (which always depend on earlier ones for compile/correctness
 reasons). Result: misleadingly-further-along tasks that couldn't actually
 pass + wasted token budget on doomed downstream work.
 
-Fix: subtask BLOCKED → return WorkerOutcome(BLOCKED) immediately, mark
-remaining subtasks as SKIPPED so the user can see which slices never
-ran. The user resumes after fixing the cause via `quikode resume <id>`.
+Fix: subtask BLOCKED → return WorkerOutcome(BLOCKED) immediately and keep
+remaining subtasks PENDING with a visible upstream-block note. The user resumes
+after fixing the cause via `quikode resume <id>`.
 """
 
 from __future__ import annotations
@@ -164,11 +164,13 @@ def test_block_on_first_subtask_skips_remaining_and_returns_blocked(tmp_path):
     s1 = worker.store.get_subtask("R-001", "S-01")
     assert s1["state"] == SubtaskState.BLOCKED.value
 
-    # 4. S-02 and S-03 are SKIPPED (visible in store).
+    # 4. S-02 and S-03 remain PENDING (visible in store).
     s2 = worker.store.get_subtask("R-001", "S-02")
     s3 = worker.store.get_subtask("R-001", "S-03")
-    assert s2["state"] == SubtaskState.SKIPPED.value
-    assert s3["state"] == SubtaskState.SKIPPED.value
+    assert s2["state"] == SubtaskState.PENDING.value
+    assert s3["state"] == SubtaskState.PENDING.value
+    assert s2["last_error"] == "upstream subtask S-01 blocked"
+    assert s3["last_error"] == "upstream subtask S-01 blocked"
 
     # 5. Task itself transitioned to BLOCKED.
     task = worker.store.get("R-001")
@@ -177,8 +179,8 @@ def test_block_on_first_subtask_skips_remaining_and_returns_blocked(tmp_path):
     worker.store.conn.close()
 
 
-def test_block_on_middle_subtask_skips_only_later(tmp_path):
-    """When S-02 of [S-01, S-02, S-03] blocks, S-01 stays DONE, S-03 is SKIPPED."""
+def test_block_on_middle_subtask_holds_only_later_pending(tmp_path):
+    """When S-02 of [S-01, S-02, S-03] blocks, S-01 stays DONE, S-03 stays PENDING."""
     plan = _build_plan(["S-01", "S-02", "S-03"])
     worker = _build_worker(tmp_path, plan)
 
@@ -217,7 +219,8 @@ def test_block_on_middle_subtask_skips_only_later(tmp_path):
     s3 = worker.store.get_subtask("R-001", "S-03")
     assert s1["state"] == SubtaskState.DONE.value
     assert s2["state"] == SubtaskState.BLOCKED.value
-    assert s3["state"] == SubtaskState.SKIPPED.value
+    assert s3["state"] == SubtaskState.PENDING.value
+    assert s3["last_error"] == "upstream subtask S-02 blocked"
     worker.store.conn.close()
 
 
@@ -310,16 +313,26 @@ def test_transient_checker_failures_capped_not_treated_as_real_attempts(tmp_path
     worker.store.conn.close()
 
 
-def test_pre_existing_skipped_subtask_returns_blocked(tmp_path):
-    """If a resume comes in with a SKIPPED subtask in its plan, that's a
-    sign of a prior partial run we can't safely continue past — return
-    BLOCKED rather than re-attempting (which might cascade further damage)."""
+def test_pre_existing_skipped_subtask_is_repaired_to_pending(tmp_path):
+    """Legacy SKIPPED rows are cascade markers, not valid resume blockers."""
     plan = _build_plan(["S-01", "S-02"])
     worker = _build_worker(tmp_path, plan)
     worker.store.update_subtask("R-001", "S-01", state=SubtaskState.SKIPPED.value)
 
-    outcome = worker._subtask_loop()
-    assert outcome is not None
-    assert outcome.final_state is State.BLOCKED
-    assert "SKIPPED" in outcome.note
+    def fake_do(subtask, attempt, triage_notes):
+        worker.store.update_subtask("R-001", subtask.id, state=SubtaskState.DOING.value)
+
+    def fake_pass(subtask):
+        worker.store.update_subtask("R-001", subtask.id, state=SubtaskState.DONE.value)
+        return _SubtaskPassOutcome(kind="settled")
+
+    with (
+        patch.object(worker, "_do_subtask", side_effect=fake_do),
+        patch.object(worker, "_check_subtask", return_value=_CheckerOutcome(Verdict.PASS, "", False, 0, "")),
+        patch.object(worker, "_handle_subtask_pass", side_effect=fake_pass),
+    ):
+        outcome = worker._subtask_loop()
+
+    assert outcome is None
+    assert worker.store.get_subtask("R-001", "S-01")["state"] == SubtaskState.DONE.value
     worker.store.conn.close()

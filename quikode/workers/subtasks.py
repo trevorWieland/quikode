@@ -190,7 +190,7 @@ class SubtaskWorkerMixin(
             sid = row.get("subtask_id")
             if not sid or sid in plan_ids:
                 continue
-            if row.get("state") in (SubtaskState.DONE.value, SubtaskState.SKIPPED.value):
+            if row.get("state") == SubtaskState.DONE.value:
                 continue
             try:
                 sub = _subtask_from_row(row)
@@ -210,11 +210,10 @@ class SubtaskWorkerMixin(
         Used by both the original spec loop (`_subtask_loop`) and the v3
         fixup-decomposition flow (`_run_fixup_round`). Subtasks already in
         DONE state in the store are skipped (idempotent for resume + for
-        re-entry after a fixup round). On a subtask block, every still-
-        PENDING subtask in the *passed-in* set after the failure is marked
-        SKIPPED — the original-spec topo of `self.plan` is still consulted
-        too, so cascade-skip semantics work transitively across spec ↔ fixup
-        boundaries.
+        re-entry after a fixup round). On a subtask block, the task enters
+        BLOCKED immediately and later PENDING subtasks remain PENDING with an
+        explanatory note so resume/rewind can continue without a stale terminal
+        cascade marker.
         """
         hard_max = self.cfg.subtask_hard_max_attempts
         for subtask in subtasks:
@@ -233,7 +232,12 @@ class SubtaskWorkerMixin(
         if existing and existing["state"] == SubtaskState.DONE.value:
             return None
         if existing and existing["state"] == SubtaskState.SKIPPED.value:
-            return WorkerOutcome(State.BLOCKED, f"subtask {subtask.id} pre-existed in SKIPPED state")
+            _tw.log.warning(
+                "task %s subtask %s had old SKIPPED state; repairing to PENDING",
+                self.node.id,
+                subtask.id,
+            )
+            self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.PENDING.value)
         yield_outcome = self._maybe_yield_at_boundary()
         if yield_outcome is not None:
             return yield_outcome
@@ -416,8 +420,8 @@ class SubtaskWorkerMixin(
     ) -> WorkerOutcome:
         reason_text = block_reason or f"exhausted hard ceiling of {hard_max} attempts"
         self._mark_subtask_blocked(subtask, reason_text)
-        self._mark_remaining_pending_as_skipped(after=subtask.id, subtasks=subtasks)
-        reason = f"subtask {subtask.id} blocked: {reason_text}; remaining subtasks skipped."
+        self._mark_remaining_pending_after_block(after=subtask.id, subtasks=subtasks)
+        reason = f"subtask {subtask.id} blocked: {reason_text}; remaining subtasks held pending."
         fsm_runtime.block_current(self.store, self.node.id, note=reason, last_error=reason[:1000])
         return WorkerOutcome(State.BLOCKED, reason)
 

@@ -191,4 +191,4 @@ class SubtaskState(StrEnum):
     TRIAGING = "triaging"
     DONE = "done"
     BLOCKED = "blocked"  # per-subtask retry budget exhausted; whole-spec final check still gets a shot
-    SKIPPED = "skipped"  # explicitly skipped (e.g. dep blocked)
+    SKIPPED = "skipped"  # old cascade marker; workers repair it to pending

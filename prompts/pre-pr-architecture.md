@@ -80,6 +80,11 @@ other four gates — leave it for them.
      drift from a non-mandatory pattern.
 6. Output a single JSON object — no preamble, no explanation outside
    the JSON.
+7. Do not run shell commands or inspect repository files. The audit
+   input is complete: use only `architecture_corpus`,
+   `architecture_refs_in_diff`, and `diff_excerpt`.
+8. Do not emit progress/status updates. Your first and only assistant
+   message must be the final audit JSON object.
 
 Schema:
 

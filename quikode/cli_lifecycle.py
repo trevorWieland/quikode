@@ -249,10 +249,9 @@ def resume(
         container_id=None,  # container is gone; let provision spin up a fresh one
         resume_from_existing_subtasks=1,
     )
-    # Re-pend every non-done subtask. "skipped" is included because the worker
-    # uses it as a cascade-skip marker (set by _mark_remaining_pending_as_skipped
-    # when an upstream blocked) — not as an intentional user skip. Once the
-    # upstream block is resolved, those downstream slices need a fresh chance.
+    # Re-pend every non-done subtask. Older workspaces may contain "skipped"
+    # cascade markers; those were never user intent, so resume repairs them to
+    # pending alongside active/blocked subtasks.
     for s in subs:
         if s["state"] != "done":
             store.update_subtask(task_id, s["subtask_id"], state="pending")

@@ -103,9 +103,17 @@ RUN . "$NVM_DIR/nvm.sh" && npm install -g ccusage @ccusage/codex @ccusage/openco
 # `lefthook run pre-commit --files-from-stdin` for per-subtask gating.
 RUN . "$NVM_DIR/nvm.sh" && npm install -g lefthook
 
+# ---- browser test system dependencies ----------------------------------------
+# The Playwright browser binaries are host-cache mounted at runtime, but the OS
+# shared libraries must be present in every fresh task container. Install the
+# Chromium dependency set into the image so Z-99/local-CI success survives daemon
+# restarts and new container provisioning.
+USER root
+RUN npx -y playwright@1.59.1 install-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
 # ---- shell niceties -----------------------------------------------------------
 # Make all CLIs available in BOTH login and non-login shells regardless of USER.
-USER root
 RUN cat > /etc/profile.d/quikode.sh <<'EOF'
 export NVM_DIR=/home/dev/.nvm
 export PATH=/home/dev/.cargo/bin:/home/dev/.local/bin:/home/dev/.opencode/bin:$NVM_DIR/versions/node/current/bin:$PATH

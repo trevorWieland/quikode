@@ -86,9 +86,10 @@ def test_cli_native_happy_path_returns_validated_instance() -> None:
     assert len(transport.invocations) == 1
 
 
-def test_cli_native_returns_invalid_structured_dict_surfaces_parse_errors() -> None:
-    """If the CLI claims cli_native but returns a malformed dict, surface a
-    parse_errors entry — do NOT re-prompt (cli_native promised conformance)."""
+def test_cli_native_returns_invalid_structured_dict_gets_one_reprompt() -> None:
+    """If the CLI claims cli_native but returns a malformed dict, issue one
+    schema repair prompt. Codex can return a sibling-role-shaped object even
+    when `--output-schema` is present."""
     transport = StubTransport(
         name="claude-stub",
         schema_enforcement="cli_native",
@@ -99,15 +100,51 @@ def test_cli_native_returns_invalid_structured_dict_surfaces_parse_errors() -> N
                 rc=0,
                 transient=False,
                 duration_s=1.0,
-            )
+            ),
+            RawTransportResult(
+                raw_text=None,
+                structured={"verdict": "uncertain", "rationale": "after repair"},
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+            ),
+        ],
+    )
+    wrapper = JsonOutputAgent(transport=transport, output_schema=ProgressVerdict)
+    result = wrapper.invoke("hello", handle=object(), timeout=60)
+    assert isinstance(result.structured, ProgressVerdict)
+    assert result.structured.verdict == "uncertain"
+    assert result.parse_errors == ()
+    assert len(transport.invocations) == 2
+    assert "Your previous response failed schema validation" in transport.invocations[1]
+
+
+def test_cli_native_second_invalid_structured_dict_surfaces_parse_errors() -> None:
+    transport = StubTransport(
+        name="claude-stub",
+        schema_enforcement="cli_native",
+        responses=[
+            RawTransportResult(
+                raw_text=None,
+                structured={"verdict": "totally-bogus-value", "rationale": "x"},
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+            ),
+            RawTransportResult(
+                raw_text=None,
+                structured={"verdict": "still-bogus", "rationale": "x"},
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+            ),
         ],
     )
     wrapper = JsonOutputAgent(transport=transport, output_schema=ProgressVerdict)
     result = wrapper.invoke("hello", handle=object(), timeout=60)
     assert result.structured is None
-    assert len(result.parse_errors) >= 1
-    # No re-prompt issued.
-    assert len(transport.invocations) == 1
+    assert len(result.parse_errors) >= 2
+    assert len(transport.invocations) == 2
 
 
 # ---------- client_side: happy path on first try ----------
