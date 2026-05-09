@@ -568,6 +568,42 @@ def test_spec_mode_runs_all_five_stages(tmp_path, monkeypatch):
     assert captured["stages_run"] == ["local_ci", "rubric", "standards", "architecture", "behavior"]
 
 
+def test_pre_pr_resume_reuses_passed_stages_before_failed_stage(tmp_path, monkeypatch):
+    """Restart recovery should not throw away earlier gauntlet passes just
+    because a later stage failed. Failed stages still rerun so their full
+    findings are available for fixup planning.
+    """
+    store, mn_id, _ = _seed_merge_node(tmp_path, ["R-001", "R-002"])
+    worker, captured, _ = _build_pipeline_worker(tmp_path, store, mn_id, [[], []], monkeypatch)
+    resume_summary = {
+        "cycle": 1,
+        "stages": [
+            {"name": "local_ci", "passed": True, "summary": "local CI passed"},
+            {"name": "rubric", "passed": True, "summary": "rubric passed"},
+            {"name": "standards", "passed": False, "summary": "standards failed"},
+            {"name": "architecture", "passed": None, "summary": "queued"},
+            {"name": "behavior", "passed": None, "summary": "queued"},
+        ],
+    }
+
+    stages = worker._execute_audit_stages(
+        cycle=1,
+        diff_excerpt="diff",
+        plan_text="plan",
+        merge_node_mode=False,
+        resume_summary=resume_summary,
+    )
+
+    assert captured["stages_run"] == ["standards", "architecture", "behavior"]
+    assert [(s.name, s.passed) for s in stages] == [
+        ("local_ci", True),
+        ("rubric", True),
+        ("standards", True),
+        ("architecture", True),
+        ("behavior", True),
+    ]
+
+
 def test_behavior_audit_uses_union_of_parent_expected_evidence(tmp_path, monkeypatch):
     """Behavior audit's `expected_evidence` is the union of source parents'."""
     store, mn_id, _ = _seed_merge_node(tmp_path, ["R-001", "R-002"])

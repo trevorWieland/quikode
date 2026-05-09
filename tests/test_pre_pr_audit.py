@@ -23,9 +23,6 @@ Tests cover:
 - merge_failed_stage_reports + collect_finding_ids preserved across
   the rewrite (legacy dict shape).
 - collect_standards_text reads contract source_text.
-- Plan 35 PR-B `unreferenced-applicable-standard` finding fires when
-  a profile doc's `applies_to` glob matches changed files but no
-  subtask cited it.
 - Source-level regression: heuristic regex / `json.loads(cand)` cannot
   re-appear.
 """
@@ -384,10 +381,11 @@ def test_run_standards_audit_parse_failure_returns_synthetic_fail(tmp_path):
     assert outcome.findings[0]["kind"] == "parse_failure"
 
 
-def test_run_standards_audit_unreferenced_applicable_fires(tmp_path):
-    """Plan 35 PR-B §2.10: when the diff touches a file matching a profile
-    doc's `applies_to` glob and no subtask cited that doc, an
-    `unreferenced-applicable-standard` finding fires (severity medium)."""
+def test_run_standards_audit_does_not_synthesize_uncited_profile_findings(tmp_path):
+    """The standards gate reports only auditor findings. Missing
+    `standards_referenced` coverage is planner quality, not a synthetic
+    standards violation.
+    """
     cfg = _build_cfg(tmp_path)
     doc = _make_standards_doc(
         repo_relative="profiles/rust-cargo/rust/no-any.md",
@@ -412,43 +410,8 @@ def test_run_standards_audit_unreferenced_applicable_fires(tmp_path):
             diff_excerpt=diff,
             cited_refs=[],  # nothing cited
         )
-    assert not outcome.passed
-    assert any(
-        f.get("kind") == "unreferenced_applicable_standard"
-        and f.get("profile_doc_ref") == "profiles/rust-cargo/rust/no-any.md"
-        for f in outcome.findings
-    )
-
-
-def test_run_standards_audit_unreferenced_applicable_skips_when_cited(tmp_path):
-    """When the subtask DOES cite the matching profile doc, the
-    unreferenced-applicable detector is silent."""
-    cfg = _build_cfg(tmp_path)
-    doc = _make_standards_doc(
-        repo_relative="profiles/rust-cargo/rust/no-any.md",
-        applies_to=("**/*.ts",),
-        sections=("Rules",),
-        name="no-any",
-    )
-    profile = _make_profile("rust-cargo", docs=(doc,))
-    contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
-    audit = PrePRStandardsAuditOutput(findings=[])
-    fake_agent = MagicMock()
-    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{}")
-    diff = "diff --git a/src/app.ts b/src/app.ts\n@@ -1 +1 @@\n-x\n+y\n"
-    with (
-        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
-        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
-    ):
-        outcome = pre_pr_audit.run_standards_audit(
-            cfg=cfg,
-            handle=_stub_handle(),
-            contract=contract,
-            diff_excerpt=diff,
-            cited_refs=[("profiles/rust-cargo/rust/no-any.md", "Rules")],
-        )
     assert outcome.passed
-    assert not any(f.get("kind") == "unreferenced_applicable_standard" for f in outcome.findings)
+    assert outcome.findings == []
 
 
 # ----- Behavior audit -----

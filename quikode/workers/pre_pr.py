@@ -316,18 +316,33 @@ class PrePrWorkerMixin:
         `expected_evidence` is the union of source parents'
         `expected_evidence`.
         """
-        for cycle in range(1, self.cfg.pre_pr_audit_max_cycles + 1):
+        resume_summary = self._resumable_pre_pr_audit_summary()
+        start_cycle = int(resume_summary["cycle"]) if resume_summary else 1
+        for cycle in range(start_cycle, self.cfg.pre_pr_audit_max_cycles + 1):
             _tw.log.info(
                 "task %s: pre-pr pipeline cycle %d/%d", self.node.id, cycle, self.cfg.pre_pr_audit_max_cycles
             )
-            # Seed the audit summary so the TUI shows queued / in-flight /
-            # done states for each stage as the cycle progresses.
-            self.store.begin_pre_pr_audit_cycle(self.node.id, cycle)
-            fsm_runtime.enter_local_ci_checking(
-                self.store,
-                self.node.id,
-                note=f"pre-pr cycle {cycle}: local-ci ({self.cfg.local_ci_command})",
+            cycle_resume_summary = (
+                resume_summary if resume_summary and int(resume_summary["cycle"]) == cycle else None
             )
+            if cycle_resume_summary:
+                passed = ", ".join(self._resumable_pre_pr_stage_names(cycle_resume_summary))
+                _tw.log.info(
+                    "task %s: resuming pre-pr audit cycle %d after passed stage(s): %s",
+                    self.node.id,
+                    cycle,
+                    passed,
+                )
+            else:
+                # Seed the audit summary so the TUI shows queued / in-flight /
+                # done states for each stage as the cycle progresses.
+                self.store.begin_pre_pr_audit_cycle(self.node.id, cycle)
+            if not self._pre_pr_stage_passed(cycle_resume_summary, "local_ci"):
+                fsm_runtime.enter_local_ci_checking(
+                    self.store,
+                    self.node.id,
+                    note=f"pre-pr cycle {cycle}: local-ci ({self.cfg.local_ci_command})",
+                )
 
             # Build the diff excerpt against the base branch — every audit
             # consumes this. Compute once per cycle (commits may have
@@ -340,6 +355,7 @@ class PrePrWorkerMixin:
                 diff_excerpt=diff_excerpt,
                 plan_text=plan_text,
                 merge_node_mode=merge_node_mode,
+                resume_summary=cycle_resume_summary,
             )
             cycle_result = _tw.pre_pr_audit.PipelineCycleResult(cycle=cycle, stages=stages)
             for s in cycle_result.stages:
@@ -385,9 +401,9 @@ class PrePrWorkerMixin:
                     "Every id below MUST appear in your output's "
                     "`findings_addressed` array AND be addressed by at "
                     "least one subtask's stage-typed coverage "
-                    "(`rubric_targets`, `standards_referenced`, or "
-                    "`behavior_evidence_advanced` matching the finding's "
-                    "namespace). The per-subtask `addresses_findings` "
+                    "(`rubric_targets`, `standards_referenced`, "
+                    "`architecture_referenced`, or `behavior_evidence_advanced` "
+                    "matching the finding's namespace). The per-subtask `addresses_findings` "
                     "field is gone (Plan 33 D2). Dropping ids is forbidden.\n\n"
                     + "\n".join(f"- `{fid}`" for fid in expected_finding_ids)
                     + "\n\n---\n\n"
@@ -410,6 +426,7 @@ class PrePrWorkerMixin:
                 return outcome
             # Loop back to the top — re-run the full pipeline against
             # whatever the doer just landed.
+            resume_summary = None
 
         # Exhausted cycles.
         note = (
@@ -457,8 +474,65 @@ class PrePrWorkerMixin:
             return "\n".join(head)
         return out
 
+    def _resumable_pre_pr_audit_summary(self: Any) -> dict[str, Any] | None:
+        """Return a persisted in-progress audit summary that can be resumed.
+
+        The summary stores short stage status for TUI display. It is safe to
+        reuse already-passed stages even when later stages failed; failed
+        stages require full structured finding reports, so the worker reruns
+        them.
+        """
+        summary = self.store.get_pre_pr_audit_summary(self.node.id)
+        if not isinstance(summary, dict):
+            return None
+        try:
+            cycle = int(summary.get("cycle"))
+        except (TypeError, ValueError):
+            return None
+        if cycle < 1 or cycle > int(self.cfg.pre_pr_audit_max_cycles):
+            return None
+        stages = list(summary.get("stages") or [])
+        if not any(s.get("passed") is True for s in stages if isinstance(s, dict)):
+            return None
+        return summary
+
+    @staticmethod
+    def _resumable_pre_pr_stage_names(summary: dict[str, Any]) -> list[str]:
+        return [
+            str(s.get("name"))
+            for s in list(summary.get("stages") or [])
+            if isinstance(s, dict) and s.get("passed") is True and s.get("name")
+        ]
+
+    @staticmethod
+    def _pre_pr_stage_passed(summary: dict[str, Any] | None, stage_name: str) -> bool:
+        if not summary:
+            return False
+        return stage_name in PrePrWorkerMixin._resumable_pre_pr_stage_names(summary)
+
+    @staticmethod
+    def _stage_outcome_from_summary(summary: dict[str, Any] | None, stage_name: str) -> Any | None:
+        if not summary:
+            return None
+        for stage in list(summary.get("stages") or []):
+            if not isinstance(stage, dict):
+                continue
+            if stage.get("name") == stage_name and stage.get("passed") is True:
+                return _tw.pre_pr_audit.StageOutcome(
+                    name=stage_name,
+                    passed=True,
+                    summary=str(stage.get("summary") or "resumed from prior passed stage"),
+                )
+        return None
+
     def _execute_audit_stages(
-        self: Any, *, cycle: int, diff_excerpt: str, plan_text: str, merge_node_mode: bool
+        self: Any,
+        *,
+        cycle: int,
+        diff_excerpt: str,
+        plan_text: str,
+        merge_node_mode: bool,
+        resume_summary: dict[str, Any] | None = None,
     ) -> list[Any]:
         """Run the audit stages in order. On a merge-node cycle without
         `kind="merge-integration"` subtasks, rubric + standards +
@@ -474,23 +548,47 @@ class PrePrWorkerMixin:
         def enter(label: str) -> None:
             fsm_runtime.enter_pre_pr_auditing(self.store, self.node.id, note=f"pre-pr cycle {cycle}: {label}")
 
-        local_ci = _tw.pre_pr_audit.run_local_ci_gate(cfg=self.cfg, handle=self._h, log_path=self.log_path)
-        rec("local_ci", local_ci)
+        def run_or_reuse(stage_name: str, runner: Any | None = None, **kwargs: Any) -> Any:
+            reused = self._stage_outcome_from_summary(resume_summary, stage_name)
+            if reused is not None:
+                _tw.log.info(
+                    "task %s pre-pr cycle %d stage `%s`: reusing prior PASS after restart",
+                    self.node.id,
+                    cycle,
+                    stage_name,
+                )
+                return reused
+            if runner is None:
+                raise RuntimeError(f"no runner configured for pre-pr stage {stage_name}")
+            outcome = runner(**kwargs)
+            rec(stage_name, outcome)
+            return outcome
+
+        local_ci = run_or_reuse(
+            "local_ci",
+            _tw.pre_pr_audit.run_local_ci_gate,
+            cfg=self.cfg,
+            handle=self._h,
+            log_path=self.log_path,
+        )
         stages: list[Any] = [local_ci]
         if (not merge_node_mode) or self._merge_integration_subtasks_present():
             contract = self._evaluation_contract()
             cited_standards, cited_architecture = self._collect_cited_refs()
             enter("rubric audit")
-            rubric = _tw.pre_pr_audit.run_rubric_audit(
+            rubric = run_or_reuse(
+                "rubric",
+                _tw.pre_pr_audit.run_rubric_audit,
                 cfg=self.cfg,
                 handle=self._h,
                 diff_excerpt=diff_excerpt,
                 plan_text=plan_text,
                 log_path=self.log_path,
             )
-            rec("rubric", rubric)
             enter("standards audit")
-            standards = _tw.pre_pr_audit.run_standards_audit(
+            standards = run_or_reuse(
+                "standards",
+                _tw.pre_pr_audit.run_standards_audit,
                 cfg=self.cfg,
                 handle=self._h,
                 contract=contract,
@@ -498,9 +596,10 @@ class PrePrWorkerMixin:
                 cited_refs=cited_standards,
                 log_path=self.log_path,
             )
-            rec("standards", standards)
             enter("architecture audit")
-            architecture = _tw.pre_pr_audit.run_architecture_audit(
+            architecture = run_or_reuse(
+                "architecture",
+                _tw.pre_pr_audit.run_architecture_audit,
                 cfg=self.cfg,
                 handle=self._h,
                 contract=contract,
@@ -508,10 +607,11 @@ class PrePrWorkerMixin:
                 cited_refs=cited_architecture,
                 log_path=self.log_path,
             )
-            rec("architecture", architecture)
             stages.extend([rubric, standards, architecture])
         enter("behavior audit")
-        behavior = _tw.pre_pr_audit.run_behavior_audit(
+        behavior = run_or_reuse(
+            "behavior",
+            _tw.pre_pr_audit.run_behavior_audit,
             cfg=self.cfg,
             handle=self._h,
             expected_evidence=self._behavior_audit_expected_evidence(merge_node_mode=merge_node_mode),
@@ -519,7 +619,6 @@ class PrePrWorkerMixin:
             plan_text=plan_text,
             log_path=self.log_path,
         )
-        rec("behavior", behavior)
         stages.append(behavior)
         return stages
 

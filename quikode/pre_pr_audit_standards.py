@@ -4,10 +4,7 @@ Lives in its own module so `pre_pr_audit.py` stays under the 600-line
 architecture budget. Plan 35 PR-B retargets the prompt context: instead
 of a free-form 60k blob, the audit receives `profile_catalog` (the
 contract's rendered profile catalog) + `standards_refs_in_diff` (the
-per-task pinned profile sections inlined). The
-`unreferenced-applicable-standard` detector runs after the LLM auditor
-returns and contributes additional findings keyed off each profile
-doc's `applies_to` glob.
+per-task pinned profile sections inlined).
 """
 
 from __future__ import annotations
@@ -21,10 +18,8 @@ from .config import Config
 from .evaluation_contract import EvaluationContract
 from .execution import ExecutionSandbox
 from .pre_pr_audit_refs import (
-    changed_files_from_diff,
     collect_standards_refs_in_diff,
     render_cited_sections,
-    unreferenced_applicable_standards,
 )
 
 
@@ -64,7 +59,7 @@ def run_standards_audit(
                 }
             ],
         )
-    cited_sections, cited_doc_paths = collect_standards_refs_in_diff(contract=contract, cited=cited_refs)
+    cited_sections, _ = collect_standards_refs_in_diff(contract=contract, cited=cited_refs)
     standards_refs_in_diff = render_cited_sections(cited_sections)
     structured, result, early = _pp._invoke_audit(
         "standards",
@@ -83,27 +78,15 @@ def run_standards_audit(
     if early is not None:
         return early
     assert isinstance(structured, PrePRStandardsAuditOutput)
-    changed_files = changed_files_from_diff(diff_excerpt)
-    extra = unreferenced_applicable_standards(
-        contract=contract,
-        changed_files=changed_files,
-        cited_doc_paths=cited_doc_paths,
-    )
-    return _build_standards_outcome(structured, result, unreferenced_findings=extra)
+    return _build_standards_outcome(structured, result)
 
 
 def _build_standards_outcome(
     audit: PrePRStandardsAuditOutput,
     result: JsonAgentResult,
-    *,
-    unreferenced_findings: list[dict] | None = None,
 ) -> _pp.StageOutcome:
     """Bridge `PrePRStandardsAuditOutput` → `StageOutcome`. Findings
     retain the existing dict shape so downstream consumers don't change.
-
-    Plan 35 §2.10: `unreferenced_findings` (the unreferenced-applicable
-    detector output) are appended into the same findings list and gated
-    on the same severity threshold — same fixup-planner shape.
     """
     findings_dicts: list[dict] = [
         {
@@ -117,8 +100,6 @@ def _build_standards_outcome(
         }
         for f in audit.findings
     ]
-    if unreferenced_findings:
-        findings_dicts.extend(unreferenced_findings)
     serious = [f for f in findings_dicts if f.get("severity") in ("medium", "high", "critical")]
     raw_excerpt = _pp._tail(result.raw_text or "", 200 if serious else 80)
     if serious:

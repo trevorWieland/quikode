@@ -4,19 +4,15 @@ The architecture audit grades the diff against the project's documented
 subsystem contracts (`cfg.architecture_docs_dir`). It runs through the
 JsonAgent layer with `PrePRArchitectureAuditOutput` as the output schema
 and is parallel in shape to `run_standards_audit` — same gating
-(severity ≥ medium fails), same parse-failure shape, same
-unreferenced-applicable detector (this time keyed off
-`cfg.architecture_path_map`).
+(severity ≥ medium fails), same parse-failure shape.
 
 Tests cover:
 - Happy path with low-severity findings → outcome passes.
 - High-severity finding → outcome fails.
 - Parse failure → synthetic FAIL with `kind="parse_failure"`.
 - Empty corpus → config_error.
-- `unreferenced-applicable-architecture` finding fires when the diff
-  touches a path matched by `architecture_path_map` but no subtask
-  cited the mapped doc.
-- The detector is silent when the subtask DID cite the matching doc.
+- The audit does not synthesize findings from `architecture_path_map`
+  when the auditor itself reports none.
 """
 
 from __future__ import annotations
@@ -236,15 +232,11 @@ def test_run_architecture_audit_parse_failure_returns_synthetic_fail(tmp_path):
     assert outcome.findings[0]["kind"] == "parse_failure"
 
 
-# ----- Unreferenced-applicable detector -----
-
-
-def test_run_architecture_audit_unreferenced_applicable_fires(tmp_path):
-    """Plan 35 §2.10: when `architecture_path_map` says
-    `crates/identity-policy/**` → `docs/.../identity-policy.md`, the
-    diff touches that path, and no subtask cited the doc, a
-    `unreferenced-applicable-architecture` finding fires (severity
-    medium → fails the stage)."""
+def test_run_architecture_audit_does_not_synthesize_path_map_findings(tmp_path):
+    """The architecture gate reports only auditor findings. A path-map match
+    without `architecture_referenced` coverage is planner quality, not a
+    synthetic architecture violation.
+    """
     cfg = _build_cfg(
         tmp_path,
         architecture_path_map={
@@ -271,42 +263,5 @@ def test_run_architecture_audit_unreferenced_applicable_fires(tmp_path):
             diff_excerpt=diff,
             cited_refs=[],
         )
-    assert not outcome.passed
-    matches = [f for f in outcome.findings if f.get("kind") == "unreferenced_applicable_architecture"]
-    assert matches, f"expected unreferenced_applicable_architecture finding; got {outcome.findings!r}"
-    assert matches[0]["architecture_doc_ref"] == "docs/architecture/subsystems/identity-policy.md"
-
-
-def test_run_architecture_audit_unreferenced_applicable_skips_when_cited(tmp_path):
-    """When the subtask DOES cite the mapped doc, the unreferenced-applicable
-    detector is silent."""
-    cfg = _build_cfg(
-        tmp_path,
-        architecture_path_map={
-            "crates/identity-policy/**": "docs/architecture/subsystems/identity-policy.md",
-        },
-    )
-    arch = ArchitectureCorpus(root=Path("/tmp"), docs=(_make_arch_doc(),))
-    contract = _make_contract(arch_corpus=arch, arch_source_text="arch toc")
-    audit = PrePRArchitectureAuditOutput(findings=[])
-    fake_agent = MagicMock()
-    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{}")
-    diff = (
-        "diff --git a/crates/identity-policy/src/lib.rs b/crates/identity-policy/src/lib.rs\n"
-        "@@ -1 +1 @@\n-x\n+y\n"
-    )
-    with (
-        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
-        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
-    ):
-        outcome = pre_pr_audit.run_architecture_audit(
-            cfg=cfg,
-            handle=_stub_handle(),
-            contract=contract,
-            diff_excerpt=diff,
-            cited_refs=[
-                ("docs/architecture/subsystems/identity-policy.md", "Permissions"),
-            ],
-        )
     assert outcome.passed
-    assert not any(f.get("kind") == "unreferenced_applicable_architecture" for f in outcome.findings)
+    assert outcome.findings == []
