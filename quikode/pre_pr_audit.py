@@ -293,25 +293,35 @@ def _build_rubric_outcome(
     summary_lines = ", ".join(f"{s.name}={s.score}" for s in scores)
     raw_excerpt = _tail(result.raw_text or "", 200 if failing else 80)
     if failing:
-        findings: list[dict] = [
-            {
-                "kind": "rubric_below_threshold",
-                "id": f"category-{s.name}",
-                "category": s.name,
-                "score": s.score,
-                "rationale": s.rationale,
-                "gaps_to_reach_ten": [
-                    {
-                        "id": gap.id,
-                        "description": gap.description,
-                        "concrete_fix": gap.concrete_fix,
-                        "files": list(gap.files),
-                    }
-                    for gap in s.gaps_to_reach_ten
-                ],
-            }
-            for s in failing
-        ]
+        failing_names = {s.name for s in failing}
+        findings: list[dict] = []
+        for s in scores:
+            if s.name in failing_names:
+                kind = "rubric_below_threshold"
+                finding_id = f"category-{s.name}"
+            elif s.score < 10 and s.gaps_to_reach_ten:
+                kind = "rubric_reach_ten_gap"
+                finding_id = f"reach-ten-{s.name}"
+            else:
+                continue
+            findings.append(
+                {
+                    "kind": kind,
+                    "id": finding_id,
+                    "category": s.name,
+                    "score": s.score,
+                    "rationale": s.rationale,
+                    "gaps_to_reach_ten": [
+                        {
+                            "id": gap.id,
+                            "description": gap.description,
+                            "concrete_fix": gap.concrete_fix,
+                            "files": list(gap.files),
+                        }
+                        for gap in s.gaps_to_reach_ten
+                    ],
+                }
+            )
         return StageOutcome(
             name="rubric",
             passed=False,

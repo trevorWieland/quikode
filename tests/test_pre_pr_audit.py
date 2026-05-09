@@ -192,7 +192,19 @@ def test_run_rubric_audit_failing_category_below_threshold(tmp_path):
                     )
                 ],
             ),
-            RubricCategoryScore(name="performance", score=8, rationale="ok"),
+            RubricCategoryScore(
+                name="performance",
+                score=8,
+                rationale="passes threshold but can be tighter",
+                gaps_to_reach_ten=[
+                    RubricGap(
+                        id="batch-project-list",
+                        description="Project list still does one query per row",
+                        concrete_fix="Batch-load owner data before rendering the list",
+                        files=["src/projects.rs"],
+                    )
+                ],
+            ),
         ]
     )
     fake_agent = MagicMock()
@@ -211,12 +223,55 @@ def test_run_rubric_audit_failing_category_below_threshold(tmp_path):
     assert "rubric failed" in outcome.summary
     # Legacy dict shape preserved (collect_finding_ids reads `id` /
     # `category` / `gaps_to_reach_ten`).
-    assert len(outcome.findings) == 1
+    assert len(outcome.findings) == 2
     f = outcome.findings[0]
+    assert f["kind"] == "rubric_below_threshold"
     assert f["category"] == "security"
     assert f["score"] == 4
     assert f["id"] == "category-security"
     assert f["gaps_to_reach_ten"][0]["id"] == "validate-org-name"
+    improvement = outcome.findings[1]
+    assert improvement["kind"] == "rubric_reach_ten_gap"
+    assert improvement["category"] == "performance"
+    assert improvement["score"] == 8
+    assert improvement["id"] == "reach-ten-performance"
+    assert improvement["gaps_to_reach_ten"][0]["id"] == "batch-project-list"
+
+
+def test_run_rubric_audit_all_pass_does_not_forward_reach_ten_gaps(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    audit = PrePRRubricAuditOutput(
+        categories=[
+            RubricCategoryScore(
+                name="security",
+                score=8,
+                rationale="above threshold",
+                gaps_to_reach_ten=[
+                    RubricGap(
+                        id="add-rate-limit",
+                        description="Endpoint lacks a rate-limit guard",
+                        concrete_fix="Add per-user request throttling",
+                        files=["src/api.rs"],
+                    )
+                ],
+            ),
+            RubricCategoryScore(name="performance", score=10, rationale="complete"),
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_rubric_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert outcome.passed
+    assert outcome.findings == []
 
 
 def test_run_rubric_audit_parse_failure_returns_synthetic_fail(tmp_path):
