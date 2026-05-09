@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 
 from quikode.config import Config
-from quikode.state import State, Store
+from quikode.state import State, Store, SubtaskState
 
 
 def _store(tmp_path) -> Store:
@@ -55,6 +55,36 @@ def test_in_implementation_state_resumes_to_pending(tmp_path, from_state):
     row = s.get("T-1")
     assert row["state"] == State.PENDING.value
     assert row["resume_from_existing_subtasks"] == 1
+    s.conn.close()
+
+
+def test_repair_stale_skipped_subtasks(tmp_path):
+    s = _store(tmp_path)
+    s.upsert_pending("T-1")
+    s.append_subtasks(
+        "T-1",
+        [
+            {
+                "subtask_id": "S-01",
+                "title": "blocked first slice",
+                "depends_on": [],
+                "acceptance": ["done"],
+            },
+            {
+                "subtask_id": "S-02",
+                "title": "stale skipped downstream slice",
+                "depends_on": ["S-01"],
+                "acceptance": ["done"],
+            },
+        ],
+    )
+    s.update_subtask("T-1", "S-02", state=SubtaskState.SKIPPED.value)
+
+    repaired = s.repair_stale_skipped_subtasks()
+
+    assert repaired == [("T-1", "S-02")]
+    assert s.get_subtask("T-1", "S-02")["state"] == SubtaskState.PENDING.value
+    assert s.repair_stale_skipped_subtasks() == []
     s.conn.close()
 
 

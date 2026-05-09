@@ -103,6 +103,26 @@ class StoreSubtaskMixin:
                 vals,
             )
 
+    def repair_stale_skipped_subtasks(self: Any) -> list[tuple[str, str]]:
+        """Repair pre-Plan-38 cascade markers.
+
+        `skipped` used to mean "downstream subtask did not run because an
+        earlier subtask blocked." That marker is no longer a valid persisted
+        state: downstream work must remain `pending` so resume/rewind can run
+        it normally after the blocker is cleared.
+        """
+        now = time.time()
+        with self.tx() as c:
+            rows = c.execute(
+                "SELECT task_id, subtask_id FROM subtasks WHERE state = ? ORDER BY task_id, subtask_id",
+                (SubtaskState.SKIPPED.value,),
+            ).fetchall()
+            c.execute(
+                "UPDATE subtasks SET state = ?, updated_at = ? WHERE state = ?",
+                (SubtaskState.PENDING.value, now, SubtaskState.SKIPPED.value),
+            )
+        return [(str(r["task_id"]), str(r["subtask_id"])) for r in rows]
+
     def reset_subtask_for_rewind(self: Any, task_id: str, subtask_id: str) -> None:
         """Reset a subtask to a fresh PENDING state for plan-27 rewind.
 

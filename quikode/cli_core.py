@@ -303,6 +303,13 @@ def _recover_orphan_tasks(store: Store) -> None:
         console.print(f"[yellow]orphan recovery:[/] {tid}: {frm} -> {to}")
     if recovered:
         console.print(f"[yellow]recovered {len(recovered)} orphan task(s) from prior run[/]")
+    repaired_skipped = store.repair_stale_skipped_subtasks()
+    for tid, sid in repaired_skipped[:20]:
+        console.print(f"[yellow]stale skipped repair:[/] {tid}/{sid}: skipped -> pending")
+    if len(repaired_skipped) > 20:
+        console.print(f"[yellow]stale skipped repair:[/] ... {len(repaired_skipped) - 20} more")
+    if repaired_skipped:
+        console.print(f"[yellow]repaired {len(repaired_skipped)} stale skipped subtask(s)[/]")
 
 
 def _retry_failed_tasks(store: Store, scope: set[str] | None) -> None:
