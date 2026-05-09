@@ -19,7 +19,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
-from quikode.subtask_schema import Subtask
+from quikode.subtask_schema import STABILIZATION_SUBTASK_ID, Subtask
 from quikode.types import Verdict
 from quikode.worker import TaskWorker
 
@@ -32,6 +32,18 @@ def _stub_subtask() -> Subtask:
         files_to_touch=("foo.rs",),
         boundary="",
         acceptance=("compiles",),
+        notes="",
+    )
+
+
+def _z99_subtask() -> Subtask:
+    return Subtask(
+        id=STABILIZATION_SUBTASK_ID,
+        title="Stabilize spec gate",
+        depends_on=("S-01",),
+        files_to_touch=(),
+        boundary="",
+        acceptance=("spec gate passes",),
         notes="",
     )
 
@@ -63,6 +75,29 @@ def test_objective_gate_pass_returns_none(tmp_path):
     with patch("quikode.worker.exec_in", return_value=(0, "all checks pass\n", "")):
         out = w._run_subtask_check_command(_stub_subtask())
     assert out is None
+
+
+def test_z99_objective_gate_uses_local_ci_command_and_timeout(tmp_path):
+    """The system-injected stabilization subtask is the holistic guard; its
+    objective gate must run the full local-CI command, not the lighter
+    per-subtask check."""
+    cfg = Config(
+        repo_path=tmp_path,
+        dag_path=tmp_path / "dag.json",
+        subtask_check_command="just check",
+        subtask_check_timeout_s=17,
+        local_ci_command="just ci",
+        local_ci_timeout_s=1234,
+    )
+    w = _make_worker(cfg)
+
+    with patch("quikode.worker.exec_in", return_value=(0, "all checks pass\n", "")) as exec_in:
+        out = w._run_subtask_check_command(_z99_subtask())
+
+    assert out is None
+    args, kwargs = exec_in.call_args
+    assert args[1] == ["bash", "-lc", "cd /workspace && just ci"]
+    assert kwargs["timeout"] == 1234
 
 
 def test_objective_gate_fail_synthesizes_checker_fail(tmp_path):

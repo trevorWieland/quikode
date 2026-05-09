@@ -136,6 +136,10 @@ ensure the Playwright cache configured by `playwright_cache_dir` has Chromium
 installed and that the quikode dev image has been rebuilt with Playwright's
 Chromium OS dependencies. Missing browser binaries and missing shared libraries
 are both environment failures; a warmed Z-99 container can mask either one.
+Z-99 is the system-injected holistic stabilization subtask; its objective
+gate must run `local_ci_command` (for tanren, `just ci`) rather than the
+lighter `subtask_check_command`, and a later pre-PR local-CI failure means the
+Z-99 pass was not authoritative.
 When pre-PR audits fail, confirm the fixup planner maps architecture findings
 through `architecture_referenced` rather than treating them as standards refs or
 as uncovered findings.

@@ -48,7 +48,7 @@ from quikode.agent_schemas import (
 )
 from quikode.agents.transient_quota import _is_transient_container_failure
 from quikode.state import SubtaskState
-from quikode.subtask_schema import Subtask
+from quikode.subtask_schema import STABILIZATION_SUBTASK_ID, Subtask
 from quikode.types import Verdict
 from quikode.workers.outcomes import CheckerOutcome as _CheckerOutcome
 from quikode.workers.witness_runner import run_scoped_witnesses
@@ -365,7 +365,12 @@ class SubtaskExecutionMixin:
         )
 
     def _run_subtask_check_command(self: Any, subtask: Subtask) -> _CheckerOutcome | None:
-        cmd_str = (self.cfg.subtask_check_command or "").strip()
+        if subtask.id == STABILIZATION_SUBTASK_ID:
+            cmd_str = (self.cfg.local_ci_command or "").strip()
+            timeout_s = self.cfg.local_ci_timeout_s
+        else:
+            cmd_str = (self.cfg.subtask_check_command or "").strip()
+            timeout_s = self.cfg.subtask_check_timeout_s
         if not cmd_str:
             return None
         _tw.log.info("subtask %s/%s: running objective check `%s`", self.node.id, subtask.id, cmd_str)
@@ -374,7 +379,7 @@ class SubtaskExecutionMixin:
                 self._h,
                 ["bash", "-lc", f"cd /workspace && {cmd_str}"],
                 log_path=self.log_path,
-                timeout=self.cfg.subtask_check_timeout_s,
+                timeout=timeout_s,
             )
         except (_tw.subprocess.TimeoutExpired, OSError) as e:
             _tw.log.warning(
