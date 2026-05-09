@@ -224,6 +224,9 @@ class SubtaskExecutionMixin:
                 per_witness_timeout_s=int(self.cfg.subtask_witness_timeout_seconds),
                 exec_in=_tw.exec_in,
                 log_path=self.log_path,
+                fallback_commands=list(
+                    (self._last_doer_envelope.witness_commands_run if self._last_doer_envelope else ()) or ()
+                ),
             )
         except Exception as e:
             _tw.log.warning(

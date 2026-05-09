@@ -172,7 +172,7 @@ def test_clean_doer_envelope_runs_witnesses(tmp_path) -> None:
     scoped witness runner with the subtask's evidence ids."""
     cfg = _cfg(tmp_path)
     w = _build_worker(cfg)
-    envelope = DoerEnvelope(summary="ok", files_touched=["x"])
+    envelope = DoerEnvelope(summary="ok", files_touched=["x"], witness_commands_run=["just tests"])
     captured: dict[str, Any] = {}
 
     def fake_run_scoped(**kwargs):
@@ -197,6 +197,7 @@ def test_clean_doer_envelope_runs_witnesses(tmp_path) -> None:
         )
     assert captured["evidence_ids"] == ["B-0061-test-positive"]
     assert captured["per_witness_timeout_s"] == cfg.subtask_witness_timeout_seconds
+    assert captured["fallback_commands"] == ["just tests"]
     assert w._last_diff_text == "diff text"
     assert w._last_witness_results["B-0061-test-positive"]["classification"] == "OK"
 

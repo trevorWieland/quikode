@@ -140,6 +140,11 @@ Z-99 is the system-injected holistic stabilization subtask; its objective
 gate must run `local_ci_command` (for tanren, `just ci`) rather than the
 lighter `subtask_check_command`, and a later pre-PR local-CI failure means the
 Z-99 pass was not authoritative.
+If a behavior-proof subtask repeatedly fails with `classification=NO_COMMAND`,
+check whether the DAG expected-evidence row lacks a runnable command. Current
+workers recover by executing a matching command from the validated doer envelope
+as a last resort; older workers require either a DAG `witness_command` patch or
+manual retry after upgrade.
 When pre-PR audits fail, confirm the fixup planner maps architecture findings
 through `architecture_referenced` rather than treating them as standards refs or
 as uncovered findings.

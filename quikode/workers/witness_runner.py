@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -130,6 +131,62 @@ def _evidence_id_to_command(
     return None, None
 
 
+def _behavior_token(evidence_id: str) -> str:
+    m = re.search(r"\bB-\d{4}\b", evidence_id)
+    return m.group(0) if m else ""
+
+
+def _looks_like_behavior_witness_command(cmd: str) -> bool:
+    lowered = cmd.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "just tests",
+            "just web-e2e",
+            "playwright test",
+            "cargo run",
+            "bdd-runner",
+        )
+    )
+
+
+def _fallback_command_from_doer_report(
+    fallback_commands: list[str] | tuple[str, ...] | None,
+    evidence_id: str,
+) -> str | None:
+    """Recover a runnable command from the validated doer envelope.
+
+    The doer report is not proof. This helper only turns a missing-command
+    situation into another objective execution by selecting a reported command
+    that appears to target the requested behavior witness.
+    """
+    commands = [c.strip() for c in fallback_commands or () if isinstance(c, str) and c.strip()]
+    if not commands:
+        return None
+    token = _behavior_token(evidence_id)
+    tokened = [c for c in commands if token and token in c]
+    if tokened:
+        for predicate in (
+            lambda c: "TANREN_BIN_" in c and _looks_like_behavior_witness_command(c),
+            lambda c: "cargo run" in c.lower() and _looks_like_behavior_witness_command(c),
+            lambda c: "playwright test" in c.lower(),
+        ):
+            matches = [c for c in tokened if predicate(c)]
+            if matches:
+                return matches[-1]
+        matches = [c for c in tokened if _looks_like_behavior_witness_command(c)]
+        if matches:
+            return matches[-1]
+    matches = [c for c in commands if _looks_like_behavior_witness_command(c)]
+    if not matches:
+        return None
+    for marker in ("just tests", "cargo run", "just web-e2e", "playwright test"):
+        preferred = [c for c in matches if marker in c.lower()]
+        if preferred:
+            return preferred[-1]
+    return matches[-1]
+
+
 def _load_workspace_expected_evidence(
     *,
     handle: Any,
@@ -183,6 +240,7 @@ def run_scoped_witnesses(
     per_witness_timeout_s: int,
     exec_in: ExecFn,
     log_path: Path | None = None,
+    fallback_commands: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run witness commands for the listed evidence ids inside the
     container. See module docstring for cap formulas + result shape.
@@ -209,6 +267,8 @@ def run_scoped_witnesses(
                 )
             cmd, _row = _evidence_id_to_command(workspace_expected_evidence, evidence_id)
         if cmd is None:
+            cmd = _fallback_command_from_doer_report(fallback_commands, evidence_id)
+        if cmd is None:
             results[evidence_id] = {
                 "rc": None,
                 "stdout_excerpt": "",
@@ -217,7 +277,7 @@ def run_scoped_witnesses(
                 "classification": "NO_COMMAND",
                 "note": (
                     f"no runnable command for evidence id {evidence_id!r} on the node "
-                    "(checker must read the diff to verify this witness)"
+                    "or doer envelope (checker must read the diff to verify this witness)"
                 ),
             }
             continue
