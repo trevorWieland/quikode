@@ -57,6 +57,13 @@ This is the highest-leverage section of this document. The four recovery primiti
 
 **Never leave a BLOCKED or FAILED task as a strategy.** When you find one, you act on it now. A "wait for plan-N to ship before acting" recommendation stalls the workspace and conflates "what to fix systemically" with "what to do for this task right now." System fixes ship in parallel via `plans/`, but the BLOCKED task itself gets a recovery primitive immediately.
 
+Structured-output violations are not a normal reason to block a task. They
+must first be retried on the agent call that emitted the bad output with
+precise schema/validator feedback. Treat `BLOCKED` as a critical escape hatch
+after the configured repair budget is exhausted, not as ordinary control flow.
+Plan 39 adds this explicitly for fixup-planner schema/validator failures via
+`fixup_planner_output_retries`.
+
 ### 3.4 Escalation, not repetition
 
 Track which primitive you've already used for a given task in this run:

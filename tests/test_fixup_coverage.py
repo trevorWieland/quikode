@@ -30,6 +30,7 @@ from pydantic import ValidationError
 
 from quikode import planner_validators
 from quikode.agent_schemas import FixupPlannerOutput
+from quikode.agents.json_protocol import JsonAgentResult
 from quikode.architecture_docs import ArchitectureCorpus, load_architecture
 from quikode.config import Config
 from quikode.dag import Node
@@ -45,6 +46,7 @@ from quikode.workers import fixup_coverage as fc
 from quikode.workers import planner_driver
 from quikode.workers.fixup_coverage import (
     missing_finding_coverage,
+    run_fixup_planner_loop,
     validate_fixup_plan,
 )
 
@@ -303,6 +305,44 @@ def test_fixup_plan_fails_on_unknown_standards_ref(tmp_path: Path):
     assert "standards_refs" in feedback or "standards profile" in feedback
 
 
+def test_fixup_plan_accepts_profile_doc_with_generic_section(tmp_path: Path):
+    """Fixups keep the standards doc bucket strict but tolerate section aliases
+    emitted by audits."""
+    fixup_output = _fixup_planner_output(
+        findings_addressed=["standards:profiles/rust-cargo/rust/error-handling.md§Audit Rule"],
+        standards_referenced=[
+            {"doc_path": "profiles/rust-cargo/rust/error-handling.md", "section": "Audit Rule"}
+        ],
+    )
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
+        contract=_populated_contract(tmp_path),
+        node=_node(),
+        audit_findings=["standards:profiles/rust-cargo/rust/error-handling.md§Audit Rule"],
+    )
+    assert plan is not None, feedback
+    assert feedback is None
+
+
+def test_fixup_plan_accepts_arch_doc_with_generic_section(tmp_path: Path):
+    """Architecture fixup refs follow the same rule: wrong doc buckets fail,
+    generic section labels do not."""
+    fixup_output = _fixup_planner_output(
+        findings_addressed=["architecture:docs/architecture/subsystems/identity-policy.md§Rules"],
+        architecture_referenced=[
+            {"doc_path": "docs/architecture/subsystems/identity-policy.md", "section": "Rules"}
+        ],
+    )
+    plan, feedback = validate_fixup_plan(
+        fixup_output,
+        contract=_populated_contract(tmp_path),
+        node=_node(),
+        audit_findings=["architecture:docs/architecture/subsystems/identity-policy.md§Rules"],
+    )
+    assert plan is not None, feedback
+    assert feedback is None
+
+
 def test_fixup_plan_accepts_when_audit_findings_empty(tmp_path: Path):
     """`fixup-final` / `fixup-ci` / `fixup-review` rounds carry no
     typed finding bundle — the driver passes `audit_findings=None`
@@ -413,6 +453,79 @@ def test_fixup_driver_does_not_invoke_validate_rubric_coverage(monkeypatch, tmp_
     )
     assert plan is not None, feedback
     assert calls == []
+
+
+def test_fixup_planner_output_violation_retries_before_escape_hatch(monkeypatch, tmp_path):
+    """Malformed fixup-planner output is a retryable output violation, not an
+    immediate task-level block. The driver should retry in-place and accept a
+    corrected payload within the configured budget."""
+
+    class _Store:
+        def __init__(self) -> None:
+            self.artifacts: list[tuple[str, str]] = []
+
+        def record_agent_call_started(self, *_args: Any, **_kwargs: Any) -> int:
+            return 1
+
+        def record_agent_call_finished(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def add_artifact(self, _task_id: str, kind: str, content: str) -> None:
+            self.artifacts.append((kind, content))
+
+    class _Agent:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def invoke(self, *_args: Any, **_kwargs: Any) -> JsonAgentResult:
+            self.calls += 1
+            if self.calls == 1:
+                return JsonAgentResult(
+                    structured=None,
+                    rc=0,
+                    transient=False,
+                    duration_s=0,
+                    parse_errors=("subtasks: Field required",),
+                    raw_text='{"summary": "bad"}',
+                )
+            return JsonAgentResult(
+                structured=_fixup_planner_output(
+                    findings_addressed=["behavior:B-0066"],
+                    behavior_evidence_advanced=["B-0066"],
+                ),
+                rc=0,
+                transient=False,
+                duration_s=0,
+            )
+
+    agent = _Agent()
+    monkeypatch.setattr(fc, "make_agent", lambda *_args, **_kwargs: agent)
+    cfg = Config(repo_path=tmp_path, dag_path=tmp_path / "dag.json")
+    cfg.fixup_planner_output_retries = 2
+    worker = type(
+        "Worker",
+        (),
+        {
+            "cfg": cfg,
+            "node": _node(["B-0066"]),
+            "store": _Store(),
+            "_h": object(),
+            "log_path": None,
+        },
+    )()
+
+    plan = run_fixup_planner_loop(
+        worker,
+        base_prompt="base",
+        kind="fixup-pre-pr-audit",
+        round_no=1,
+        audit_findings=["behavior:B-0066"],
+        contract=_populated_contract(tmp_path),
+        log=type("Log", (), {"warning": lambda *_args, **_kwargs: None})(),
+    )
+
+    assert plan is not None
+    assert agent.calls == 2
 
 
 def test_spec_planner_driver_invokes_all_spec_validators(monkeypatch):

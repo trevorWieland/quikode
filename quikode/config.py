@@ -230,6 +230,17 @@ class Config(BaseModel):
         le=5,
         description="Free retries when the fixup planner returns rc=124 (timeout / transient container failure). Doesn't burn `fixup_max_rounds`.",
     )
+    fixup_planner_output_retries: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description=(
+            "Driver-level re-prompts when the fixup planner emits malformed "
+            "JSON or a plan that fails runtime validators. Output violations "
+            "are retried in-place; BLOCKED is the final escape hatch after "
+            "this budget is exhausted."
+        ),
+    )
     preempt_at_subtask_boundary: bool = Field(
         default=False,
     )

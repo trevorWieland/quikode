@@ -378,10 +378,10 @@ def test_finding_coverage_fails_on_duplicate_coverage():
     assert "F-02" in exc_info.value.message
 
 
-def test_finding_coverage_flags_unknown_rubric_claim():
+def test_finding_coverage_accepts_extra_rubric_claim():
     """A subtask declares `rubric_targets=[security]` but no audit finding
-    references security — surfaces as `unknown` so the planner trims the
-    over-claim."""
+    references security. Extra stage-typed claims may be useful context for
+    fixup work and must not block an otherwise complete repair plan."""
     plan = _fixup_plan(
         _subtask(
             "F-01",
@@ -392,11 +392,7 @@ def test_finding_coverage_flags_unknown_rubric_claim():
             behavior_evidence_advanced=("B-0066",),
         ),
     )
-    with pytest.raises(PlannerValidationError) as exc_info:
-        validate_finding_coverage(plan, ["behavior:B-0066"])
-    assert exc_info.value.which == "finding_coverage"
-    assert "unknown" in exc_info.value.message
-    assert "rubric:security" in exc_info.value.message
+    validate_finding_coverage(plan, ["behavior:B-0066"])
 
 
 def test_finding_coverage_accepts_empty_rubric_targets_when_finding_is_behavior_only():

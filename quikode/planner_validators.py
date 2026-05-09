@@ -370,30 +370,11 @@ def _is_parse_failure_finding(finding_id: str) -> bool:
     return tail == "parse_failure"
 
 
-def _unknown_finding_claims(
-    holders: dict[str, list[str]],
-    expected_set: set[str],
-) -> list[tuple[str, str]]:
-    unknown: list[tuple[str, str]] = []
-    for fid_key, owners in holders.items():
-        # Don't flag standards-doc-only keys that we synthesize as a fallback
-        # for finding ids that lack an explicit `§section` part.
-        if fid_key in expected_set:
-            continue
-        # Skip the synthetic doc-only standards key — only flag stage-typed
-        # claims that don't map to any expected finding when the namespace is
-        # rubric: or behavior: (those are unambiguous).
-        if fid_key.startswith(("rubric:", "behavior:")):
-            for owner in owners:
-                unknown.append((owner, fid_key))
-    return unknown
-
-
 def _classify_finding_coverage(
     plan: FixupPlan, expected: list[str]
-) -> tuple[list[str], list[tuple[str, list[str]]], list[tuple[str, str]]]:
+) -> tuple[list[str], list[tuple[str, list[str]]]]:
     """Partition the fixup plan's stage-typed coverage into
-    (missing, duplicated, unknown) for the audit-finding namespace.
+    (missing, duplicated) for the audit-finding namespace.
 
     A finding id is covered when it can be matched to a subtask's
     stage-typed field by namespace prefix:
@@ -435,8 +416,7 @@ def _classify_finding_coverage(
         elif len(set(owners)) > 1:
             duplicated.append((fid, sorted(set(owners))))
 
-    expected_set = set(expected)
-    return missing, duplicated, _unknown_finding_claims(holders, expected_set)
+    return missing, duplicated
 
 
 def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> None:
@@ -474,8 +454,8 @@ def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> Non
     expected = [fid for fid in audit_findings if not _is_parse_failure_finding(fid)]
     if not expected:
         return
-    missing, duplicated, unknown = _classify_finding_coverage(plan, expected)
-    if not missing and not duplicated and not unknown:
+    missing, duplicated = _classify_finding_coverage(plan, expected)
+    if not missing and not duplicated:
         return
 
     parts: list[str] = []
@@ -499,14 +479,6 @@ def validate_finding_coverage(plan: FixupPlan, audit_findings: list[str]) -> Non
             + "\n".join(f"- {fid!r}: {owners!r}" for fid, owners in duplicated)
             + "\nThe audit completeness check is a partition; assign "
             "each finding to exactly one subtask."
-        )
-    if unknown:
-        parts.append(
-            "unknown stage-typed claim (subtask declares a "
-            "rubric/behavior coverage that doesn't match any audit "
-            "finding):\n"
-            + "\n".join(f"- subtask {sid!r}: {fid!r}" for sid, fid in unknown)
-            + f"\nValid finding ids from this audit: {expected!r}"
         )
     raise PlannerValidationError(
         "finding_coverage",

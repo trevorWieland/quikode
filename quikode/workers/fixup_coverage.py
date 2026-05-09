@@ -34,12 +34,12 @@ from pydantic import ValidationError
 
 from quikode.agent_registry import make_agent
 from quikode.agent_schemas import FixupPlannerOutput, SubtaskSpec
+from quikode.architecture_docs import find_arch_doc
 from quikode.planner_validators import (
     PlannerValidationError,
-    validate_architecture_refs,
     validate_finding_coverage,
-    validate_standards_refs,
 )
+from quikode.standards_profiles import find_doc
 from quikode.subtask_schema import FixupPlan, PlanValidationError
 
 if TYPE_CHECKING:
@@ -194,10 +194,13 @@ def validate_fixup_plan(
     * `validate_evidence_partition(plan, node)` — same as the spec
       side; the audit's `behavior:<id>` findings need exactly-once
       coverage so this stays universal.
-    * `validate_standards_refs(plan, contract)` — Plan 35: cited
-      standards refs must live under a loaded profile.
-    * `validate_architecture_refs(plan, contract)` — Plan 35: cited
-      architecture refs must live under `cfg.architecture_docs_dir`.
+    * `_validate_fixup_standards_doc_refs(plan, contract)` — cited
+      standards refs must live under a loaded profile. Section names are
+      intentionally lenient on fixups: audit findings often carry generic
+      sections like `Rules`, while the doc bucket is the hard contract.
+    * `_validate_fixup_architecture_doc_refs(plan, contract)` — cited
+      architecture refs must live under `cfg.architecture_docs_dir`, with
+      the same section-lenient fixup behavior.
 
     `audit_findings` may be None or empty — both short-circuit the
     finding-coverage validator (common for `fixup-final` / `fixup-ci`
@@ -221,8 +224,8 @@ def validate_fixup_plan(
         # original behavior witness on the node, especially when the behavior
         # stage already passed. `validate_finding_coverage` covers any failed
         # `behavior:<id>` audit findings that genuinely need a fixup slice.
-        validate_standards_refs(plan, contract)
-        validate_architecture_refs(plan, contract)
+        _validate_fixup_standards_doc_refs(plan, contract)
+        _validate_fixup_architecture_doc_refs(plan, contract)
     except PlannerValidationError as ve:
         return None, (
             f"Your previous fixup plan failed validator `{ve.which}`. "
@@ -230,6 +233,62 @@ def validate_fixup_plan(
             f"{ve.message}"
         )
     return plan, None
+
+
+def _validate_fixup_standards_doc_refs(plan: FixupPlan, contract: EvaluationContract) -> None:
+    """Fixup-only standards citation check.
+
+    Spec plans must cite exact sections so the original decomposition is
+    crisp. Audit-fixup plans are different: the failing audit already
+    names concrete findings, and the planner often preserves audit refs
+    such as `§Rules` even when the profile doc uses a more specific
+    heading. Keep the hard bucket check, but do not block progress on a
+    section alias.
+    """
+    profiles = contract.standards.profiles
+    profile_names = [p.name for p in profiles]
+    bad: list[tuple[str, str]] = []
+    for subtask in plan.subtasks:
+        for ref in subtask.standards_referenced:
+            if find_doc(profiles, ref.doc_path) is None:
+                bad.append((subtask.id, ref.doc_path))
+    if not bad:
+        return
+    bullets = "\n".join(
+        f"- subtask {sid!r} cites standards ref {path!r}: doc_path does not live "
+        f"under any configured standards profile (loaded: {profile_names!r})"
+        for sid, path in bad
+    )
+    raise PlannerValidationError(
+        "standards_refs",
+        "validate_fixup_standards_doc_refs: "
+        f"{len(bad)} standards reference(s) do not resolve to a loaded "
+        f"profile doc. Fix:\n{bullets}",
+    )
+
+
+def _validate_fixup_architecture_doc_refs(plan: FixupPlan, contract: EvaluationContract) -> None:
+    """Fixup-only architecture citation check; doc bucket strict,
+    section aliases lenient."""
+    corpus = contract.architecture.corpus
+    bad: list[tuple[str, str]] = []
+    for subtask in plan.subtasks:
+        for ref in subtask.architecture_referenced:
+            if find_arch_doc(corpus, ref.doc_path) is None:
+                bad.append((subtask.id, ref.doc_path))
+    if not bad:
+        return
+    bullets = "\n".join(
+        f"- subtask {sid!r} cites architecture ref {path!r}: doc_path does not "
+        f"live under the configured architecture_docs_dir ({corpus.root})"
+        for sid, path in bad
+    )
+    raise PlannerValidationError(
+        "architecture_refs",
+        "validate_fixup_architecture_doc_refs: "
+        f"{len(bad)} architecture reference(s) do not resolve under the "
+        f"configured architecture_docs_dir. Fix:\n{bullets}",
+    )
 
 
 def split_subtask_rows_for_planner(rows: list[dict], done_state_value: str) -> tuple[list[dict], list[dict]]:
@@ -295,9 +354,10 @@ def run_fixup_planner_loop(
 
     * Building the fixup-planner agent through `make_agent`.
     * The transient-retry budget (`cfg.fixup_planner_retries_on_transient`).
-    * One re-prompt round on schema-validation failure (parse_errors)
-      and one on runtime-validator failure — separate from each other,
-      both using the same `validator_retries_left=1` budget per round.
+    * Bounded re-prompt rounds on schema-validation failures and
+      runtime-validator failures. These are output violations, so the
+      driver retries the same planner call with precise feedback before
+      falling back to BLOCKED.
     * Persisting the agent-call record + the per-attempt artifact.
 
     Returns the runtime `FixupPlan` on success, or None on agent
@@ -306,7 +366,7 @@ def run_fixup_planner_loop(
     agent = make_agent("fixup_planner", worker.cfg)
     cfg = worker.cfg
     retries_left = cfg.fixup_planner_retries_on_transient
-    validator_retries_left = 1
+    output_retries_left = cfg.fixup_planner_output_retries
     attempt_no = 0
     cur_prompt = base_prompt
     while True:
@@ -354,19 +414,22 @@ def run_fixup_planner_loop(
             log.warning("fixup planner exited rc=%d (kind=%s round=%d)", result.rc, kind, round_no)
             return None
         if result.parse_errors or result.structured is None:
-            if validator_retries_left <= 0:
+            if output_retries_left <= 0:
                 log.warning(
-                    "fixup planner output failed schema validation after retry (kind=%s round=%d): %s",
+                    "fixup planner output failed schema validation after output-retry budget "
+                    "(kind=%s round=%d): %s",
                     kind,
                     round_no,
                     "; ".join(result.parse_errors)[:300] if result.parse_errors else "no output",
                 )
                 return None
-            validator_retries_left -= 1
+            output_retries_left -= 1
             log.warning(
-                "fixup planner output failed schema validation (kind=%s round=%d); re-prompting once",
+                "fixup planner output failed schema validation (kind=%s round=%d); "
+                "re-prompting (%d output retries left)",
                 kind,
                 round_no,
+                output_retries_left,
             )
             cur_prompt = build_schema_failure_feedback(result.parse_errors) + "\n\n---\n\n" + base_prompt
             continue
@@ -386,19 +449,21 @@ def run_fixup_planner_loop(
         )
         if plan is not None:
             return plan
-        if validator_retries_left <= 0:
+        if output_retries_left <= 0:
             log.warning(
-                "fixup planner output failed validators after retry (kind=%s round=%d): %s",
+                "fixup planner output failed validators after output-retry budget (kind=%s round=%d): %s",
                 kind,
                 round_no,
                 (feedback or "")[:300],
             )
             return None
-        validator_retries_left -= 1
+        output_retries_left -= 1
         log.warning(
-            "fixup planner output failed validators (kind=%s round=%d); re-prompting once",
+            "fixup planner output failed validators (kind=%s round=%d); "
+            "re-prompting (%d output retries left)",
             kind,
             round_no,
+            output_retries_left,
         )
         cur_prompt = (feedback or "") + "\n\n---\n\n" + base_prompt
 

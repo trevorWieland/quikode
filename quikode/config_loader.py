@@ -229,6 +229,9 @@ def load_config(root: Path | None = None) -> Config:
         ),
         review_rounds_max=int(raw.get("review_rounds_max", defaults.review_rounds_max)),
         fixup_max_rounds=int(raw.get("fixup_max_rounds", defaults.fixup_max_rounds)),
+        fixup_planner_output_retries=int(
+            raw.get("fixup_planner_output_retries", defaults.fixup_planner_output_retries)
+        ),
         preempt_at_subtask_boundary=bool(
             raw.get("preempt_at_subtask_boundary", defaults.preempt_at_subtask_boundary)
         ),
