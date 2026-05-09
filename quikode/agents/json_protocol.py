@@ -276,6 +276,35 @@ def build_reprompt(prompt: str, error: ValidationError, schema: type[BaseModel])
     return f"{prompt}\n\n---\n\n{feedback}"
 
 
+def codex_output_schema(schema: type[BaseModel]) -> dict[str, Any]:
+    """Return a Codex/OpenAI-compatible structured-output schema.
+
+    The Responses API's JSON schema subset requires every object property
+    to be listed in `required`, even when the Pydantic model has defaults.
+    Pydantic emits those defaulted fields as optional, so normalize before
+    handing the schema to `codex exec --output-schema`.
+    """
+    raw_schema = schema.model_json_schema()
+    _normalize_object_required(raw_schema)
+    return raw_schema
+
+
+def _normalize_object_required(value: Any) -> None:
+    """Recursively tighten object schemas in-place for Codex JSON mode."""
+    if isinstance(value, dict):
+        value.pop("default", None)
+        properties = value.get("properties")
+        if isinstance(properties, dict):
+            value["additionalProperties"] = False
+            value["required"] = list(properties.keys())
+        for child in value.values():
+            _normalize_object_required(child)
+        return
+    if isinstance(value, list):
+        for child in value:
+            _normalize_object_required(child)
+
+
 # ---------- wrappers ----------
 
 
@@ -561,4 +590,5 @@ __all__ = [
     "RawTransportResult",
     "WritesFilesAgent",
     "build_reprompt",
+    "codex_output_schema",
 ]

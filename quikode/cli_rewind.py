@@ -125,6 +125,7 @@ def apply_rewind(
         task_id,
         state=State.PENDING.value,
         last_error=None,
+        failure_reason=None,
         container_id=None,
         resume_from_existing_subtasks=1,
         block_forensics=None,

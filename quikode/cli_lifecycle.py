@@ -154,6 +154,7 @@ def _retry_one(
         note=note,
         ci_triage_retries=0,
         last_error=None,
+        failure_reason=None,
         branch=None,
         worktree_path=None,
         container_id=None,
@@ -244,6 +245,7 @@ def resume(
         note=note,
         ci_triage_retries=0,
         last_error=None,
+        failure_reason=None,
         container_id=None,  # container is gone; let provision spin up a fresh one
         resume_from_existing_subtasks=1,
     )

@@ -29,6 +29,7 @@ from .json_protocol import (
     RawTransportResult,
     _ExecOutcome,
     _run_with_retry,
+    codex_output_schema,
 )
 
 
@@ -62,7 +63,7 @@ class CodexLitellmJsonAgent:
         token = secrets.token_hex(4)
         schema_path = f"/tmp/qk_codex_schema_{token}.json"
         out_path = f"/tmp/qk_codex_out_{token}.txt"
-        schema_text = json.dumps(output_schema.model_json_schema())
+        schema_text = json.dumps(codex_output_schema(output_schema))
         codex_parts = [
             "codex",
             "exec",
@@ -80,14 +81,14 @@ class CodexLitellmJsonAgent:
             out_path,
             "-",
         ]
-        write_schema = f"cat > {schema_path} <<'__QK_SCHEMA_EOF__'\n{schema_text}\n__QK_SCHEMA_EOF__"
+        write_schema = f"cat > {schema_path} <<'__QK_SCHEMA_EOF__'\n{schema_text}\n__QK_SCHEMA_EOF__\n"
         shell_cmd = (
-            f"set -o pipefail; "
-            f"{write_schema}; "
-            f"{' '.join(codex_parts)} >&2; "
-            f"_qk_rc=$?; "
-            f"cat {out_path} 2>/dev/null; "
-            f"rm -f {schema_path} {out_path}; "
+            "set -o pipefail\n"
+            f"{write_schema}"
+            f"{' '.join(codex_parts)} >&2\n"
+            "_qk_rc=$?\n"
+            f"cat {out_path} 2>/dev/null\n"
+            f"rm -f {schema_path} {out_path}\n"
             f"exit $_qk_rc"
         )
         cmd = ["bash", "-lc", shell_cmd]

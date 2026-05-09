@@ -305,6 +305,7 @@ def _retry_failed_tasks(store: Store, scope: set[str] | None) -> None:
                 note="auto retry-failed",
                 ci_triage_retries=0,
                 last_error=None,
+                failure_reason=None,
                 container_id=None,
                 resume_from_existing_subtasks=1,
             )

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     pr_number INTEGER,
     plan_text TEXT,
     last_error TEXT,
+    failure_reason TEXT,
     ci_triage_retries INTEGER DEFAULT 0,
     last_pr_event_ts TEXT,
     -- v2 Phase A: track main HEAD at branch time + last successful rebase, so
@@ -290,3 +291,9 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass
     conn.execute("UPDATE agent_calls SET started_at = ts WHERE started_at IS NULL")
+    # Plan 38 calibration: planner validator/parse failures pass a compact
+    # machine-readable failure reason through the generic transition path.
+    try:
+        conn.execute("ALTER TABLE tasks ADD COLUMN failure_reason TEXT")
+    except sqlite3.OperationalError:
+        pass

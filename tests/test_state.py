@@ -86,6 +86,19 @@ def test_set_field(tmp_path: Path):
     assert row["pr_number"] == 42
 
 
+def test_transition_records_failure_reason(tmp_path: Path):
+    s = Store(tmp_path / "q.db")
+    s.upsert_pending("R-1")
+    s.transition(
+        "R-1",
+        State.BLOCKED,
+        last_error="planner parse failed",
+        failure_reason="planner_parse_failure",
+    )
+    row = s.get("R-1")
+    assert row["failure_reason"] == "planner_parse_failure"
+
+
 def test_artifacts(tmp_path: Path):
     s = Store(tmp_path / "q.db")
     s.upsert_pending("R-1")

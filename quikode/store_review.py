@@ -266,6 +266,7 @@ class StoreReviewMixin:
             "needs_intent_review": 0,
             "needs_parent_rebase": 0,
             "last_error": None,
+            "failure_reason": None,
         }
 
         recovered: list[tuple[str, str, str]] = []

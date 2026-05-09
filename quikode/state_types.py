@@ -24,6 +24,7 @@ class TaskRow(TypedDict):
     pr_number: NotRequired[int | None]
     plan_text: NotRequired[str]
     last_error: NotRequired[str | None]
+    failure_reason: NotRequired[str | None]
     ci_triage_retries: NotRequired[int | None]
     last_pr_event_ts: NotRequired[str | None]
     base_ref_sha: NotRequired[str | None]
