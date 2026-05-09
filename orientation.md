@@ -128,7 +128,7 @@ qk daemon stop
 qk daemon start --detach --max-parallel 12 --retry-failed
 ```
 
-**LiteLLM proxy (plan 38).** Codex 0.128+ only speaks the OpenAI Responses API. For non-OpenAI providers (z.ai, Wafer Pass, etc.) a local LiteLLM proxy bridges Responses → Chat Completions on `127.0.0.1:4000`. Codex provider configs at `~/.codex/config.toml` use `base_url = "http://host.docker.internal:4000/v1"` so both the host shell AND tanren task containers reach the proxy (containers via the `--add-host=host.docker.internal:host-gateway` flag plan-38 PR-A added to `quikode/docker_env.py`). API keys live in `~/.codex/.env` (mode 600), sourced by `~/.bashrc` for every interactive shell. Litellm config at `~/.codex/litellm_config.yaml`. Start:
+**LiteLLM proxy (plan 38).** Codex 0.128+ only speaks the OpenAI Responses API. For non-OpenAI providers (z.ai, Wafer Pass, etc.) a local LiteLLM proxy bridges Responses → Chat Completions on `127.0.0.1:4000`. Codex provider configs at `~/.codex/config.toml` use `base_url = "http://host.docker.internal:4000/v1"` for tanren task containers (via the `--add-host=host.docker.internal:host-gateway` flag plan-38 PR-A added to `quikode/docker_env.py`). On the Linux host itself, `host.docker.internal` may not resolve; host-side manual probes should use `127.0.0.1:4000` or override the provider base URL with `-c 'model_providers.<provider>.base_url="http://127.0.0.1:4000/v1"'`. API keys live in `~/.codex/.env` (mode 600), sourced by `~/.bashrc` for every interactive shell. Litellm config at `~/.codex/litellm_config.yaml`. Start:
 
 ```bash
 set -a; . ~/.codex/.env; set +a
@@ -326,7 +326,7 @@ Plans `01–27` and `29` are pre-`optimizations`-branch context; see `plans/00-I
 
 - **Daemon: STOPPED.** Will restart only after the §9.3 deploy sequence runs (re-seed + start).
 - **Workspace: WIPED clean.** `qk reset --yes --close-prs` ran cleanly. SQLite DB dropped, all `qk-*` containers removed, all `quikode/*` branches purged (local + remote), worktrees cleaned.
-- **LiteLLM proxy: RUNNING** in docker as `litellm-bridge` on `127.0.0.1:4000`, with `ZAI_API_KEY` and `WAFER_API_KEY` from `~/.codex/.env` mounted via `-e`. Health probe returns `status: healthy`. `--add-host=host.docker.internal:host-gateway` is wired into tanren container provisioning so containers can reach the proxy via `host.docker.internal:4000`.
+- **LiteLLM proxy: RUNNING** in docker as `litellm-bridge` on `127.0.0.1:4000`, with `ZAI_API_KEY` and `WAFER_API_KEY` from `~/.codex/.env` mounted via `-e`. Health probe returns `status: healthy`. `--add-host=host.docker.internal:host-gateway` is wired into tanren container provisioning so task containers can reach the proxy via `host.docker.internal:4000`; host-side probes should use `127.0.0.1:4000` unless the host has its own `host.docker.internal` mapping.
 - **Codex profiles:** 7 in `~/.codex/config.toml`. Direct OpenAI: `gpt5` (gpt-5.5), `codex` (gpt-5.3-codex). Proxy-routed (via `together_ai/<MODEL>` litellm prefix): `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen`. All seven verified via hello-world `--output-schema` test. CLI-native enforcement on the two direct profiles; client-side pydantic validation on the five proxy-routed profiles.
 - **z.ai** has a 5-hour usage window; if a `glm-zai` model returns 429 with "Usage limit reached for 5 hour", swap to `glm-wafer` until the window resets (Beijing-time reset stamp in the error message).
 - **API keys:** `~/.codex/.env` (mode 600) + `~/.bashrc` sources via `set -a; . ~/.codex/.env; set +a`. NEVER commit these or echo them.
@@ -443,10 +443,13 @@ fixed in code, while provider routing remains operationally constrained:
   `WritesFilesAgent` runs on `glm-zai` / `glm-wafer` repeatedly returned
   `doer_output_invalid` with an empty diff; raw logs showed
   `stream disconnected before completion: error sending request for url
-  (http://host.docker.internal:4000/v1/responses)`. Operational mitigation for
-  overnight runs: keep `subtask_doer_model` and `conflict_resolver_model` on
-  direct `gpt-5.3-codex`; use proxy-routed profiles only for lower-risk JSON
-  or read-only roles until the LiteLLM/write-role transport is fixed.
+  (http://host.docker.internal:4000/v1/responses)`. A host-side Wafer probe
+  with the base URL corrected to `127.0.0.1` reached LiteLLM but still produced
+  only a shell command in a code block, created no file, and ignored the JSON
+  schema. Operational mitigation for overnight runs: keep `subtask_doer_model`
+  and `conflict_resolver_model` on direct `gpt-5.3-codex`; use proxy-routed
+  profiles only for lower-risk JSON or read-only roles until the
+  LiteLLM/write-role transport is fixed.
 
 After hotfix + reinstall, daemon stable at pid (varies per restart);
 8 tasks in PROVISIONING, first wave running fresh under the new

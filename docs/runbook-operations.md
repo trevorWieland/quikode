@@ -46,6 +46,13 @@ runs. Failure signature:
 - `quikode show <task-id>` shows repeated `doer_output_invalid` retries.
 - The doer produced an empty diff.
 - Raw task logs include `stream disconnected before completion: error sending request for url (http://host.docker.internal:4000/v1/responses)`.
+- In a corrected host probe (`127.0.0.1` base URL), Wafer returned a shell
+  command in a code block instead of issuing a tool call, created no file, and
+  ignored `--output-schema`.
+
+For host-side manual proxy probes on Linux, use `127.0.0.1:4000`. The
+`host.docker.internal:4000` provider URL is for task containers, where quikode
+adds the Docker host-gateway mapping.
 
 Immediate mitigation:
 
