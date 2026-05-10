@@ -432,6 +432,64 @@ def test_quota_fallback_invokes_next_transport(tmp_path) -> None:
     assert "quota fallback: glm-zai -> glm-wafer" in (tmp_path / "agent.log").read_text()
 
 
+def test_quota_fallback_can_end_on_cli_native_codex(tmp_path) -> None:
+    primary = StubTransport(
+        name="glm-zai",
+        schema_enforcement="client_side",
+        responses=[
+            RawTransportResult(
+                raw_text=None,
+                structured=None,
+                rc=1,
+                transient=False,
+                duration_s=1.0,
+                stderr_excerpt="HTTP 429: z.ai exhausted",
+            )
+        ],
+    )
+    wafer = StubTransport(
+        name="glm-wafer",
+        schema_enforcement="client_side",
+        responses=[
+            RawTransportResult(
+                raw_text=None,
+                structured=None,
+                rc=1,
+                transient=False,
+                duration_s=2.0,
+                stderr_excerpt="HTTP 429: wafer exhausted",
+            )
+        ],
+    )
+    codex = StubTransport(
+        name="codex_direct",
+        schema_enforcement="cli_native",
+        responses=[
+            RawTransportResult(
+                raw_text=None,
+                structured={"verdict": "progressing", "rationale": "codex last resort"},
+                rc=0,
+                transient=False,
+                duration_s=3.0,
+            )
+        ],
+    )
+    transport = QuotaFallbackJsonAgent(primary=primary, fallbacks=(wafer, codex))
+    wrapper = JsonOutputAgent(transport=transport, output_schema=ProgressVerdict)
+
+    result = wrapper.invoke("hi", handle=object(), log_path=tmp_path / "agent.log", timeout=60)
+
+    assert isinstance(result.structured, ProgressVerdict)
+    assert result.structured.rationale == "codex last resort"
+    assert result.duration_s == 6.0
+    assert len(primary.invocations) == 1
+    assert len(wafer.invocations) == 1
+    assert len(codex.invocations) == 1
+    log_text = (tmp_path / "agent.log").read_text()
+    assert "quota fallback: glm-zai -> glm-wafer" in log_text
+    assert "quota fallback: glm-wafer -> codex_direct" in log_text
+
+
 def test_run_with_retry_can_surface_quota_immediately(monkeypatch) -> None:
     calls = {"n": 0}
 

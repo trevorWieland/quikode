@@ -37,8 +37,12 @@ tmux new-session -d -s qk-health-loop \
 
 `GLM-5.1-zai` is the preferred write-heavy profile when the local LiteLLM
 proxy is healthy. The model registry gives it an automatic quota fallback to
-`GLM-5.1-wafer`: a Z.ai 429 is surfaced immediately to the fallback wrapper
-instead of sleeping inside the primary provider.
+`GLM-5.1-wafer`, then direct `gpt-5.3-codex`: a Z.ai 429 is surfaced
+immediately to the fallback wrapper instead of sleeping inside the primary
+provider, and a Wafer 429 falls through to Codex so doer work can continue.
+When both subscription providers are exhausted, keep a five-hour reset probe
+running; every new call still retries Z.ai first because the primary model
+remains `GLM-5.1-zai`.
 
 Proxy-routed z.ai/Wafer profiles still use client-side JSON validation because
 LiteLLM drops Codex `output_schema` during Responses -> Chat translation. The

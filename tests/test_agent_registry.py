@@ -65,9 +65,11 @@ def test_make_agent_planner_override_to_glm_zai() -> None:
     assert isinstance(agent.transport.primary, CodexLitellmJsonAgent)
     assert agent.transport.primary.profile == "glm-zai"
     assert agent.transport.primary.quota_max_total_wait_s == 0
-    assert len(agent.transport.fallbacks) == 1
+    assert len(agent.transport.fallbacks) == 2
     assert isinstance(agent.transport.fallbacks[0], CodexLitellmJsonAgent)
     assert agent.transport.fallbacks[0].profile == "glm-wafer"
+    assert isinstance(agent.transport.fallbacks[1], CodexDirectJsonAgent)
+    assert agent.transport.fallbacks[1].profile == "codex"
     assert agent.output_schema is PlannerOutput
 
 
@@ -80,9 +82,11 @@ def test_make_agent_subtask_doer_returns_writes_files_with_doer_envelope() -> No
     assert isinstance(agent.transport.primary, CodexLitellmJsonAgent)
     assert agent.transport.primary.profile == "glm-zai"
     assert agent.transport.primary.quota_max_total_wait_s == 0
-    assert len(agent.transport.fallbacks) == 1
+    assert len(agent.transport.fallbacks) == 2
     assert isinstance(agent.transport.fallbacks[0], CodexLitellmJsonAgent)
     assert agent.transport.fallbacks[0].profile == "glm-wafer"
+    assert isinstance(agent.transport.fallbacks[1], CodexDirectJsonAgent)
+    assert agent.transport.fallbacks[1].profile == "codex"
 
 
 def test_make_agent_subtask_doer_override_to_claude_opus() -> None:

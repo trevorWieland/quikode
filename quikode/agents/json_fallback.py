@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -29,13 +30,9 @@ class QuotaFallbackJsonAgent:
     ):
         if not fallbacks:
             raise ValueError("QuotaFallbackJsonAgent requires at least one fallback")
-        schema_enforcement = primary.schema_enforcement
-        for fallback in fallbacks:
-            if fallback.schema_enforcement != schema_enforcement:
-                raise ValueError("quota fallback transports must share schema_enforcement")
         self.primary = primary
         self.fallbacks = fallbacks
-        self.schema_enforcement = schema_enforcement
+        self.schema_enforcement = primary.schema_enforcement
 
     def invoke(
         self,
@@ -56,6 +53,7 @@ class QuotaFallbackJsonAgent:
                 log_path=log_path,
                 timeout=timeout,
             )
+            raw = _normalize_for_primary_schema(raw, primary_schema_enforcement=self.schema_enforcement)
             combined = _combine(prior, raw) if prior is not None else raw
             if not _is_quota_exhausted(raw.rc, raw.raw_text or "", raw.stderr_excerpt):
                 return combined
@@ -63,7 +61,9 @@ class QuotaFallbackJsonAgent:
                 return combined
             _append_fallback_note(log_path, transport, transports[index + 1])
             prior = combined
-        return prior  # pragma: no cover - loop always returns with non-empty transports
+        if prior is None:  # pragma: no cover - transports is always non-empty
+            raise RuntimeError("quota fallback invoked without transports")
+        return prior
 
 
 def _append_fallback_note(
@@ -97,19 +97,56 @@ def _combine(first: RawTransportResult | None, second: RawTransportResult) -> Ra
         rc=second.rc,
         transient=second.transient,
         duration_s=first.duration_s + second.duration_s,
-        tokens_input=_sum_opt(first.tokens_input, second.tokens_input),
-        tokens_output=_sum_opt(first.tokens_output, second.tokens_output),
-        cost_usd=_sum_opt(first.cost_usd, second.cost_usd),
+        tokens_input=_sum_int_opt(first.tokens_input, second.tokens_input),
+        tokens_output=_sum_int_opt(first.tokens_output, second.tokens_output),
+        cost_usd=_sum_float_opt(first.cost_usd, second.cost_usd),
         stderr_excerpt=stderr[-2000:],
     )
 
 
-def _sum_opt(left: int | float | None, right: int | float | None) -> int | float | None:
+def _sum_int_opt(left: int | None, right: int | None) -> int | None:
     if left is None:
         return right
     if right is None:
         return left
     return left + right
+
+
+def _sum_float_opt(left: float | None, right: float | None) -> float | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return left + right
+
+
+def _normalize_for_primary_schema(
+    raw: RawTransportResult,
+    *,
+    primary_schema_enforcement: str,
+) -> RawTransportResult:
+    """Adapt a fallback transport result to the wrapper's exposed schema tier.
+
+    A direct Codex fallback returns `structured` under cli-native enforcement,
+    but a LiteLLM primary exposes client-side enforcement to the outer wrapper.
+    Convert that structured object back into JSON text so the existing
+    client-side pydantic path can validate it uniformly.
+    """
+    if primary_schema_enforcement != "client_side":
+        return raw
+    if raw.raw_text is not None or raw.structured is None:
+        return raw
+    return RawTransportResult(
+        raw_text=json.dumps(raw.structured),
+        structured=None,
+        rc=raw.rc,
+        transient=raw.transient,
+        duration_s=raw.duration_s,
+        tokens_input=raw.tokens_input,
+        tokens_output=raw.tokens_output,
+        cost_usd=raw.cost_usd,
+        stderr_excerpt=raw.stderr_excerpt,
+    )
 
 
 __all__ = ["QuotaFallbackJsonAgent"]

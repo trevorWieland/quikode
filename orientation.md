@@ -341,8 +341,9 @@ Plans `01–27` and `29` are pre-`optimizations`-branch context; see `plans/00-I
 - **Workspace: WIPED clean.** `qk reset --yes --close-prs` ran cleanly. SQLite DB dropped, all `qk-*` containers removed, all `quikode/*` branches purged (local + remote), worktrees cleaned.
 - **LiteLLM proxy: RUNNING** in docker as `litellm-bridge` on `127.0.0.1:4000`, with `ZAI_API_KEY` and `WAFER_API_KEY` from `~/.codex/.env` mounted via `-e`. Health probe returns `status: healthy`. `--add-host=host.docker.internal:host-gateway` is wired into tanren container provisioning so task containers can reach the proxy via `host.docker.internal:4000`; host-side probes should use `127.0.0.1:4000` unless the host has its own `host.docker.internal` mapping.
 - **Codex profiles:** 7 in `~/.codex/config.toml`. Direct OpenAI: `gpt5` (gpt-5.5), `codex` (gpt-5.3-codex). Proxy-routed (via `together_ai/<MODEL>` litellm prefix): `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen`. All seven verified via hello-world `--output-schema` test. CLI-native enforcement on the two direct profiles; client-side pydantic validation on the five proxy-routed profiles.
-- **z.ai** has a 5-hour usage window. `GLM-5.1-zai` now declares `GLM-5.1-wafer`
-  as a quota fallback in `model_registry.py`, so a 429 swaps to Wafer for that
+- **z.ai** has a 5-hour usage window. `GLM-5.1-zai` now declares
+  `GLM-5.1-wafer`, then `gpt-5.3-codex`, as its quota fallback chain in
+  `model_registry.py`, so a 429 swaps to Wafer and then direct Codex for that
   agent call instead of sleeping the worker inside Z.ai.
 - **API keys:** `~/.codex/.env` (mode 600) + `~/.bashrc` sources via `set -a; . ~/.codex/.env; set +a`. NEVER commit these or echo them.
 
@@ -459,10 +460,10 @@ fixed in code, while provider routing remains operationally constrained:
   pydantic validation plus one structured re-prompt. A schema-valid JSON object
   may be recovered from surrounding provider prose; malformed doer bookkeeping
   is telemetry and must not replace diff grading. Quota 429s are handled by the
-  GLM-Z.ai -> GLM-Wafer fallback. Non-quota transport failures such as repeated
-  empty diffs or stream disconnects are still operator-actionable: temporarily
-  move write-heavy roles to direct `gpt-5.3-codex`, reset the affected subtask
-  retries, and resume.
+  GLM-Z.ai -> GLM-Wafer -> direct Codex fallback. Non-quota transport failures
+  such as repeated empty diffs or stream disconnects are still
+  operator-actionable: temporarily move write-heavy roles to direct
+  `gpt-5.3-codex`, reset the affected subtask retries, and resume.
 
 After hotfix + reinstall, daemon stable at pid (varies per restart);
 8 tasks in PROVISIONING, first wave running fresh under the new

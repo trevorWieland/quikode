@@ -45,8 +45,9 @@ class ModelSpec:
     `codex_profile` is mandatory iff `transport` starts with `codex_`.
     `claude_model_id` is mandatory iff `transport == "claude"`.
     `quota_fallbacks` lists model names to try when this model returns a
-    quota/rate-limit failure. Fallbacks must use the same schema enforcement
-    tier so the role wrapper can validate the eventual response uniformly.
+    quota/rate-limit failure. The fallback wrapper exposes the primary model's
+    schema-enforcement tier and normalizes direct-Codex structured payloads
+    when they are used behind a client-side primary.
     """
 
     name: str
@@ -79,7 +80,7 @@ def _build_models() -> dict[str, ModelSpec]:
             transport="codex_litellm",
             schema_enforcement="client_side",
             codex_profile="glm-zai",
-            quota_fallbacks=("GLM-5.1-wafer",),
+            quota_fallbacks=("GLM-5.1-wafer", "gpt-5.3-codex"),
         ),
         ModelSpec(
             name="GLM-5.1-wafer",
@@ -172,11 +173,6 @@ def _validate_fallbacks(models: dict[str, ModelSpec]) -> None:
             fallback = models.get(fallback_name)
             if fallback is None:
                 raise ValueError(f"model {spec.name!r}: unknown quota fallback {fallback_name!r}")
-            if fallback.schema_enforcement != spec.schema_enforcement:
-                raise ValueError(
-                    f"model {spec.name!r}: quota fallback {fallback_name!r} uses "
-                    f"schema_enforcement={fallback.schema_enforcement}; expected {spec.schema_enforcement}"
-                )
 
 
 MODELS: dict[str, ModelSpec] = _build_models()

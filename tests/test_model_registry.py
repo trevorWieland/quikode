@@ -45,9 +45,9 @@ def test_get_model_known_name() -> None:
     assert spec.codex_profile == "gpt5"
 
 
-def test_glm_zai_falls_back_to_wafer_on_quota() -> None:
+def test_glm_zai_falls_back_to_wafer_then_codex_on_quota() -> None:
     spec = get_model("GLM-5.1-zai")
-    assert spec.quota_fallbacks == ("GLM-5.1-wafer",)
+    assert spec.quota_fallbacks == ("GLM-5.1-wafer", "gpt-5.3-codex")
 
 
 def test_get_model_unknown_raises_keyerror() -> None:
