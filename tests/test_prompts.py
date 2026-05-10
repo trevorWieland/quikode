@@ -396,3 +396,67 @@ def test_subtask_doer_omits_reproduce_block_for_spec_kind(tmp_path):
     contract = build_for(dag.nodes["R-001"], cfg)
     out = subtask_doer_prompt(cfg, dag.nodes["R-001"], _subtask(), contract)
     assert "Reproduce-before-fix" not in out
+
+
+# ----- plan 55: agent-self-clean primitive -----
+
+
+def test_subtask_doer_renders_audit_bootstrap_block_for_fixup_ci(tmp_path):
+    """Plan 55: when `cfg.audit_bootstrap_command` is set, the §6a block
+    for `kind="fixup_ci"` exposes the literal command so the doer can
+    re-run it inside the container if local CI doesn't reproduce GitHub."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path).model_copy(
+        update={"audit_bootstrap_command": "pnpm install --frozen-lockfile && just regenerate-all"}
+    )
+    contract = build_for(dag.nodes["R-001"], cfg)
+    fixup_subtask = Subtask(
+        id="F-CI-1-build-fix",
+        title="Regenerate web contracts",
+        depends_on=(),
+        files_to_touch=("apps/web/generated-interface-contracts.ts",),
+        boundary="Regenerate, do not edit by hand.",
+        acceptance=("contracts:check passes",),
+        notes="",
+        kind="fixup-ci",
+    )
+    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], fixup_subtask, contract)
+    # The literal bootstrap command must appear in the prompt.
+    assert "pnpm install --frozen-lockfile && just regenerate-all" in out
+    # Plan-55 framing surfaces somewhere near the §6a block.
+    assert "clean-state bootstrap" in out
+
+
+def test_subtask_doer_omits_audit_bootstrap_block_when_unset(tmp_path):
+    """Plan 55 back-compat: with `cfg.audit_bootstrap_command=""` the
+    new paragraph does not render — operators that don't opt in see the
+    pre-plan-55 prompt verbatim."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path)  # default empty bootstrap command
+    contract = build_for(dag.nodes["R-001"], cfg)
+    fixup_subtask = Subtask(
+        id="F-CI-1-build-fix",
+        title="Regenerate web contracts",
+        depends_on=(),
+        files_to_touch=(),
+        boundary="x",
+        acceptance=("y",),
+        notes="",
+        kind="fixup-ci",
+    )
+    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], fixup_subtask, contract)
+    assert "clean-state bootstrap" not in out
+    # The plan 53 §6a content is still present though — only the new
+    # plan-55 paragraph is gated on the bootstrap command being set.
+    assert "Reproduce-before-fix" in out
+
+
+def test_subtask_doer_omits_audit_bootstrap_block_for_spec_kind(tmp_path):
+    """Plan 55 negative control: even with the bootstrap command set,
+    a regular `kind="spec"` subtask sees no §6a block at all."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path).model_copy(update={"audit_bootstrap_command": "pnpm install --frozen-lockfile"})
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], _subtask(), contract)
+    assert "Reproduce-before-fix" not in out
+    assert "clean-state bootstrap" not in out

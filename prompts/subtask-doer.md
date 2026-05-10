@@ -92,6 +92,25 @@ reproduce the CI failure under fresh-state conditions:
   that case, write a short note in your stop message naming what
   you tried (which caches you wiped, which chain you ran, what was
   green) and stop — do NOT fabricate edits to look productive.
+{% if cfg.audit_bootstrap_command %}* **Project clean-state bootstrap (Plan 55):** if your local CI does
+  not reproduce GitHub's failure, suspect environmental drift. The
+  project ships a single clean-state bootstrap command that mirrors
+  a fresh GitHub Actions runner end-to-end. Run it inside the
+  container before re-running the failing recipe:
+
+  ```
+  {{ cfg.audit_bootstrap_command }}
+  ```
+
+  The orchestrator already ran this command at audit-cycle start,
+  but caches can drift from your own intermediate edits — rerunning
+  is safe and fast in the steady-state. After it completes, run
+  the failing CI recipe again and observe whether the failure now
+  reproduces. If it does, you have a real diff to make. If it
+  still does not, your investigation note in the stop message
+  should name what you tried alongside the bootstrap command so
+  the operator can diagnose the environmental gap.
+{% endif %}
 {% if subtask.root_cause_hypothesis %}
 The fixup planner's hypothesis for THIS subtask was:
 

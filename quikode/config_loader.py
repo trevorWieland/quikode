@@ -417,6 +417,9 @@ def load_config(root: Path | None = None) -> Config:
                 defaults.pre_pr_release_valve_max_critical_findings,
             )
         ),
+        # Plan 55: fresh-container provisioning per audit cycle + bootstrap.
+        audit_fresh_container=bool(raw.get("audit_fresh_container", defaults.audit_fresh_container)),
+        audit_bootstrap_command=str(raw.get("audit_bootstrap_command", defaults.audit_bootstrap_command)),
         daemon_heartbeat_staleness_s=int(
             daemon.get("heartbeat_staleness_s", defaults.daemon_heartbeat_staleness_s)
         ),

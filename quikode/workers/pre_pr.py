@@ -8,6 +8,7 @@ from typing import Any
 from quikode import fsm_runtime, runtime_shutdown
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import FixupPlan
+from quikode.workers.audit_bootstrap import prepare_audit_cycle
 from quikode.workers.fixup_coverage import (
     build_coverage_gap_addendum,
     missing_finding_coverage,
@@ -341,6 +342,93 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
             raise RuntimeError(f"push failed: {out[:1000]}")
         return None
 
+    def _enter_audit_cycle(
+        self: Any,
+        cycle: int,
+        resume_summary: dict[str, Any] | None,
+    ) -> tuple[dict[str, Any] | None, WorkerOutcome | None]:
+        """Per-cycle preamble: detect resume, seed summary, plan-55 bootstrap.
+
+        Returns `(cycle_resume_summary, outcome)`. When `outcome` is not
+        None the caller short-circuits the cycle (BLOCKED via the bootstrap
+        path). Resumed cycles skip the bootstrap so already-passed stages
+        on disk aren't invalidated by a re-provision.
+        """
+        cycle_resume_summary = (
+            resume_summary if resume_summary and int(resume_summary["cycle"]) == cycle else None
+        )
+        if cycle_resume_summary:
+            passed = ", ".join(self._resumable_pre_pr_stage_names(cycle_resume_summary))
+            _tw.log.info(
+                "task %s: resuming pre-pr audit cycle %d after passed stage(s): %s",
+                self.node.id,
+                cycle,
+                passed,
+            )
+            return cycle_resume_summary, None
+        # Seed the audit summary so the TUI shows queued / in-flight /
+        # done states for each stage as the cycle progresses.
+        self.store.begin_pre_pr_audit_cycle(self.node.id, cycle)
+        # Plan 55: optionally re-provision a clean dev container + run the
+        # project's bootstrap command so the gauntlet runs against fresh-
+        # runner state. No-op when cfg.audit_fresh_container is False.
+        return cycle_resume_summary, prepare_audit_cycle(self, cycle=cycle)
+
+    def _settle_pre_pr_cycle(
+        self: Any,
+        cycle: int,
+        cycle_result: Any,
+    ) -> tuple[WorkerOutcome | None] | None:
+        """Inspect a finished cycle for a settle condition.
+
+        Returns:
+            None if the cycle failed without settling (caller continues
+                into the fixup-planner path).
+            (None,) when the cycle passed cleanly — caller surfaces
+                `return None` (pipeline pass).
+            (WorkerOutcome,) when the cycle ended via the release valve
+                (open PR with deferred findings) or via a structural
+                failure (BLOCKED).
+        """
+        if cycle_result.passed:
+            _tw.log.info(
+                "task %s pre-pr pipeline passed on cycle %d/%d — proceeding to open PR",
+                self.node.id,
+                cycle,
+                self.cfg.pre_pr_audit_max_cycles,
+            )
+            return (None,)
+        valve_report = release_valve_report(self.cfg, cycle_result)
+        if valve_report is not None:
+            self.store.add_artifact(
+                self.node.id,
+                DEFERRED_PRE_PR_FINDINGS_ARTIFACT,
+                valve_report,
+            )
+            _tw.log.info(
+                "task %s: pre-pr release valve opened after cycle %d; deferred failed stage(s): %s",
+                self.node.id,
+                cycle,
+                ", ".join(s.name for s in cycle_result.failed_stages),
+            )
+            return (None,)
+        structural_report = structural_failure_report(cycle_result)
+        if structural_report is not None:
+            self.store.add_artifact(
+                self.node.id,
+                f"pre_pr_audit:cycle_{cycle}",
+                structural_report,
+            )
+            note = f"pre-pr cycle {cycle} structural audit failure; blocked instead of fixup planning"
+            fsm_runtime.block_current(
+                self.store,
+                self.node.id,
+                note=note,
+                last_error=structural_report[:1000],
+            )
+            return (WorkerOutcome(State.BLOCKED, note),)
+        return None
+
     def _run_pre_pr_pipeline(self: Any, *, merge_node_mode: bool = False) -> WorkerOutcome | None:
         """5-stage gate before opening a PR. Returns None on pass,
         WorkerOutcome(BLOCKED) after `cfg.pre_pr_audit_max_cycles` fails.
@@ -362,21 +450,9 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
             _tw.log.info(
                 "task %s: pre-pr pipeline cycle %d/%d", self.node.id, cycle, self.cfg.pre_pr_audit_max_cycles
             )
-            cycle_resume_summary = (
-                resume_summary if resume_summary and int(resume_summary["cycle"]) == cycle else None
-            )
-            if cycle_resume_summary:
-                passed = ", ".join(self._resumable_pre_pr_stage_names(cycle_resume_summary))
-                _tw.log.info(
-                    "task %s: resuming pre-pr audit cycle %d after passed stage(s): %s",
-                    self.node.id,
-                    cycle,
-                    passed,
-                )
-            else:
-                # Seed the audit summary so the TUI shows queued / in-flight /
-                # done states for each stage as the cycle progresses.
-                self.store.begin_pre_pr_audit_cycle(self.node.id, cycle)
+            cycle_resume_summary, bootstrap_outcome = self._enter_audit_cycle(cycle, resume_summary)
+            if bootstrap_outcome is not None:
+                return bootstrap_outcome
             if not self._pre_pr_stage_passed(cycle_resume_summary, "local_ci"):
                 fsm_runtime.enter_local_ci_checking(
                     self.store,
@@ -412,45 +488,9 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
                     "PASS" if s.passed else "FAIL",
                 )
 
-            if cycle_result.passed:
-                _tw.log.info(
-                    "task %s pre-pr pipeline passed on cycle %d/%d — proceeding to open PR",
-                    self.node.id,
-                    cycle,
-                    self.cfg.pre_pr_audit_max_cycles,
-                )
-                return None
-
-            valve_report = release_valve_report(self.cfg, cycle_result)
-            if valve_report is not None:
-                self.store.add_artifact(
-                    self.node.id,
-                    DEFERRED_PRE_PR_FINDINGS_ARTIFACT,
-                    valve_report,
-                )
-                _tw.log.info(
-                    "task %s: pre-pr release valve opened after cycle %d; deferred failed stage(s): %s",
-                    self.node.id,
-                    cycle,
-                    ", ".join(s.name for s in cycle_result.failed_stages),
-                )
-                return None
-
-            structural_report = structural_failure_report(cycle_result)
-            if structural_report is not None:
-                self.store.add_artifact(
-                    self.node.id,
-                    f"pre_pr_audit:cycle_{cycle}",
-                    structural_report,
-                )
-                note = f"pre-pr cycle {cycle} structural audit failure; blocked instead of fixup planning"
-                fsm_runtime.block_current(
-                    self.store,
-                    self.node.id,
-                    note=note,
-                    last_error=structural_report[:1000],
-                )
-                return WorkerOutcome(State.BLOCKED, note)
+            settled = self._settle_pre_pr_cycle(cycle, cycle_result)
+            if settled is not None:
+                return settled[0]
 
             # Failure path: merge findings → triage → fixup planner.
             fsm_runtime.enter_fixup_planning(

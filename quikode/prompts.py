@@ -32,7 +32,7 @@ def _env(prompts_dir: Path) -> Environment:
     )
 
 
-def render(cfg: Config, template: str, **ctx) -> str:
+def render(cfg: Config, /, template: str, **ctx) -> str:
     env = _env(cfg.prompts_dir)
     return env.get_template(template).render(**ctx)
 
@@ -129,6 +129,10 @@ def subtask_doer_prompt(
     gate_command = (
         cfg.local_ci_command if subtask.id == STABILIZATION_SUBTASK_ID else cfg.subtask_check_command
     )
+    # Plan 55: surface the live cfg under the literal `cfg` template name so
+    # the doer prompt can render `cfg.audit_bootstrap_command`. `render`'s
+    # first parameter is positional-only so passing `cfg=cfg` here lands as
+    # a Jinja context variable, not a duplicate of the prompts-dir argument.
     return render(
         cfg,
         "subtask-doer.md",
@@ -138,6 +142,7 @@ def subtask_doer_prompt(
         contract=contract,
         triage_notes=triage_notes,
         subtask_check_command=gate_command,
+        cfg=cfg,
     )
 
 

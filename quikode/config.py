@@ -475,6 +475,9 @@ class Config(BaseModel):
         le=100,
         description="Maximum critical findings the release valve may defer.",
     )
+    # Plan 55: fresh-container provisioning + bootstrap per audit cycle.
+    audit_fresh_container: bool = Field(default=False, description=desc.AUDIT_FRESH_CONTAINER)
+    audit_bootstrap_command: str = Field(default="", description=desc.AUDIT_BOOTSTRAP_COMMAND)
 
     # ----- v3 Phase C: daemon supervisor -----
     daemon_heartbeat_staleness_s: int = Field(

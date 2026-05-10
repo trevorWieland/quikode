@@ -288,6 +288,48 @@ def test_orphan_audit_fires_when_loader_silently_swallows_override(tmp_path, cap
     assert "orphan" in matches[0]
 
 
+def test_load_config_wires_audit_fresh_container(tmp_path):
+    """Plan 55: opt-in fresh provisioning per audit cycle must be readable
+    from the workspace toml; plan 50's orphan audit would otherwise warn
+    that the override never landed."""
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\nrepo_path = "{repo}"\ndag_path = "{dag}"\naudit_fresh_container = true\n'
+        ),
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.audit_fresh_container is True
+
+
+def test_load_config_wires_audit_bootstrap_command(tmp_path):
+    """Plan 55: project bootstrap command (free-form string) must be
+    readable from the workspace toml."""
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            'audit_bootstrap_command = "pnpm install --frozen-lockfile && just regenerate-all"\n'
+        ),
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.audit_bootstrap_command == ("pnpm install --frozen-lockfile && just regenerate-all")
+
+
+def test_load_config_audit_bootstrap_defaults_back_compat(tmp_path):
+    """Plan 55 back-compat: workspaces without the new keys default to the
+    pre-plan-55 behavior — fresh provisioning OFF, bootstrap empty."""
+    _scaffold_workspace(
+        tmp_path,
+        toml_body='profile = "tanren"\nrepo_path = "{repo}"\ndag_path = "{dag}"\n',
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.audit_fresh_container is False
+    assert cfg.audit_bootstrap_command == ""
+
+
 def test_load_config_reads_pre_pr_budget_and_release_valve_knobs(tmp_path):
     _scaffold_workspace(
         tmp_path,

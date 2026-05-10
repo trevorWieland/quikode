@@ -106,3 +106,22 @@ PRE_PR_RELEASE_VALVE_AFTER_CYCLES = (
     "Open the PR after this many pre-PR cycles when only configured "
     "quality stages are failing. Set -1 to disable."
 )
+
+AUDIT_FRESH_CONTAINER = (
+    "Plan 55: re-provision a fresh dev container at the start of every "
+    "pre-PR audit cycle. Off by default for back-compat — opt in to "
+    "preempt the env-drift class of failures (cached node_modules / "
+    "target/ / generated artifacts on the local container masking the "
+    "fresh-runner state GitHub CI sees). Costs ~5-10 min provisioning "
+    "overhead per audit cycle; net positive vs an env-drift crash loop."
+)
+
+AUDIT_BOOTSTRAP_COMMAND = (
+    "Plan 55: project-defined clean-state command run inside the "
+    "fresh audit container before the audit gauntlet. Empty string "
+    "disables the bootstrap step. The command runs at "
+    "`/workspace` with a 15-minute timeout. If it produces a worktree "
+    "diff, the orchestrator auto-commits + pushes it as "
+    "`audit-bootstrap: cycle <N>`. Bootstrap rc != 0 fails the task "
+    "fast with `audit_bootstrap_failed`, distinct from audit failures."
+)
