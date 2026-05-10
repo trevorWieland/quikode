@@ -261,7 +261,7 @@ def test_pipeline_cycle_result_with_architecture_failure():
         pre_pr_audit.StageOutcome(
             "architecture",
             False,
-            "1 medium+ severity",
+            "high 1/0",
             findings=[
                 {
                     "id": "arch-001",

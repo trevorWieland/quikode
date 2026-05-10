@@ -102,6 +102,11 @@ def test_config_extra_fields_forbidden():
         _cfg(unknown_field=1)
 
 
+def test_release_valve_defer_stages_are_quality_stage_names():
+    with pytest.raises(ValidationError):
+        _cfg(pre_pr_release_valve_defer_stages=["local_ci"])
+
+
 def test_config_validate_assignment_enforces_bounds():
     """Settings modal mutates config.max_parallel = N; we want pydantic to
     reject out-of-bounds at assignment, not just construction."""

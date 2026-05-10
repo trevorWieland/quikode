@@ -78,10 +78,11 @@ def run_standards_audit(
     if early is not None:
         return early
     assert isinstance(structured, PrePRStandardsAuditOutput)
-    return _build_standards_outcome(structured, result)
+    return _build_standards_outcome(cfg, structured, result)
 
 
 def _build_standards_outcome(
+    cfg: Config,
     audit: PrePRStandardsAuditOutput,
     result: JsonAgentResult,
 ) -> _pp.StageOutcome:
@@ -100,20 +101,29 @@ def _build_standards_outcome(
         }
         for f in audit.findings
     ]
-    serious = [f for f in findings_dicts if f.get("severity") in ("medium", "high", "critical")]
-    raw_excerpt = _pp._tail(result.raw_text or "", 200 if serious else 80)
-    if serious:
+    violations = _pp.severity_budget_violations(
+        findings_dicts,
+        medium=cfg.pre_pr_standards_max_medium_findings,
+        high=cfg.pre_pr_standards_max_high_findings,
+        critical=cfg.pre_pr_standards_max_critical_findings,
+    )
+    raw_excerpt = _pp._tail(result.raw_text or "", 200 if violations else 80)
+    severity_summary = _pp.severity_budget_summary(findings_dicts)
+    if violations:
         return _pp.StageOutcome(
             name="standards",
             passed=False,
-            summary=f"standards failed: {len(serious)} medium+ severity finding(s)",
+            summary=(
+                "standards failed: severity budget exceeded "
+                f"({_pp.format_severity_budget_violations(violations)}; {severity_summary})"
+            ),
             raw_output=raw_excerpt,
             findings=findings_dicts,
         )
     return _pp.StageOutcome(
         name="standards",
         passed=True,
-        summary=f"standards passed ({len(findings_dicts)} low-severity note(s))",
+        summary=f"standards passed ({severity_summary})",
         raw_output=raw_excerpt,
         findings=findings_dicts,
     )

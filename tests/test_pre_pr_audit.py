@@ -15,7 +15,7 @@ Tests cover:
 - Rubric / standards / behavior happy path → outcome reflects the
   validated pydantic instance.
 - Rubric / standards / behavior gating semantics (any category below
-  threshold, any severity ≥ medium, any unverified behavior).
+  threshold, configured severity budgets, any unverified behavior).
 - `parse_errors` non-empty → synthetic FAIL outcome labeled
   `parse_failure` (plan-12/14 invariant: structural failure, NOT a
   fabricated content finding).
@@ -368,10 +368,88 @@ def test_run_standards_audit_happy_path_low_severity(tmp_path):
             cited_refs=[("profiles/rust-cargo/rust/error-handling.md", "Rules")],
         )
     assert outcome.passed
-    assert "low-severity note(s)" in outcome.summary
+    assert "1 low" in outcome.summary
     assert outcome.findings[0]["severity"] == "low"
     # Plan 35 PR-B: the rename to `profile_doc_ref` carries through.
     assert outcome.findings[0]["profile_doc_ref"].startswith("profiles/rust-cargo")
+
+
+def test_run_standards_audit_one_medium_within_default_budget_passes(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    profile = _make_profile("rust-cargo", docs=(_make_standards_doc(),))
+    contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
+    audit = PrePRStandardsAuditOutput(
+        findings=[
+            StandardsFinding(
+                id="rename-account-orgs",
+                file="src/x.rs",
+                line=42,
+                severity="medium",
+                standards_doc_ref="profiles/rust-cargo/rust/error-handling.md§Rules",
+                description="minor boundary naming drift",
+                concrete_fix="rename the helper",
+            )
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_standards_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            contract=contract,
+            diff_excerpt="diff",
+            cited_refs=[],
+        )
+    assert outcome.passed
+    assert "1 medium" in outcome.summary
+    assert outcome.findings[0]["severity"] == "medium"
+
+
+def test_run_standards_audit_forwards_all_findings_when_budget_exceeded(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    cfg.pre_pr_standards_max_medium_findings = 0
+    profile = _make_profile("rust-cargo", docs=(_make_standards_doc(),))
+    contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
+    audit = PrePRStandardsAuditOutput(
+        findings=[
+            StandardsFinding(
+                id="medium-one",
+                file="src/x.rs",
+                line=42,
+                severity="medium",
+                standards_doc_ref="profiles/rust-cargo/rust/error-handling.md§Rules",
+                description="budgeted finding",
+            ),
+            StandardsFinding(
+                id="low-one",
+                file="src/y.rs",
+                line=1,
+                severity="low",
+                standards_doc_ref="profiles/rust-cargo/rust/error-handling.md§Rules",
+                description="advisory finding",
+            ),
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_standards_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            contract=contract,
+            diff_excerpt="diff",
+            cited_refs=[],
+        )
+    assert not outcome.passed
+    assert "medium 1/0" in outcome.summary
+    assert [f["id"] for f in outcome.findings] == ["medium-one", "low-one"]
 
 
 def test_run_standards_audit_serious_finding_fails(tmp_path):
@@ -405,7 +483,7 @@ def test_run_standards_audit_serious_finding_fails(tmp_path):
             cited_refs=[],
         )
     assert not outcome.passed
-    assert "1 medium+ severity" in outcome.summary
+    assert "high 1/0" in outcome.summary
     # Legacy dict shape preserved.
     assert outcome.findings[0]["id"] == "rename-account-orgs"
     assert outcome.findings[0]["severity"] == "high"

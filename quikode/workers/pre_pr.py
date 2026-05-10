@@ -5,7 +5,8 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from quikode import fsm_runtime
+from quikode import fsm_runtime, pre_pr_audit
+from quikode.config import Config
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import FixupPlan
 from quikode.workers.fixup_coverage import (
@@ -23,6 +24,59 @@ class _TaskWorkerGlobals:
 
 
 _tw = _TaskWorkerGlobals()
+
+
+DEFERRED_PRE_PR_FINDINGS_ARTIFACT = "pre_pr_deferred_findings"
+_NON_DEFERABLE_FINDING_KINDS = {
+    "config_error",
+    "bootstrap_error",
+    "infra",
+    "parse_failure",
+    "render_failure",
+    "transport",
+}
+
+
+def _pre_pr_release_valve_report(cfg: Config, cycle_result: Any) -> str | None:
+    """Return the PR-body/artifact report when the release valve may open
+    a PR with deferred quality findings. None means the normal fixup loop
+    must continue.
+    """
+    after_cycles = int(cfg.pre_pr_release_valve_after_cycles)
+    failed = list(cycle_result.failed_stages)
+    if after_cycles < 0 or int(cycle_result.cycle) < after_cycles or not failed:
+        return None
+    failed_names = {s.name for s in failed}
+    if "local_ci" in failed_names or "behavior" in failed_names:
+        return None
+    deferable = set(cfg.pre_pr_release_valve_defer_stages)
+    if not failed_names.issubset(deferable):
+        return None
+
+    critical_count = 0
+    has_non_deferable_finding = False
+    for stage in failed:
+        if not stage.findings:
+            has_non_deferable_finding = True
+        for finding in list(stage.findings or []):
+            kind = str(finding.get("kind") or "")
+            if kind in _NON_DEFERABLE_FINDING_KINDS:
+                has_non_deferable_finding = True
+            if str(finding.get("severity") or "").lower() == "critical":
+                critical_count += 1
+    if has_non_deferable_finding or critical_count > int(cfg.pre_pr_release_valve_max_critical_findings):
+        return None
+
+    rendered = pre_pr_audit.merge_failed_stage_reports(failed)
+    return (
+        "## Deferred pre-PR audit findings\n\n"
+        f"quikode opened this PR after pre-PR audit cycle {cycle_result.cycle} "
+        f"because `local_ci` and `behavior` passed, and only configured "
+        "quality-audit content findings remained.\n\n"
+        f"Deferred stage(s): {', '.join(sorted(failed_names))}.\n\n"
+        "---\n\n"
+        f"{rendered}"
+    )
 
 
 class PrePrWorkerMixin:
@@ -373,6 +427,21 @@ class PrePrWorkerMixin:
                     self.node.id,
                     cycle,
                     self.cfg.pre_pr_audit_max_cycles,
+                )
+                return None
+
+            release_valve_report = _pre_pr_release_valve_report(self.cfg, cycle_result)
+            if release_valve_report is not None:
+                self.store.add_artifact(
+                    self.node.id,
+                    DEFERRED_PRE_PR_FINDINGS_ARTIFACT,
+                    release_valve_report,
+                )
+                _tw.log.info(
+                    "task %s: pre-pr release valve opened after cycle %d; deferred failed stage(s): %s",
+                    self.node.id,
+                    cycle,
+                    ", ".join(s.name for s in cycle_result.failed_stages),
                 )
                 return None
 

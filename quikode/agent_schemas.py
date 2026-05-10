@@ -358,8 +358,8 @@ class StandardsFinding(BaseModel):
 class PrePRStandardsAuditOutput(BaseModel):
     """Top-level shape from the pre-PR standards audit.
 
-    Mirrors `prompts/pre-pr-standards.md`. Worker gates on `severity`
-    >= medium.
+    Mirrors `prompts/pre-pr-standards.md`. Worker gates on configurable
+    severity budgets; low findings are advisory.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -397,8 +397,8 @@ class ArchitectureFinding(BaseModel):
 class PrePRArchitectureAuditOutput(BaseModel):
     """Top-level shape from the pre-PR architecture audit.
 
-    Mirrors `prompts/pre-pr-architecture.md`. Worker gates on `severity`
-    >= medium (same gating as standards). Plan 35 §2.10.
+    Mirrors `prompts/pre-pr-architecture.md`. Worker gates on configurable
+    severity budgets; low findings are advisory. Plan 35 §2.10.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")

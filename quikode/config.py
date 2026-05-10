@@ -25,6 +25,13 @@ class StackingStrategy(StrEnum):
     AGGRESSIVE = "aggressive"
 
 
+PrePrQualityStage = Literal["rubric", "standards", "architecture"]
+
+
+def _default_pre_pr_release_valve_defer_stages() -> list[PrePrQualityStage]:
+    return ["rubric", "standards", "architecture"]
+
+
 class Config(BaseModel):
     """Per-workspace quikode configuration. Loaded from .quikode/config.toml.
 
@@ -435,6 +442,42 @@ class Config(BaseModel):
     architecture_docs_dir: Path = Field(Path("docs/architecture"), description="Architecture-docs root.")
     architecture_doc_globs: list[str] = Field(default_factory=lambda: ["**/*.md"], description="Doc globs.")
     architecture_path_map: dict[str, str] = Field(default_factory=dict, description="Path→doc map (PR-B).")
+    pre_pr_standards_max_medium_findings: int = Field(
+        default=1,
+        ge=0,
+        le=100,
+        description="Standards audit medium-severity budget; low findings remain advisory.",
+    )
+    pre_pr_standards_max_high_findings: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="Standards audit high-severity budget before the stage fails.",
+    )
+    pre_pr_standards_max_critical_findings: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="Standards audit critical-severity budget before the stage fails.",
+    )
+    pre_pr_architecture_max_medium_findings: int = Field(
+        default=1,
+        ge=0,
+        le=100,
+        description="Architecture audit medium-severity budget; low findings remain advisory.",
+    )
+    pre_pr_architecture_max_high_findings: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="Architecture audit high-severity budget before the stage fails.",
+    )
+    pre_pr_architecture_max_critical_findings: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="Architecture audit critical-severity budget before the stage fails.",
+    )
     playwright_cache_dir: Path = Field(
         Path("~/.cache/ms-playwright"),
         description="Host cache mounted at /home/dev/.cache/ms-playwright in task containers.",
@@ -450,6 +493,25 @@ class Config(BaseModel):
         ge=60,
         le=3600,
         description="Per-audit-agent timeout. Each of rubric / standards / behavior runs once per cycle.",
+    )
+    pre_pr_release_valve_after_cycles: int = Field(
+        default=5,
+        ge=-1,
+        le=20,
+        description=(
+            "Open the PR after this many pre-PR cycles when only configured "
+            "quality stages are failing. Set -1 to disable."
+        ),
+    )
+    pre_pr_release_valve_defer_stages: list[PrePrQualityStage] = Field(
+        default_factory=_default_pre_pr_release_valve_defer_stages,
+        description="Quality audit stages whose content findings may be deferred to PR review.",
+    )
+    pre_pr_release_valve_max_critical_findings: int = Field(
+        default=0,
+        ge=0,
+        le=100,
+        description="Maximum critical findings the release valve may defer.",
     )
 
     # ----- v3 Phase C: daemon supervisor -----

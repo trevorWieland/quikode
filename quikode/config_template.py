@@ -21,6 +21,15 @@ max_parallel = 3
 base_branch = "main"
 pr_remote = "origin"
 triage_budget_per_phase = 3
+pre_pr_standards_max_medium_findings = 1
+pre_pr_standards_max_high_findings = 0
+pre_pr_standards_max_critical_findings = 0
+pre_pr_architecture_max_medium_findings = 1
+pre_pr_architecture_max_high_findings = 0
+pre_pr_architecture_max_critical_findings = 0
+pre_pr_release_valve_after_cycles = 5
+pre_pr_release_valve_defer_stages = ["rubric", "standards", "architecture"]
+pre_pr_release_valve_max_critical_findings = 0
 
 [execution]
 # Reserved for future remote backends ("ssh-docker", "vm-sandbox").
@@ -72,6 +81,15 @@ standards_profiles_dir = "profiles"
 standards_profiles = ["rust-cargo"]
 architecture_docs_dir = "docs/architecture"
 architecture_doc_globs = ["**/*.md"]
+pre_pr_standards_max_medium_findings = 1
+pre_pr_standards_max_high_findings = 0
+pre_pr_standards_max_critical_findings = 0
+pre_pr_architecture_max_medium_findings = 1
+pre_pr_architecture_max_high_findings = 0
+pre_pr_architecture_max_critical_findings = 0
+pre_pr_release_valve_after_cycles = 5
+pre_pr_release_valve_defer_stages = ["rubric", "standards", "architecture"]
+pre_pr_release_valve_max_critical_findings = 0
 playwright_cache_dir = "~/.cache/ms-playwright"
 
 [execution]

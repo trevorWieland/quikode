@@ -88,7 +88,8 @@ For each standards alignment finding, the audit grader emits:
 }
 ```
 
-The gate fails when ANY finding has severity >= medium. Every diff hunk
+The gate applies quikode's configured severity budgets (low findings are
+advisory; medium/high/critical budgets decide pass/fail). Every diff hunk
 is checked against every relevant standards profile section —
 implementation that matches the canonical text wins; implementation
 that drifts generates a finding. Pin standards refs in your subtask
@@ -113,7 +114,8 @@ For each architecture-alignment finding, the audit grader emits:
 }
 ```
 
-The gate fails when ANY finding has severity >= medium. The architecture
+The gate applies quikode's configured severity budgets (low findings are
+advisory; medium/high/critical budgets decide pass/fail). The architecture
 audit grades the diff against this project's documented subsystem
 contracts: module/subsystem boundaries, undocumented cross-subsystem
 coupling, deviations from documented interface contracts, missing

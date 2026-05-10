@@ -95,6 +95,47 @@ class PipelineCycleResult:
         return [s for s in self.stages if not s.passed]
 
 
+def severity_counts(findings: list[dict]) -> dict[str, int]:
+    counts = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+    for finding in findings:
+        severity = str(finding.get("severity") or "").lower()
+        if severity in counts:
+            counts[severity] += 1
+    return counts
+
+
+def severity_budget_violations(
+    findings: list[dict],
+    *,
+    medium: int,
+    high: int,
+    critical: int,
+) -> dict[str, tuple[int, int]]:
+    counts = severity_counts(findings)
+    budgets = {
+        "medium": medium,
+        "high": high,
+        "critical": critical,
+    }
+    return {
+        severity: (counts[severity], budget)
+        for severity, budget in budgets.items()
+        if counts[severity] > budget
+    }
+
+
+def severity_budget_summary(findings: list[dict]) -> str:
+    counts = severity_counts(findings)
+    return (
+        f"{counts['critical']} critical, {counts['high']} high, "
+        f"{counts['medium']} medium, {counts['low']} low"
+    )
+
+
+def format_severity_budget_violations(violations: dict[str, tuple[int, int]]) -> str:
+    return ", ".join(f"{severity} {actual}/{budget}" for severity, (actual, budget) in violations.items())
+
+
 # ----- Stage 0: local CI gate -----
 
 
@@ -542,10 +583,14 @@ __all__ = [
     "StageOutcome",
     "collect_finding_ids",
     "collect_standards_text",
+    "format_severity_budget_violations",
     "merge_failed_stage_reports",
     "run_architecture_audit",
     "run_behavior_audit",
     "run_local_ci_gate",
     "run_rubric_audit",
     "run_standards_audit",
+    "severity_budget_summary",
+    "severity_budget_violations",
+    "severity_counts",
 ]

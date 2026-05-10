@@ -296,11 +296,56 @@ def load_config(root: Path | None = None) -> Config:
         ),
         architecture_doc_globs=list(raw.get("architecture_doc_globs", defaults.architecture_doc_globs)),
         architecture_path_map=dict(raw.get("architecture_path_map", defaults.architecture_path_map)),
+        pre_pr_standards_max_medium_findings=int(
+            raw.get(
+                "pre_pr_standards_max_medium_findings",
+                defaults.pre_pr_standards_max_medium_findings,
+            )
+        ),
+        pre_pr_standards_max_high_findings=int(
+            raw.get("pre_pr_standards_max_high_findings", defaults.pre_pr_standards_max_high_findings)
+        ),
+        pre_pr_standards_max_critical_findings=int(
+            raw.get(
+                "pre_pr_standards_max_critical_findings",
+                defaults.pre_pr_standards_max_critical_findings,
+            )
+        ),
+        pre_pr_architecture_max_medium_findings=int(
+            raw.get(
+                "pre_pr_architecture_max_medium_findings",
+                defaults.pre_pr_architecture_max_medium_findings,
+            )
+        ),
+        pre_pr_architecture_max_high_findings=int(
+            raw.get(
+                "pre_pr_architecture_max_high_findings",
+                defaults.pre_pr_architecture_max_high_findings,
+            )
+        ),
+        pre_pr_architecture_max_critical_findings=int(
+            raw.get(
+                "pre_pr_architecture_max_critical_findings",
+                defaults.pre_pr_architecture_max_critical_findings,
+            )
+        ),
         playwright_cache_dir=_path(
             raw.get("playwright_cache_dir"), defaults.playwright_cache_dir.expanduser()
         ),
         pre_pr_audit_max_cycles=int(raw.get("pre_pr_audit_max_cycles", defaults.pre_pr_audit_max_cycles)),
         pre_pr_audit_timeout_s=int(raw.get("pre_pr_audit_timeout_s", defaults.pre_pr_audit_timeout_s)),
+        pre_pr_release_valve_after_cycles=int(
+            raw.get("pre_pr_release_valve_after_cycles", defaults.pre_pr_release_valve_after_cycles)
+        ),
+        pre_pr_release_valve_defer_stages=list(
+            raw.get("pre_pr_release_valve_defer_stages", defaults.pre_pr_release_valve_defer_stages)
+        ),
+        pre_pr_release_valve_max_critical_findings=int(
+            raw.get(
+                "pre_pr_release_valve_max_critical_findings",
+                defaults.pre_pr_release_valve_max_critical_findings,
+            )
+        ),
         daemon_heartbeat_staleness_s=int(
             daemon.get("heartbeat_staleness_s", defaults.daemon_heartbeat_staleness_s)
         ),

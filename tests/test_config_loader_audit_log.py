@@ -96,3 +96,31 @@ def test_audit_log_silent_on_no_overrides(tmp_path, caplog):
         if rec.name == "quikode.config_loader" and rec.levelno == logging.INFO
     ]
     assert audit_lines == []
+
+
+def test_load_config_reads_pre_pr_budget_and_release_valve_knobs(tmp_path):
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            "pre_pr_standards_max_medium_findings = 2\n"
+            "pre_pr_standards_max_high_findings = 1\n"
+            "pre_pr_standards_max_critical_findings = 0\n"
+            "pre_pr_architecture_max_medium_findings = 3\n"
+            "pre_pr_architecture_max_high_findings = 1\n"
+            "pre_pr_architecture_max_critical_findings = 0\n"
+            "pre_pr_release_valve_after_cycles = 6\n"
+            'pre_pr_release_valve_defer_stages = ["standards", "architecture"]\n'
+            "pre_pr_release_valve_max_critical_findings = 0\n"
+        ),
+    )
+
+    cfg = load_config(tmp_path)
+
+    assert cfg.pre_pr_standards_max_medium_findings == 2
+    assert cfg.pre_pr_standards_max_high_findings == 1
+    assert cfg.pre_pr_architecture_max_medium_findings == 3
+    assert cfg.pre_pr_release_valve_after_cycles == 6
+    assert cfg.pre_pr_release_valve_defer_stages == ["standards", "architecture"]

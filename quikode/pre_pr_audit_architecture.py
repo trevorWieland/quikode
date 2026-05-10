@@ -5,8 +5,8 @@ architecture budget. Same shape as `pre_pr_audit.run_standards_audit`:
 renders the architecture corpus TOC + cited section bodies + the diff,
 invokes the `pre_pr_architecture` JsonAgent role, and bridges the
 validated `PrePRArchitectureAuditOutput` into a `StageOutcome` with
-the existing dict-shape findings. Severity gating is `>= medium` (same
-as standards).
+the existing dict-shape findings. Severity gating uses the configured
+architecture severity budgets (same shape as standards).
 """
 
 from __future__ import annotations
@@ -81,10 +81,11 @@ def run_architecture_audit(
     if early is not None:
         return early
     assert isinstance(structured, PrePRArchitectureAuditOutput)
-    return _build_architecture_outcome(structured, result)
+    return _build_architecture_outcome(cfg, structured, result)
 
 
 def _build_architecture_outcome(
+    cfg: Config,
     audit: PrePRArchitectureAuditOutput,
     result: JsonAgentResult,
 ) -> _pp.StageOutcome:
@@ -105,20 +106,29 @@ def _build_architecture_outcome(
         }
         for f in audit.findings
     ]
-    serious = [f for f in findings_dicts if f.get("severity") in ("medium", "high", "critical")]
-    raw_excerpt = _pp._tail(result.raw_text or "", 200 if serious else 80)
-    if serious:
+    violations = _pp.severity_budget_violations(
+        findings_dicts,
+        medium=cfg.pre_pr_architecture_max_medium_findings,
+        high=cfg.pre_pr_architecture_max_high_findings,
+        critical=cfg.pre_pr_architecture_max_critical_findings,
+    )
+    raw_excerpt = _pp._tail(result.raw_text or "", 200 if violations else 80)
+    severity_summary = _pp.severity_budget_summary(findings_dicts)
+    if violations:
         return _pp.StageOutcome(
             name="architecture",
             passed=False,
-            summary=f"architecture failed: {len(serious)} medium+ severity finding(s)",
+            summary=(
+                "architecture failed: severity budget exceeded "
+                f"({_pp.format_severity_budget_violations(violations)}; {severity_summary})"
+            ),
             raw_output=raw_excerpt,
             findings=findings_dicts,
         )
     return _pp.StageOutcome(
         name="architecture",
         passed=True,
-        summary=f"architecture passed ({len(findings_dicts)} low-severity note(s))",
+        summary=f"architecture passed ({severity_summary})",
         raw_output=raw_excerpt,
         findings=findings_dicts,
     )

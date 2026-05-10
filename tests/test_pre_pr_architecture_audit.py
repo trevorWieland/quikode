@@ -3,11 +3,11 @@
 The architecture audit grades the diff against the project's documented
 subsystem contracts (`cfg.architecture_docs_dir`). It runs through the
 JsonAgent layer with `PrePRArchitectureAuditOutput` as the output schema
-and is parallel in shape to `run_standards_audit` — same gating
-(severity ≥ medium fails), same parse-failure shape.
+and is parallel in shape to `run_standards_audit` — same configurable
+severity-budget gating, same parse-failure shape.
 
 Tests cover:
-- Happy path with low-severity findings → outcome passes.
+- Happy path with advisory findings within budget → outcome passes.
 - High-severity finding → outcome fails.
 - Parse failure → synthetic FAIL with `kind="parse_failure"`.
 - Empty corpus → config_error.
@@ -169,6 +169,39 @@ def test_run_architecture_audit_happy_path_low_severity(tmp_path):
 # ----- Severity gating -----
 
 
+def test_run_architecture_audit_one_medium_within_default_budget_passes(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    arch = ArchitectureCorpus(root=Path("/tmp"), docs=(_make_arch_doc(),))
+    contract = _make_contract(arch_corpus=arch, arch_source_text="arch toc")
+    audit = PrePRArchitectureAuditOutput(
+        findings=[
+            ArchitectureFinding(
+                id="medium-architecture-note",
+                file="src/identity.rs",
+                line=42,
+                severity="medium",
+                architecture_doc_ref="docs/architecture/subsystems/identity-policy.md§Permissions",
+                description="call path needs clearer boundary alignment",
+            )
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.return_value = _make_json_result(structured=audit, raw_text="{...}")
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_architecture_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            contract=contract,
+            diff_excerpt="diff --git a/src/identity.rs b/src/identity.rs\n",
+            cited_refs=[],
+        )
+    assert outcome.passed
+    assert "1 medium" in outcome.summary
+
+
 def test_run_architecture_audit_high_severity_fails(tmp_path):
     cfg = _build_cfg(tmp_path)
     arch = ArchitectureCorpus(root=Path("/tmp"), docs=(_make_arch_doc(),))
@@ -200,7 +233,7 @@ def test_run_architecture_audit_high_severity_fails(tmp_path):
             cited_refs=[],
         )
     assert not outcome.passed
-    assert "1 medium+ severity" in outcome.summary
+    assert "high 1/0" in outcome.summary
     assert outcome.findings[0]["id"] == "cross-subsystem-coupling-001"
 
 
