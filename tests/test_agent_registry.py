@@ -16,6 +16,7 @@ from quikode.agent_schemas import (
 from quikode.agents.json_claude import ClaudeJsonAgent
 from quikode.agents.json_codex_direct import CodexDirectJsonAgent
 from quikode.agents.json_codex_litellm import CodexLitellmJsonAgent
+from quikode.agents.json_fallback import QuotaFallbackJsonAgent
 from quikode.agents.json_protocol import JsonOutputAgent, WritesFilesAgent
 from quikode.config import Config
 from quikode.model_registry import MODELS
@@ -60,8 +61,13 @@ def test_make_agent_planner_override_to_glm_zai() -> None:
     cfg = _cfg(planner_model="GLM-5.1-zai")
     agent = make_agent("planner", cfg)
     assert isinstance(agent, JsonOutputAgent)
-    assert isinstance(agent.transport, CodexLitellmJsonAgent)
-    assert agent.transport.profile == "glm-zai"
+    assert isinstance(agent.transport, QuotaFallbackJsonAgent)
+    assert isinstance(agent.transport.primary, CodexLitellmJsonAgent)
+    assert agent.transport.primary.profile == "glm-zai"
+    assert agent.transport.primary.quota_max_total_wait_s == 0
+    assert len(agent.transport.fallbacks) == 1
+    assert isinstance(agent.transport.fallbacks[0], CodexLitellmJsonAgent)
+    assert agent.transport.fallbacks[0].profile == "glm-wafer"
     assert agent.output_schema is PlannerOutput
 
 
@@ -70,8 +76,13 @@ def test_make_agent_subtask_doer_returns_writes_files_with_doer_envelope() -> No
     agent = make_agent("subtask_doer", cfg)
     assert isinstance(agent, WritesFilesAgent)
     assert agent.envelope_schema is DoerEnvelope
-    assert isinstance(agent.transport, CodexLitellmJsonAgent)
-    assert agent.transport.profile == "glm-zai"
+    assert isinstance(agent.transport, QuotaFallbackJsonAgent)
+    assert isinstance(agent.transport.primary, CodexLitellmJsonAgent)
+    assert agent.transport.primary.profile == "glm-zai"
+    assert agent.transport.primary.quota_max_total_wait_s == 0
+    assert len(agent.transport.fallbacks) == 1
+    assert isinstance(agent.transport.fallbacks[0], CodexLitellmJsonAgent)
+    assert agent.transport.fallbacks[0].profile == "glm-wafer"
 
 
 def test_make_agent_subtask_doer_override_to_claude_opus() -> None:

@@ -42,6 +42,7 @@ from .agent_schemas import (
 from .agents.json_claude import ClaudeJsonAgent
 from .agents.json_codex_direct import CodexDirectJsonAgent
 from .agents.json_codex_litellm import CodexLitellmJsonAgent
+from .agents.json_fallback import QuotaFallbackJsonAgent
 from .agents.json_protocol import (
     JsonAgentTransport,
     JsonOutputAgent,
@@ -186,7 +187,7 @@ ROLES: dict[str, RoleSpec] = {
 }
 
 
-def _build_transport(spec: ModelSpec) -> JsonAgentTransport:
+def _build_base_transport(spec: ModelSpec, *, quota_max_total_wait_s: int | None = None) -> JsonAgentTransport:
     """Construct the right transport shim for a model spec."""
     if spec.transport == "codex_direct":
         if spec.codex_profile is None:  # pragma: no cover — registry validates this
@@ -195,12 +196,24 @@ def _build_transport(spec: ModelSpec) -> JsonAgentTransport:
     if spec.transport == "codex_litellm":
         if spec.codex_profile is None:  # pragma: no cover
             raise ValueError(f"model {spec.name!r}: codex_litellm missing codex_profile")
-        return CodexLitellmJsonAgent(profile=spec.codex_profile)
+        return CodexLitellmJsonAgent(
+            profile=spec.codex_profile,
+            quota_max_total_wait_s=quota_max_total_wait_s,
+        )
     if spec.transport == "claude":
         if spec.claude_model_id is None:  # pragma: no cover
             raise ValueError(f"model {spec.name!r}: claude missing claude_model_id")
         return ClaudeJsonAgent(model_id=spec.claude_model_id)
     raise ValueError(f"model {spec.name!r}: unknown transport {spec.transport!r}")
+
+
+def _build_transport(spec: ModelSpec) -> JsonAgentTransport:
+    """Construct transport, including configured quota fallbacks."""
+    if not spec.quota_fallbacks:
+        return _build_base_transport(spec)
+    primary = _build_base_transport(spec, quota_max_total_wait_s=0)
+    fallbacks = tuple(_build_base_transport(MODELS[name]) for name in spec.quota_fallbacks)
+    return QuotaFallbackJsonAgent(primary=primary, fallbacks=fallbacks)
 
 
 def make_agent(role: str, cfg: Config) -> JsonOutputAgent | WritesFilesAgent:

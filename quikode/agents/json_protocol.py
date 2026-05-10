@@ -176,6 +176,7 @@ def _run_with_retry(
     stdin: str | None,
     log_path: Path | None,
     timeout: int,
+    quota_max_total_wait_s: int | None = None,
 ) -> _ExecOutcome:
     """Shared retry/quota/transient-detection loop for all JSON shims.
 
@@ -199,7 +200,7 @@ def _run_with_retry(
     """
     backoff_s = _quota_backoff_initial_s()
     backoff_max_s = _quota_backoff_max_s()
-    max_total_wait_s = _quota_max_total_wait_s()
+    max_total_wait_s = _quota_max_total_wait_s() if quota_max_total_wait_s is None else quota_max_total_wait_s
     waited_s = 0
     quota_retries = 0
     auth_backoff = _BackoffState(

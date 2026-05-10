@@ -17,6 +17,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from quikode.agent_schemas import DoerEnvelope, ProgressVerdict
+from quikode.agents.json_fallback import QuotaFallbackJsonAgent
 from quikode.agents.json_protocol import (
     JsonOutputAgent,
     RawTransportResult,
@@ -333,6 +334,71 @@ def test_transport_failure_returns_no_structured_no_reprompt() -> None:
     assert result.transient is True
     assert result.parse_errors == ()  # didn't try to parse — transport failed
     assert len(transport.invocations) == 1
+
+
+def test_quota_fallback_invokes_next_transport(tmp_path) -> None:
+    primary = StubTransport(
+        name="glm-zai",
+        schema_enforcement="client_side",
+        responses=[
+            RawTransportResult(
+                raw_text=None,
+                structured=None,
+                rc=1,
+                transient=False,
+                duration_s=1.0,
+                stderr_excerpt="HTTP 429: rate limit exceeded",
+            )
+        ],
+    )
+    fallback = StubTransport(
+        name="glm-wafer",
+        schema_enforcement="client_side",
+        responses=[
+            RawTransportResult(
+                raw_text='{"verdict":"progressing","rationale":"fallback worked"}',
+                structured=None,
+                rc=0,
+                transient=False,
+                duration_s=2.0,
+            )
+        ],
+    )
+    transport = QuotaFallbackJsonAgent(primary=primary, fallbacks=(fallback,))
+    wrapper = JsonOutputAgent(transport=transport, output_schema=ProgressVerdict)
+
+    result = wrapper.invoke("hi", handle=object(), log_path=tmp_path / "agent.log", timeout=60)
+
+    assert isinstance(result.structured, ProgressVerdict)
+    assert result.structured.verdict == "progressing"
+    assert result.duration_s == 3.0
+    assert len(primary.invocations) == 1
+    assert len(fallback.invocations) == 1
+    assert "quota fallback: glm-zai -> glm-wafer" in (tmp_path / "agent.log").read_text()
+
+
+def test_run_with_retry_can_surface_quota_immediately(monkeypatch) -> None:
+    calls = {"n": 0}
+
+    def fake_exec_in(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        calls["n"] += 1
+        return 1, "", "HTTP 429: rate limit exceeded"
+
+    monkeypatch.setattr("quikode.agents.json_protocol.exec_in", fake_exec_in)
+
+    out = _run_with_retry(
+        object(),
+        ["codex"],
+        stdin="prompt",
+        log_path=None,
+        timeout=60,
+        quota_max_total_wait_s=0,
+    )
+
+    assert calls["n"] == 1
+    assert out.rc == 1
+    assert out.timed_out is False
+    assert "quota wait exceeded 0s" in out.stderr
 
 
 def test_run_with_retry_retries_codex_auth_refresh_race(monkeypatch, tmp_path) -> None:

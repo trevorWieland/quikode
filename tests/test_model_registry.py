@@ -45,6 +45,11 @@ def test_get_model_known_name() -> None:
     assert spec.codex_profile == "gpt5"
 
 
+def test_glm_zai_falls_back_to_wafer_on_quota() -> None:
+    spec = get_model("GLM-5.1-zai")
+    assert spec.quota_fallbacks == ("GLM-5.1-wafer",)
+
+
 def test_get_model_unknown_raises_keyerror() -> None:
     with pytest.raises(KeyError) as exc:
         get_model("totally-bogus-model")

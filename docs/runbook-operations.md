@@ -35,13 +35,14 @@ tmux new-session -d -s qk-health-loop \
 
 ## Provider routing
 
-Direct OpenAI profiles are currently the safe choice for write-heavy roles.
-Keep `subtask_doer_model` and `conflict_resolver_model` on `gpt-5.3-codex`
-during unattended runs.
+`GLM-5.1-zai` is the preferred write-heavy profile when the local LiteLLM
+proxy is healthy. The model registry gives it an automatic quota fallback to
+`GLM-5.1-wafer`: a Z.ai 429 is surfaced immediately to the fallback wrapper
+instead of sleeping inside the primary provider.
 
-Proxy-routed z.ai/Wafer profiles through LiteLLM are useful for lower-risk
-JSON/read-only roles, but they are not yet reliable for `WritesFilesAgent`
-runs. Failure signature:
+Proxy-routed z.ai/Wafer profiles still use client-side JSON validation because
+LiteLLM drops Codex `output_schema` during Responses -> Chat translation.
+Watch for write-role transport failures that are not quota failures:
 
 - `quikode show <task-id>` shows repeated `doer_output_invalid` retries.
 - The doer produced an empty diff.
@@ -54,11 +55,11 @@ For host-side manual proxy probes on Linux, use `127.0.0.1:4000`. The
 `host.docker.internal:4000` provider URL is for task containers, where quikode
 adds the Docker host-gateway mapping.
 
-Immediate mitigation:
+Immediate mitigation for non-quota provider breakage:
 
 ```bash
 quikode daemon stop
-$EDITOR .quikode/config.toml   # set subtask_doer_model/conflict_resolver_model to "gpt-5.3-codex"
+$EDITOR .quikode/config.toml   # temporarily set subtask_doer_model/conflict_resolver_model to "gpt-5.3-codex"
 quikode reset-retries <task-id> <subtask-id>
 quikode resume <task-id> --reason 'switch write roles to direct codex after LiteLLM transport failures'
 quikode daemon start --detach --max-parallel <N>

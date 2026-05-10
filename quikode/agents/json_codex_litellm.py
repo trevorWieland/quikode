@@ -46,8 +46,9 @@ class CodexLitellmJsonAgent:
     name = "codex_litellm"
     schema_enforcement: str = "client_side"
 
-    def __init__(self, *, profile: str):
+    def __init__(self, *, profile: str, quota_max_total_wait_s: int | None = None):
         self.profile = profile
+        self.quota_max_total_wait_s = quota_max_total_wait_s
 
     def invoke(
         self,
@@ -94,7 +95,14 @@ class CodexLitellmJsonAgent:
         cmd = ["bash", "-lc", shell_cmd]
         before = ccusage.fetch_session_stats("codex", handle=handle)
         t0 = time.time()
-        outcome = _run_with_retry(handle, cmd, stdin=prompt, log_path=log_path, timeout=timeout)
+        outcome = _run_with_retry(
+            handle,
+            cmd,
+            stdin=prompt,
+            log_path=log_path,
+            timeout=timeout,
+            quota_max_total_wait_s=self.quota_max_total_wait_s,
+        )
         duration_s = time.time() - t0
         return _build_raw_result(
             outcome,

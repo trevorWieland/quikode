@@ -44,6 +44,9 @@ class ModelSpec:
 
     `codex_profile` is mandatory iff `transport` starts with `codex_`.
     `claude_model_id` is mandatory iff `transport == "claude"`.
+    `quota_fallbacks` lists model names to try when this model returns a
+    quota/rate-limit failure. Fallbacks must use the same schema enforcement
+    tier so the role wrapper can validate the eventual response uniformly.
     """
 
     name: str
@@ -51,6 +54,7 @@ class ModelSpec:
     schema_enforcement: SchemaEnforcement
     codex_profile: str | None = None
     claude_model_id: str | None = None
+    quota_fallbacks: tuple[str, ...] = ()
 
 
 def _build_models() -> dict[str, ModelSpec]:
@@ -75,6 +79,7 @@ def _build_models() -> dict[str, ModelSpec]:
             transport="codex_litellm",
             schema_enforcement="client_side",
             codex_profile="glm-zai",
+            quota_fallbacks=("GLM-5.1-wafer",),
         ),
         ModelSpec(
             name="GLM-5.1-wafer",
@@ -126,6 +131,7 @@ def _build_models() -> dict[str, ModelSpec]:
         if spec.name in out:
             raise ValueError(f"duplicate model name in registry: {spec.name!r}")
         out[spec.name] = spec
+    _validate_fallbacks(out)
     return out
 
 
@@ -155,6 +161,22 @@ def _validate(spec: ModelSpec) -> None:
         raise ValueError(f"model {spec.name!r}: codex_litellm must declare schema_enforcement=client_side")
     if spec.transport == "claude" and spec.schema_enforcement != "cli_native":
         raise ValueError(f"model {spec.name!r}: claude must declare schema_enforcement=cli_native")
+
+
+def _validate_fallbacks(models: dict[str, ModelSpec]) -> None:
+    """Validate cross-row quota fallback references after the registry is built."""
+    for spec in models.values():
+        for fallback_name in spec.quota_fallbacks:
+            if fallback_name == spec.name:
+                raise ValueError(f"model {spec.name!r}: quota_fallbacks cannot reference itself")
+            fallback = models.get(fallback_name)
+            if fallback is None:
+                raise ValueError(f"model {spec.name!r}: unknown quota fallback {fallback_name!r}")
+            if fallback.schema_enforcement != spec.schema_enforcement:
+                raise ValueError(
+                    f"model {spec.name!r}: quota fallback {fallback_name!r} uses "
+                    f"schema_enforcement={fallback.schema_enforcement}; expected {spec.schema_enforcement}"
+                )
 
 
 MODELS: dict[str, ModelSpec] = _build_models()
