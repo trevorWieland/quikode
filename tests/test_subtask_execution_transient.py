@@ -16,7 +16,10 @@ incremented the attempt counter; the gate failed in <1s; ceiling reached in
 
 from __future__ import annotations
 
-from quikode.agents.transient_quota import _is_transient_container_failure
+from quikode.agents.transient_quota import (
+    _is_transient_agent_auth_failure,
+    _is_transient_container_failure,
+)
 
 
 def test_no_such_container_is_transient():
@@ -59,3 +62,15 @@ def test_empty_stderr_with_nonzero_rc_is_not_transient():
     # No marker → treat as a real failure. Caller's responsibility to
     # decide whether to retry based on the verdict.
     assert _is_transient_container_failure(1, "") is False
+
+
+def test_codex_refresh_token_reuse_is_transient_agent_auth_failure():
+    stderr = (
+        "ERROR: Your access token could not be refreshed because your refresh token was already used. "
+        '{"code":"refresh_token_reused"}'
+    )
+    assert _is_transient_agent_auth_failure(99, "", stderr) is True
+
+
+def test_bare_unauthorized_is_not_transient_agent_auth_failure():
+    assert _is_transient_agent_auth_failure(1, "", "HTTP error: 401 Unauthorized") is False

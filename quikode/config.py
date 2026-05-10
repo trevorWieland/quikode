@@ -585,6 +585,12 @@ class Config(BaseModel):
     progress_model: str = Field(default="gpt-5.5")
     # Per-role timeouts not already declared above (registry `timeout_s_field`).
     planner_timeout_s: int = Field(default=1200, ge=60, le=14400)
+    planner_retries_on_transient: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description="Free retries when the initial planner transport reports a transient agent/infra failure.",
+    )
     subtask_triage_timeout_s: int = Field(default=600, ge=30, le=3600)
     merge_planner_timeout_s: int = Field(default=1800, ge=120, le=7200)
     conflict_resolver_timeout_s: int = Field(default=1800, ge=60, le=14400)

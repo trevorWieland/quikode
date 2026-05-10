@@ -14,7 +14,11 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, ValidationError
 
 from ..execution import exec_in
-from .transient_quota import _is_quota_exhausted, _is_transient_container_failure
+from .transient_quota import (
+    _is_quota_exhausted,
+    _is_transient_agent_auth_failure,
+    _is_transient_container_failure,
+)
 
 log = logging.getLogger("quikode.agents.json")
 
@@ -89,6 +93,18 @@ def _quota_max_total_wait_s() -> int:
     return int(os.environ.get("QUIKODE_QUOTA_MAX_TOTAL_WAIT_S", "28800"))
 
 
+def _auth_backoff_initial_s() -> int:
+    return int(os.environ.get("QUIKODE_AUTH_BACKOFF_INITIAL_S", "15"))
+
+
+def _auth_backoff_max_s() -> int:
+    return int(os.environ.get("QUIKODE_AUTH_BACKOFF_MAX_S", "120"))
+
+
+def _auth_max_total_wait_s() -> int:
+    return int(os.environ.get("QUIKODE_AUTH_MAX_TOTAL_WAIT_S", "900"))
+
+
 @dataclass(frozen=True)
 class _ExecOutcome:
     """Internal result of one wrapped `exec_in` call inside `_run_with_retry`."""
@@ -97,6 +113,60 @@ class _ExecOutcome:
     stdout: str
     stderr: str
     timed_out: bool
+
+
+@dataclass
+class _BackoffState:
+    next_s: int
+    max_s: int
+    waited_s: int
+    max_total_s: int
+    retries: int = 0
+
+
+def _append_agent_log(log_path: Path | None, message: str) -> None:
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as f:
+        f.write(message + "\n")
+
+
+def _handle_agent_auth_retry(
+    *,
+    rc: int,
+    out: str,
+    err: str,
+    state: _BackoffState,
+    log_path: Path | None,
+) -> tuple[bool, _ExecOutcome | None]:
+    if not _is_transient_agent_auth_failure(rc, out, err):
+        return False, None
+    if state.waited_s >= state.max_total_s:
+        give_up = (
+            f"\n[quikode] agent auth refresh retry exceeded {state.max_total_s}s "
+            f"after {state.retries} retries; surfacing as transient transport failure"
+        )
+        log.warning(give_up.strip())
+        _append_agent_log(log_path, give_up)
+        return True, _ExecOutcome(
+            rc=124,
+            stdout=out,
+            stderr=(err or "") + give_up,
+            timed_out=True,
+        )
+    sleep_s = state.next_s
+    wait_msg = (
+        f"\n[quikode] agent auth refresh failure (rc={rc}); retry {state.retries + 1}, "
+        f"sleeping {sleep_s}s (cumulative {state.waited_s}s of {state.max_total_s}s cap)"
+    )
+    log.warning(wait_msg.strip())
+    _append_agent_log(log_path, wait_msg)
+    time.sleep(sleep_s)
+    state.waited_s += sleep_s
+    state.next_s = min(state.next_s * 2, state.max_s)
+    state.retries += 1
+    return True, None
 
 
 def _run_with_retry(
@@ -118,6 +188,10 @@ def _run_with_retry(
       exponential backoff (5min → 10 → 20 → 30min cap) and retry the same
       call up to `_quota_max_total_wait_s`. The FSM never sees a
       quota-exhausted result.
+    - agent auth refresh races (`token_revoked` / `refresh_token_reused`) →
+      short exponential backoff and retry. If the auth race never clears,
+      return a transient rc=124 outcome so worker-level transient handling
+      can avoid misclassifying it as a task/content failure.
 
     Returns `_ExecOutcome` carrying rc + stdout + stderr; the caller's
     transport shim translates into `RawTransportResult` (parsing structured
@@ -128,6 +202,12 @@ def _run_with_retry(
     max_total_wait_s = _quota_max_total_wait_s()
     waited_s = 0
     quota_retries = 0
+    auth_backoff = _BackoffState(
+        next_s=_auth_backoff_initial_s(),
+        max_s=_auth_backoff_max_s(),
+        waited_s=0,
+        max_total_s=_auth_max_total_wait_s(),
+    )
     while True:
         try:
             rc, out, err = exec_in(handle, cmd, log_path=log_path, stdin=stdin, timeout=timeout)
@@ -158,10 +238,7 @@ def _run_with_retry(
                 f"\n[quikode] container-level transient failure detected: rc={rc}; "
                 f"treating as transient retry"
             )
-            if log_path is not None:
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with log_path.open("a") as f:
-                    f.write(annotation + "\n")
+            _append_agent_log(log_path, annotation)
             return _ExecOutcome(
                 rc=124,
                 stdout=out,
@@ -199,6 +276,17 @@ def _run_with_retry(
             waited_s += sleep_s
             backoff_s = min(backoff_s * 2, backoff_max_s)
             quota_retries += 1
+            continue
+        auth_handled, auth_outcome = _handle_agent_auth_retry(
+            rc=rc,
+            out=out,
+            err=err,
+            state=auth_backoff,
+            log_path=log_path,
+        )
+        if auth_outcome is not None:
+            return auth_outcome
+        if auth_handled:
             continue
         return _ExecOutcome(rc=rc, stdout=out, stderr=err, timed_out=False)
 

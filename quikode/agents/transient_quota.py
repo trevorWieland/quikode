@@ -40,6 +40,18 @@ _QUOTA_EXHAUSTED_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"insufficient[ _-]?quota", re.IGNORECASE),
 )
 
+# Codex direct can trip a short-lived OAuth refresh race when several
+# concurrent `codex exec` calls try to refresh the same token. Treat the
+# recognizable signatures as transport transients so one credential race does
+# not become a task-level planning/checking failure.
+_AGENT_AUTH_TRANSIENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\btoken_revoked\b", re.IGNORECASE),
+    re.compile(r"\brefresh_token_reused\b", re.IGNORECASE),
+    re.compile(r"invalidated oauth token", re.IGNORECASE),
+    re.compile(r"refresh token (?:has )?already been used", re.IGNORECASE),
+    re.compile(r"access token could not be refreshed", re.IGNORECASE),
+)
+
 
 def _is_transient_container_failure(rc: int, stderr: str) -> bool:
     """True when a non-zero exit looks like a container-infra glitch.
@@ -78,7 +90,27 @@ def _is_quota_exhausted(rc: int, stdout: str, stderr: str) -> bool:
     return False
 
 
+def _is_transient_agent_auth_failure(rc: int, stdout: str, stderr: str) -> bool:
+    """True when an agent CLI failure looks like a retryable auth race.
+
+    This intentionally does not classify a bare HTTP 401 as transient. A plain
+    unauthorized response can mean the operator needs to re-authenticate; the
+    refresh-token race has more specific signatures that are safe to retry
+    briefly.
+    """
+    if rc == 0:
+        return False
+    for blob in (stderr, stdout):
+        if not blob:
+            continue
+        for pat in _AGENT_AUTH_TRANSIENT_PATTERNS:
+            if pat.search(blob):
+                return True
+    return False
+
+
 __all__ = [
     "_is_quota_exhausted",
+    "_is_transient_agent_auth_failure",
     "_is_transient_container_failure",
 ]

@@ -383,6 +383,9 @@ def load_config(root: Path | None = None) -> Config:
         conflict_resolver_model=str(raw.get("conflict_resolver_model", defaults.conflict_resolver_model)),
         progress_model=str(raw.get("progress_model", defaults.progress_model)),
         planner_timeout_s=int(raw.get("planner_timeout_s", defaults.planner_timeout_s)),
+        planner_retries_on_transient=int(
+            raw.get("planner_retries_on_transient", defaults.planner_retries_on_transient)
+        ),
         subtask_triage_timeout_s=int(raw.get("subtask_triage_timeout_s", defaults.subtask_triage_timeout_s)),
         merge_planner_timeout_s=int(raw.get("merge_planner_timeout_s", defaults.merge_planner_timeout_s)),
         conflict_resolver_timeout_s=int(

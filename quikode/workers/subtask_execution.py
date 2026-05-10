@@ -477,6 +477,15 @@ class SubtaskExecutionMixin:
             tokens_output=result.tokens_output,
             cost_usd=result.cost_usd,
         )
+        if result.rc != 0 or result.transient:
+            text = (
+                "TRIAGE TRANSPORT FAILURE\n"
+                "failure_layer: transport\n"
+                "root_cause: triage agent transport failed before producing structured guidance\n"
+                f"details: rc={result.rc}; {(result.stderr_excerpt or '')[:1000]}"
+            )
+            self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", text)
+            return text
         if result.parse_errors or not isinstance(result.structured, SubtaskTriageOutput):
             errs = list(result.parse_errors or ())
             if not errs and result.structured is not None:

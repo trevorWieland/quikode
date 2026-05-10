@@ -149,6 +149,10 @@ _MAX_VALIDATOR_RETRIES = 2
 _MAX_PARSE_ERROR_RETRIES = 2
 
 
+class _PlannerTransientFailure(RuntimeError):
+    """Planner transport failed for an infra/agent-auth reason."""
+
+
 class _PlannerInvokeOutcome:
     """Internal result of one `_invoke_planner_once` round-trip.
 
@@ -206,10 +210,36 @@ class PlannerDriverMixin:
         prior_attempt_notes: str | None = None
         validator_retries = 0
         parse_retries = 0
+        transient_retries = 0
         # First attempt + up to (validator_retries + parse_retries) re-prompts.
         while True:
             phase = self._planner_phase(validator_retries, parse_retries)
-            outcome = self._invoke_planner_once(contract, phase, prior_attempt_notes)
+            try:
+                outcome = self._invoke_planner_once(contract, phase, prior_attempt_notes)
+            except _PlannerTransientFailure as e:
+                max_transient = int(getattr(self.cfg, "planner_retries_on_transient", 3))
+                if transient_retries >= max_transient:
+                    note = (
+                        f"planner transport failed after {max_transient + 1} transient attempts: "
+                        f"{str(e)[:500]}"
+                    )
+                    fsm_runtime.block_current(
+                        self.store,
+                        self.node.id,
+                        note=note,
+                        last_error=note[:1000],
+                        failure_reason="planner_transport",
+                    )
+                    raise RuntimeError(note) from e
+                transient_retries += 1
+                _tw.log.warning(
+                    "planner transport transient for %s (attempt %d/%d): %s",
+                    self.node.id,
+                    transient_retries,
+                    max_transient + 1,
+                    str(e)[:300],
+                )
+                continue
             # Persist plan_text immediately so resumes can read what the
             # planner emitted on this attempt (mirrors the prior contract:
             # plan_text is the JSON the worker is consuming).
@@ -338,6 +368,11 @@ class PlannerDriverMixin:
         if plan_text:
             self.store.add_artifact(self.node.id, "planner_output", plan_text)
         if result.rc != 0:
+            if result.transient:
+                raise _PlannerTransientFailure(
+                    f"planner agent exited transient rc={result.rc}: "
+                    f"{(result.stderr_excerpt or '')[:500]}"
+                )
             raise RuntimeError(f"planner agent exited rc={result.rc}: {(result.stderr_excerpt or '')[:500]}")
         if result.parse_errors or result.structured is None:
             feedback = _build_parse_error_feedback(result.parse_errors)

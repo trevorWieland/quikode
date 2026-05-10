@@ -21,6 +21,7 @@ from quikode.agents.json_protocol import (
     JsonOutputAgent,
     RawTransportResult,
     WritesFilesAgent,
+    _run_with_retry,
     build_reprompt,
 )
 
@@ -272,6 +273,47 @@ def test_transport_failure_returns_no_structured_no_reprompt() -> None:
     assert result.transient is True
     assert result.parse_errors == ()  # didn't try to parse — transport failed
     assert len(transport.invocations) == 1
+
+
+def test_run_with_retry_retries_codex_auth_refresh_race(monkeypatch, tmp_path) -> None:
+    calls = {"n": 0}
+
+    def fake_exec_in(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (
+                99,
+                "",
+                'ERROR: Your access token could not be refreshed because your refresh token was already used. '
+                '{"code":"refresh_token_reused"}',
+            )
+        return 0, '{"ok": true}', ""
+
+    monkeypatch.setenv("QUIKODE_AUTH_BACKOFF_INITIAL_S", "0")
+    monkeypatch.setattr("quikode.agents.json_protocol.exec_in", fake_exec_in)
+    monkeypatch.setattr("quikode.agents.json_protocol.time.sleep", lambda _seconds: None)
+
+    out = _run_with_retry(object(), ["codex"], stdin="prompt", log_path=tmp_path / "agent.log", timeout=60)
+
+    assert calls["n"] == 2
+    assert out.rc == 0
+    assert out.stdout == '{"ok": true}'
+    assert "agent auth refresh failure" in (tmp_path / "agent.log").read_text()
+
+
+def test_run_with_retry_exhausted_codex_auth_refresh_is_transient(monkeypatch) -> None:
+    def fake_exec_in(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
+        return 99, "", '{"code":"token_revoked","message":"Encountered invalidated oauth token"}'
+
+    monkeypatch.setenv("QUIKODE_AUTH_BACKOFF_INITIAL_S", "0")
+    monkeypatch.setenv("QUIKODE_AUTH_MAX_TOTAL_WAIT_S", "0")
+    monkeypatch.setattr("quikode.agents.json_protocol.exec_in", fake_exec_in)
+
+    out = _run_with_retry(object(), ["codex"], stdin="prompt", log_path=None, timeout=60)
+
+    assert out.rc == 124
+    assert out.timed_out is True
+    assert "agent auth refresh retry exceeded" in out.stderr
 
 
 # ---------- WritesFilesAgent shares the same wrapper logic ----------
