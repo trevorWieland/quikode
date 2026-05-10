@@ -58,12 +58,34 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
                 fixup planner failed AND the fallback also can't
                 make progress (which the caller surfaces as task BLOCKED).
         """
-        if fsm_runtime.current_state(self.store, self.node.id) is not State.ADDRESSING_FEEDBACK:
-            fsm_runtime.enter_fixup_planning(
-                self.store,
-                self.node.id,
-                note=f"{kind} round {round_no} ({trigger})",
-            )
+        # Plan 54 (plan-49 follow-up): re-read state right before the
+        # FSM call. The dispatcher upstream may have read state at an
+        # earlier tick and the parent task may have transitioned (e.g.
+        # `ADDRESSING_FEEDBACK → PENDING_CI` via the feedback caller's
+        # exception handler) between then and now. `enter_fixup_planning`
+        # is only valid from `LOCAL_CI_CHECKING` / `PRE_PR_AUDITING`
+        # (and a no-op from `FIXUP_PLANNING`); any other source state
+        # raises `InvalidTransition`. Skip the FSM event when the
+        # current state isn't one we can transition from — the next
+        # FSM tick will re-evaluate.
+        current = fsm_runtime.current_state(self.store, self.node.id)
+        if current is not State.ADDRESSING_FEEDBACK:
+            if current in (State.LOCAL_CI_CHECKING, State.PRE_PR_AUDITING, State.FIXUP_PLANNING):
+                fsm_runtime.enter_fixup_planning(
+                    self.store,
+                    self.node.id,
+                    note=f"{kind} round {round_no} ({trigger})",
+                )
+            else:
+                _tw.log.info(
+                    "task %s: %s round %d (%s) requested but parent state is %s; "
+                    "skipping enter_fixup_planning (no valid transition)",
+                    self.node.id,
+                    kind,
+                    round_no,
+                    trigger,
+                    current.value,
+                )
         fixup_plan = self._invoke_fixup_planner(
             kind=kind,
             round_no=round_no,

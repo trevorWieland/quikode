@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
 from quikode.dag import DAG
+from quikode.fsm import Event
 from quikode.state import State, Store, SubtaskState
 from quikode.subtask_schema import Plan, Subtask
 from quikode.types import Verdict
@@ -296,6 +297,76 @@ def test_pre_commit_gate_failure_synthesizes_checker_fail(tmp_path):
     for txt in triage_calls:
         assert "pre-commit hook failed" in txt
         assert "rustfmt failed" in txt
+    worker.store.conn.close()
+
+
+def test_no_op_done_in_addressing_feedback_skips_fsm_events(tmp_path):
+    """Plan 54: when the no-op-DONE path triggers while the parent task
+    is in ADDRESSING_FEEDBACK (post-PR CI-fix loop / review-response
+    loop), `_handle_passed_subtask` must skip the per-subtask-loop
+    `enter_committing` / `enter_pushing` FSM events. Those events fire
+    `SUBTASK_PASSED` / `COMMIT_CREATED`, which the FSM only registers
+    from `CHECKING_SUBTASK` / `COMMITTING`; firing them from
+    `ADDRESSING_FEEDBACK` would raise `InvalidTransition` and crash the
+    worker. The subtask DB row must still be marked DONE."""
+    plan = _build_plan(["F-CI-1"])
+    worker = _build_worker(tmp_path, plan)
+
+    # Force the parent task into ADDRESSING_FEEDBACK before the call,
+    # mirroring the CI-fix flow where the daemon already entered that
+    # state before invoking the worker.
+    worker.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+
+    # The no-op-DONE branch in `_handle_subtask_pass` triggers when the
+    # checker_text starts with `_NO_OP_DONE_CHECKER_PREFIX`. The pass
+    # path skips the commit/push call entirely (no `commit_subtask`
+    # patch needed) and returns kind="settled".
+    no_op_text = "VERDICT: PASS\nROOT_CAUSE: subtask no-op DONE; gates green on empty diff"
+    settled, retry, checker_text = worker._handle_passed_subtask(plan.subtasks[0], checker_text=no_op_text)
+
+    assert settled is True
+    assert retry is False
+    assert checker_text == ""
+    # subtask DB row marked DONE without crashing on the FSM event
+    s1 = worker.store.get_subtask("R-001", "F-CI-1")
+    assert s1["state"] == SubtaskState.DONE.value
+    # parent task state unchanged — feedback caller advances it later
+    parent = worker.store.get("R-001")
+    assert parent["state"] == State.ADDRESSING_FEEDBACK.value
+    worker.store.conn.close()
+
+
+def test_settled_in_per_subtask_loop_state_fires_fsm_events(tmp_path):
+    """Plan 54 regression guard: when the parent task IS in a per-
+    subtask-loop state (`CHECKING_SUBTASK` here), `_handle_passed_subtask`
+    must still fire the `enter_committing` / `enter_pushing` FSM events
+    so the per-subtask-loop progresses normally."""
+    plan = _build_plan(["S-01"])
+    worker = _build_worker(tmp_path, plan)
+
+    # Reach CHECKING_SUBTASK via the canonical FSM path so apply_event
+    # transitions are registered. PLANNING → DOING_SUBTASK (PLAN_VALID)
+    # → CHECKING_SUBTASK (DOER_DONE).
+    worker.store.apply_event("R-001", Event.PLAN_VALID)
+    worker.store.apply_event("R-001", Event.DOER_DONE)
+    assert worker.store.get("R-001")["state"] == State.CHECKING_SUBTASK.value
+
+    def fake_commit_subtask(handle, subtask, message, *, branch, remote, push, log_path, timeout=300):
+        return CommitResult(success=True, commit_sha="ab" * 20, transient=False, output="ok")
+
+    with (
+        patch.object(worker, "_pre_commit_gate", return_value=(True, "skipped")),
+        patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit_subtask),
+    ):
+        settled, retry, checker_text = worker._handle_passed_subtask(
+            plan.subtasks[0], checker_text="VERDICT: PASS"
+        )
+
+    assert settled is True
+    assert retry is False
+    assert checker_text == ""
+    # FSM advanced through COMMITTING → PUSHING
+    assert worker.store.get("R-001")["state"] == State.PUSHING.value
     worker.store.conn.close()
 
 

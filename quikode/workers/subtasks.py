@@ -340,11 +340,45 @@ class SubtaskWorkerMixin(
                 return False, progress_block
         return False, None
 
+    # Plan 54: per-subtask-loop states for which `SUBTASK_PASSED` /
+    # `COMMIT_CREATED` (the `enter_committing` / `enter_pushing` chain)
+    # are valid FSM events. The CI-fix / review-response loops run
+    # subtasks while the parent task stays in `ADDRESSING_FEEDBACK`
+    # (the `enter_doing_subtask` / `enter_checking_subtask` /
+    # `enter_triaging_subtask` helpers no-op on that state); they must
+    # not fire the per-subtask-loop terminal events because the FSM
+    # rejects `addressing_feedback → committing` (`InvalidTransition`).
+    _PER_SUBTASK_LOOP_STATES = frozenset(
+        {State.DOING_SUBTASK, State.CHECKING_SUBTASK, State.TRIAGING_SUBTASK}
+    )
+
     def _handle_passed_subtask(self: Any, subtask: Subtask, checker_text: str) -> tuple[bool, bool, str]:
         pass_outcome = self._handle_subtask_pass(subtask, checker_text=checker_text)
         if pass_outcome.kind == "settled":
-            fsm_runtime.enter_committing(self.store, self.node.id, note=f"{subtask.id} passed")
-            fsm_runtime.enter_pushing(self.store, self.node.id, note=f"{subtask.id} committed and pushed")
+            # Plan 54: gate the per-subtask-loop FSM events on parent
+            # state. In the post-PR CI-fix / review-response flow the
+            # parent task is in `ADDRESSING_FEEDBACK`; the subtask DB
+            # row has already been marked DONE by `_handle_subtask_pass`
+            # (and any commit + push happened inside `commit_subtask`).
+            # Firing `SUBTASK_PASSED` from `ADDRESSING_FEEDBACK` would
+            # raise `InvalidTransition` and crash the worker; the
+            # feedback caller (`run_ci_fix_response` /
+            # `run_changes_requested_response`) handles the
+            # `FEEDBACK_PUSHED → PENDING_CI` transition once the loop
+            # finishes, so no per-subtask FSM bookkeeping is needed
+            # here for that context.
+            current = fsm_runtime.current_state(self.store, self.node.id)
+            if current in self._PER_SUBTASK_LOOP_STATES:
+                fsm_runtime.enter_committing(self.store, self.node.id, note=f"{subtask.id} passed")
+                fsm_runtime.enter_pushing(self.store, self.node.id, note=f"{subtask.id} committed and pushed")
+            else:
+                _tw.log.info(
+                    "subtask %s/%s settled while parent task is in %s; "
+                    "skipping per-subtask-loop FSM events (handled by feedback flow)",
+                    self.node.id,
+                    subtask.id,
+                    current.value,
+                )
             return True, False, ""
         if pass_outcome.kind == "transient_retry":
             fsm_runtime.enter_triaging_subtask(
