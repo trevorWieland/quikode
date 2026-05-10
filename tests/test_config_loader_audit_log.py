@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 
+from quikode import config_loader as loader_mod
+from quikode.config import Config as ConfigCls
 from quikode.config_loader import load_config
 
 
@@ -96,6 +98,159 @@ def test_audit_log_silent_on_no_overrides(tmp_path, caplog):
         if rec.name == "quikode.config_loader" and rec.levelno == logging.INFO
     ]
     assert audit_lines == []
+
+
+def test_load_config_wires_subtask_same_signature_block_count(tmp_path):
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            "subtask_same_signature_block_count = 10\n"
+        ),
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.subtask_same_signature_block_count == 10
+
+
+def test_load_config_wires_subtask_witness_timeout_seconds(tmp_path):
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            "subtask_witness_timeout_seconds = 180\n"
+        ),
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.subtask_witness_timeout_seconds == 180
+
+
+def test_load_config_wires_fixup_planner_timeout_s(tmp_path):
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\nrepo_path = "{repo}"\ndag_path = "{dag}"\nfixup_planner_timeout_s = 2400\n'
+        ),
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.fixup_planner_timeout_s == 2400
+
+
+def test_load_config_wires_fixup_planner_retries_on_transient(tmp_path):
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            "fixup_planner_retries_on_transient = 4\n"
+        ),
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.fixup_planner_retries_on_transient == 4
+
+
+def test_load_config_wires_pre_pr_architecture_model(tmp_path):
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            'pre_pr_architecture_model = "GLM-5.1-zai"\n'
+        ),
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.pre_pr_architecture_model == "GLM-5.1-zai"
+
+
+def test_orphan_audit_silent_when_override_takes_effect(tmp_path, caplog):
+    """A wired field whose override differs from the default must NOT
+    fire the orphan-audit warning."""
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            "subtask_same_signature_block_count = 10\n"
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger="quikode.config_loader")
+    load_config(tmp_path)
+    warnings = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "quikode.config_loader" and rec.levelno == logging.WARNING
+    ]
+    assert not any("subtask_same_signature_block_count" in line for line in warnings)
+
+
+def test_orphan_audit_silent_when_toml_matches_default(tmp_path, caplog):
+    """Setting a key to its exact default value is not an orphan; no
+    warning should fire because there's nothing to swallow."""
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            "max_parallel = 3\n"  # equals Field default
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger="quikode.config_loader")
+    load_config(tmp_path)
+    warnings = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "quikode.config_loader" and rec.levelno == logging.WARNING
+    ]
+    assert not any("max_parallel" in line for line in warnings)
+
+
+def test_orphan_audit_silent_for_non_config_keys(tmp_path, caplog):
+    """A toml key that isn't a Config field name (typo, sub-table) must
+    NOT fire the orphan warning."""
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\nrepo_path = "{repo}"\ndag_path = "{dag}"\n[stacking]\nmax_depth = 12\n'
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger="quikode.config_loader")
+    load_config(tmp_path)
+    warnings = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "quikode.config_loader" and rec.levelno == logging.WARNING
+    ]
+    # No top-level orphan from the [stacking] sub-table.
+    assert warnings == []
+
+
+def test_orphan_audit_fires_when_loader_silently_swallows_override(tmp_path, caplog):
+    """If a Config field is set in toml but the constructed cfg still
+    matches the default, the audit MUST emit a WARNING. Exercise the
+    helper directly with a synthesized orphan condition (raw says 99,
+    cfg shows default 5) that mirrors the bug plan 50 closes."""
+    raw: dict[str, object] = {"subtask_same_signature_block_count": 99}
+    cfg = ConfigCls(repo_path=tmp_path, dag_path=tmp_path)
+    defaults = ConfigCls(repo_path=tmp_path, dag_path=tmp_path)
+    assert cfg.subtask_same_signature_block_count == defaults.subtask_same_signature_block_count
+    caplog.set_level(logging.WARNING, logger="quikode.config_loader")
+    loader_mod._warn_orphan_overrides(raw, cfg, defaults)
+    warnings = [
+        rec.getMessage()
+        for rec in caplog.records
+        if rec.name == "quikode.config_loader" and rec.levelno == logging.WARNING
+    ]
+    matches = [w for w in warnings if "subtask_same_signature_block_count" in w]
+    assert len(matches) == 1
+    assert "99" in matches[0]
+    assert "orphan" in matches[0]
 
 
 def test_load_config_reads_pre_pr_budget_and_release_valve_knobs(tmp_path):

@@ -102,6 +102,43 @@ def _log_int_overrides(raw: dict[str, Any], defaults: Config) -> None:
         )
 
 
+def _warn_orphan_overrides(raw: dict[str, Any], cfg: Config, defaults: Config) -> None:
+    """Plan 50 audit: surface top-level TOML keys that name a Config field
+    but whose override didn't actually take effect.
+
+    This closes the gap that motivated plan 50: ``_log_int_overrides``
+    independently inspects ``raw`` against Field defaults and happily
+    logs ``config[X] = Y (overrides Field default Z)`` even when
+    ``load_config`` never reads ``X`` into the constructed ``Config``.
+    The orphan field then runs at its default and the audit log lies.
+    Iterate ``Config.model_fields`` once per daemon start and emit a
+    WARNING for any field whose top-level TOML key is set but whose
+    final ``cfg`` value still equals the default — that mismatch means
+    the loader silently swallowed the override.
+    """
+    for field_name in Config.model_fields:
+        if field_name not in raw:
+            continue
+        cfg_value = getattr(cfg, field_name)
+        default_value = getattr(defaults, field_name)
+        if cfg_value != default_value:
+            continue
+        raw_value = raw[field_name]
+        # Setting the key to the same value as the default is not an
+        # orphan — there's nothing to swallow. Only warn when the toml
+        # actually disagrees with the default.
+        if raw_value == default_value:
+            continue
+        log.warning(
+            "config[%s] = %r set in toml but cfg.%s == default %r "
+            "(orphan field — load_config may not be reading it)",
+            field_name,
+            raw_value,
+            field_name,
+            default_value,
+        )
+
+
 def find_config_root(start: Path | None = None) -> Path:
     """Walk up looking for .quikode/config.toml; default to cwd."""
     cur = (start or Path.cwd()).resolve()
@@ -184,7 +221,7 @@ def load_config(root: Path | None = None) -> Config:
         max_parallel_auto=bool(profile.resource_defaults.get("max_parallel_auto", False)),
     )
     _log_int_overrides(raw, defaults)
-    return Config(
+    cfg = Config(
         profile=profile.name,
         repo_path=_path(raw["repo_path"], root),
         dag_path=_path(raw["dag_path"], root),
@@ -218,8 +255,20 @@ def load_config(root: Path | None = None) -> Config:
         subtask_flatline_block_count=int(
             raw.get("subtask_flatline_block_count", defaults.subtask_flatline_block_count)
         ),
+        subtask_same_signature_block_count=int(
+            raw.get(
+                "subtask_same_signature_block_count",
+                defaults.subtask_same_signature_block_count,
+            )
+        ),
         subtask_transient_max_retries=int(
             raw.get("subtask_transient_max_retries", defaults.subtask_transient_max_retries)
+        ),
+        subtask_witness_timeout_seconds=int(
+            raw.get(
+                "subtask_witness_timeout_seconds",
+                defaults.subtask_witness_timeout_seconds,
+            )
         ),
         pre_commit_runner=raw.get("pre_commit_runner", defaults.pre_commit_runner),
         pre_commit_timeout_s=int(raw.get("pre_commit_timeout_s", defaults.pre_commit_timeout_s)),
@@ -231,6 +280,13 @@ def load_config(root: Path | None = None) -> Config:
         fixup_max_rounds=int(raw.get("fixup_max_rounds", defaults.fixup_max_rounds)),
         fixup_planner_output_retries=int(
             raw.get("fixup_planner_output_retries", defaults.fixup_planner_output_retries)
+        ),
+        fixup_planner_timeout_s=int(raw.get("fixup_planner_timeout_s", defaults.fixup_planner_timeout_s)),
+        fixup_planner_retries_on_transient=int(
+            raw.get(
+                "fixup_planner_retries_on_transient",
+                defaults.fixup_planner_retries_on_transient,
+            )
         ),
         preempt_at_subtask_boundary=bool(
             raw.get("preempt_at_subtask_boundary", defaults.preempt_at_subtask_boundary)
@@ -377,6 +433,9 @@ def load_config(root: Path | None = None) -> Config:
         subtask_triage_model=str(raw.get("subtask_triage_model", defaults.subtask_triage_model)),
         pre_pr_rubric_model=str(raw.get("pre_pr_rubric_model", defaults.pre_pr_rubric_model)),
         pre_pr_standards_model=str(raw.get("pre_pr_standards_model", defaults.pre_pr_standards_model)),
+        pre_pr_architecture_model=str(
+            raw.get("pre_pr_architecture_model", defaults.pre_pr_architecture_model)
+        ),
         pre_pr_behavior_model=str(raw.get("pre_pr_behavior_model", defaults.pre_pr_behavior_model)),
         fixup_planner_model=str(raw.get("fixup_planner_model", defaults.fixup_planner_model)),
         merge_planner_model=str(raw.get("merge_planner_model", defaults.merge_planner_model)),
@@ -399,3 +458,5 @@ def load_config(root: Path | None = None) -> Config:
         replan_planner_model=str(raw.get("replan_planner_model", defaults.replan_planner_model)),
         replan_planner_timeout_s=int(raw.get("replan_planner_timeout_s", defaults.replan_planner_timeout_s)),
     )
+    _warn_orphan_overrides(raw, cfg, defaults)
+    return cfg
