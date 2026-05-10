@@ -2,12 +2,32 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.request import urlopen
 
 from .architecture_docs import load_architecture
 from .config import Config
+from .model_registry import get_model
 from .standards_profiles import load_profiles
+
+_ROLE_MODEL_FIELDS: tuple[str, ...] = (
+    "planner_model",
+    "subtask_doer_model",
+    "subtask_checker_model",
+    "subtask_triage_model",
+    "pre_pr_rubric_model",
+    "pre_pr_standards_model",
+    "pre_pr_architecture_model",
+    "pre_pr_behavior_model",
+    "fixup_planner_model",
+    "merge_planner_model",
+    "conflict_resolver_model",
+    "progress_model",
+    "intent_reviewer_model",
+    "replan_planner_model",
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +60,7 @@ def validate_launch_config(cfg: Config) -> None:
         issues.append(ConfigIssue("local_ci_command", "must be non-empty for the pre-PR gate"))
     _check_standards(issues, cfg)
     _check_architecture(issues, cfg)
+    _check_model_bindings_and_proxy(issues, cfg)
     if issues:
         raise ConfigValidationError(issues)
 
@@ -89,6 +110,44 @@ def _check_architecture(issues: list[ConfigIssue], cfg: Config) -> None:
             ConfigIssue(
                 "architecture_docs_dir",
                 f"no architecture docs loaded from {corpus.root}; set architecture_docs_dir + architecture_doc_globs",
+            )
+        )
+
+
+def _check_model_bindings_and_proxy(issues: list[ConfigIssue], cfg: Config) -> None:
+    litellm_bindings: list[str] = []
+    for field in _ROLE_MODEL_FIELDS:
+        model_name = getattr(cfg, field, "")
+        try:
+            spec = get_model(model_name)
+        except KeyError as exc:
+            issues.append(ConfigIssue(field, str(exc)))
+            continue
+        if spec.transport == "codex_litellm":
+            litellm_bindings.append(f"{field}={model_name}")
+    if not litellm_bindings:
+        return
+    url = os.environ.get(
+        "QUIKODE_LITELLM_CONTAINER_HEALTH_URL",
+        "http://172.17.0.1:4000/health/readiness",
+    )
+    try:
+        with urlopen(url, timeout=2) as response:
+            body = response.read(512).decode("utf-8", errors="replace")
+    except Exception as exc:
+        joined = ", ".join(litellm_bindings)
+        issues.append(
+            ConfigIssue(
+                "litellm_proxy",
+                f"codex_litellm model(s) configured ({joined}) but proxy health check failed at {url}: {exc}",
+            )
+        )
+        return
+    if "healthy" not in body.lower():
+        issues.append(
+            ConfigIssue(
+                "litellm_proxy",
+                f"proxy health check at {url} did not report healthy: {body[:200]}",
             )
         )
 

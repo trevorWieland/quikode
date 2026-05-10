@@ -53,7 +53,10 @@ Watch for write-role transport failures that are not quota failures:
 
 For host-side manual proxy probes on Linux, use `127.0.0.1:4000`. The
 `host.docker.internal:4000` provider URL is for task containers, where quikode
-adds the Docker host-gateway mapping.
+adds the Docker host-gateway mapping. The LiteLLM bridge must publish both
+`127.0.0.1:4000` and the Docker host-gateway address, usually
+`172.17.0.1:4000`; publishing only `127.0.0.1` makes host probes pass while
+containerized Codex calls fail.
 
 Immediate mitigation for non-quota provider breakage:
 

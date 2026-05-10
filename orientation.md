@@ -135,19 +135,20 @@ qk daemon stop
 qk daemon start --detach --max-parallel 12 --retry-failed
 ```
 
-**LiteLLM proxy (plan 38).** Codex 0.128+ only speaks the OpenAI Responses API. For non-OpenAI providers (z.ai, Wafer Pass, etc.) a local LiteLLM proxy bridges Responses → Chat Completions on `127.0.0.1:4000`. Codex provider configs at `~/.codex/config.toml` use `base_url = "http://host.docker.internal:4000/v1"` for tanren task containers (via the `--add-host=host.docker.internal:host-gateway` flag plan-38 PR-A added to `quikode/docker_env.py`). On the Linux host itself, `host.docker.internal` may not resolve; host-side manual probes should use `127.0.0.1:4000` or override the provider base URL with `-c 'model_providers.<provider>.base_url="http://127.0.0.1:4000/v1"'`. API keys live in `~/.codex/.env` (mode 600), sourced by `~/.bashrc` for every interactive shell. Litellm config at `~/.codex/litellm_config.yaml`. Start:
+**LiteLLM proxy (plan 38).** Codex 0.128+ only speaks the OpenAI Responses API. For non-OpenAI providers (z.ai, Wafer Pass, etc.) a local LiteLLM proxy bridges Responses -> Chat Completions on `127.0.0.1:4000` for host probes and `172.17.0.1:4000` for task containers. Codex provider configs at `~/.codex/config.toml` use `base_url = "http://host.docker.internal:4000/v1"` for tanren task containers (via the `--add-host=host.docker.internal:host-gateway` flag plan-38 PR-A added to `quikode/docker_env.py`). On the Linux host itself, `host.docker.internal` may not resolve; host-side manual probes should use `127.0.0.1:4000` or override the provider base URL with `-c 'model_providers.<provider>.base_url="http://127.0.0.1:4000/v1"'`. API keys live in `~/.codex/.env` (mode 600), sourced by `~/.bashrc` for every interactive shell. Litellm config at `~/.codex/litellm_config.yaml`. Start:
 
 ```bash
 set -a; . ~/.codex/.env; set +a
 docker run -d --name litellm-bridge \
   -p 127.0.0.1:4000:4000 \
+  -p 172.17.0.1:4000:4000 \
   -v "$HOME/.codex/litellm_config.yaml:/app/config.yaml" \
   -e ZAI_API_KEY -e WAFER_API_KEY \
   ghcr.io/berriai/litellm:main-stable \
   --config /app/config.yaml --host 0.0.0.0 --port 4000
 ```
 
-Health probe: `curl -sS http://127.0.0.1:4000/health/readiness` returns `status: healthy`. Codex profiles configured: `gpt5` (gpt-5.5 direct OpenAI), `codex` (gpt-5.3-codex direct OpenAI), `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen` (proxy-routed). Direct-OpenAI profiles bypass the proxy entirely. Schema enforcement is **CLI-native** for direct-OpenAI + claude profiles; **client-side via pydantic** for proxy-routed profiles (litellm 1.83 drops `output_schema` during Responses → Chat translation AND most upstream providers don't honor `response_format: json_schema` either — verified directly against wafer/GLM-5.1 on 2026-05-08). Use `together_ai/<MODEL>` (NOT `openai/<MODEL>`) as the litellm prefix to force the translation; `openai/` passes through.
+Health probes: `curl -sS http://127.0.0.1:4000/health/readiness` on the host and `docker exec <qk-dev-container> curl -sS http://host.docker.internal:4000/health/readiness` from a task container both return `status: healthy`. Codex profiles configured: `gpt5` (gpt-5.5 direct OpenAI), `codex` (gpt-5.3-codex direct OpenAI), `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen` (proxy-routed). Direct-OpenAI profiles bypass the proxy entirely. Schema enforcement is **CLI-native** for direct-OpenAI + claude profiles; **client-side via pydantic** for proxy-routed profiles (litellm 1.83 drops `output_schema` during Responses -> Chat translation AND most upstream providers don't honor `response_format: json_schema` either — verified directly against wafer/GLM-5.1 on 2026-05-08). Use `together_ai/<MODEL>` (NOT `openai/<MODEL>`) as the litellm prefix to force the translation; `openai/` passes through.
 
 **Restart cost model.** Restarting the daemon kills every in-flight agent subprocess inside its container. Orphan recovery cleanly resets each affected task to PENDING + a resume marker; the next worker run picks up from the nearest non-DONE subtask. The cost is **per-task, bounded by one in-flight agent call (10–30 min), not cumulative task runtime.** Subtask-level commits are preserved on the branch. Don't hesitate to restart for a meaningful fix; do consider clustering several pending fixes into one restart.
 
@@ -363,7 +364,8 @@ bash scripts/reinstall.sh --skip-tests
 
 # 3. Verify proxy health.
 curl -sS http://127.0.0.1:4000/health/readiness
-# expect status: healthy
+docker exec <qk-dev-container> curl -sS http://host.docker.internal:4000/health/readiness
+# both expect status: healthy
 
 # 4. Migrate the live workspace's config.toml off the retired
 #    [agents.<phase>] sections — config_loader REJECTS them with a

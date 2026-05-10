@@ -16,6 +16,11 @@ quota backoff window instead of using Wafer Pass as the subscription fallback.
 - `QuotaFallbackJsonAgent` wraps fallback-capable transports and invokes the
   next provider when the previous provider reports quota/rate-limit exhaustion.
 - The live Tanren config was updated to `subtask_doer_model = "GLM-5.1-zai"`.
+- Launch validation now checks the Docker-host LiteLLM health URL whenever any
+  role is bound to a `codex_litellm` model, catching proxy binding mistakes
+  before workers start.
+- The LiteLLM runbook now publishes both `127.0.0.1:4000` for host probes and
+  `172.17.0.1:4000` for `host.docker.internal` traffic from task containers.
 
 The fallback is intentionally narrow. Schema failures, empty diffs, and
 non-quota transport failures still surface through the normal JSON/subtask

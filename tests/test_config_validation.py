@@ -23,6 +23,8 @@ def _cfg(tmp_path: Path, **overrides) -> Config:
         standards_profiles=["rust-cargo"],
         architecture_docs_dir=_ARCH_FIX,
         architecture_doc_globs=["**/*.md"],
+        subtask_doer_model="gpt-5.3-codex",
+        conflict_resolver_model="gpt-5.3-codex",
     )
     return cfg.model_copy(update=overrides)
 
@@ -51,3 +53,20 @@ def test_launch_config_rejects_missing_architecture_docs(tmp_path: Path) -> None
     message = str(exc_info.value)
     assert "architecture_docs_dir" in message
     assert "no architecture docs loaded" in message
+
+
+def test_launch_config_rejects_unreachable_litellm_proxy(tmp_path: Path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, subtask_doer_model="GLM-5.1-zai")
+
+    def fail_urlopen(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("quikode.config_validation.urlopen", fail_urlopen)
+
+    with pytest.raises(ConfigValidationError) as exc_info:
+        validate_launch_config(cfg)
+
+    message = str(exc_info.value)
+    assert "litellm_proxy" in message
+    assert "GLM-5.1-zai" in message
+    assert "connection refused" in message
