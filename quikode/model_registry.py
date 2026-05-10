@@ -74,13 +74,29 @@ def _build_models() -> dict[str, ModelSpec]:
             schema_enforcement="cli_native",
             codex_profile="codex",
         ),
+        ModelSpec(
+            # Light-tier OpenAI for narrow-output roles (progress watchdog,
+            # intent reviewer). Cheaper per call than gpt-5.5 / codex; uses
+            # low reasoning effort by codex profile. Same cli-native schema
+            # enforcement as gpt-5.5.
+            name="gpt-5.4-mini",
+            transport="codex_direct",
+            schema_enforcement="cli_native",
+            codex_profile="gpt-mini",
+        ),
         # Litellm-routed (Tier 2 — client_side)
         ModelSpec(
             name="GLM-5.1-zai",
             transport="codex_litellm",
             schema_enforcement="client_side",
             codex_profile="glm-zai",
-            quota_fallbacks=("GLM-5.1-wafer", "gpt-5.3-codex"),
+            # Fallback chain: subscription-billed first (z.ai → Wafer), then
+            # Anthropic Sonnet for the harder cases where cheap-tier writes-
+            # files capability would burn cycles, then OpenAI codex-tuned as
+            # the always-works floor. Sonnet's analytical reasoning over
+            # apply_patch makes it a meaningful intermediate, not just a
+            # cost step.
+            quota_fallbacks=("GLM-5.1-wafer", "claude-sonnet-4-6", "gpt-5.3-codex"),
         ),
         ModelSpec(
             name="GLM-5.1-wafer",
