@@ -16,7 +16,10 @@ from quikode.types import Verdict
 from quikode.workers.outcomes import WorkerOutcome
 from quikode.workers.planner_driver import PlannerDriverMixin, _wire_to_runtime_plan
 from quikode.workers.subtask_completion import SubtaskCompletionMixin
-from quikode.workers.subtask_execution import SubtaskExecutionMixin
+from quikode.workers.subtask_execution import (
+    _EMPTY_DIFF_CHECKER_PREFIX,
+    SubtaskExecutionMixin,
+)
 from quikode.workers.subtask_progress import SubtaskProgressMixin
 
 
@@ -356,7 +359,24 @@ class SubtaskWorkerMixin(
         fsm_runtime.enter_triaging_subtask(
             self.store, self.node.id, note=f"{subtask.id} attempt {attempt} failed"
         )
-        triage_notes, failure_layer = self._triage_subtask(subtask, attempt, hard_max, checker_text)
+        # Plan 51: empty-diff transport failures skip the LLM triage
+        # call. The triage agent has nothing to teach against (the diff
+        # is empty by construction), so synthesize a transport-layer
+        # note directly and stamp `failure_layer="transport"` on the
+        # retry signature. The synthesized text mirrors the shape of
+        # the existing triage-transport-failure artifact for
+        # consistency with `qk show`.
+        if checker_text.startswith(_EMPTY_DIFF_CHECKER_PREFIX):
+            triage_notes = (
+                "TRIAGE TRANSPORT FAILURE\n"
+                "failure_layer: transport\n"
+                "root_cause: doer produced no diff (empty git status). "
+                "Transport-class failure; no LLM triage call needed."
+            )
+            failure_layer: str | None = "transport"
+            self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", triage_notes)
+        else:
+            triage_notes, failure_layer = self._triage_subtask(subtask, attempt, hard_max, checker_text)
         self.store.update_subtask(
             self.node.id, subtask.id, triage_notes=triage_notes, state=SubtaskState.TRIAGING.value
         )
@@ -387,15 +407,26 @@ class SubtaskWorkerMixin(
         )
 
     def _maybe_signature_stop_loss(self: Any, subtask: Subtask) -> str | None:
-        """Block when the last N non-transient retry_reasons share the
-        same `(category, signature)` tuple. Plan 23.
+        """Block when the last K non-transient retry_reasons indicate
+        a transport-class failure storm (plan 51), or when the last N
+        share the same `(category, signature)` tuple (plan 23).
 
-        Independent of `_maybe_record_progress_block` — that one relies
-        on the progress-check agent's verdict, which can rate
-        different-but-equally-invalid output as 'progressing' and so
-        misses retry storms with stable failure signatures (e.g.
-        R-0005/S-10's `doer_output_invalid rc=0` loop).
+        The transport stop-loss runs first and at a much lower cap
+        (default K=3) because no amount of retry on a broken transport
+        will help — the doer model is silently producing empty diffs
+        and the right operator action is a model swap, not more
+        attempts. The same-signature stop-loss (plan 23) stays as-is
+        for non-transport layers, where productive retry IS possible
+        when the failure shifts category.
+
+        Both checks are independent of `_maybe_record_progress_block` —
+        that one relies on the progress-check agent's verdict, which
+        can rate different-but-equally-invalid output as 'progressing'
+        and so misses retry storms with stable failure signatures.
         """
+        transport_block = self._maybe_transport_stop_loss(subtask)
+        if transport_block is not None:
+            return transport_block
         n = self.cfg.subtask_same_signature_block_count
         if n < 2:
             return None
@@ -410,6 +441,39 @@ class SubtaskWorkerMixin(
         return (
             f"same-signature stop-loss: last {n} non-transient retries all "
             f"share category={cat!r} signature={sig_short!r}"
+        )
+
+    def _maybe_transport_stop_loss(self: Any, subtask: Subtask) -> str | None:
+        """Plan 51: BLOCK after K consecutive non-transient retries
+        whose retry signature carries `,layer=transport` AND whose
+        category is a content-failure category (`checker_fail` or
+        `doer_output_invalid` — the two categories the empty-diff
+        synthesized outcome routes through `retry_classify`).
+
+        K is `cfg.subtask_transport_stop_loss_count` (default 3) and
+        is intentionally smaller than the same-signature cap. The
+        block message is operator-clear about the recommended action:
+        swap `subtask_doer_model` to a known-reliable model and
+        resume.
+        """
+        k = self.cfg.subtask_transport_stop_loss_count
+        if k < 2:
+            return None
+        sigs = self.store.last_n_retry_signatures(self.node.id, subtask.id, limit=k)
+        if len(sigs) < k:
+            return None
+        for cat, sig in sigs:
+            if cat not in ("checker_fail", "doer_output_invalid"):
+                return None
+            if ",layer=transport" not in sig:
+                return None
+        return (
+            f"transport stop-loss: last {k} non-transient retries had empty "
+            f"diffs (layer=transport). The doer model is not producing work "
+            f"product. Check `cfg.subtask_doer_model` and the underlying "
+            f"transport (litellm bridge, codex profile, provider quota). "
+            f"Operator action: swap subtask_doer_model to a known-reliable "
+            f"model and resume."
         )
 
     def _maybe_record_progress_block(self: Any, subtask: Subtask, attempt: int) -> str | None:

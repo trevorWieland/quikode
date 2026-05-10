@@ -261,6 +261,12 @@ def load_config(root: Path | None = None) -> Config:
                 defaults.subtask_same_signature_block_count,
             )
         ),
+        subtask_transport_stop_loss_count=int(
+            raw.get(
+                "subtask_transport_stop_loss_count",
+                defaults.subtask_transport_stop_loss_count,
+            )
+        ),
         subtask_transient_max_retries=int(
             raw.get("subtask_transient_max_retries", defaults.subtask_transient_max_retries)
         ),

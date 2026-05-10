@@ -103,3 +103,128 @@ def test_layer_constant_attempts_trip_stop_loss(tmp_path):
     assert "same-signature stop-loss" in outcome.note
     assert do_calls == [1, 2, 3]
     worker.store.conn.close()
+
+
+# ----- plan 51: transport stop-loss -----
+
+
+def _empty_diff_checker_outcome() -> _CheckerOutcome:
+    """Fixture: the FAIL outcome `_check_subtask` synthesizes when the
+    doer's worktree had no edits. Mirrors the prefix consumed by
+    `_record_subtask_triage` to skip the LLM triage call and stamp
+    `failure_layer="transport"` on the retry signature."""
+    return _CheckerOutcome(
+        verdict=Verdict.FAIL,
+        checker_text=(
+            "VERDICT: FAIL\nROOT_CAUSE: doer produced no diff "
+            "(transport-class failure). git status --porcelain "
+            "returned 0 entries. Skipping LLM checker; this is not a "
+            "content-grading failure."
+        ),
+        transient=False,
+        rc=None,
+        stderr="",
+    )
+
+
+def test_transport_stop_loss_fires_after_three_empty_diffs(tmp_path):
+    """Plan 51: 3 consecutive `(checker_fail, ,layer=transport)` retries
+    trip the transport stop-loss with the distinct operator-clear
+    message — well below the same-signature cap. Triage agent is NEVER
+    invoked because the empty-diff checker prefix short-circuits the
+    triage path."""
+    plan = _build_plan(["S-01"])
+    worker = _build_worker(
+        tmp_path,
+        plan,
+        hard_max=20,
+        progress_after=20,
+        progress_every=20,
+        flatline_block=10,
+        # Set same-signature cap higher than transport cap to confirm
+        # transport stop-loss fires first.
+        same_signature_block=10,
+    )
+    # Default transport cap is 3; assert and also confirm wiring.
+    assert worker.cfg.subtask_transport_stop_loss_count == 3
+    do_calls: list[int] = []
+    triage_calls: list[int] = []
+
+    def fake_do(subtask, attempt, triage_notes):
+        do_calls.append(attempt)
+
+    def fake_triage(subtask, attempt, budget, checker_text):
+        triage_calls.append(attempt)
+        return "should not run", "rubric"
+
+    with (
+        patch.object(worker, "_do_subtask", side_effect=fake_do),
+        patch.object(worker, "_check_subtask", return_value=_empty_diff_checker_outcome()),
+        patch.object(worker, "_triage_subtask", side_effect=fake_triage),
+    ):
+        outcome = worker._subtask_loop()
+
+    assert outcome is not None
+    assert outcome.final_state is State.BLOCKED
+    assert "transport stop-loss" in outcome.note
+    assert "subtask_doer_model" in outcome.note
+    assert "same-signature stop-loss" not in outcome.note
+    # Three doer attempts → block on the third.
+    assert do_calls == [1, 2, 3]
+    # LLM triage path NEVER invoked on the empty-diff branch.
+    assert triage_calls == []
+    worker.store.conn.close()
+
+
+def test_transport_stop_loss_does_not_fire_for_local_ci_layer(tmp_path):
+    """Plan 51 negative control: 3 consecutive checker-fails with
+    `layer=local_ci` (a content-class failure layer) must NOT trip the
+    transport stop-loss. Same-signature stop-loss owns that case at
+    its own (higher) cap."""
+    plan = _build_plan(["S-01"])
+    worker = _build_worker(
+        tmp_path,
+        plan,
+        hard_max=5,
+        progress_after=20,
+        progress_every=20,
+        flatline_block=10,
+        # Higher than transport cap; same-signature stop-loss should
+        # still own this case at the same-signature cap. We pick 5 so
+        # the loop blocks on the hard ceiling first when the
+        # same-signature cap doesn't hit; with a constant local_ci
+        # layer the same-signature cap *will* hit at 5 by design.
+        same_signature_block=20,
+    )
+    do_calls: list[int] = []
+
+    def fake_do(subtask, attempt, triage_notes):
+        do_calls.append(attempt)
+
+    def fake_triage(subtask, attempt, budget, checker_text):
+        return "stuck on local_ci", "local_ci"
+
+    with (
+        patch.object(worker, "_do_subtask", side_effect=fake_do),
+        patch.object(
+            worker,
+            "_check_subtask",
+            return_value=_CheckerOutcome(
+                verdict=Verdict.FAIL,
+                checker_text="VERDICT: FAIL\nROOT_CAUSE: ci stage failed",
+                transient=False,
+                rc=0,
+                stderr="",
+            ),
+        ),
+        patch.object(worker, "_triage_subtask", side_effect=fake_triage),
+    ):
+        outcome = worker._subtask_loop()
+
+    assert outcome is not None
+    assert outcome.final_state is State.BLOCKED
+    assert "transport stop-loss" not in outcome.note
+    # Hard-ceiling block path; same-signature cap was set high.
+    assert "hard ceiling" in outcome.note
+    assert do_calls == [1, 2, 3, 4, 5]
+    worker.store.conn.close()

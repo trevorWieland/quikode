@@ -114,6 +114,23 @@ def test_load_config_wires_subtask_same_signature_block_count(tmp_path):
     assert cfg.subtask_same_signature_block_count == 10
 
 
+def test_load_config_wires_subtask_transport_stop_loss_count(tmp_path):
+    """Plan 51: the new `subtask_transport_stop_loss_count` Field must
+    be readable from the workspace toml. Plan 50's orphan-audit warning
+    would otherwise surface this as a silent override."""
+    _scaffold_workspace(
+        tmp_path,
+        toml_body=(
+            'profile = "tanren"\n'
+            'repo_path = "{repo}"\n'
+            'dag_path = "{dag}"\n'
+            "subtask_transport_stop_loss_count = 5\n"
+        ),
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.subtask_transport_stop_loss_count == 5
+
+
 def test_load_config_wires_subtask_witness_timeout_seconds(tmp_path):
     _scaffold_workspace(
         tmp_path,

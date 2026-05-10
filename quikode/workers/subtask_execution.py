@@ -59,6 +59,12 @@ _tw = _TaskWorkerGlobals()
 
 _DOER_ARTIFACT_MAX = 20000
 
+# Plan 51: prefix on the synthesized checker artifact when the doer
+# returned no diff. `_record_subtask_triage` matches on this prefix to
+# skip the LLM triage call (an empty diff offers nothing to teach
+# against) and stamp `failure_layer="transport"` directly.
+_EMPTY_DIFF_CHECKER_PREFIX = "VERDICT: FAIL\nROOT_CAUSE: doer produced no diff"
+
 
 class SubtaskExecutionMixin:
     # Cached state set by `_do_subtask`, consumed by `_check_subtask` /
@@ -193,11 +199,13 @@ class SubtaskExecutionMixin:
     # ----- checker -----
 
     def _check_subtask(self: Any, subtask: Subtask) -> _CheckerOutcome:
-        """Plan 47: always invoke the LLM checker against the diff +
-        witness output. The doer no longer emits a bookkeeping
-        envelope, so there's nothing to short-circuit on; the worker
-        runs the objective command first, and otherwise hands the
-        diff to the checker."""
+        """Plan 47: invoke the LLM checker against the diff + witness
+        output after the objective command (`just check`) gates the
+        attempt. The doer no longer emits a bookkeeping envelope, so
+        there's nothing to short-circuit on except the empty-diff
+        transport-class failure introduced by plan 51 — when the doer
+        rc=0'd but produced no work product, we synthesize a FAIL
+        outcome rather than burning checker tokens on an empty diff."""
         fsm_runtime.enter_checking_subtask(self.store, self.node.id, note=subtask.id)
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.CHECKING.value)
 
@@ -205,7 +213,44 @@ class SubtaskExecutionMixin:
         if objective_outcome is not None:
             return objective_outcome
 
+        # Plan 51: empty-diff is a transport-class failure, not a
+        # content-grading failure. Skip the LLM checker entirely — the
+        # diff is empty, there's nothing to grade. The synthesized
+        # outcome IS the verdict; `_record_subtask_triage` reads the
+        # prefix and skips the LLM triage call too, stamping
+        # `failure_layer="transport"` directly so the new transport
+        # stop-loss can fire after K (default 3) attempts instead of
+        # the same-signature default 5/10.
+        if not self._last_diff_text:
+            return self._classify_empty_diff_outcome(subtask)
+
         return self._run_llm_subtask_checker(subtask)
+
+    def _classify_empty_diff_outcome(self: Any, subtask: Subtask) -> _CheckerOutcome:
+        """Synthesize a FAIL outcome for the empty-diff transport-class
+        failure path (plan 51). Persists a dedicated
+        `subtask_empty_diff:<id>` artifact so `qk show` surfaces the
+        empty-diff history alongside the (also-persisted) checker
+        artifact carrying the synthesized verdict text."""
+        text = (
+            f"{_EMPTY_DIFF_CHECKER_PREFIX} "
+            "(transport-class failure). git status --porcelain "
+            "returned 0 entries. Skipping LLM checker; this is not a "
+            "content-grading failure."
+        )
+        self.store.add_artifact(self.node.id, f"subtask_checker:{subtask.id}", text)
+        self.store.add_artifact(
+            self.node.id,
+            f"subtask_empty_diff:{subtask.id}",
+            "doer rc=0 but worktree had no edits (git status --porcelain empty).",
+        )
+        return _CheckerOutcome(
+            verdict=Verdict.FAIL,
+            checker_text=text,
+            transient=False,
+            rc=None,
+            stderr="",
+        )
 
     def _run_llm_subtask_checker(self: Any, subtask: Subtask) -> _CheckerOutcome:
         contract = self._evaluation_contract()

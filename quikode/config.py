@@ -159,6 +159,12 @@ class Config(BaseModel):
         le=20,
         description=desc.SUBTASK_SAME_SIGNATURE_BLOCK,
     )
+    subtask_transport_stop_loss_count: int = Field(
+        default=3,
+        ge=2,
+        le=10,
+        description=desc.SUBTASK_TRANSPORT_STOP_LOSS,
+    )
     subtask_transient_max_retries: int = Field(
         default=5,
         ge=0,

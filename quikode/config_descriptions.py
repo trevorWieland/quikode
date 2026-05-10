@@ -30,6 +30,16 @@ SUBTASK_SAME_SIGNATURE_BLOCK = (
     "the progress-check agent rates 'progressing'. Plan 23."
 )
 
+SUBTASK_TRANSPORT_STOP_LOSS = (
+    "Empty-diff transport-class failures before BLOCKING the "
+    "subtask. Lower than the same-signature cap because no amount "
+    "of retry on a broken transport will help; the right action is "
+    "operator-swap of the doer model. Fires when the last K "
+    "non-transient retry_reasons all share `category in "
+    "{checker_fail, doer_output_invalid}` AND signature includes "
+    "`,layer=transport`. Plan 51."
+)
+
 FIXUP_PLANNER_TIMEOUT = (
     "Per-invocation timeout for the fixup planner. Plan 33 "
     "calibration (after the tanren deploy doer-timeout incident): "

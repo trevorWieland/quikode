@@ -380,5 +380,63 @@ def test_run_doer_agent_records_call_with_subtask_id(tmp_path) -> None:
     assert finished.kwargs["cost_usd"] == 0.05
 
 
+# ---------- plan 51: empty-diff transport-class failure ----------
+
+
+def test_check_subtask_empty_diff_short_circuits_to_synthesized_outcome(tmp_path) -> None:
+    """Plan 51: when the doer produced no diff (`_last_diff_text == ""`),
+    `_check_subtask` synthesizes a FAIL outcome with the fixed
+    transport-failure prefix and skips the LLM checker entirely. No
+    `make_agent("subtask_checker")` call should fire."""
+    cfg = _cfg(tmp_path)
+    w = _build_worker(cfg)
+    w._last_diff_text = ""
+    w._last_witness_results = {}
+    make_agent_calls: list[str] = []
+
+    def fake_make_agent(role: str, _cfg: Config) -> Any:
+        make_agent_calls.append(role)
+        raise AssertionError(f"checker should be skipped on empty diff; got make_agent({role!r})")
+
+    with (
+        patch("quikode.workers.subtask_execution.make_agent", side_effect=fake_make_agent),
+        patch("quikode.workers.subtask_execution.fsm_runtime"),
+    ):
+        outcome = w._check_subtask(_S04_WEB_SUBTASK)
+
+    assert outcome.verdict is Verdict.FAIL
+    assert outcome.transient is False
+    assert outcome.rc is None
+    assert outcome.checker_text.startswith("VERDICT: FAIL\nROOT_CAUSE: doer produced no diff")
+    assert make_agent_calls == []
+    # Both the synthesized checker artifact and the dedicated empty-diff
+    # artifact should land in the store for `qk show` visibility.
+    artifact_kinds = [c[0][1] for c in w.store.add_artifact.call_args_list]
+    assert f"subtask_checker:{_S04_WEB_SUBTASK.id}" in artifact_kinds
+    assert f"subtask_empty_diff:{_S04_WEB_SUBTASK.id}" in artifact_kinds
+
+
+def test_check_subtask_non_empty_diff_still_invokes_llm_checker(tmp_path) -> None:
+    """Plan 51 negative control: when the diff is non-empty the original
+    LLM-checker path still runs."""
+    cfg = _cfg(tmp_path)
+    w = _build_worker(cfg)
+    w._last_diff_text = "diff --git a/x b/x\n+changed"
+    w._last_witness_results = {}
+    checker_out = SubtaskCheckerOutput(
+        verdict="pass",
+        findings=[SubtaskCheckerFinding(category="security", verdict="pass", rationale="ok")],
+        overall_assessment="ok",
+    )
+    stub = _StubAgent(_StubAgentResult(structured=checker_out, rc=0))
+    with (
+        patch("quikode.workers.subtask_execution.make_agent", return_value=stub),
+        patch("quikode.workers.subtask_execution.fsm_runtime"),
+    ):
+        outcome = w._check_subtask(_S04_WEB_SUBTASK)
+    assert outcome.verdict is Verdict.PASS
+    assert stub.last_prompt is not None  # LLM checker DID run
+
+
 # Suppress unused-import warning for `Path`.
 _ = Path
