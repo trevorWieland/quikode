@@ -10,7 +10,7 @@ Pinned contract:
 - Clears `pre_pr_audit_summary`.
 - Sets task state to PENDING with `resume_from_existing_subtasks=1`.
 - `--dry-run` makes no DB or git changes; the plan is printed.
-- `git reset --hard <target_sha>` and `git push --force-with-lease` are
+- `git reset --hard <target_sha>` and `git push --no-verify --force-with-lease` are
   invoked against the worktree path (verified via subprocess monkeypatch).
 """
 
@@ -211,6 +211,7 @@ def test_rewind_invokes_git_reset_and_push(tmp_path, monkeypatch):
         "-C",
         str(worktree_path),
         "push",
+        "--no-verify",
         "--force-with-lease",
         "origin",
         "quikode/r-001-abc",

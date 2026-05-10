@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -105,10 +106,11 @@ def apply_rewind(
         console.print(f"[red]git reset failed:[/]\n{rc.stderr.strip()}")
         raise typer.Exit(3)
     if not keep_remote:
-        console.print(f"[cyan]→ git push --force-with-lease origin {branch}[/]")
+        console.print(f"[cyan]→ git push --no-verify --force-with-lease origin {branch}[/]")
         push_rc = run_cmd(
-            ["git", "-C", str(worktree_path), "push", "--force-with-lease", "origin", branch],
+            ["git", "-C", str(worktree_path), "push", "--no-verify", "--force-with-lease", "origin", branch],
             capture_output=True,
+            env={**os.environ, "HUSKY": "0", "LEFTHOOK": "0"},
             text=True,
         )
         if push_rc.returncode != 0:
