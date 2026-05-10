@@ -191,7 +191,7 @@ def test_pass_with_transient_push_failure_retries_without_burning_budget(tmp_pat
             ),
         ),
         patch.object(worker, "_pre_commit_gate", return_value=(True, "skipped")),
-        patch.object(worker, "_triage_subtask", return_value="should not be called"),
+        patch.object(worker, "_triage_subtask", return_value=("should not be called", None)),
         patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit),
     ):
         outcome = worker._subtask_loop()
@@ -225,7 +225,7 @@ def test_pass_with_real_commit_failure_falls_into_triage_and_bumps_retries(tmp_p
 
     def fake_triage(subtask, attempt, budget, checker_text):
         triage_calls.append(checker_text[:200])
-        return "fix it"
+        return "fix it", None
 
     with (
         patch.object(worker, "_do_subtask", side_effect=lambda s, a, t: None),
@@ -269,7 +269,7 @@ def test_pre_commit_gate_failure_synthesizes_checker_fail(tmp_path):
 
     def fake_triage(subtask, attempt, budget, checker_text):
         triage_calls.append(checker_text)
-        return "fix the formatting"
+        return "fix the formatting", None
 
     # Both attempts fail the gate → subtask BLOCKs.
     with (

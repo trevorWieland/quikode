@@ -38,6 +38,8 @@ import re
 from collections.abc import Mapping
 from typing import Any, Final, Literal
 
+from quikode.types import Verdict
+
 RetryCategory = Literal[
     "doer_output_invalid",
     "checker_fail",
@@ -118,11 +120,6 @@ _PATTERNS: list[tuple[re.Pattern[str], RetryCategory, str | None]] = [
     ),
 ]
 
-# A small list of "don't match these as the catch-all": when we DO see a
-# checker verdict in the output, it's either FAIL or PASS — both go to
-# `checker_fail` / `doer_output_invalid` rather than `other`.
-_CHECKER_VERDICT_RE = re.compile(r'"verdict"\s*:\s*"(?P<v>FAIL|PASS)"', re.IGNORECASE)
-
 
 def classify_retry(
     *,
@@ -130,11 +127,30 @@ def classify_retry(
     stderr: str = "",
     stdout: str = "",
     hint: str | None = None,
+    verdict: Verdict | str | None = None,
+    failure_layer: str | None = None,
 ) -> tuple[RetryCategory, str]:
     """Classify a single retry. Returns (category, short_signature).
 
     `hint` is an optional caller-supplied tag — e.g. "checker" / "doer" /
     "pre_commit" — used to disambiguate when patterns aren't decisive.
+
+    `verdict` is the structured checker verdict (`Verdict.FAIL`, `"FAIL"`,
+    `"PASS"`, or `None`). When `hint="checker"` and `verdict` is provided
+    the classifier no longer scrapes rendered text — it goes straight to
+    `("checker_fail", "verdict=FAIL")`. Plan 47 retired the doer envelope
+    so all checker FAILs share a structurally identical artifact body;
+    plan 48 layers the structured verdict on top so the signature carries
+    real information.
+
+    `failure_layer` is the structured triage failure layer
+    (`local_ci`, `rubric`, `standards`, `architecture`, `behavior`,
+    `parse_failure`, `transport`) when triage produced a
+    `SubtaskTriageOutput`, else `None`. When provided AND the resulting
+    category is a work-content failure (`checker_fail` /
+    `doer_output_invalid`), the layer is embedded in the signature so the
+    plan-23 same-signature stop-loss compares attempts at the layer
+    granularity rather than treating every checker FAIL as identical.
     """
     blob = "\n".join(s for s in (stderr or "", stdout or "") if s)
     sig_default = f"rc={rc if rc is not None else '?'}"
@@ -143,19 +159,25 @@ def classify_retry(
         category: RetryCategory = "container_oom"
         signature = "rc=137 (OOMKilled)"
     else:
-        category, signature = _classify_retry_blob(blob, sig_default, hint, rc)
+        category, signature = _classify_retry_blob(blob, sig_default, hint, rc, verdict)
+    if category in ("checker_fail", "doer_output_invalid") and failure_layer:
+        signature = f"{signature},layer={failure_layer}"
     return (category, signature)
 
 
 def _classify_retry_blob(
-    blob: str, sig_default: str, hint: str | None, rc: int | None
+    blob: str,
+    sig_default: str,
+    hint: str | None,
+    rc: int | None,
+    verdict: Verdict | str | None,
 ) -> tuple[RetryCategory, str]:
     for pat, category, _sig_ex in _PATTERNS:
         m = pat.search(blob)
         if m:
             snippet = blob[max(0, m.start() - 15) : m.end() + 30].replace("\n", " ").strip()
             return (category, snippet[:120] or sig_default)
-    hint_result = _classify_retry_hint(blob, sig_default, hint)
+    hint_result = _classify_retry_hint(sig_default, hint, verdict)
     if hint_result is not None:
         return hint_result
     if rc is None:
@@ -163,17 +185,27 @@ def _classify_retry_blob(
     return ("other", sig_default)
 
 
-def _classify_retry_hint(blob: str, sig_default: str, hint: str | None) -> tuple[RetryCategory, str] | None:
+def _classify_retry_hint(
+    sig_default: str, hint: str | None, verdict: Verdict | str | None
+) -> tuple[RetryCategory, str] | None:
     if hint == "pre_commit":
         return ("pre_commit_hook_fail", sig_default)
     if hint == "network":
         return ("network_timeout", sig_default)
     if hint != "checker":
         return None
-    m = _CHECKER_VERDICT_RE.search(blob)
-    if m and m.group("v").upper() == "FAIL":
+    verdict_name = _verdict_name(verdict)
+    if verdict_name == "FAIL":
         return ("checker_fail", "verdict=FAIL")
     return ("doer_output_invalid", sig_default)
+
+
+def _verdict_name(verdict: Verdict | str | None) -> str | None:
+    if verdict is None:
+        return None
+    if isinstance(verdict, Verdict):
+        return verdict.name
+    return str(verdict).upper()
 
 
 # ----- summary helpers used by `quikode show` -----

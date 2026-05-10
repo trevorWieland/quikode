@@ -318,7 +318,7 @@ def test_e2e_pre_commit_failure_then_pass_converges(tmp_path):
             ),
         ),
         patch.object(worker, "_pre_commit_gate", side_effect=fake_gate),
-        patch.object(worker, "_triage_subtask", return_value="reformat the code"),
+        patch.object(worker, "_triage_subtask", return_value=("reformat the code", None)),
         patch("quikode.worker.worktree.commit_subtask", side_effect=fake_commit),
     ):
         outcome = worker._subtask_loop()

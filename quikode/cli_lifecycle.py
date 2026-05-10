@@ -17,12 +17,12 @@ from .cli_context import (
     docker_env,
     fsm_runtime,
     load_config,
-    os,
     shutil,
     subprocess,
     typer,
     worktree,
 )
+from .cli_unblock_context import launch_unblock_editor, print_unblock_context
 
 
 @app.command()
@@ -208,6 +208,13 @@ def resume(
     parses the previously stored plan_text, and the subtask loop picks up
     at the first non-DONE subtask.
 
+    Plan 48: any subtask whose state was `blocked` at the moment of
+    resume also has its retry counters and `retry_reasons` history
+    cleared, so the resumed attempt does not count against the
+    same-signature stop-loss that just fired. Done subtasks keep their
+    audit trail untouched; pending subtasks unblocked-by-association
+    have nothing to clear.
+
     Use this when a transient failure (network hang, timeout) crashed a
     task that had already completed real work. Use `retry` if you want a
     full fresh start (different doer model, scope change, etc.).
@@ -249,12 +256,31 @@ def resume(
         container_id=None,  # container is gone; let provision spin up a fresh one
         resume_from_existing_subtasks=1,
     )
+    # Capture the original blocked set BEFORE the re-pend pass mutates
+    # rows; the second pass below uses this to clear retry state only on
+    # subtasks that the operator's resume is explicitly forgiving.
+    blocked_subtask_ids = [s["subtask_id"] for s in subs if s["state"] == "blocked"]
     # Re-pend every non-done subtask. Older workspaces may contain "skipped"
     # cascade markers; those were never user intent, so resume repairs them to
     # pending alongside active/blocked subtasks.
     for s in subs:
         if s["state"] != "done":
             store.update_subtask(task_id, s["subtask_id"], state="pending")
+    # Plan 48: the operator is explicitly disregarding the prior block, so
+    # the resumed attempt should not inherit the stop-loss history that
+    # just fired. Clear retry counters and retry_reasons on rows whose
+    # original state was `blocked`. Done subtasks keep their audit trail;
+    # pending subtasks unblocked-by-association have nothing to clear.
+    for sid in blocked_subtask_ids:
+        store.update_subtask(
+            task_id,
+            sid,
+            retry_reasons=None,
+            retries=0,
+            transient_retries=0,
+            flatline_count=0,
+            progress_check_count=0,
+        )
     console.print(
         f"[green]resume {task_id} → pending[/]  "
         f"[dim]({done} done · {pending} to redo · planner will be skipped)[/]"
@@ -424,78 +450,9 @@ def unblock(
             f"[yellow]task {task_id} is in state '{state_val}', not 'blocked'. "
             f"unblock is a no-op for non-blocked tasks; printing context anyway.[/]"
         )
-    _print_unblock_context(store, task_id, row)
+    print_unblock_context(store, task_id, row)
     if edit:
-        _launch_unblock_editor(row)
-
-
-def _print_unblock_context(store: Store, task_id: str, row: Mapping[str, Any]) -> None:
-    sub_blocked = ""
-    for s in store.list_subtasks(task_id):
-        if s["state"] == "blocked":
-            sub_blocked = s["subtask_id"]
-            break
-    worktree_path = row.get("worktree_path") or "(none — task never provisioned)"
-    branch = row.get("branch") or "(none)"
-    pr_url = row.get("pr_url") or "(none)"
-    console.print(
-        f"[bold]Task {task_id} is BLOCKED[/]" + (f" at [cyan]{sub_blocked}[/]" if sub_blocked else "")
-    )
-    console.print(f"  Worktree: [cyan]{worktree_path}[/]")
-    console.print(f"  Branch:   [cyan]{branch}[/]")
-    console.print(f"  PR:       [cyan]{pr_url}[/]")
-    last_err = row.get("last_error") or ""
-    if last_err:
-        console.print(f"\n[bold]Reason:[/] {str(last_err)[:400]}")
-    _print_block_forensics(store, task_id)
-    console.print("\n[bold]To unblock:[/]")
-    console.print(f"  - cd {worktree_path}")
-    console.print("  - investigate; commit fixes")
-    console.print(f"  - run [b]quikode resume {task_id}[/] from the workspace dir to continue")
-
-
-def _print_block_forensics(store: Store, task_id: str) -> None:
-    forensics = store.get_block_forensics(task_id)
-    if not forensics:
-        return
-    console.print("\n[bold]Forensics:[/]")
-    _print_retry_categories(forensics)
-    _print_subtask_forensics(forensics)
-    last_co = (forensics.get("last_checker_outputs") or [])[:1]
-    if last_co:
-        excerpt = (last_co[0].get("excerpt") or "")[:300]
-        console.print(f"\n  [dim]last checker output excerpt:[/]\n  {excerpt}")
-    peak = forensics.get("peak_mem_bytes")
-    if peak:
-        console.print(f"\n  peak rss: [dim]{peak / (1024**3):.1f} GB[/]")
-
-
-def _print_retry_categories(forensics: dict) -> None:
-    cats = forensics.get("retry_categories_total") or {}
-    if cats:
-        cats_str = " ".join(f"{c}={n}" for c, n in sorted(cats.items(), key=lambda kv: -kv[1]))
-        console.print(f"  retry categories: [dim]{cats_str}[/]")
-
-
-def _print_subtask_forensics(forensics: dict) -> None:
-    for ps in forensics.get("per_subtask") or []:
-        r = ps.get("retries") or 0
-        tr = ps.get("transient_retries") or 0
-        fl = ps.get("flatline_count") or 0
-        if r or tr or fl:
-            console.print(f"  [cyan]{ps.get('subtask_id')}[/]: retries={r} transient={tr} flatline={fl}")
-
-
-def _launch_unblock_editor(row: Mapping[str, Any]) -> None:
-    editor = os.environ.get("EDITOR") or "vi"
-    wt = row.get("worktree_path")
-    if not wt:
-        console.print("[yellow]--edit requested but no worktree path set; skipping editor launch[/]")
-        return
-    try:
-        subprocess.run([editor, str(wt)], check=False)
-    except (FileNotFoundError, subprocess.SubprocessError) as e:
-        console.print(f"[yellow]could not launch editor {editor!r}: {e}[/]")
+        launch_unblock_editor(row)
 
 
 @app.command("demo")

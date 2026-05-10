@@ -142,7 +142,7 @@ def test_block_on_first_subtask_skips_remaining_and_returns_blocked(tmp_path):
         )
 
     def fake_triage(subtask, attempt, budget, checker_text):
-        return "fix it"
+        return "fix it", None
 
     with (
         patch.object(worker, "_do_subtask", side_effect=fake_do),
@@ -205,7 +205,7 @@ def test_block_on_middle_subtask_holds_only_later_pending(tmp_path):
     with (
         patch.object(worker, "_do_subtask", side_effect=fake_do),
         patch.object(worker, "_check_subtask", side_effect=fake_check),
-        patch.object(worker, "_triage_subtask", return_value="fix it"),
+        patch.object(worker, "_triage_subtask", return_value=("fix it", None)),
         patch.object(worker, "_handle_subtask_pass", side_effect=fake_pass),
     ):
         outcome = worker._subtask_loop()
@@ -287,7 +287,7 @@ def test_transient_checker_failures_capped_not_treated_as_real_attempts(tmp_path
     def fake_triage(*a, **kw):
         nonlocal triage_was_called
         triage_was_called = True
-        return "no"
+        return "no", None
 
     # Speed up time.sleep so the loop's 15s backoff per transient doesn't
     # actually delay the test. (worker.py imports `time` at module level.)

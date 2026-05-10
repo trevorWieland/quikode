@@ -356,22 +356,31 @@ class SubtaskWorkerMixin(
         fsm_runtime.enter_triaging_subtask(
             self.store, self.node.id, note=f"{subtask.id} attempt {attempt} failed"
         )
-        triage_notes = self._triage_subtask(subtask, attempt, hard_max, checker_text)
+        triage_notes, failure_layer = self._triage_subtask(subtask, attempt, hard_max, checker_text)
         self.store.update_subtask(
             self.node.id, subtask.id, triage_notes=triage_notes, state=SubtaskState.TRIAGING.value
         )
         self.store.increment_subtask_retries(self.node.id, subtask.id)
-        self._append_retry_reason(subtask, attempt, outcome, transient=False)
+        self._append_retry_reason(subtask, attempt, outcome, transient=False, failure_layer=failure_layer)
         return triage_notes
 
     def _append_retry_reason(
-        self: Any, subtask: Subtask, attempt: int, outcome: Any, *, transient: bool
+        self: Any,
+        subtask: Subtask,
+        attempt: int,
+        outcome: Any,
+        *,
+        transient: bool,
+        failure_layer: str | None = None,
     ) -> None:
+        verdict = getattr(outcome, "verdict", None)
         cat, sig = _tw.retry_classify.classify_retry(
             rc=outcome.rc,
             stderr=outcome.stderr,
             stdout=outcome.checker_text,
             hint="checker",
+            verdict=verdict,
+            failure_layer=failure_layer,
         )
         self.store.append_retry_reason(
             self.node.id, subtask.id, attempt=attempt, category=cat, signature=sig, transient=transient

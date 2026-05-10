@@ -285,11 +285,12 @@ def test_triage_renders_failure_layer_into_artifact(tmp_path) -> None:
     )
     stub = _StubAgent(_StubAgentResult(structured=triage_out, rc=0))
     with patch("quikode.workers.subtask_execution.make_agent", return_value=stub):
-        text = w._triage_subtask(
+        text, layer = w._triage_subtask(
             _S04_WEB_SUBTASK, attempt=2, budget=10, checker_output="VERDICT: FAIL\n[FAIL]"
         )
     assert "failure_layer: rubric" in text
     assert "missing input validation" in text
+    assert layer == "rubric"
 
 
 def test_triage_parse_failure_returns_synthetic_text(tmp_path) -> None:
@@ -298,9 +299,12 @@ def test_triage_parse_failure_returns_synthetic_text(tmp_path) -> None:
     w._last_diff_text = "diff"
     stub = _StubAgent(_StubAgentResult(structured=None, rc=0, parse_errors=("root_cause: required",)))
     with patch("quikode.workers.subtask_execution.make_agent", return_value=stub):
-        text = w._triage_subtask(_S04_WEB_SUBTASK, attempt=2, budget=10, checker_output="VERDICT: FAIL")
+        text, layer = w._triage_subtask(
+            _S04_WEB_SUBTASK, attempt=2, budget=10, checker_output="VERDICT: FAIL"
+        )
     assert "TRIAGE PARSE FAILURE" in text
     assert "parse_failure" in text
+    assert layer is None
 
 
 # ---------- diff capture ----------

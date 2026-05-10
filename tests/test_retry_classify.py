@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from quikode import retry_classify
 from quikode.state import State, Store
+from quikode.types import Verdict
 
 # ----- Pattern matching -----
 
@@ -93,16 +94,49 @@ def test_classify_checker_timeout():
 
 
 def test_classify_checker_hint_with_fail_verdict():
-    """When the checker emits a structured verdict and the hint is 'checker',
-    classify as a real checker_fail."""
+    """Plan 48: when the caller plumbs the structured `Verdict.FAIL`, the
+    classifier emits `("checker_fail", "verdict=FAIL")` regardless of the
+    rendered stdout shape. The pre-plan-48 `_CHECKER_VERDICT_RE` regex
+    that scraped rendered text is gone."""
     cat, sig = retry_classify.classify_retry(
         rc=0,
         stderr="",
-        stdout='{"verdict": "FAIL", "root_cause": "missing handler"}',
+        stdout="VERDICT: FAIL\nROOT_CAUSE: missing handler",
         hint="checker",
+        verdict=Verdict.FAIL,
     )
     assert cat == "checker_fail"
-    assert "FAIL" in sig
+    assert sig == "verdict=FAIL"
+
+
+def test_classify_checker_hint_with_fail_verdict_as_string():
+    """`verdict` accepts the string form too — callers that don't import
+    the enum can pass `"FAIL"` directly."""
+    cat, sig = retry_classify.classify_retry(
+        rc=0,
+        stderr="",
+        stdout="",
+        hint="checker",
+        verdict="FAIL",
+    )
+    assert cat == "checker_fail"
+    assert sig == "verdict=FAIL"
+
+
+def test_classify_checker_hint_failure_layer_in_signature():
+    """Plan 48: structured `failure_layer` is embedded in the signature on
+    work-content failures so the plan-23 same-signature stop-loss
+    distinguishes layers."""
+    cat, sig = retry_classify.classify_retry(
+        rc=0,
+        stderr="",
+        stdout="",
+        hint="checker",
+        verdict=Verdict.FAIL,
+        failure_layer="local_ci",
+    )
+    assert cat == "checker_fail"
+    assert sig == "verdict=FAIL,layer=local_ci"
 
 
 def test_classify_checker_hint_no_verdict_falls_to_doer_invalid():
@@ -115,6 +149,33 @@ def test_classify_checker_hint_no_verdict_falls_to_doer_invalid():
         hint="checker",
     )
     assert cat == "doer_output_invalid"
+
+
+def test_classify_doer_invalid_failure_layer_in_signature():
+    """`failure_layer` is embedded for `doer_output_invalid` too — both
+    work-content categories carry the layer suffix."""
+    cat, sig = retry_classify.classify_retry(
+        rc=1,
+        stderr="some random failure detail",
+        stdout="",
+        hint="checker",
+        failure_layer="rubric",
+    )
+    assert cat == "doer_output_invalid"
+    assert sig.endswith(",layer=rubric")
+
+
+def test_classify_failure_layer_ignored_for_non_work_content_categories():
+    """`failure_layer` is only embedded when the resulting category is a
+    work-content failure. Rate-limit / OOM / etc. signatures stay untouched."""
+    cat, sig = retry_classify.classify_retry(
+        rc=137,
+        stderr="",
+        stdout="",
+        failure_layer="local_ci",
+    )
+    assert cat == "container_oom"
+    assert "layer=" not in sig
 
 
 def test_classify_unknown_falls_through_to_other():

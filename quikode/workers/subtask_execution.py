@@ -348,12 +348,21 @@ class SubtaskExecutionMixin:
 
     # ----- triage -----
 
-    def _triage_subtask(self: Any, subtask: Subtask, attempt: int, budget: int, checker_output: str) -> str:
+    def _triage_subtask(
+        self: Any, subtask: Subtask, attempt: int, budget: int, checker_output: str
+    ) -> tuple[str, str | None]:
         """Plan 47: senior-engineer-tutoring-junior triage on the
         JsonAgent layer. Inputs are the targeted contract, the
-        checker's text output, and the unified diff. Output is
-        rendered to a human-readable string for the next doer
-        attempt's prompt context."""
+        checker's text output, and the unified diff.
+
+        Returns `(rendered_text, failure_layer)`. `failure_layer` is the
+        structured layer from `SubtaskTriageOutput` (one of `local_ci`,
+        `rubric`, `standards`, `architecture`, `behavior`,
+        `parse_failure`, `transport`) when triage produced one;
+        transport / parse-failure paths return `None` because no
+        structured triage was emitted (plan 48 — the caller stamps a
+        layer-less signature in that case rather than fabricating a
+        layer)."""
         _ = attempt
         _ = budget  # retry budget is unused by the new prompt; kept for the call-site signature
         contract = self._evaluation_contract()
@@ -396,7 +405,7 @@ class SubtaskExecutionMixin:
                 f"details: rc={result.rc}; {(result.stderr_excerpt or '')[:1000]}"
             )
             self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", text)
-            return text
+            return text, None
         if result.parse_errors or not isinstance(result.structured, SubtaskTriageOutput):
             errs = list(result.parse_errors or ())
             if not errs and result.structured is not None:
@@ -410,10 +419,10 @@ class SubtaskExecutionMixin:
                 f"details: {'; '.join(errs)[:1000]}"
             )
             self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", text)
-            return text
+            return text, None
         triage_text = _render_triage_output_for_artifact(result.structured)
         self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", triage_text)
-        return triage_text
+        return triage_text, result.structured.failure_layer
 
 
 def _render_checker_output_for_artifact(out: SubtaskCheckerOutput) -> str:
