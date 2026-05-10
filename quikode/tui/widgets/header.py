@@ -22,6 +22,7 @@ class HeaderSnapshot:
     merged: int
     total_in_scope: int
     dag_ready_unseeded: int = 0  # ready per DAG but not yet in the store
+    pending_eligible: int = 0  # seeded + pending + deps all merged — could run if a slot freed
     tokens_total: int | None = None
     orchestrator_running: bool = False
     heartbeat_age_s: float | None = None
@@ -70,9 +71,15 @@ class WorkspaceHeader(Static):
         ready_seg = (
             f" · ready in DAG [b cyan]{snap.dag_ready_unseeded}[/]" if snap.dag_ready_unseeded > 0 else ""
         )
+        # "pending+eligible" — seeded tasks whose deps are all merged but
+        # which haven't been picked up yet (slot-blocked or stacking-gate
+        # gated). Surfaces the depth of the queue behind max_parallel so
+        # the operator can see "we'd be running N more if slots opened".
+        pending_seg = f" · pending [b yellow]{snap.pending_eligible}[/]" if snap.pending_eligible > 0 else ""
         line2 = (
             f"in-flight [b]{snap.in_flight}[/] · awaiting [b green]{snap.awaiting}[/]"
             f" · blocked [b red]{snap.blocked}[/]"
+            f"{pending_seg}"
             f"{ready_seg}"
             f" · merged [b]{progress}[/] · tokens this run [b]{tokens}[/]"
         )

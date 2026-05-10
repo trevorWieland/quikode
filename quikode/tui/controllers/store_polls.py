@@ -307,6 +307,7 @@ class StorePoller:
         counts: dict[str, int],
     ) -> HeaderSnapshot:
         total_tasks, dag_ready_unseeded = self._dag_progress(rows)
+        pending_eligible = self._pending_eligible_count(rows)
         tokens_row = c.execute("SELECT COALESCE(SUM(tokens_used), 0) AS t FROM agent_calls").fetchone()
         tokens_total = int(tokens_row["t"]) if tokens_row and tokens_row["t"] else None
         return HeaderSnapshot(
@@ -321,8 +322,29 @@ class StorePoller:
             merged=counts["merged"],
             total_in_scope=total_tasks,
             dag_ready_unseeded=dag_ready_unseeded,
+            pending_eligible=pending_eligible,
             tokens_total=tokens_total,
             orchestrator_running=False,
+        )
+
+    def _pending_eligible_count(self, rows: list[sqlite3.Row]) -> int:
+        """Seeded tasks whose deps are all merged AND state is pending.
+
+        Approximates the "could run if slots opened" set. Doesn't model the
+        full stacking-readiness=settled gate (which gates on parent settle
+        time), so this is an upper bound for `stacking_readiness="settled"`
+        workspaces — still the right operator signal for "queue depth".
+        """
+        dag = self._load_dag_cached()
+        if dag is None:
+            return 0
+        merged_ids = {r["id"] for r in rows if r["state"] == State.MERGED.value}
+        return sum(
+            1
+            for r in rows
+            if r["state"] == State.PENDING.value
+            and r["id"] in dag.nodes
+            and all(dep in merged_ids for dep in dag.nodes[r["id"]].depends_on)
         )
 
     def _dag_progress(self, rows: list[sqlite3.Row]) -> tuple[int, int]:
