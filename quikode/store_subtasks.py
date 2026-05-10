@@ -9,8 +9,22 @@ from quikode.state_types import ContainerStatsRow, SubtaskRow, SubtaskState
 
 
 class StoreSubtaskMixin:
-    def upsert_subtasks(self: Any, task_id: str, subtasks: list[dict]) -> None:
-        """Replace any existing subtasks for this task with the given list."""
+    def upsert_subtasks(
+        self: Any,
+        task_id: str,
+        subtasks: list[dict],
+        *,
+        planning_cycle: int = 1,
+        planning_kind: str = "initial",
+    ) -> None:
+        """Replace any existing subtasks for this task with the given list.
+
+        Plan 52: every emission carries `(planning_cycle, planning_kind)`
+        so `qk replan-cycle` can target the most-recent cycle's rows.
+        Per-row `planning_cycle` / `planning_kind` keys override the
+        function-level defaults — used by the worker re-fire path to
+        re-emit cycle N rows with N (not N+1) after a replan-cycle.
+        """
         now = time.time()
         with self.tx() as c:
             c.execute("DELETE FROM subtasks WHERE task_id = ?", (task_id,))
@@ -18,8 +32,9 @@ class StoreSubtaskMixin:
                 c.execute(
                     "INSERT INTO subtasks "
                     "(task_id, subtask_id, title, depends_on, files_to_touch, boundary, "
-                    " acceptance, notes, kind, state, retries, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    " acceptance, notes, kind, state, retries, "
+                    " planning_cycle, planning_kind, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
                     (
                         task_id,
                         s["subtask_id"],
@@ -31,12 +46,21 @@ class StoreSubtaskMixin:
                         s.get("notes", ""),
                         s.get("kind", "spec"),
                         SubtaskState.PENDING.value,
+                        int(s.get("planning_cycle", planning_cycle)),
+                        str(s.get("planning_kind", planning_kind)),
                         now,
                         now,
                     ),
                 )
 
-    def append_subtasks(self: Any, task_id: str, subtasks: list[dict]) -> None:
+    def append_subtasks(
+        self: Any,
+        task_id: str,
+        subtasks: list[dict],
+        *,
+        planning_cycle: int | None = None,
+        planning_kind: str = "fixup",
+    ) -> None:
         """Append new subtasks to the existing set for `task_id` without deleting.
 
         Used by the v3 fixup-decomposition flow: when final-check or CI fails,
@@ -45,6 +69,13 @@ class StoreSubtaskMixin:
         Skips rows whose `subtask_id` already exists for the task — the
         planner is responsible for unique IDs (e.g. `F-final-1-line-budget`)
         but we double-guard so a planner repeat doesn't error mid-round.
+
+        Plan 52: each appended row defaults to one cycle past the current
+        MAX(planning_cycle) so successive fixup planner calls produce a
+        well-ordered sequence (initial=1, first fixup=2, second fixup=3,
+        ...). Pass `planning_cycle=N` explicitly when re-emitting after
+        `qk replan-cycle` so the regenerated rows carry the prior
+        cycle's number rather than incrementing.
         """
         now = time.time()
         with self.tx() as c:
@@ -52,14 +83,25 @@ class StoreSubtaskMixin:
                 r[0]
                 for r in c.execute("SELECT subtask_id FROM subtasks WHERE task_id = ?", (task_id,)).fetchall()
             }
+            if planning_cycle is None:
+                row = c.execute(
+                    "SELECT COALESCE(MAX(planning_cycle), 0) AS m FROM subtasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                effective_cycle = int(row["m"] if row else 0) + 1
+            else:
+                effective_cycle = int(planning_cycle)
             for s in subtasks:
                 if s["subtask_id"] in existing:
                     continue
+                row_cycle = int(s.get("planning_cycle", effective_cycle))
+                row_kind = str(s.get("planning_kind", planning_kind))
                 c.execute(
                     "INSERT INTO subtasks "
                     "(task_id, subtask_id, title, depends_on, files_to_touch, boundary, "
-                    " acceptance, notes, kind, state, retries, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                    " acceptance, notes, kind, state, retries, "
+                    " planning_cycle, planning_kind, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)",
                     (
                         task_id,
                         s["subtask_id"],
@@ -71,6 +113,8 @@ class StoreSubtaskMixin:
                         s.get("notes", ""),
                         s.get("kind", "spec"),
                         SubtaskState.PENDING.value,
+                        row_cycle,
+                        row_kind,
                         now,
                         now,
                     ),
@@ -459,92 +503,6 @@ class StoreSubtaskMixin:
                 "  updated_at = ? "
                 "WHERE id = ?",
                 (ids_json, branches_json, pr_branches_json, time.time(), task_id),
-            )
-
-    def get_pre_pr_audit_summary(self: Any, task_id: str) -> dict[str, Any]:
-        """Read the most recent pre-PR audit summary for a task.
-
-        Shape:
-          {"cycle": int, "stages": [{"name": str, "passed": bool|None,
-                                     "summary": str}], "ts": float}
-        `passed=None` means the stage hasn't run yet in the current
-        cycle (or is currently in flight). The TUI uses that to render
-        a "…" indicator distinct from pass/fail.
-        """
-        with self._tx_lock:
-            r = self.conn.execute(
-                "SELECT pre_pr_audit_summary FROM tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-        if r is None or not r["pre_pr_audit_summary"]:
-            return cast(dict[str, Any], None)
-        try:
-            data = json.loads(r["pre_pr_audit_summary"])
-        except (json.JSONDecodeError, TypeError):
-            return cast(dict[str, Any], None)
-        return cast(dict[str, Any], data) if isinstance(data, dict) else cast(dict[str, Any], None)
-
-    def begin_pre_pr_audit_cycle(self: Any, task_id: str, cycle: int) -> None:
-        """Reset the audit summary at the top of a new cycle so stale stage
-        results from prior cycles don't bleed into the TUI display. The
-        five stages are pre-seeded with `passed=None` (in-flight) so the
-        operator sees a "queued" indicator before each stage actually runs.
-        Plan 35 PR-B grew this from four stages to five — added the
-        `architecture` stage between `standards` and `behavior`.
-        """
-        seeded = {
-            "cycle": cycle,
-            "ts": time.time(),
-            "stages": [
-                {"name": "local_ci", "passed": None, "summary": "queued"},
-                {"name": "rubric", "passed": None, "summary": "queued"},
-                {"name": "standards", "passed": None, "summary": "queued"},
-                {"name": "architecture", "passed": None, "summary": "queued"},
-                {"name": "behavior", "passed": None, "summary": "queued"},
-            ],
-        }
-        with self.tx() as c:
-            c.execute(
-                "UPDATE tasks SET pre_pr_audit_summary = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(seeded), time.time(), task_id),
-            )
-
-    def update_pre_pr_audit_stage(
-        self: Any,
-        task_id: str,
-        *,
-        cycle: int,
-        stage_name: str,
-        passed: bool,
-        summary: str,
-    ) -> None:
-        """Update one stage's outcome on the current cycle. Idempotent:
-        re-calling with the same stage name overwrites. If the cycle on
-        disk doesn't match the caller's cycle, no-op (defensive against
-        a worker that re-entered the pipeline before clearing)."""
-        existing = self.get_pre_pr_audit_summary(task_id)
-        if existing is None or existing.get("cycle") != cycle:
-            # Caller forgot to call begin_pre_pr_audit_cycle — seed lazily.
-            self.begin_pre_pr_audit_cycle(task_id, cycle)
-            existing = self.get_pre_pr_audit_summary(task_id)
-            if existing is None:
-                return
-        stages = list(existing.get("stages") or [])
-        replaced = False
-        for s in stages:
-            if s.get("name") == stage_name:
-                s["passed"] = bool(passed)
-                s["summary"] = str(summary)[:300]
-                replaced = True
-                break
-        if not replaced:
-            stages.append({"name": stage_name, "passed": bool(passed), "summary": str(summary)[:300]})
-        existing["stages"] = stages
-        existing["ts"] = time.time()
-        with self.tx() as c:
-            c.execute(
-                "UPDATE tasks SET pre_pr_audit_summary = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(existing), time.time(), task_id),
             )
 
     def get_block_forensics(self: Any, task_id: str) -> dict | None:

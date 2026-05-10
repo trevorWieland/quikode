@@ -39,6 +39,7 @@ from quikode.state_types import (
     TaskRow,
 )
 from quikode.store_forensics import StoreForensicsMixin
+from quikode.store_planning_cycle import StorePlanningCycleMixin
 from quikode.store_review import StoreReviewMixin
 from quikode.store_subtasks import StoreSubtaskMixin
 from quikode.store_tasks import StoreTaskMixin
@@ -60,7 +61,13 @@ __all__ = [
 ]
 
 
-class Store(StoreTaskMixin, StoreSubtaskMixin, StoreForensicsMixin, StoreReviewMixin):
+class Store(
+    StoreTaskMixin,
+    StoreSubtaskMixin,
+    StorePlanningCycleMixin,
+    StoreForensicsMixin,
+    StoreReviewMixin,
+):
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self.path = db_path

@@ -212,6 +212,7 @@ class MergeNodeWorker(TaskWorker):
         fsm_runtime.environment_ready(
             self.store, self.node.id, note="merge-node provisioned; entering planning"
         )
+        # Plan 52: merge-node seeded subtasks are cycle-1 / kind="merge".
         self.store.upsert_subtasks(
             self.node.id,
             [
@@ -226,6 +227,8 @@ class MergeNodeWorker(TaskWorker):
                     "kind": "merge-integration",
                 }
             ],
+            planning_cycle=1,
+            planning_kind="merge",
         )
         fsm_runtime.enter_doing_subtask(
             self.store,
@@ -363,6 +366,8 @@ class MergeNodeWorker(TaskWorker):
                 f"merge-node {self.node.id}: merge-planner agent did not produce a "
                 f"valid plan after sequential conflict; BLOCKing for operator review",
             )
+        # Plan 52: merge-planner subtasks share the merge-node's single
+        # planning cycle (merge nodes have one cycle by design).
         self.store.upsert_subtasks(
             self.node.id,
             [
@@ -378,6 +383,8 @@ class MergeNodeWorker(TaskWorker):
                 }
                 for s in plan.subtasks
             ],
+            planning_cycle=1,
+            planning_kind="merge",
         )
         # Make the parsed plan visible to the inherited subtask loop
         # helpers that read self.plan / self.plan_text.

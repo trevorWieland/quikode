@@ -210,6 +210,12 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
             return WorkerOutcome(State.BLOCKED, note)
 
         # Persist the new fixup subtasks (additive — does NOT delete spec rows).
+        # Plan 52: each fixup planner call is a new planning cycle. The
+        # store's `append_subtasks` defaults `planning_cycle` to
+        # `MAX(planning_cycle) + 1` when none is supplied, which is the
+        # right behavior here AND on `qk replan-cycle` re-fire (the
+        # CLI deleted cycle-N rows first, so MAX = N-1 and the next
+        # emission lands at N as required by plan 52).
         self.store.append_subtasks(
             self.node.id,
             [
@@ -225,6 +231,7 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
                 }
                 for s in fixup_plan.subtasks
             ],
+            planning_kind="fixup_ci" if kind == "fixup-ci" else "fixup",
         )
         _tw.log.info(
             "fixup round %d (%s): planned %d subtask(s): %s",

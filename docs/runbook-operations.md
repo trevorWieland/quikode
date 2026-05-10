@@ -107,13 +107,15 @@ If you've **just tightened the stacking gate** (e.g. flipped `stacking_readiness
 
 ## Interventions
 
-`retry <id>` — wipes worktree + branch + subtask rows; planner re-plans from scratch. Requires task in BLOCKED/FAILED/ABORTED. For PENDING tasks, `abort` first.
-
-`rewind <id> <subtask>` — surgical: rewinds branch + worktree to predecessor's commit; resets target + every topo-after subtask to PENDING; preserves prior subtasks' commits. Requires BLOCKED/FAILED. `--dry-run` first.
-
 `resume <id>` — drops a BLOCKED/FAILED task back to PENDING with a resume marker; preserves worktree, branch, subtask rows.
 
 `reset-retries <id> [<subtask>]` — zeroes retry counters on BLOCKED subtasks without discarding committed work. Pair with `resume`.
+
+`rewind <id> <subtask>` — surgical: rewinds branch + worktree to predecessor's commit; resets target + every topo-after subtask to PENDING; preserves prior subtasks' commits. Requires BLOCKED/FAILED. `--dry-run` first.
+
+`replan-cycle <id>` — plan 52 cycle-scoped recovery: deletes only the most-recent planning cycle's subtasks, force-pushes the branch back to before that cycle's first commit, and sets a marker so the worker re-fires the matching planner phase (fixup / replan / merge) on the next scheduling tick. Earlier cycles' commits + retry counters survive. Requires BLOCKED/FAILED with at least one non-initial cycle (cycle ≥ 2). `--dry-run` first. **Default escalation when `rewind` didn't unstick the loop and the failing subtask is in a non-initial cycle (`F-…`, `F-CI-…`, replan output, merge-integration).**
+
+`retry <id>` — last resort: wipes worktree + branch + subtask rows; planner re-plans from scratch. Requires task in BLOCKED/FAILED/ABORTED. For PENDING tasks, `abort` first. Reserve for tasks where even the initial planner output was wrong-shape; otherwise prefer `replan-cycle`, which preserves earlier-cycle work.
 
 `abort <id>` — marks a task ABORTED and tears down its container.
 
@@ -121,7 +123,7 @@ If you've **just tightened the stacking gate** (e.g. flipped `stacking_readiness
 
 `mark-merged <id>` — marks already-landed upstream work as merged.
 
-For decision rules on which intervention to use, see `orientation.md` §3 (Resolving blockers — the intervention decision framework).
+For decision rules on which intervention to use, see `orientation.md` §3 (Resolving blockers — the intervention decision framework). Escalation order: resume / reset-retries → rewind → replan-cycle → retry.
 
 ## ntfy review-ready notifications
 

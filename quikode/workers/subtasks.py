@@ -97,13 +97,25 @@ class SubtaskWorkerMixin(
                 )
             else:
                 # Clear the flag so subsequent runs follow the normal path.
-                self.store.set_field(self.node.id, resume_from_existing_subtasks=0)
+                # Plan 52: also clear the replan-cycle marker once the
+                # worker has consumed the resume — the matching planner
+                # phase will re-fire naturally as the worker progresses
+                # (fixup planner on audit failure, replan planner on
+                # CHANGES_REQUESTED, merge planner on integration). The
+                # marker is a hint, not a control-flow gate.
+                self.store.set_field(
+                    self.node.id,
+                    resume_from_existing_subtasks=0,
+                    replan_cycle_marker=None,
+                )
                 return
 
         fsm_runtime.environment_ready(self.store, self.node.id)
         plan = self._invoke_planner_with_validators(contract)
         self.plan = plan
         # Persist subtasks so `quikode show / subtasks / export` can surface them.
+        # Plan 52: tag the initial planner emission as cycle 1 / kind="initial"
+        # so `qk replan-cycle` knows which rows belong to the first cycle.
         self.store.upsert_subtasks(
             self.node.id,
             [
@@ -118,6 +130,8 @@ class SubtaskWorkerMixin(
                 }
                 for s in plan.subtasks
             ],
+            planning_cycle=1,
+            planning_kind="initial",
         )
 
     def _has_existing_fixup_subtasks(self: Any) -> bool:

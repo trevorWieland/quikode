@@ -86,19 +86,19 @@ Recovery: stop the daemon. The next start runs crash recovery through the FSM. I
 
 First look: `quikode show <id>`, GitHub PR state, and parent branch metadata.
 
-Recovery: if parent-base deletion caused the close, use the rebase path. If a human closed the PR intentionally, decide between `abort`, `retry`, or local branch inspection.
+Recovery: if parent-base deletion caused the close, use the rebase path. If a human closed the PR intentionally, decide between `abort`, `replan-cycle`, `retry`, or local branch inspection. Prefer `replan-cycle` when the closure was triggered by issues localized to a non-initial planning cycle (post-PR replan / fixup) — earlier-cycle commits stay intact.
 
 ## Rebase Conflict Unresolved
 
 First look: task worktree, conflict markers, and conflict resolver artifact.
 
-Recovery: resolve locally, commit as needed, then `resume`. If the branch is not usable, `retry`.
+Recovery: resolve locally, commit as needed, then `resume`. If the branch is not usable, escalate per orientation §3.4: `replan-cycle` when a non-initial cycle is the toxic one, `retry` only as a last resort when the foundation itself was wrong-shape.
 
 ## Feedback Cap Hit
 
 First look: review rounds, unresolved thread list, CI failures, and latest fixup artifacts.
 
-Recovery: operator chooses one of: merge externally, post guidance, `resume`, or `retry`.
+Recovery: operator chooses one of: merge externally, post guidance, `resume`, `replan-cycle` (re-decompose just the failing fixup / replan cycle without losing earlier-cycle commits — plan 52), or `retry` (last resort: discards all committed work; reserved for tasks where even the initial plan was wrong-shape).
 
 ## Seed Evidence Mismatch
 

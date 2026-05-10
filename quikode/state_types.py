@@ -76,6 +76,9 @@ class TaskRow(TypedDict):
     seed_source: NotRequired[str | None]
     seed_evidence: NotRequired[str | None]
     seeded_at: NotRequired[float | None]
+    # Plan 52: hint set by `qk replan-cycle` so the worker / operator can
+    # see which cycle was reset. JSON: {"cycle": int, "kind": str, "ts": float}.
+    replan_cycle_marker: NotRequired[str | None]
     created_at: float
     updated_at: float
 
@@ -110,6 +113,11 @@ class SubtaskRow(TypedDict):
     # v3.7 advisory scope review: comma-separated effective lane after the
     # scope-reviewer accepted drift from declared `files_to_touch`.
     accepted_files: NotRequired[str | None]
+    # Plan 52: planner provenance — `planning_cycle` is the 1-based ordinal
+    # of the planner invocation that emitted this row; `planning_kind` is
+    # one of `initial` / `fixup` / `fixup_ci` / `replan` / `merge`.
+    planning_cycle: NotRequired[int | None]
+    planning_kind: NotRequired[str | None]
     created_at: NotRequired[float | None]
     updated_at: NotRequired[float | None]
 

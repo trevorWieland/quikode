@@ -8,7 +8,11 @@ an already-migrated DB is a no-op.
 
 from __future__ import annotations
 
+import logging
+import re
 import sqlite3
+
+log = logging.getLogger("quikode.state_schema")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -92,6 +96,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     seed_source TEXT,
     seed_evidence TEXT,
     seeded_at REAL,
+    -- Plan 52: hint set by `qk replan-cycle` so the worker / operator can
+    -- see which planning cycle was reset and (eventually) why it re-fired.
+    -- JSON: {"cycle": int, "kind": str, "ts": float}. Cleared by the
+    -- worker once the replanned cycle's subtasks have been re-emitted.
+    replan_cycle_marker TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -189,6 +198,15 @@ CREATE TABLE IF NOT EXISTS subtasks (
     -- the scope-reviewer accepted drift from `files_to_touch`. NULL when
     -- the actual diff matched the planner's declared lane exactly.
     accepted_files TEXT,
+    -- Plan 52: planning provenance per row. `planning_cycle` is the
+    -- 1-based ordinal of the planner invocation that emitted this row;
+    -- `planning_kind` is the kind of planner (initial / fixup / replan
+    -- / merge). Together they let `qk replan-cycle` target only the
+    -- most-recent cycle's rows, preserving every earlier cycle's
+    -- committed work + retry counters. Defaults match the initial
+    -- planner so pre-plan-52 rows backfill cleanly.
+    planning_cycle INTEGER NOT NULL DEFAULT 1,
+    planning_kind TEXT NOT NULL DEFAULT 'initial',
     created_at REAL,
     updated_at REAL,
     UNIQUE(task_id, subtask_id)
@@ -297,3 +315,98 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE tasks ADD COLUMN failure_reason TEXT")
     except sqlite3.OperationalError:
         pass
+    # Plan 52: subtask planning provenance + per-task replan marker.
+    _apply_plan52_migration(conn)
+
+
+# Plan 52 backfill heuristic: subtask-id naming convention encodes the
+# planner that emitted the row. `S-NN-*` and `Z-99-*` are initial-cycle.
+# `F-N-...-*` (where N is a digit) indicates fixup-cycle N+1 — the +1
+# offsets the initial planner's cycle 1. `F-CI-*` is CI-driven fixup;
+# we lump those into a synthetic `(2, "fixup_ci")` because we don't have
+# a per-task ordinal at backfill time. Anything that doesn't match falls
+# back to (1, "initial") so the field stays well-defined for the new
+# `qk replan-cycle` primitive without rewriting historical truth.
+_FIXUP_NUMERIC_RE = re.compile(r"^F-(\d+)-")
+_FIXUP_CI_RE = re.compile(r"^F-CI-")
+_INITIAL_PREFIX_RE = re.compile(r"^(S-\d+|Z-99|R-\d+)-?")
+
+
+def _infer_planning_provenance(subtask_id: str) -> tuple[int, str]:
+    """Map a subtask id to (planning_cycle, planning_kind).
+
+    Heuristic only — used for backfill of pre-plan-52 rows. New rows are
+    populated explicitly by each planner call site so the CLI's cycle
+    targeting stays exact.
+    """
+    if _INITIAL_PREFIX_RE.match(subtask_id):
+        return (1, "initial")
+    m = _FIXUP_NUMERIC_RE.match(subtask_id)
+    if m:
+        try:
+            cycle = int(m.group(1)) + 1
+        except ValueError:
+            return (1, "initial")
+        return (max(cycle, 2), "fixup")
+    if _FIXUP_CI_RE.match(subtask_id):
+        return (2, "fixup_ci")
+    return (1, "initial")
+
+
+def _apply_plan52_migration(conn: sqlite3.Connection) -> None:
+    """Add subtasks.planning_cycle / planning_kind + tasks.replan_cycle_marker.
+
+    Backfills existing subtask rows via `_infer_planning_provenance`. A
+    failure to parse a single subtask id MUST NOT prevent daemon
+    startup; we fall back to the (1, "initial") default and warn.
+    """
+    try:
+        conn.execute("ALTER TABLE subtasks ADD COLUMN planning_cycle INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE subtasks ADD COLUMN planning_kind TEXT NOT NULL DEFAULT 'initial'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE tasks ADD COLUMN replan_cycle_marker TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # Backfill: only rows that still hold the column defaults. Re-runs are
+    # no-ops because the WHERE narrows to default rows only.
+    try:
+        rows = conn.execute(
+            "SELECT id, subtask_id FROM subtasks WHERE planning_cycle = 1 AND planning_kind = 'initial'"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    for row in rows:
+        sid = row["subtask_id"] if isinstance(row, sqlite3.Row) else row[1]
+        rowid = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+        try:
+            cycle, kind = _infer_planning_provenance(str(sid))
+        except Exception as exc:
+            log.warning(
+                "plan52 backfill: could not infer planning provenance for "
+                "subtask id %r (rowid=%s): %s — leaving defaults",
+                sid,
+                rowid,
+                exc,
+            )
+            continue
+        if cycle == 1 and kind == "initial":
+            # Defaults already match — skip the UPDATE for ID-prefix
+            # matches that resolved to the default values.
+            continue
+        try:
+            conn.execute(
+                "UPDATE subtasks SET planning_cycle = ?, planning_kind = ? WHERE id = ?",
+                (cycle, kind, rowid),
+            )
+        except sqlite3.OperationalError as exc:
+            log.warning(
+                "plan52 backfill: UPDATE failed for subtask rowid=%s id=%r: %s",
+                rowid,
+                sid,
+                exc,
+            )

@@ -509,7 +509,17 @@ class PrLifecycleWorkerMixin:
             return WorkerOutcome(State.BLOCKED, "replan output unparseable")
 
         # Persist new subtasks; merge state from prior DONE subtasks where ids match.
+        # Plan 52: replan output is always its own planning cycle. We tag
+        # rows with kind="replan" and bump the cycle to one past whatever
+        # was already on disk, so `qk replan-cycle` can target this set
+        # specifically instead of the spec subtasks `upsert_subtasks`
+        # otherwise would have replaced wholesale.
         prior_done = {s["subtask_id"]: s for s in existing_subtasks if s["state"] == SubtaskState.DONE.value}
+        prior_max_cycle = max(
+            (int(r.get("planning_cycle") or 1) for r in existing_subtasks),
+            default=0,
+        )
+        replan_cycle = prior_max_cycle + 1
         new_rows = []
         for s in new_plan.subtasks:
             row = {
@@ -522,7 +532,12 @@ class PrLifecycleWorkerMixin:
                 "notes": s.notes,
             }
             new_rows.append(row)
-        self.store.upsert_subtasks(self.node.id, new_rows)
+        self.store.upsert_subtasks(
+            self.node.id,
+            new_rows,
+            planning_cycle=replan_cycle,
+            planning_kind="replan",
+        )
         # Restore DONE state on subtasks whose ids carried over from the old plan
         for sid in prior_done:
             if sid in {s.id for s in new_plan.subtasks}:

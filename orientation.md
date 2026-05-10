@@ -29,14 +29,23 @@ The 5-retry / 3-audit-cycle numbers are **soft signal caps**, not hard kill caps
 
 This is the highest-leverage section of this document. The four recovery primitives differ in how much work they discard and what they preserve. Picking the wrong one wastes the worker's prior progress OR fails to unstick the loop. Pick **the least destructive primitive that resolves the failure mode.**
 
-### 3.1 The four primitives
+### 3.1 The five primitives
 
 | Primitive | Discards | Preserves |
 |---|---|---|
 | `qk resume <task>` | nothing | worktree, branch, all subtask rows, retry counters |
 | `qk reset-retries <task> [<subtask>]` then `qk resume` | retry counters | worktree, branch, all subtask rows, committed work |
 | `qk rewind <task> <subtask>` | target subtask + every topo-after subtask's state; force-pushes branch back to predecessor's commit | every prior subtask's commits; doer prior-output artifacts (plan 22 carry-forward) |
+| `qk replan-cycle <task>` | latest planning cycle's subtask rows + every commit landed during that cycle; force-pushes branch back to before the cycle started | every earlier cycle's commits + retry counters; preserved `plan_text` so the worker reuses the initial decomposition; planner re-fires for THIS cycle (fixup / replan / merge) on the next scheduling tick |
 | `qk retry <task>` | worktree, branch, all subtask rows | seed evidence + DAG node identity only |
+
+The four "cycle-aware" primitives form a graduated ladder: `resume` /
+`reset-retries` for infra noise, `rewind` for one toxic subtask,
+`replan-cycle` for one toxic *planning cycle* (fixup / replan / merge),
+`retry` only when the very first decomposition was wrong-shape and even
+the initial planner output needs to be thrown away. Each primitive
+preserves more of the prior work than the next one down. **Pick the
+least destructive primitive that resolves the failure mode.**
 
 ### 3.2 Decision table
 
@@ -45,17 +54,20 @@ This is the highest-leverage section of this document. The four recovery primiti
 | Task FAILED via container/codex CLI flake (CRASH on a checker / objective-gate call), no real doer poison | **`qk resume`** | Infra noise, no toxic state. Worker resumes from the nearest non-DONE subtask. |
 | Many tasks BLOCKED with `container_vanished` retry histogram dominating `qk show` | **`qk reset-retries` + `qk resume`** (batch) | Plan 20 territory — infra burned the budget, not real work. Don't retry, don't rewind. |
 | Subtask hit same-signature stop-loss for the **first** time AND prior subtasks landed cleanly AND a clean restart of *just that subtask* should produce different doer behavior | **`qk rewind <task> <subtask>`** | Toxic accumulated state in the target subtask is the problem; predecessors are sound. |
-| Subtask BLOCKED **again** after rewind already used (or `daemon start --retry-failed` auto-resumed it once and it re-blocked) | **`qk retry <task>`** | Rewind didn't unstick; planner needs to re-plan from scratch. |
-| Task BLOCKED and the diagnosis is **planner over-scoping** (subtask spans too many files / too many interface surfaces for one doer attempt) | **`qk retry <task>`** | The plan itself is the bug. A retry forces the planner to re-decompose; rewind would re-attempt the same too-big slice. |
-| You shipped a **planner-prompt edit** and want running tasks to benefit | **`qk retry <task>`** on every running task that would benefit | `qk resume` skips the planner; existing subtask plans were generated under the OLD prompt and will keep producing the old shape regardless of doer prompts. |
+| Subtask BLOCKED **again** after rewind already used AND the failing subtask belongs to a **non-initial** planning cycle (fixup / replan / merge — `F-N-…` / `F-CI-…` / replan output / merge-integration) | **`qk replan-cycle <task>`** | The cycle's decomposition itself is wrong-shape; re-decompose just that cycle. Earlier-cycle commits + retry counters survive. Plan 52. |
+| Task BLOCKED and the diagnosis is **fixup planner over-scoping** (a fixup subtask spans too many findings / too many files for one doer attempt, but earlier cycles' work is sound) | **`qk replan-cycle <task>`** | Re-fire the fixup planner with the same audit findings as input. The new emission may decompose more granularly. Don't retry — that torches every passing earlier-cycle commit. |
+| Task BLOCKED in cycle 1 (initial planner output) AND the diagnosis is **initial-decomposition over-scoping** (the very first plan asked for too much in one subtask) | **`qk retry <task>`** | This is the case retry was reserved for — the foundation itself is wrong-shape. Truly doomed-from-the-start node. Use sparingly: most cycle-level non-convergence belongs to fixup / replan cycles, not the initial plan. |
+| You shipped a **planner-prompt edit** affecting the initial planner and want running tasks to benefit | **`qk retry <task>`** on every running task that would benefit | `qk resume` skips the planner; existing subtask plans were generated under the OLD prompt. (For fixup / replan / merge planner edits, prefer `qk replan-cycle` per the rule above — it preserves earlier work.) |
 | You shipped a **doer-prompt edit** that prevents long-term debt (forbids a class of bad reasoning, tightens summary rules, etc.) and the affected tasks have already accumulated worktree state under the old prompt | **`qk retry <task>`** on those tasks | Plan 22's prior-output carry-forward will otherwise feed OLD doer thinking into the next attempt and re-prime the same bad pattern. |
 | You shipped a **doer-prompt edit** that's small / corrective and likely to auto-heal under the next attempt | **Let it ride.** Rewind on the next block. | Cheaper than retry; you only pay rewind cost when the heal didn't take. |
-| Soft cap (>5 retries on a subtask) tripping repeatedly **across multiple tasks** with the same root cause | **First diagnose root cause; ship a system fix in plans/; THEN retry the affected tasks.** | Mass intervention without a system fix is wasted effort — they'll re-block. But ship the fix in parallel, don't queue tasks behind it. |
+| Soft cap (>5 retries on a subtask) tripping repeatedly **across multiple tasks** with the same root cause | **First diagnose root cause; ship a system fix in plans/; THEN retry / replan-cycle the affected tasks.** | Mass intervention without a system fix is wasted effort — they'll re-block. But ship the fix in parallel, don't queue tasks behind it. |
 | You **tightened the stacking gate** (e.g. flipped `stacking_readiness` to `"settled"`, raised `review_ready_settle_s`, shipped a new readiness predicate) | **Wipe every PENDING task whose worktree was forked off a non-merged parent** — `qk abort && qk retry` per task | The new gate only governs FUTURE picks. Pre-tightening worktrees were forked under the looser gate, often off parents in PROVISIONING / DOING_SUBTASK / PENDING_CI-not-yet-green. Children built atop those foundations have rotten bases — no doer-prompt fix can save them. See `docs/runbook-incident-response.md` § "Fruit-of-rotten-tree wipe" for the full sequence. |
 
 ### 3.3 The cardinal rule
 
 **Never leave a BLOCKED or FAILED task as a strategy.** When you find one, you act on it now. A "wait for plan-N to ship before acting" recommendation stalls the workspace and conflates "what to fix systemically" with "what to do for this task right now." System fixes ship in parallel via `plans/`, but the BLOCKED task itself gets a recovery primitive immediately.
+
+**Cycle-aware preservation.** With plan 52 in hand, `qk retry` is the *last-resort* primitive — reserved for tasks where even the initial decomposition was wrong-shape. The natural pair for cycle-level non-convergence is `qk rewind` (one toxic subtask) → `qk replan-cycle` (one toxic cycle). Both preserve every earlier-cycle commit. Reach for `qk retry` only when the failing subtask is in cycle 1 (the initial planner's output) AND a fresh planner pass is the right move. For fixup / replan / merge cycles, `qk replan-cycle` is almost always the correct escalation.
 
 Structured-output violations are not a normal reason to block a task. They
 must first be retried on the agent call that emitted the bad output with
@@ -66,11 +78,14 @@ Plan 39 adds this explicitly for fixup-planner schema/validator failures via
 
 ### 3.4 Escalation, not repetition
 
-Track which primitive you've already used for a given task in this run:
+Track which primitive you've already used for a given task in this run, and walk the ladder up — do not loop back. The natural escalation order:
 
-- First block on a task → **rewind** (or resume / reset-retries for infra cases).
-- Second block on the same task, after rewind already used → **retry**.
-- `qk daemon start --retry-failed` (which calls `resume_task` on every blocked/failed row) counts as having "spent" the resume step.
+1. **`qk resume` / `qk reset-retries`** — infra-class noise (container vanished, transient checker crash). No real doer work poisoned.
+2. **`qk rewind <task> <subtask>`** — toxic state in one target subtask, predecessors sound.
+3. **`qk replan-cycle <task>`** — cycle-level over-scoping or non-convergence in a fixup / replan / merge cycle. Preserves every earlier cycle's commits; just re-decomposes the failing cycle. *This is the default for "rewind didn't unstick the loop AND the failing subtask is in a non-initial cycle."*
+4. **`qk retry <task>`** — last resort, reserved for "even the initial planner output was wrong-shape." Discards every commit on the branch; the planner re-decomposes from scratch. Use only when steps 1–3 don't apply (typically: a cycle-1 subtask's decomposition is fundamentally over-scoped).
+
+`qk daemon start --retry-failed` (which calls `resume_task` on every blocked/failed row) counts as having "spent" the resume step.
 
 Do **not** loop back to a primitive you've already tried. Escalate.
 
@@ -81,10 +96,13 @@ When a block is the second instance of a known failure mode in this run, the use
 ### 3.6 Worked examples
 
 - **"R-0010 / S-07-testkit blocked. New doer prompt should fix the disclaim pattern."** First block, predecessors clean, prompt-change-likely-to-auto-heal → **let it ride**, rewind on next block.
-- **"R-0010 / S-07-testkit blocked AGAIN with the new prompt."** Second block, prompt didn't auto-heal, root cause is planner over-scoping → **`qk retry R-0010`** (rewind would land in the same too-big slice).
+- **"R-0010 / S-07-testkit blocked AGAIN with the new prompt; S-07 is in the initial planning cycle."** Second block, prompt didn't auto-heal, root cause is initial-planner over-scoping → **`qk retry R-0010`** (rewind would land in the same too-big slice; replan-cycle doesn't apply because the failing subtask is in cycle 1).
+- **"R-0040 had 34/35 subtasks done; F-CI-1 (a fixup-cycle subtask) hit transport stop-loss after rewind."** Failing subtask is in a non-initial cycle (`F-CI-…` → fixup_ci) AND the task has substantial earlier-cycle commits to preserve → **`qk replan-cycle R-0040`**. The fixup planner re-fires for that cycle; the 34 cycle-1 commits stay. **Never `qk retry` here** — it would torch weeks of doer/checker work that already passed.
+- **"R-0008 has 40/62 done; an `F-2-3-rubric-fix` subtask blocked twice in a row, fixup-cycle 3 looks over-scoped."** Non-initial cycle with substantial preserved work → **`qk replan-cycle R-0008`**, not retry.
 - **"R-0007 FAILED — checker crashed on docker exec."** Infra crash, no toxic state → **`qk resume R-0007`**.
 - **"12 tasks BLOCKED at 50/50 retries simultaneously, container_vanished histogram."** Plan 20 cascade → **`qk reset-retries` + `qk resume` per task**, batch.
-- **"Just shipped a planner edit that decomposes audit-fixup more aggressively."** Running tasks were planned under the OLD prompt → **`qk retry`** on the affected ones.
+- **"Just shipped a fixup-planner-prompt edit that decomposes audit findings more aggressively."** Running tasks have prior fixup cycles planned under the OLD prompt → **`qk replan-cycle`** on the affected ones (initial cycle's commits + the initial decomposition all stay; only the latest fixup cycle re-decomposes under the new prompt).
+- **"Just shipped an INITIAL-planner-prompt edit (e.g. tighter contract on `S-NN-*` shape)."** Running tasks were decomposed under the OLD initial prompt — fixup-cycle preservation isn't enough, the foundation needs to change → **`qk retry`** on the affected ones.
 - **"Just shipped a doer-prompt edit forbidding a disclaim pattern. R-0011 has been running fine without that pattern; R-0012 has accumulated worktree state where the pattern was active."** R-0011: let it ride. R-0012: **retry** (carry-forward will re-prime the bad pattern).
 - **"Just shipped plan 30 (settled stacking gate). 13 PENDING tasks have worktrees from the prior speculative gate."** Fruit-of-rotten-tree → **`qk abort && qk retry`** each — they were forked off non-merged parents and the new gate ensures the next attempt starts from a CI-green base.
 

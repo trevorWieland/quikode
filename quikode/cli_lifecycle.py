@@ -5,19 +5,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from . import cli_rewind
+from . import cli_replan_cycle, cli_rewind
 from .cli_context import (
     Path,
     State,
     Store,
     _open_store,
-    _resolve_repo_clone_url,
     app,
     console,
     docker_env,
     fsm_runtime,
     load_config,
-    shutil,
     subprocess,
     typer,
     worktree,
@@ -427,6 +425,72 @@ def rewind(
     )
 
 
+@app.command("replan-cycle")
+def replan_cycle(
+    task_id: str,
+    keep_remote: bool = typer.Option(
+        False,
+        "--keep-remote",
+        help=(
+            "Skip force-pushing the local rewind to the remote branch. "
+            "The next subtask commit will then need to handle non-fast-forward "
+            "divergence (auto-rebase)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the replan-cycle plan without changing any state.",
+    ),
+) -> None:
+    """Reset the most-recent planning cycle's subtasks and re-fire that planner.
+
+    Plan 52. Sits between `qk rewind` (one subtask) and `qk retry` (whole
+    task) in the escalation ladder. When a task has substantial earlier-
+    cycle commits AND the failing subtask belongs to a fixup / replan /
+    merge cycle (not the initial plan), this primitive re-decomposes
+    just that cycle without torching the foundation.
+
+    Behavior:
+    - Refuses (exit 2) on tasks not in BLOCKED or FAILED.
+    - Refuses (exit 2) on tasks with no worktree_path / branch on disk.
+    - Refuses (exit 2) when the latest planning cycle is 1 ("initial");
+      operator must opt into a full restart explicitly via `qk retry`.
+    - Identifies the latest planning cycle from the new
+      `subtasks.planning_cycle` column; subtasks at that cycle are the
+      reset target.
+    - `git reset --hard`s the worktree to the commit BEFORE the first
+      cycle-N subtask landed, force-pushes the branch (unless
+      --keep-remote), then DELETES all cycle-N rows so the worker's
+      natural fixup / replan / merge flow re-emits them with the same
+      cycle ordinal (next emission increments from N-1 back to N).
+    - Sets a `replan_cycle_marker` JSON hint on the task row carrying
+      `(cycle, kind, ts)` for observability.
+    - Drops the task to PENDING with `resume_from_existing_subtasks=1`
+      so the worker skips the initial planner and uses the preserved
+      `plan_text` for cycle 1.
+
+    Examples:
+      qk replan-cycle R-0040
+      qk replan-cycle R-0040 --dry-run
+      qk replan-cycle R-0040 --keep-remote
+    """
+    cfg = load_config()
+    store = _open_store(cfg)
+    plan = cli_replan_cycle.validate_replan_cycle_inputs(store, task_id, run_cmd=subprocess.run)
+    cli_replan_cycle.print_replan_cycle_plan(task_id, plan)
+    if dry_run:
+        console.print("[dim]--dry-run: no changes made[/]")
+        return
+    cli_replan_cycle.apply_replan_cycle(
+        store,
+        task_id,
+        plan,
+        keep_remote=keep_remote,
+        run_cmd=subprocess.run,
+    )
+
+
 @app.command("unblock")
 def unblock(
     task_id: str,
@@ -453,86 +517,6 @@ def unblock(
     print_unblock_context(store, task_id, row)
     if edit:
         launch_unblock_editor(row)
-
-
-@app.command("demo")
-def demo(
-    task_id: str,
-    clean: bool = typer.Option(False, "--clean", help="If target dir exists, remove it and re-clone"),
-):
-    """Materialize a task's PR branch in `<repo-parent>/<repo>-demo` for hands-on testing.
-
-    Solves "git worktree already in use": instead of attaching another
-    worktree to the daemon's repo, we maintain a separate clone at a
-    sibling path. Re-runs are idempotent — existing demo dirs get a fetch
-    + checkout instead of a fresh clone (unless --clean is passed).
-    """
-    cfg = load_config()
-    store = _open_store(cfg)
-    row = store.get(task_id)
-    if not row:
-        console.print(f"[red]no task {task_id} in store[/]")
-        raise typer.Exit(1)
-    branch = row.get("branch")
-    if not branch:
-        console.print(f"[red]task {task_id} has no branch yet — has it been provisioned?[/]")
-        raise typer.Exit(1)
-
-    repo_path = cfg.repo_path
-    target_dir = repo_path.parent / f"{repo_path.name}-demo"
-    if clean and target_dir.exists():
-        console.print(f"[yellow]--clean: removing {target_dir}[/]")
-        shutil.rmtree(target_dir)
-    if target_dir.exists():
-        _checkout_demo_branch(target_dir, str(branch))
-    else:
-        _clone_demo_repo(repo_path, target_dir, str(branch))
-    console.print(f"\n[bold green]demo ready[/] at [cyan]{target_dir}[/]")
-    _print_demo_hint(target_dir)
-
-
-def _checkout_demo_branch(target_dir: Path, branch: str) -> None:
-    console.print(f"[cyan]demo dir exists at {target_dir}[/] — fetching + checking out [b]{branch}[/]")
-    subprocess.run(["git", "fetch", "origin", branch], cwd=str(target_dir), check=False)
-    rc = _git_checkout(target_dir, branch)
-    if rc.returncode != 0:
-        console.print(f"[red]git checkout failed: {rc.stderr}[/]")
-        raise typer.Exit(1)
-
-
-def _clone_demo_repo(repo_path: Path, target_dir: Path, branch: str) -> None:
-    clone_url = _resolve_repo_clone_url(repo_path)
-    if not clone_url:
-        console.print("[red]could not determine clone url for the repo[/]")
-        raise typer.Exit(1)
-    console.print(f"[cyan]cloning[/] {clone_url} → {target_dir}")
-    rc = subprocess.run(["git", "clone", clone_url, str(target_dir)], capture_output=True, text=True)
-    if rc.returncode != 0:
-        console.print(f"[red]git clone failed: {rc.stderr}[/]")
-        raise typer.Exit(1)
-    rc = _git_checkout(target_dir, branch)
-    if rc.returncode == 0:
-        return
-    subprocess.run(["git", "fetch", "origin", branch], cwd=str(target_dir), check=False)
-    rc = _git_checkout(target_dir, branch)
-    if rc.returncode != 0:
-        console.print(f"[red]git checkout {branch} failed: {rc.stderr}[/]")
-        raise typer.Exit(1)
-
-
-def _git_checkout(target_dir: Path, branch: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", "checkout", branch], cwd=str(target_dir), capture_output=True, text=True)
-
-
-def _print_demo_hint(target_dir: Path) -> None:
-    if (target_dir / "pyproject.toml").exists() or (target_dir / "uv.lock").exists():
-        console.print(f"  cd {target_dir} && uv sync && source .venv/bin/activate")
-    elif (target_dir / "Cargo.toml").exists():
-        console.print(f"  cd {target_dir} && cargo build")
-    elif (target_dir / "package.json").exists():
-        console.print(f"  cd {target_dir} && npm install")
-    else:
-        console.print(f"  cd {target_dir}")
 
 
 @app.command("mark-merged")
