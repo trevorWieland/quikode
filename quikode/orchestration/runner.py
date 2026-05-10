@@ -24,6 +24,7 @@ from quikode.orchestration.merge_watch import MergeWatchMixin
 from quikode.orchestration.rebase_watch import RebaseWatchMixin
 from quikode.orchestration.review_watch import ReviewWatchMixin
 from quikode.orchestration.supervision import SupervisionMixin
+from quikode.runtime_shutdown import request_stop
 from quikode.state import State, Store, TaskRow
 from quikode.workers.factory import build_task_worker
 from quikode.workers.task_worker import TaskWorker
@@ -96,6 +97,7 @@ class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWa
         self._stop = threading.Event()
 
     def stop(self) -> None:
+        request_stop()
         self._stop.set()
 
     def run(self) -> None:

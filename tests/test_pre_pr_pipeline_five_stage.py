@@ -20,7 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from quikode import pre_pr_audit
+import pytest
+
+from quikode import pre_pr_audit, runtime_shutdown
 from quikode.agent_schemas import (
     ArchitectureFinding,
     PrePRArchitectureAuditOutput,
@@ -40,6 +42,9 @@ from quikode.evaluation_contract import (
     StandardsStageRubric,
 )
 from quikode.standards_profiles import StandardsDoc, StandardsProfile
+from quikode.state import State
+from quikode.workers import task_worker as task_worker_mod
+from quikode.workers.pre_pr import PrePrWorkerMixin
 
 
 def _stub_handle() -> MagicMock:
@@ -294,3 +299,81 @@ def test_collect_finding_ids_namespaces_architecture_stage():
     assert "architecture:arch-cross-subsystem-001" in ids
     # Standards namespace does NOT carry the architecture finding.
     assert not any(fid.startswith("standards:") for fid in ids)
+
+
+def test_execute_audit_stages_discards_stage_result_after_shutdown(tmp_path):
+    """SIGTERM can interrupt an in-flight audit and leave the CLI with no
+    schema output. Do not persist that partial result as a real failed stage.
+    """
+    cfg = _build_cfg(tmp_path)
+    store = MagicMock()
+    store.get.return_value = {"state": State.PRE_PR_AUDITING.value}
+
+    class FakeWorker:
+        _execute_audit_stages = PrePrWorkerMixin._execute_audit_stages
+        _stage_outcome_from_summary = staticmethod(PrePrWorkerMixin._stage_outcome_from_summary)
+
+        def __init__(self):
+            self.cfg = cfg
+            self.store = store
+            self.node = MagicMock(id="R-SHUTDOWN", expected_evidence=[])
+            self.log_path = tmp_path / "worker.log"
+
+        @property
+        def _h(self):
+            return _stub_handle()
+
+        def _evaluation_contract(self):
+            return _make_contract()
+
+        def _collect_cited_refs(self):
+            return [], []
+
+        def _merge_integration_subtasks_present(self):
+            return False
+
+        def _behavior_audit_expected_evidence(self, *, merge_node_mode: bool):
+            return []
+
+    def interrupted_behavior(**_kwargs):
+        assert task_worker_mod.pre_pr_audit is pre_pr_audit
+        runtime_shutdown.request_stop()
+        return pre_pr_audit.StageOutcome(
+            "behavior",
+            False,
+            "behavior audit response failed schema validation — failing closed (parse_failure)",
+            findings=[{"kind": "parse_failure"}],
+        )
+
+    try:
+        with (
+            patch(
+                "quikode.pre_pr_audit.run_local_ci_gate",
+                return_value=pre_pr_audit.StageOutcome("local_ci", True, "ok"),
+            ),
+            patch(
+                "quikode.pre_pr_audit.run_rubric_audit",
+                return_value=pre_pr_audit.StageOutcome("rubric", True, "ok"),
+            ),
+            patch(
+                "quikode.pre_pr_audit.run_standards_audit",
+                return_value=pre_pr_audit.StageOutcome("standards", True, "ok"),
+            ),
+            patch(
+                "quikode.pre_pr_audit.run_architecture_audit",
+                return_value=pre_pr_audit.StageOutcome("architecture", True, "ok"),
+            ),
+            patch("quikode.pre_pr_audit.run_behavior_audit", side_effect=interrupted_behavior),
+        ):
+            with pytest.raises(runtime_shutdown.ShutdownRequested):
+                FakeWorker()._execute_audit_stages(
+                    cycle=1,
+                    diff_excerpt="diff",
+                    plan_text="plan",
+                    merge_node_mode=False,
+                )
+    finally:
+        runtime_shutdown.clear_stop()
+
+    calls = [call.kwargs["stage_name"] for call in store.update_pre_pr_audit_stage.call_args_list]
+    assert calls == ["local_ci", "rubric", "standards", "architecture"]

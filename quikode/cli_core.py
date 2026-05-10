@@ -33,6 +33,7 @@ from .cli_context import (
     worktree,
 )
 from .config_validation import ConfigValidationError, validate_launch_config
+from .runtime_shutdown import request_stop
 
 
 @app.command()
@@ -388,6 +389,7 @@ def _install_stop_handlers(orch: Orchestrator) -> None:
             console.print("[yellow]received stop signal - winding down...[/]")
         except Exception:
             pass
+        request_stop()
         orch.stop()
 
     signal.signal(signal.SIGTERM, _request_stop)

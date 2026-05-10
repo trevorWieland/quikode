@@ -9,7 +9,7 @@ from quikode.config import Config
 from quikode.dag import Node
 from quikode.state import Store
 from quikode.workers.pr_lifecycle import PrLifecycleWorkerMixin
-from quikode.workers.pre_pr import _pre_pr_release_valve_report
+from quikode.workers.pre_pr import _pre_pr_release_valve_report, _pre_pr_structural_failure_report
 
 
 def _cfg(tmp_path: Path, **overrides) -> Config:
@@ -88,6 +88,27 @@ def test_release_valve_rejects_parse_infra_config_and_transport_failures(tmp_pat
             _pass("behavior"),
         )
         assert _pre_pr_release_valve_report(cfg, result) is None
+
+
+def test_structural_failures_block_instead_of_fixup_planning():
+    for kind in ("parse_failure", "infra", "config_error", "transport", "render_failure", "bootstrap_error"):
+        result = _cycle(
+            _pass("local_ci"),
+            _fail("behavior", findings=[{"kind": kind, "message": "not content"}]),
+        )
+        report = _pre_pr_structural_failure_report(result)
+        assert report is not None
+        assert f"behavior:{kind}" in report
+
+
+def test_content_findings_are_not_structural_failures():
+    result = _cycle(
+        _pass("local_ci"),
+        _fail("standards", findings=[{"id": "std-1", "severity": "high"}]),
+        _pass("behavior"),
+    )
+
+    assert _pre_pr_structural_failure_report(result) is None
 
 
 def test_release_valve_rejects_failed_stage_without_structured_findings(tmp_path):

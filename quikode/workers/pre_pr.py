@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from quikode import fsm_runtime, pre_pr_audit
+from quikode import fsm_runtime, pre_pr_audit, runtime_shutdown
 from quikode.config import Config
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import FixupPlan
@@ -76,6 +76,31 @@ def _pre_pr_release_valve_report(cfg: Config, cycle_result: Any) -> str | None:
         f"Deferred stage(s): {', '.join(sorted(failed_names))}.\n\n"
         "---\n\n"
         f"{rendered}"
+    )
+
+
+def _pre_pr_structural_failure_report(cycle_result: Any) -> str | None:
+    """Return a block report when an audit stage failed structurally.
+
+    These are quikode/runtime failures, not code-review findings. Planning
+    fixup subtasks for them creates toxic work: the doer cannot fix an
+    auditor parse failure or transport/config failure in the target repo.
+    """
+    failed = list(cycle_result.failed_stages)
+    structural: list[str] = []
+    for stage in failed:
+        for finding in list(stage.findings or []):
+            kind = str(finding.get("kind") or "")
+            if kind in _NON_DEFERABLE_FINDING_KINDS:
+                structural.append(f"{stage.name}:{kind}")
+    if not structural:
+        return None
+    return (
+        "pre-PR audit stage failed structurally; blocking instead of "
+        "planning target-repo fixups: "
+        + ", ".join(structural)
+        + "\n\n"
+        + pre_pr_audit.merge_failed_stage_reports(failed)
     )
 
 
@@ -404,13 +429,18 @@ class PrePrWorkerMixin:
             diff_excerpt = self._compute_branch_diff_excerpt()
             plan_text = str(self._row().get("plan_text") or "")
 
-            stages = self._execute_audit_stages(
-                cycle=cycle,
-                diff_excerpt=diff_excerpt,
-                plan_text=plan_text,
-                merge_node_mode=merge_node_mode,
-                resume_summary=cycle_resume_summary,
-            )
+            try:
+                stages = self._execute_audit_stages(
+                    cycle=cycle,
+                    diff_excerpt=diff_excerpt,
+                    plan_text=plan_text,
+                    merge_node_mode=merge_node_mode,
+                    resume_summary=cycle_resume_summary,
+                )
+            except runtime_shutdown.ShutdownRequested:
+                note = "shutdown requested during pre-pr audit; discarding partial audit result"
+                _tw.log.info("task %s: %s", self.node.id, note)
+                return WorkerOutcome(fsm_runtime.current_state(self.store, self.node.id), note)
             cycle_result = _tw.pre_pr_audit.PipelineCycleResult(cycle=cycle, stages=stages)
             for s in cycle_result.stages:
                 _tw.log.info(
@@ -444,6 +474,22 @@ class PrePrWorkerMixin:
                     ", ".join(s.name for s in cycle_result.failed_stages),
                 )
                 return None
+
+            structural_failure_report = _pre_pr_structural_failure_report(cycle_result)
+            if structural_failure_report is not None:
+                self.store.add_artifact(
+                    self.node.id,
+                    f"pre_pr_audit:cycle_{cycle}",
+                    structural_failure_report,
+                )
+                note = f"pre-pr cycle {cycle} structural audit failure; blocked instead of fixup planning"
+                fsm_runtime.block_current(
+                    self.store,
+                    self.node.id,
+                    note=note,
+                    last_error=structural_failure_report[:1000],
+                )
+                return WorkerOutcome(State.BLOCKED, note)
 
             # Failure path: merge findings → triage → fixup planner.
             fsm_runtime.enter_fixup_planning(
@@ -630,6 +676,10 @@ class PrePrWorkerMixin:
             if runner is None:
                 raise RuntimeError(f"no runner configured for pre-pr stage {stage_name}")
             outcome = runner(**kwargs)
+            if runtime_shutdown.stop_requested():
+                raise runtime_shutdown.ShutdownRequested(
+                    f"shutdown requested after pre-pr stage {stage_name}; discarding result"
+                )
             rec(stage_name, outcome)
             return outcome
 
