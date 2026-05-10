@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.github import PRStatus
+from quikode.github_graphql import Review
 from quikode.orchestrator import Orchestrator
 from quikode.state import State, Store
 
@@ -184,4 +185,205 @@ def test_merged_pr_poll_marks_db_merged_and_schedules_child_rebase(tmp_path):
     assert child["pre_rebase_state"] == State.PENDING_CI.value
     assert "CHILD" in futures
     assert "CHILD" in review_response_futures
+    o.store.conn.close()
+
+
+# Plan 49: review-watcher state guard. The daemon entered a crash loop on
+# 2026-05-10 because `_handle_post_pr_ci_failure` and `_handle_changes_requested`
+# unconditionally fired `enter_addressing_feedback` even when the task had
+# already drifted to BLOCKED (the FSM rejects `blocked → addressing_feedback`).
+# Both call sites must skip the FSM event + worker dispatch for BLOCKED/FAILED
+# tasks until the operator unblocks.
+
+
+def _failed_pr(pr_number: int = 10) -> PRStatus:
+    return PRStatus(
+        number=pr_number,
+        url=f"https://github.com/owner/repo/pull/{pr_number}",
+        state="OPEN",
+        mergeable="MERGEABLE",
+        checks_status="failure",
+        failed_checks=[{"name": "ci/lint", "conclusion": "failure"}],
+    )
+
+
+def _changes_requested_review(review_id: str = "R-1", author: str = "alice") -> Review:
+    return Review(
+        review_id=review_id,
+        database_id=1,
+        state="CHANGES_REQUESTED",
+        submitted_at=time.time(),
+        body="please fix",
+        author=author,
+        is_bot=False,
+    )
+
+
+def test_post_pr_ci_failure_skips_when_task_blocked(tmp_path):
+    o = _orch(tmp_path)
+    _seed_awaiting_review(o)
+    # Drift the task to BLOCKED (operator-review-required) and confirm the
+    # watcher does not fire an FSM event or schedule a worker.
+    o.store.transition("PARENT", State.BLOCKED, note="review rounds exhausted")
+    row = o.store.get("PARENT")
+    assert row["state"] == State.BLOCKED.value
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    review_response_futures: set[str] = set()
+
+    with patch("quikode.orchestration.review_watch.fsm_runtime.enter_addressing_feedback") as enter_af:
+        handled = o._handle_post_pr_ci_failure(
+            row,
+            _failed_pr(),
+            now=time.time(),
+            pool=pool,
+            futures=futures,
+            review_response_futures=review_response_futures,
+        )
+
+    assert handled is False  # main loop continues with other handlers
+    enter_af.assert_not_called()
+    pool.submit.assert_not_called()
+    assert "PARENT" not in futures
+    assert "PARENT" not in review_response_futures
+    # State unchanged.
+    assert o.store.get("PARENT")["state"] == State.BLOCKED.value
+    o.store.conn.close()
+
+
+def test_post_pr_ci_failure_skips_when_task_failed(tmp_path):
+    o = _orch(tmp_path)
+    _seed_awaiting_review(o)
+    o.store.transition("PARENT", State.FAILED, note="terminal failure")
+    row = o.store.get("PARENT")
+    assert row["state"] == State.FAILED.value
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    review_response_futures: set[str] = set()
+
+    with patch("quikode.orchestration.review_watch.fsm_runtime.enter_addressing_feedback") as enter_af:
+        handled = o._handle_post_pr_ci_failure(
+            row,
+            _failed_pr(),
+            now=time.time(),
+            pool=pool,
+            futures=futures,
+            review_response_futures=review_response_futures,
+        )
+
+    assert handled is False
+    enter_af.assert_not_called()
+    pool.submit.assert_not_called()
+    assert "PARENT" not in futures
+    o.store.conn.close()
+
+
+def test_post_pr_ci_failure_proceeds_for_normal_state(tmp_path):
+    o = _orch(tmp_path)
+    _seed_awaiting_review(o)  # task is in AWAITING_REVIEW
+    row = o.store.get("PARENT")
+    assert row["state"] == State.AWAITING_REVIEW.value
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    review_response_futures: set[str] = set()
+
+    handled = o._handle_post_pr_ci_failure(
+        row,
+        _failed_pr(),
+        now=time.time(),
+        pool=pool,
+        futures=futures,
+        review_response_futures=review_response_futures,
+    )
+
+    assert handled is True
+    # Existing behavior: FSM transitioned to ADDRESSING_FEEDBACK and a worker
+    # was submitted.
+    assert o.store.get("PARENT")["state"] == State.ADDRESSING_FEEDBACK.value
+    assert "PARENT" in futures
+    assert "PARENT" in review_response_futures
+    pool.submit.assert_called_once()
+    o.store.conn.close()
+
+
+def test_changes_requested_skips_when_task_blocked(tmp_path):
+    o = _orch(tmp_path)
+    _seed_awaiting_review(o)
+    o.store.transition("PARENT", State.BLOCKED, note="review rounds exhausted")
+    row = o.store.get("PARENT")
+    assert row["state"] == State.BLOCKED.value
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    review_response_futures: set[str] = set()
+    review = _changes_requested_review("R-99")
+
+    with (
+        patch("quikode.orchestration.review_watch.fsm_runtime.enter_addressing_feedback") as enter_af,
+        patch(
+            "quikode.orchestrator.github_graphql.bundle_pr_context",
+            return_value="bundled",
+        ),
+    ):
+        o._handle_changes_requested("owner/repo", 10, row, review, pool, futures, review_response_futures)
+
+    enter_af.assert_not_called()
+    pool.submit.assert_not_called()
+    assert "PARENT" not in futures
+    assert "PARENT" not in review_response_futures
+    # The skip path must NOT advance the review cursor — next poll re-sees it.
+    assert o.store.get_last_processed_review_id("PARENT") != "R-99"
+    # State unchanged.
+    assert o.store.get("PARENT")["state"] == State.BLOCKED.value
+    o.store.conn.close()
+
+
+def test_changes_requested_skips_when_task_failed(tmp_path):
+    o = _orch(tmp_path)
+    _seed_awaiting_review(o)
+    o.store.transition("PARENT", State.FAILED, note="terminal failure")
+    row = o.store.get("PARENT")
+    assert row["state"] == State.FAILED.value
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    review_response_futures: set[str] = set()
+    review = _changes_requested_review("R-100")
+
+    with (
+        patch("quikode.orchestration.review_watch.fsm_runtime.enter_addressing_feedback") as enter_af,
+        patch(
+            "quikode.orchestrator.github_graphql.bundle_pr_context",
+            return_value="bundled",
+        ),
+    ):
+        o._handle_changes_requested("owner/repo", 10, row, review, pool, futures, review_response_futures)
+
+    enter_af.assert_not_called()
+    pool.submit.assert_not_called()
+    assert o.store.get_last_processed_review_id("PARENT") != "R-100"
+    o.store.conn.close()
+
+
+def test_changes_requested_proceeds_for_normal_state(tmp_path):
+    o = _orch(tmp_path)
+    _seed_awaiting_review(o)  # AWAITING_REVIEW
+    row = o.store.get("PARENT")
+    assert row["state"] == State.AWAITING_REVIEW.value
+    pool = _make_pool()
+    futures: dict[str, Future] = {}
+    review_response_futures: set[str] = set()
+    review = _changes_requested_review("R-7")
+
+    with patch(
+        "quikode.orchestrator.github_graphql.bundle_pr_context",
+        return_value="bundled",
+    ):
+        o._handle_changes_requested("owner/repo", 10, row, review, pool, futures, review_response_futures)
+
+    # Existing behavior preserved: FSM advanced to ADDRESSING_FEEDBACK, review
+    # cursor stamped, worker scheduled.
+    assert o.store.get("PARENT")["state"] == State.ADDRESSING_FEEDBACK.value
+    assert o.store.get_last_processed_review_id("PARENT") == "R-7"
+    assert "PARENT" in futures
+    assert "PARENT" in review_response_futures
+    pool.submit.assert_called_once()
     o.store.conn.close()

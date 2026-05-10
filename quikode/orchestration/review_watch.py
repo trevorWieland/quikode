@@ -282,6 +282,22 @@ class ReviewWatchMixin:
             bundled_context = ""
         if not bundled_context.strip():
             bundled_context = f"CHANGES_REQUESTED review by {review.author}:\n{review.body or '(no body)'}"
+        # Plan 49: re-read state right before the FSM call (the dispatcher read
+        # `task_row` earlier this tick — it may have drifted to BLOCKED/FAILED
+        # via another path, e.g. review-rounds-exhausted just above). The FSM
+        # rejects `blocked|failed → addressing_feedback`, so skip the event +
+        # the worker. Do NOT mark the review processed: when the operator
+        # unblocks, the next poll re-sees this review and addresses it.
+        fresh_row = self.store.get(task_id)
+        fresh_state = str(fresh_row.get("state")) if fresh_row else ""
+        if fresh_state in (State.BLOCKED.value, State.FAILED.value):
+            _rt.log.info(
+                "task %s: CHANGES_REQUESTED on PR #%s but task is %s — skipping FSM event; awaiting operator unblock",
+                task_id,
+                pr_number,
+                fresh_state.upper(),
+            )
+            return
         fsm_runtime.enter_addressing_feedback(
             self.store,
             task_id,
@@ -437,6 +453,22 @@ class ReviewWatchMixin:
         if pr_status.checks_status != "failure" or not pr_status.failed_checks:
             return False
         if task_row["id"] in futures or len(futures) >= review_cap:
+            return False
+        # Plan 49: never auto-schedule a CI-fix cycle on a BLOCKED/FAILED task —
+        # the FSM rejects `blocked|failed → addressing_feedback`, and prior to
+        # this guard the unconditional `enter_addressing_feedback` raised and
+        # crash-looped the orchestrator child. Skip; on the next poll the
+        # operator will (we hope) have unblocked the task and normal handling
+        # resumes. Returning False here keeps the main loop's other handlers
+        # active for this candidate.
+        current_state = str(task_row.get("state"))
+        if current_state in (State.BLOCKED.value, State.FAILED.value):
+            _rt.log.info(
+                "task %s: PR #%s CI failing but task is %s — skipping daemon CI-fix; awaiting operator unblock",
+                task_row["id"],
+                task_row.get("pr_number"),
+                current_state.upper(),
+            )
             return False
         _rt.log.info(
             "task %s: PR #%s CI failing (%d failed check(s)) — scheduling CI-fix cycle",
