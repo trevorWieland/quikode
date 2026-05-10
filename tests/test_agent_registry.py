@@ -8,7 +8,6 @@ import pytest
 
 from quikode.agent_registry import ROLES, make_agent
 from quikode.agent_schemas import (
-    DoerEnvelope,
     PlannerOutput,
     ProgressVerdict,
     SubtaskCheckerOutput,
@@ -73,11 +72,13 @@ def test_make_agent_planner_override_to_glm_zai() -> None:
     assert agent.output_schema is PlannerOutput
 
 
-def test_make_agent_subtask_doer_returns_writes_files_with_doer_envelope() -> None:
+def test_make_agent_subtask_doer_returns_writes_files_without_envelope_schema() -> None:
+    """Plan 47: doer role has no envelope schema; the transport runs in
+    plain-text mode and the wrapper invokes `invoke_raw`."""
     cfg = _cfg()
     agent = make_agent("subtask_doer", cfg)
     assert isinstance(agent, WritesFilesAgent)
-    assert agent.envelope_schema is DoerEnvelope
+    assert agent.envelope_schema is None
     assert isinstance(agent.transport, QuotaFallbackJsonAgent)
     assert isinstance(agent.transport.primary, CodexLitellmJsonAgent)
     assert agent.transport.primary.profile == "glm-zai"
@@ -95,7 +96,7 @@ def test_make_agent_subtask_doer_override_to_claude_opus() -> None:
     assert isinstance(agent, WritesFilesAgent)
     assert isinstance(agent.transport, ClaudeJsonAgent)
     assert agent.transport.model_id == "claude-opus-4-7[1m]"
-    assert agent.envelope_schema is DoerEnvelope
+    assert agent.envelope_schema is None
 
 
 def test_make_agent_subtask_checker_returns_json_output() -> None:

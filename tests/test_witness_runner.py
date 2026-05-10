@@ -185,65 +185,6 @@ def test_run_scoped_witnesses_no_command_classification() -> None:
     assert results["B-001-manual"]["rc"] is None
 
 
-def test_run_scoped_witnesses_uses_doer_reported_command_as_last_resort() -> None:
-    calls: list[list[str]] = []
-
-    def fake_exec(handle: Any, cmd: list[str], **_: Any) -> tuple[int, str, str]:
-        calls.append(cmd)
-        if "cat docs/roadmap/dag.json" in cmd[-1]:
-            return 0, "", ""
-        return 0, "20 scenarios passed", ""
-
-    results = run_scoped_witnesses(
-        handle=object(),
-        expected_evidence=[
-            {
-                "behavior_id": "B-0025",
-                "kind": "bdd",
-                "description": "feature exists but no command is declared",
-            }
-        ],
-        evidence_ids=["B-0025-bdd-positive-falsification"],
-        per_witness_timeout_s=15,
-        exec_in=fake_exec,
-        fallback_commands=[
-            "just check",
-            "TANREN_BDD_FEATURES_PATH=tests/bdd/features/B-0025-connect-existing-repo.feature "
-            "cargo run -q -p tanren-bdd --bin tanren-bdd-runner --locked",
-        ],
-    )
-
-    assert results["B-0025-bdd-positive-falsification"]["classification"] == "OK"
-    assert calls[-1] == [
-        "bash",
-        "-lc",
-        "cd /workspace && TANREN_BDD_FEATURES_PATH=tests/bdd/features/B-0025-connect-existing-repo.feature "
-        "cargo run -q -p tanren-bdd --bin tanren-bdd-runner --locked",
-    ]
-
-
-def test_run_scoped_witnesses_prefers_behavior_test_command_when_fallback_lacks_token() -> None:
-    calls: list[list[str]] = []
-
-    def fake_exec(handle: Any, cmd: list[str], **_: Any) -> tuple[int, str, str]:
-        calls.append(cmd)
-        if "cat docs/roadmap/dag.json" in cmd[-1]:
-            return 0, "", ""
-        return 0, "57 scenarios passed", ""
-
-    results = run_scoped_witnesses(
-        handle=object(),
-        expected_evidence=[{"behavior_id": "B-0046", "kind": "bdd"}],
-        evidence_ids=["B-0046-bdd-positive-falsification"],
-        per_witness_timeout_s=15,
-        exec_in=fake_exec,
-        fallback_commands=["just check", "just tests", "just web-e2e"],
-    )
-
-    assert results["B-0046-bdd-positive-falsification"]["classification"] == "OK"
-    assert calls[-1] == ["bash", "-lc", "cd /workspace && just tests"]
-
-
 def test_run_scoped_witnesses_uses_current_worktree_dag_when_node_metadata_is_stale() -> None:
     """A doer may add `witness_command` to docs/roadmap/dag.json after the
     worker loaded the in-memory node. The runner should recover that command

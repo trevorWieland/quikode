@@ -65,6 +65,40 @@ class QuotaFallbackJsonAgent:
             raise RuntimeError("quota fallback invoked without transports")
         return prior
 
+    def invoke_raw(
+        self,
+        prompt: str,
+        *,
+        handle: Any,
+        log_path: Path | None,
+        timeout: int,
+    ) -> RawTransportResult:
+        """Plan 47: walk the same primary→fallback chain in no-schema mode.
+
+        No schema-tier normalization is needed — every shim's
+        `invoke_raw` already returns `structured=None` with stdout
+        carried in `raw_text`.
+        """
+        transports = (self.primary, *self.fallbacks)
+        prior: RawTransportResult | None = None
+        for index, transport in enumerate(transports):
+            raw = transport.invoke_raw(
+                prompt,
+                handle=handle,
+                log_path=log_path,
+                timeout=timeout,
+            )
+            combined = _combine(prior, raw) if prior is not None else raw
+            if not _is_quota_exhausted(raw.rc, raw.raw_text or "", raw.stderr_excerpt):
+                return combined
+            if index == len(transports) - 1:
+                return combined
+            _append_fallback_note(log_path, transport, transports[index + 1])
+            prior = combined
+        if prior is None:  # pragma: no cover - transports is always non-empty
+            raise RuntimeError("quota fallback invoked without transports")
+        return prior
+
 
 def _append_fallback_note(
     log_path: Path | None,

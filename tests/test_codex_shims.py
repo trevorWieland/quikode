@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from quikode.agent_schemas import DoerEnvelope, PlannerOutput, ProgressVerdict
+from quikode.agent_schemas import ConflictResolverEnvelope, PlannerOutput, ProgressVerdict
 from quikode.agents.json_codex_direct import CodexDirectJsonAgent
 from quikode.agents.json_codex_litellm import CodexLitellmJsonAgent
 from quikode.agents.json_protocol import codex_output_schema
@@ -223,7 +223,7 @@ def test_codex_litellm_invocation_produces_raw_text() -> None:
     ):
         raw = agent.invoke(
             "p",
-            output_schema=DoerEnvelope,
+            output_schema=ConflictResolverEnvelope,
             handle=object(),
             log_path=None,
             timeout=60,
@@ -250,7 +250,7 @@ def test_codex_litellm_shell_command_executes_with_real_bash(tmp_path: Path) -> 
         patch("quikode.agents.json_protocol.exec_in", side_effect=fake_exec_in),
         patch("quikode.agents.ccusage.fetch_session_stats", return_value=None),
     ):
-        agent.invoke("p", output_schema=DoerEnvelope, handle=object(), log_path=None, timeout=60)
+        agent.invoke("p", output_schema=ConflictResolverEnvelope, handle=object(), log_path=None, timeout=60)
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -308,7 +308,7 @@ def test_codex_litellm_timeout_produces_transient_result() -> None:
     ):
         raw = agent.invoke(
             "p",
-            output_schema=DoerEnvelope,
+            output_schema=ConflictResolverEnvelope,
             handle=object(),
             log_path=Path("/tmp/test-lit-log"),
             timeout=1,

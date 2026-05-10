@@ -7,8 +7,10 @@ SUBTASK_DOER_TIMEOUT = (
     "ceiling): bumped to 1800s (30 min). The doer prompt's targeted "
     "rubric / standards / architecture context makes the call "
     "meaningfully heavier than the pre-Plan-33 shape, and smaller "
-    "models need the headroom to land both the diff and the "
-    "DoerEnvelope JSON before SIGTERM."
+    "models need the headroom to land the full diff before SIGTERM. "
+    "Plan 47 retired the bookkeeping envelope; the diff is the only "
+    "deliverable now, but the doer still needs every second of the "
+    "ceiling to finish multi-file edits."
 )
 
 SUBTASK_CHECKER_TIMEOUT = (

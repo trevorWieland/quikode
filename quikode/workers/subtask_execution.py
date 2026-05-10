@@ -1,48 +1,42 @@
-"""Subtask do/check/triage mixin (Plan 38 PR-B.5).
+"""Subtask do/check/triage mixin (Plan 47).
 
 The per-subtask loop runs the JsonAgent layer end-to-end:
 
-1. Doer (`subtask_doer`, writes-files) may emit a `DoerEnvelope`
-   (bookkeeping only — never graded). Schema-validation failure is
-   preserved as telemetry but does not short-circuit diff grading; the
-   code diff and witnesses remain the evidence.
-2. The worker captures the actual evidence by reading the worktree diff
-   via `git diff HEAD --no-color` (status excerpt + unified diff).
-3. Witness commands declared in `subtask.behavior_evidence_advanced` run
-   inside the container; per-witness + per-subtask caps live in
-   `quikode.workers.witness_runner`.
+1. Doer (`subtask_doer`, writes-files, no envelope) edits files in
+   `/workspace`. Plan 47 retired the bookkeeping `DoerEnvelope`: the
+   transport runs in plain-text mode (no `--output-schema` /
+   `--json-schema`), the diff is the deliverable, and the doer's
+   stdout is captured as a free-text artifact for briefing only.
+2. The worker captures the evidence by reading the worktree diff via
+   `git diff HEAD --no-color` (status excerpt + unified diff).
+3. Witness commands declared in `subtask.behavior_evidence_advanced`
+   run inside the container; per-witness + per-subtask caps live in
+   `quikode.workers.witness_runner`. The runner reloads the worktree
+   DAG before declaring `NO_COMMAND` per orientation §7 — there is no
+   doer-envelope-derived fallback.
 4. Checker (`subtask_checker`, JSON-mode) grades the diff against the
-   subtask's rubric / standards / architecture / behavior contract. The
-   DoerEnvelope is fed in labeled "doer self-report — informational only".
-5. On checker `verdict="fail"`, triage (`subtask_triage`, JSON-mode) emits
-   a `SubtaskTriageOutput` (failure_layer + root_cause + cites + teaching).
+   subtask's rubric / standards / architecture / behavior contract.
+5. On checker `verdict="fail"`, triage (`subtask_triage`, JSON-mode)
+   emits a `SubtaskTriageOutput` (failure_layer + root_cause + cites +
+   teaching).
 
-The Plan 33 SELF_AUDIT contract (parse-and-short-circuit) is gone; the
-diff is the evidence and the LLM checker is the judgment. The cost is
-one extra checker call per attempt vs. the prior fast-fail short-circuit;
-this is acceptable because (a) the short-circuit was structurally
-unreliable, (b) checker calls are cheap relative to doer calls, and (c)
-JsonAgent schema enforcement guarantees structurally clean checker
-output.
-
-Plan 22 carry-forward stays: the next attempt's prompt receives the
-prior attempt's `subtask_doer:<id>` artifact as `prior_doer_envelope`
-context. Plan 23 same-signature stop-loss runs against the new
-`failure_layer` values (`local_ci`, `rubric`, `standards`, `behavior`,
-`parse_failure`, `transport`, `architecture`).
+Plan-22 carry-forward across attempts flows through `triage_notes`
+(the structured triage output's `teaching_narrative` + cites),
+plumbed into `subtask_doer_prompt` directly. Plan 23 same-signature
+stop-loss runs against the new `failure_layer` values (`local_ci`,
+`rubric`, `standards`, `behavior`, `parse_failure`, `transport`,
+`architecture`).
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from quikode import fsm_runtime
 from quikode.agent_registry import make_agent
 from quikode.agent_schemas import (
-    DoerEnvelope,
     SubtaskCheckerFinding,
     SubtaskCheckerOutput,
     SubtaskTriageOutput,
@@ -63,36 +57,21 @@ class _TaskWorkerGlobals:
 _tw = _TaskWorkerGlobals()
 
 
-@dataclass(frozen=True)
-class _DoerCallResult:
-    """Worker-side capture of one doer invocation.
-
-    Carries the validated `DoerEnvelope` (or None on parse failure), the
-    raw envelope JSON/prose for artifact storage, and the parse-error tuple
-    so the worker can report output-protocol drift while still grading the
-    diff.
-    """
-
-    envelope: DoerEnvelope | None
-    raw_text: str
-    parse_errors: tuple[str, ...]
+_DOER_ARTIFACT_MAX = 20000
 
 
 class SubtaskExecutionMixin:
     # Cached state set by `_do_subtask`, consumed by `_check_subtask` /
-    # `_triage_subtask` within the same attempt. Class-level None
-    # defaults so `TaskWorker.__new__`-based test fixtures see safe
-    # values without needing to call __init__; production code paths
-    # always set them via `_cache_doer_state`.
-    _last_doer_envelope: ClassVar[DoerEnvelope | None] = None
-    _last_doer_parse_errors: ClassVar[tuple[str, ...]] = ()
+    # `_triage_subtask` within the same attempt. Class-level defaults
+    # so `TaskWorker.__new__`-based test fixtures see safe values
+    # without needing to call __init__; production code paths always
+    # set them via `_cache_doer_state`.
     _last_diff_text: ClassVar[str] = ""
 
     def _do_subtask(self: Any, subtask: Subtask, attempt: int, triage_notes: str | None) -> None:
         fsm_runtime.enter_doing_subtask(self.store, self.node.id, note=f"{subtask.id} attempt {attempt}")
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.DOING.value)
         contract = self._evaluation_contract()
-        prior_envelope = self._fetch_prior_doer_envelope(subtask, attempt)
         prompt = _tw.prompts.subtask_doer_prompt(
             self.cfg,
             self.node,
@@ -100,15 +79,18 @@ class SubtaskExecutionMixin:
             contract,
             plan=self.plan,
             triage_notes=triage_notes,
-            prior_doer_envelope=prior_envelope,
         )
         self._write_log_header(f"SUBTASK DOER {subtask.id} (attempt {attempt})", prompt)
-        doer_result = self._run_doer_agent(subtask, prompt, attempt)
-        self._cache_doer_state(subtask, doer_result)
+        self._run_doer_agent(subtask, prompt, attempt)
+        self._cache_doer_state(subtask)
 
     # ----- doer helpers -----
 
-    def _run_doer_agent(self: Any, subtask: Subtask, prompt: str, attempt: int) -> _DoerCallResult:
+    def _run_doer_agent(self: Any, subtask: Subtask, prompt: str, attempt: int) -> None:
+        """Plan 47: run the doer with no schema enforcement and persist
+        the stdout tail as the `subtask_doer:<id>` artifact (plain
+        text, not JSON). The diff in `/workspace` is the deliverable;
+        this artifact exists for briefing/log purposes only."""
         agent = make_agent("subtask_doer", self.cfg)
         call_id = self.store.record_agent_call_started(
             self.node.id,
@@ -131,61 +113,21 @@ class SubtaskExecutionMixin:
             tokens_output=result.tokens_output,
             cost_usd=result.cost_usd,
         )
-        envelope: DoerEnvelope | None = None
-        if isinstance(result.structured, DoerEnvelope):
-            envelope = result.structured
-        raw_text = result.raw_text or (envelope.model_dump_json(indent=2) if envelope is not None else "")
-        artifact_body = envelope.model_dump_json(indent=2) if envelope is not None else (raw_text or "")
-        self.last_doer_summary = (envelope.summary if envelope is not None else artifact_body)[-2000:]
+        artifact_body = (result.raw_text or "")[-_DOER_ARTIFACT_MAX:]
+        self.last_doer_summary = artifact_body[-2000:]
         self.store.add_artifact(
             self.node.id,
             f"subtask_doer:{subtask.id}",
             artifact_body,
         )
         _ = attempt  # captured by the log header / artifact ts
-        return _DoerCallResult(
-            envelope=envelope,
-            raw_text=raw_text,
-            parse_errors=tuple(result.parse_errors or ()),
-        )
 
-    def _cache_doer_state(self: Any, subtask: Subtask, doer_result: _DoerCallResult) -> None:
-        """Stash the validated envelope (or parse_errors), the worktree
-        diff, and the witness results so `_check_subtask` and
-        `_triage_subtask` read them without re-running the doer."""
-        self._last_doer_envelope = doer_result.envelope or self._fallback_doer_envelope(doer_result)
-        self._last_doer_parse_errors = doer_result.parse_errors
+    def _cache_doer_state(self: Any, subtask: Subtask) -> None:
+        """Compute the worktree diff and run scoped witnesses so
+        `_check_subtask` and `_triage_subtask` read them without
+        re-running the doer."""
         self._last_diff_text = self._compute_subtask_diff_excerpt()
         self._last_witness_results = self._run_scoped_witnesses(subtask)
-
-    def _fallback_doer_envelope(self: Any, doer_result: _DoerCallResult) -> DoerEnvelope:
-        details = "; ".join(doer_result.parse_errors or ("DoerEnvelope failed schema validation",))[:1200]
-        return DoerEnvelope(
-            summary="Doer bookkeeping envelope was invalid; grading the actual diff and witnesses.",
-            notes=(
-                "Doer output failed bookkeeping-envelope validation after retry. "
-                f"The envelope is informational only; parse details: {details}"
-            ),
-        )
-
-    def _fetch_prior_doer_envelope(self: Any, subtask: Subtask, attempt: int) -> DoerEnvelope | None:
-        """Plan 22 carry-forward: feed the next attempt the prior
-        attempt's `DoerEnvelope` (was `ParsedSelfAudit` pre-Plan-38). The
-        artifact stream stores the envelope JSON; we re-parse it via
-        pydantic so the prompt template renders the structured fields."""
-        if attempt <= 1:
-            return None
-        text = self.store.latest_subtask_doer_output(self.node.id, subtask.id)
-        if not text:
-            return None
-        try:
-            return DoerEnvelope.model_validate_json(text)
-        except Exception:
-            # Best-effort: a malformed prior artifact (e.g. pre-Plan-38
-            # SELF_AUDIT prose persisted before Plan 38 deployed) just
-            # degrades to no carry-forward rather than crashing the next
-            # attempt.
-            return None
 
     def _compute_subtask_diff_excerpt(self: Any) -> str:
         """`git status --porcelain` (one-line summary of touched paths)
@@ -229,9 +171,6 @@ class SubtaskExecutionMixin:
                 per_witness_timeout_s=int(self.cfg.subtask_witness_timeout_seconds),
                 exec_in=_tw.exec_in,
                 log_path=self.log_path,
-                fallback_commands=list(
-                    (self._last_doer_envelope.witness_commands_run if self._last_doer_envelope else ()) or ()
-                ),
             )
         except Exception as e:
             _tw.log.warning(
@@ -254,13 +193,11 @@ class SubtaskExecutionMixin:
     # ----- checker -----
 
     def _check_subtask(self: Any, subtask: Subtask) -> _CheckerOutcome:
-        """Plan 38 PR-B.5: always invoke the LLM checker against the diff.
-
-        The doer envelope is informational only. Even when the doer
-        emits malformed bookkeeping output, the worker still runs the
-        objective command and checker against the actual diff + witness
-        output.
-        """
+        """Plan 47: always invoke the LLM checker against the diff +
+        witness output. The doer no longer emits a bookkeeping
+        envelope, so there's nothing to short-circuit on; the worker
+        runs the objective command first, and otherwise hands the
+        diff to the checker."""
         fsm_runtime.enter_checking_subtask(self.store, self.node.id, note=subtask.id)
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.CHECKING.value)
 
@@ -270,37 +207,14 @@ class SubtaskExecutionMixin:
 
         return self._run_llm_subtask_checker(subtask)
 
-    def _synthesize_parse_failure_outcome(self: Any, subtask: Subtask) -> _CheckerOutcome:
-        """Doer envelope failed schema validation → fail-closed with
-        `failure_layer=parse_failure`. The triage agent will see the
-        parse_errors as the root cause."""
-        errs = self._last_doer_parse_errors or ("DoerEnvelope failed schema validation",)
-        details = "\n".join(errs)[:4000]
-        text = (
-            "VERDICT: FAIL\n"
-            "ROOT_CAUSE: doer envelope failed schema validation; "
-            "failure_layer=parse_failure.\n"
-            f"DETAILS:\n{details}"
-        )
-        self.store.add_artifact(self.node.id, f"subtask_parse_failure:{subtask.id}", text)
-        return _CheckerOutcome(
-            verdict=Verdict.FAIL,
-            checker_text=text,
-            transient=False,
-            rc=None,
-            stderr="",
-        )
-
     def _run_llm_subtask_checker(self: Any, subtask: Subtask) -> _CheckerOutcome:
         contract = self._evaluation_contract()
-        envelope = self._last_doer_envelope
         agent = make_agent("subtask_checker", self.cfg)
         prompt = _tw.prompts.subtask_checker_prompt(
             self.cfg,
             self.node,
             subtask,
             contract,
-            doer_envelope=envelope,
             diff_text=self._last_diff_text,
             witness_results=self._last_witness_results,
         )
@@ -435,22 +349,20 @@ class SubtaskExecutionMixin:
     # ----- triage -----
 
     def _triage_subtask(self: Any, subtask: Subtask, attempt: int, budget: int, checker_output: str) -> str:
-        """Plan 38 PR-B.5: senior-engineer-tutoring-junior triage on the
-        JsonAgent layer. Inputs are the targeted contract, the validated
-        DoerEnvelope (if present), the checker's text, the diff. Output
-        is rendered to a human-readable string for the next doer
+        """Plan 47: senior-engineer-tutoring-junior triage on the
+        JsonAgent layer. Inputs are the targeted contract, the
+        checker's text output, and the unified diff. Output is
+        rendered to a human-readable string for the next doer
         attempt's prompt context."""
         _ = attempt
         _ = budget  # retry budget is unused by the new prompt; kept for the call-site signature
         contract = self._evaluation_contract()
-        envelope = self._last_doer_envelope
         agent = make_agent("subtask_triage", self.cfg)
         prompt = _tw.prompts.subtask_triage_prompt(
             self.cfg,
             self.node,
             subtask,
             contract,
-            doer_envelope=envelope,
             checker_verdict=checker_output,
             diff_text=self._last_diff_text,
         )

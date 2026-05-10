@@ -111,6 +111,52 @@ class CodexLitellmJsonAgent:
             ccusage_before=before,
         )
 
+    def invoke_raw(
+        self,
+        prompt: str,
+        *,
+        handle: Any,
+        log_path: Path | None,
+        timeout: int,
+    ) -> RawTransportResult:
+        """Plan 47 no-schema path: run codex (via litellm) in plain mode.
+
+        Same shape as `CodexDirectJsonAgent.invoke_raw` — no schema
+        flags, just `codex exec --profile <p> -`. The result carries
+        free-text stdout in `raw_text` and `structured=None`.
+        """
+        codex_parts = [
+            "codex",
+            "exec",
+            "--profile",
+            self.profile,
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--color",
+            "never",
+            "--cd",
+            "/workspace",
+            "--skip-git-repo-check",
+            "-",
+        ]
+        cmd = ["bash", "-lc", " ".join(codex_parts)]
+        before = ccusage.fetch_session_stats("codex", handle=handle)
+        t0 = time.time()
+        outcome = _run_with_retry(
+            handle,
+            cmd,
+            stdin=prompt,
+            log_path=log_path,
+            timeout=timeout,
+            quota_max_total_wait_s=self.quota_max_total_wait_s,
+        )
+        duration_s = time.time() - t0
+        return _build_raw_result(
+            outcome,
+            duration_s=duration_s,
+            handle=handle,
+            ccusage_before=before,
+        )
+
 
 def _build_raw_result(
     outcome: _ExecOutcome,

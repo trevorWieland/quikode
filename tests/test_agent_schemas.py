@@ -7,7 +7,6 @@ from pydantic import ValidationError
 
 from quikode.agent_schemas import (
     BehaviorVerification,
-    DoerEnvelope,
     FixupPlannerOutput,
     MergePlannerOutput,
     PlannerOutput,
@@ -92,28 +91,6 @@ def test_merge_planner_output_round_trip() -> None:
         merge_context_summary="parent A renamed X; parent B added a caller",
     )
     _round_trip(plan)
-
-
-# ---------- doer ----------
-
-
-def test_doer_envelope_round_trip() -> None:
-    env = DoerEnvelope(
-        summary="touched two files",
-        files_touched=["a.py", "b.py"],
-        witness_commands_run=["pytest tests/"],
-        notes="ok",
-    )
-    _round_trip(env)
-
-
-def test_doer_envelope_defaults() -> None:
-    """All fields optional with safe defaults."""
-    env = DoerEnvelope()
-    assert env.summary == ""
-    assert env.files_touched == []
-    assert env.witness_commands_run == []
-    assert env.notes == ""
 
 
 # ---------- subtask checker ----------

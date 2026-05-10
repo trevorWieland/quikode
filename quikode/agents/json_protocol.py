@@ -267,12 +267,24 @@ class JsonOutputAgent:
 
 
 class WritesFilesAgent:
-    """Wraps a `JsonAgentTransport` for writes-files roles."""
+    """Wraps a `JsonAgentTransport` for writes-files roles.
+
+    Plan 47: `envelope_schema` is now optional. When it is `None` (the
+    post-plan-47 doer), the wrapper invokes the transport's
+    `invoke_raw` path — no `--output-schema` / `--json-schema` flags,
+    no pydantic re-prompt loop. The diff in the worktree is the sole
+    deliverable; the returned `JsonAgentResult` carries `structured=None`,
+    `parse_errors=()`, and `raw_text` for briefing/log purposes only.
+
+    When `envelope_schema` is set (the conflict-resolver), behavior is
+    unchanged — schema-validated round-trip with re-prompt-once on
+    invalid bookkeeping.
+    """
 
     def __init__(
         self,
         transport: JsonAgentTransport,
-        envelope_schema: type[BaseModel],
+        envelope_schema: type[BaseModel] | None,
     ):
         self.transport = transport
         self.envelope_schema = envelope_schema
@@ -285,6 +297,14 @@ class WritesFilesAgent:
         log_path: Path | None = None,
         timeout: int,
     ) -> JsonAgentResult:
+        if self.envelope_schema is None:
+            return _invoke_without_validation(
+                self.transport,
+                prompt,
+                handle=handle,
+                log_path=log_path,
+                timeout=timeout,
+            )
         return invoke_with_validation(
             self.transport,
             prompt,
@@ -293,6 +313,43 @@ class WritesFilesAgent:
             log_path=log_path,
             timeout=timeout,
         )
+
+
+def _invoke_without_validation(
+    transport: JsonAgentTransport,
+    prompt: str,
+    *,
+    handle: Any,
+    log_path: Path | None,
+    timeout: int,
+) -> JsonAgentResult:
+    """Plan 47: writes-files invocation without JSON-schema enforcement.
+
+    Runs the transport once via `invoke_raw`, captures rc / duration /
+    transient / tokens, and packages into a `JsonAgentResult` with
+    `structured=None` and `parse_errors=()`. The diff in `/workspace`
+    is what the worker grades; this result exists only so the worker
+    can tell `transient` apart from `success` and record the agent
+    call.
+    """
+    raw = transport.invoke_raw(
+        prompt,
+        handle=handle,
+        log_path=log_path,
+        timeout=timeout,
+    )
+    return JsonAgentResult(
+        structured=None,
+        rc=raw.rc,
+        transient=raw.transient,
+        duration_s=raw.duration_s,
+        tokens_input=raw.tokens_input,
+        tokens_output=raw.tokens_output,
+        cost_usd=raw.cost_usd,
+        parse_errors=(),
+        raw_text=raw.raw_text,
+        stderr_excerpt=raw.stderr_excerpt,
+    )
 
 
 __all__ = [

@@ -39,21 +39,6 @@ in `overall_assessment` but still grade against what's there.
 {% endfor %}{% if not witness_results %}_(no witnesses scoped to this subtask)_
 {% endif %}
 
-{% if doer_envelope %}### Doer's self-report — INFORMATIONAL ONLY (do not grade against this)
-
-The doer reported the following bookkeeping. **Grade the diff, not this
-self-report.** Discrepancies between the envelope and the diff are a
-data point but not the verdict.
-
-- **summary:** {{ doer_envelope.summary }}
-- **files_touched:** {{ doer_envelope.files_touched | join(', ') }}
-- **witness_commands_run:** {{ doer_envelope.witness_commands_run | join(', ') }}
-{% if doer_envelope.notes %}- **notes:** {{ doer_envelope.notes }}{% endif %}
-{% else %}### Doer self-report
-
-_(no doer envelope available — grade the diff and witness output directly)_
-{% endif %}
-
 ## 3. Verification matrix
 
 For each row below, decide pass / fail / unknown with a one-line

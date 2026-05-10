@@ -16,7 +16,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from quikode.agent_schemas import DoerEnvelope, ProgressVerdict
+from quikode.agent_schemas import ConflictResolverEnvelope, ProgressVerdict
 from quikode.agents.json_fallback import QuotaFallbackJsonAgent
 from quikode.agents.json_protocol import (
     JsonOutputAgent,
@@ -51,6 +51,20 @@ class StubTransport:
         log_path: Path | None,
         timeout: int,
     ) -> RawTransportResult:
+        self.invocations.append(prompt)
+        if not self.responses:
+            raise AssertionError("StubTransport: no queued response left")
+        return self.responses.pop(0)
+
+    def invoke_raw(
+        self,
+        prompt: str,
+        *,
+        handle: Any,
+        log_path: Path | None,
+        timeout: int,
+    ) -> RawTransportResult:
+        """Plan 47: StubTransport satisfies the no-schema contract too."""
         self.invocations.append(prompt)
         if not self.responses:
             raise AssertionError("StubTransport: no queued response left")
@@ -566,9 +580,10 @@ def test_writes_files_agent_validates_envelope_cli_native() -> None:
             RawTransportResult(
                 raw_text=None,
                 structured={
-                    "summary": "did the work",
+                    "summary": "resolved markers",
                     "files_touched": ["a.py"],
-                    "witness_commands_run": [],
+                    "gave_up": False,
+                    "give_up_reason": "",
                     "notes": "",
                 },
                 rc=0,
@@ -577,16 +592,24 @@ def test_writes_files_agent_validates_envelope_cli_native() -> None:
             )
         ],
     )
-    wrapper = WritesFilesAgent(transport=transport, envelope_schema=DoerEnvelope)
+    wrapper = WritesFilesAgent(transport=transport, envelope_schema=ConflictResolverEnvelope)
     result = wrapper.invoke("doer prompt", handle=object(), timeout=60)
-    assert isinstance(result.structured, DoerEnvelope)
-    assert result.structured.summary == "did the work"
+    assert isinstance(result.structured, ConflictResolverEnvelope)
+    assert result.structured.summary == "resolved markers"
     assert result.structured.files_touched == ["a.py"]
 
 
 def test_writes_files_agent_client_side_reprompt() -> None:
     bad = "{prose response without json}"
-    good = json.dumps({"summary": "ok", "files_touched": [], "witness_commands_run": [], "notes": ""})
+    good = json.dumps(
+        {
+            "summary": "ok",
+            "files_touched": [],
+            "gave_up": False,
+            "give_up_reason": "",
+            "notes": "",
+        }
+    )
     transport = StubTransport(
         name="codex-litellm-stub",
         schema_enforcement="client_side",
@@ -595,10 +618,69 @@ def test_writes_files_agent_client_side_reprompt() -> None:
             RawTransportResult(raw_text=good, structured=None, rc=0, transient=False, duration_s=1.0),
         ],
     )
-    wrapper = WritesFilesAgent(transport=transport, envelope_schema=DoerEnvelope)
+    wrapper = WritesFilesAgent(transport=transport, envelope_schema=ConflictResolverEnvelope)
     result = wrapper.invoke("doer prompt", handle=object(), timeout=60)
-    assert isinstance(result.structured, DoerEnvelope)
+    assert isinstance(result.structured, ConflictResolverEnvelope)
     assert len(transport.invocations) == 2
+
+
+def test_writes_files_agent_no_schema_runs_invoke_raw() -> None:
+    """Plan 47: when envelope_schema is None (the doer), the wrapper
+    invokes `transport.invoke_raw` and returns a `JsonAgentResult`
+    with `structured=None`, `parse_errors=()`, and `raw_text` from the
+    CLI's stdout. No re-prompt loop, no schema validation."""
+
+    @dataclass
+    class RawCapturingStub:
+        name: str = "raw-stub"
+        schema_enforcement: str = "client_side"
+        invocations: list[str] = field(default_factory=list)
+        raw_invocations: list[str] = field(default_factory=list)
+
+        def invoke(
+            self,
+            prompt: str,
+            *,
+            output_schema: type[BaseModel] | None,
+            handle: Any,
+            log_path: Path | None,
+            timeout: int,
+        ) -> RawTransportResult:
+            raise AssertionError("no-schema path must not call .invoke()")
+
+        def invoke_raw(
+            self,
+            prompt: str,
+            *,
+            handle: Any,
+            log_path: Path | None,
+            timeout: int,
+        ) -> RawTransportResult:
+            self.raw_invocations.append(prompt)
+            return RawTransportResult(
+                raw_text="apply_patch ok\nsummary line",
+                structured=None,
+                rc=0,
+                transient=False,
+                duration_s=12.5,
+                tokens_input=100,
+                tokens_output=50,
+                cost_usd=0.01,
+                stderr_excerpt="",
+            )
+
+    transport = RawCapturingStub()
+    wrapper = WritesFilesAgent(transport=transport, envelope_schema=None)
+    result = wrapper.invoke("doer prompt", handle=object(), timeout=60)
+    assert result.structured is None
+    assert result.parse_errors == ()
+    assert result.raw_text == "apply_patch ok\nsummary line"
+    assert result.rc == 0
+    assert result.duration_s == 12.5
+    assert result.tokens_input == 100
+    assert result.tokens_output == 50
+    assert result.cost_usd == 0.01
+    assert transport.raw_invocations == ["doer prompt"]
 
 
 # ---------- build_reprompt: standalone unit test ----------

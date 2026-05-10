@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from quikode.agent_schemas import DoerEnvelope, PlannerOutput
+from quikode.agent_schemas import PlannerOutput
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.evaluation_contract import build_for
@@ -130,13 +130,11 @@ def test_subtask_checker_renders_plan_33_targeted_block(tmp_path):
         interfaces=("web", "api"),
         notes="follow behavior-proof.md",
     )
-    envelope = DoerEnvelope(summary="implemented bdd")
     out = subtask_checker_prompt(
         cfg,
         dag.nodes["R-001"],
         sub,
         contract,
-        doer_envelope=envelope,
         diff_text="diff --git a/x b/x",
         witness_results={},
     )

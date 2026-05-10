@@ -26,7 +26,6 @@ from pydantic import BaseModel
 
 from .agent_schemas import (
     ConflictResolverEnvelope,
-    DoerEnvelope,
     FixupPlannerOutput,
     IntentReviewVerdict,
     MergePlannerOutput,
@@ -56,9 +55,10 @@ from .model_registry import MODELS, ModelSpec
 class RoleSpec:
     """One row in the role registry.
 
-    `output_schema` is the pydantic model the role's agent emits. For
-    writes-files roles, this is the bookkeeping `DoerEnvelope`; the
-    real evidence is the diff (read separately by the worker).
+    `output_schema` is the pydantic model the role's agent emits, or
+    `None` for writes-files roles that have no bookkeeping envelope at
+    all (the doer post-plan-47: the diff is the only evidence and the
+    transport runs in plain text mode).
 
     `writes_files=True` selects the `WritesFilesAgent` wrapper;
     `False` selects `JsonOutputAgent`.
@@ -69,7 +69,7 @@ class RoleSpec:
     """
 
     name: str
-    output_schema: type[BaseModel]
+    output_schema: type[BaseModel] | None
     writes_files: bool
     default_model: str
     timeout_s_field: str
@@ -84,8 +84,11 @@ ROLES: dict[str, RoleSpec] = {
         timeout_s_field="planner_timeout_s",
     ),
     "subtask_doer": RoleSpec(
+        # Plan 47: doer no longer emits a bookkeeping envelope. The diff is
+        # the sole evidence; the transport runs in plain-text mode (no
+        # --output-schema / --json-schema, no pydantic re-prompt loop).
         name="subtask_doer",
-        output_schema=DoerEnvelope,
+        output_schema=None,
         writes_files=True,
         default_model="GLM-5.1-zai",
         timeout_s_field="subtask_doer_timeout_s",
@@ -245,6 +248,8 @@ def make_agent(role: str, cfg: Config) -> JsonOutputAgent | WritesFilesAgent:
     transport = _build_transport(spec)
     if role_spec.writes_files:
         return WritesFilesAgent(transport=transport, envelope_schema=role_spec.output_schema)
+    if role_spec.output_schema is None:
+        raise ValueError(f"role {role!r}: non-writes-files roles must declare output_schema; got None")
     return JsonOutputAgent(transport=transport, output_schema=role_spec.output_schema)
 
 

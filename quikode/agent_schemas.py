@@ -137,27 +137,6 @@ class MergePlannerOutput(BaseModel):
     merge_context_summary: str = Field(default="")
 
 
-# ---------- doer (writes-files agent) ----------
-
-
-class DoerEnvelope(BaseModel):
-    """Lightweight bookkeeping envelope emitted by the doer / conflict-resolver.
-
-    NOT a contract for grading. The diff is the evidence; a separate
-    JSON-mode judging agent reads the diff + runs witnesses + emits
-    judgment. This envelope lets the worker show "here's what the doer
-    claims to have touched" in the TUI / briefing while keeping the
-    actual evaluation diff-driven.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    summary: str = Field(default="")
-    files_touched: list[str] = Field(default_factory=list)
-    witness_commands_run: list[str] = Field(default_factory=list)
-    notes: str = Field(default="")
-
-
 # ---------- conflict resolver ----------
 
 
@@ -473,7 +452,6 @@ __all__ = [
     "BehaviorCompletenessGap",
     "BehaviorVerification",
     "ConflictResolverEnvelope",
-    "DoerEnvelope",
     "FixupPlannerOutput",
     "IntentReviewVerdict",
     "IntentReviewVerdictValue",

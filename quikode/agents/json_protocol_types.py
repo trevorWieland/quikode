@@ -56,3 +56,24 @@ class JsonAgentTransport(Protocol):
         log_path: Path | None,
         timeout: int,
     ) -> RawTransportResult: ...
+
+    def invoke_raw(
+        self,
+        prompt: str,
+        *,
+        handle: Any,
+        log_path: Path | None,
+        timeout: int,
+    ) -> RawTransportResult:
+        """Invoke the underlying CLI with no JSON-schema enforcement.
+
+        Plan 47: writes-files roles without a bookkeeping envelope (the
+        post-plan-47 doer) run the CLI in apply-patch mode without
+        passing `--output-schema` / `--json-schema`. The shim records
+        rc, stdout, stderr, duration, transient, and tokens; no
+        pydantic validation happens. `structured` is always None;
+        `raw_text` carries whatever the CLI emitted on stdout (free
+        text — not parsed). The diff in `/workspace` is the actual
+        deliverable; this output is informational only.
+        """
+        ...

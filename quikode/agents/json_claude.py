@@ -75,6 +75,34 @@ class ClaudeJsonAgent:
             ccusage_before=before,
         )
 
+    def invoke_raw(
+        self,
+        prompt: str,
+        *,
+        handle: Any,
+        log_path: Path | None,
+        timeout: int,
+    ) -> RawTransportResult:
+        """Plan 47 no-schema path: run claude in apply-edits mode.
+
+        Drops `--json-schema` (and `--output-format json`) so the CLI
+        emits plain assistant text. The doer's deliverable is the
+        worktree diff, captured separately by the worker; this text
+        is informational only. ccusage delta gives us tokens / cost.
+        """
+        invocation = f"claude -p --permission-mode acceptEdits --add-dir /workspace --model {self.model_id}"
+        cmd = ["bash", "-lc", invocation]
+        before = ccusage.fetch_session_stats("claude", handle=handle)
+        t0 = time.time()
+        outcome = _run_with_retry(handle, cmd, stdin=prompt, log_path=log_path, timeout=timeout)
+        duration_s = time.time() - t0
+        return _build_raw_text_result(
+            outcome,
+            duration_s=duration_s,
+            handle=handle,
+            ccusage_before=before,
+        )
+
 
 @dataclass
 class _ParsedEnvelope:
@@ -210,6 +238,41 @@ def _safe_int(v: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return n if n >= 0 else None
+
+
+def _build_raw_text_result(
+    outcome: _ExecOutcome,
+    *,
+    duration_s: float,
+    handle: Any,
+    ccusage_before: ccusage.CCUsageStats | None,
+) -> RawTransportResult:
+    """Plan 47: package a no-schema claude invocation as a raw-text result.
+
+    No JSON envelope to parse — claude's `-p` plain mode just emits
+    assistant text on stdout. ccusage delta gives us tokens / cost.
+    """
+    raw_text: str | None = outcome.stdout if outcome.stdout else None
+    after = ccusage.fetch_session_stats("claude", handle=handle)
+    delta = ccusage.snapshot_delta("claude", ccusage_before, after)
+    tokens_input: int | None = None
+    tokens_output: int | None = None
+    cost_usd: float | None = None
+    if delta is not None and delta.total_tokens > 0:
+        tokens_input = delta.tokens_input
+        tokens_output = delta.tokens_output
+        cost_usd = delta.cost_usd
+    return RawTransportResult(
+        raw_text=raw_text,
+        structured=None,
+        rc=outcome.rc,
+        transient=outcome.timed_out,
+        duration_s=duration_s,
+        tokens_input=tokens_input,
+        tokens_output=tokens_output,
+        cost_usd=cost_usd,
+        stderr_excerpt=(outcome.stderr or "")[-2000:],
+    )
 
 
 __all__ = ["ClaudeJsonAgent"]

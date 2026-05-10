@@ -6,7 +6,6 @@ from pathlib import Path
 
 from jinja2 import ChoiceLoader, Environment, FileSystemLoader, StrictUndefined
 
-from .agent_schemas import DoerEnvelope
 from .config import Config
 from .dag import DAG, Node
 from .evaluation_contract import EvaluationContract
@@ -119,15 +118,14 @@ def subtask_doer_prompt(
     *,
     plan: Plan | None = None,
     triage_notes: str | None = None,
-    prior_doer_envelope: DoerEnvelope | None = None,
 ) -> str:
-    """Plan 38 PR-B.5: subtask-doer prompt takes the full
-    `EvaluationContract` (rendered into §3 via `ec_targeted`) plus an
-    optional structured `prior_doer_envelope` carrying the prior
-    attempt's bookkeeping (files_touched / witnesses_run / summary).
-    The doer emits a `DoerEnvelope` JSON object — bookkeeping only;
-    the diff is what's graded. Z-99 still runs the full local-CI gate;
-    per-subtask gating uses `cfg.subtask_check_command`."""
+    """Plan 47: subtask-doer prompt takes the full `EvaluationContract`
+    (rendered into §3 via `ec_targeted`). Carry-forward across attempts
+    flows in `triage_notes` (the structured triage output's
+    `teaching_narrative` + cites); there is no separate envelope
+    carry-forward. The doer's deliverable is the worktree diff. Z-99
+    still runs the full local-CI gate; per-subtask gating uses
+    `cfg.subtask_check_command`."""
     gate_command = (
         cfg.local_ci_command if subtask.id == STABILIZATION_SUBTASK_ID else cfg.subtask_check_command
     )
@@ -139,7 +137,6 @@ def subtask_doer_prompt(
         subtask=subtask,
         contract=contract,
         triage_notes=triage_notes,
-        prior_doer_envelope=prior_doer_envelope,
         subtask_check_command=gate_command,
     )
 
@@ -150,21 +147,19 @@ def subtask_checker_prompt(
     subtask,
     contract: EvaluationContract,
     *,
-    doer_envelope: DoerEnvelope | None,
     diff_text: str,
     witness_results: dict[str, dict],
 ) -> str:
-    """Plan 38 PR-B.5: checker grades the unified diff against the
-    targeted contract. Receives the doer's `DoerEnvelope` as
-    informational context (NOT the contract being graded), the diff,
-    and the per-subtask scoped witness results."""
+    """Plan 47: checker grades the unified diff against the targeted
+    contract. The doer no longer emits a bookkeeping envelope; the
+    checker reads the diff and the per-subtask scoped witness results,
+    period."""
     return render(
         cfg,
         "subtask-checker.md",
         node=node,
         subtask=subtask,
         contract=contract,
-        doer_envelope=doer_envelope,
         diff_text=diff_text[:20000],
         witness_results=witness_results,
     )
@@ -176,21 +171,18 @@ def subtask_triage_prompt(
     subtask,
     contract: EvaluationContract,
     *,
-    doer_envelope: DoerEnvelope | None,
     checker_verdict: str,
     diff_text: str,
 ) -> str:
-    """Plan 38 PR-B.5: senior-engineer-tutoring-junior triage. Inputs
-    are the targeted contract slice, the doer envelope (informational),
-    the checker's text output, and the unified diff. Output is a
-    `SubtaskTriageOutput` JSON instance."""
+    """Plan 47: senior-engineer-tutoring-junior triage. Inputs are the
+    targeted contract slice, the checker's text output, and the unified
+    diff. Output is a `SubtaskTriageOutput` JSON instance."""
     return render(
         cfg,
         "subtask-triage.md",
         node=node,
         subtask=subtask,
         contract=contract,
-        doer_envelope=doer_envelope,
         checker_verdict=checker_verdict,
         diff_text=diff_text[:20000],
     )

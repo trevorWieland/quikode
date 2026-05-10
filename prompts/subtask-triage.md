@@ -21,18 +21,6 @@ wrong, with file:line cites, and teach them the concept they missed**.
 
 {{ ec_targeted(contract, subtask) }}
 
-{% if doer_envelope %}### The doer's self-report (informational)
-
-- **summary:** {{ doer_envelope.summary }}
-- **files_touched:** {{ doer_envelope.files_touched | join(', ') }}
-- **witness_commands_run:** {{ doer_envelope.witness_commands_run | join(', ') }}
-{% if doer_envelope.notes %}- **notes:** {{ doer_envelope.notes }}{% endif %}
-{% else %}### Doer self-report
-
-_(no doer envelope available; the doer's output failed schema validation
-or didn't run — the failure layer is most likely `parse_failure`.)_
-{% endif %}
-
 ### The checker's verdict
 
 ```
@@ -84,10 +72,13 @@ Emit a single JSON object matching the `SubtaskTriageOutput` schema:
   standards).
 - `behavior` — a `behavior_evidence_advanced` witness produced
   empty/stub output, or did not run.
-- `parse_failure` — the doer's `DoerEnvelope` or the checker's
-  `SubtaskCheckerOutput` failed schema validation. The next attempt
-  needs to emit a structurally clean response; the content fix follows
-  from the checker's earlier verdict if any.
+- `parse_failure` — the checker's `SubtaskCheckerOutput` or the
+  triage agent's own structured output failed schema validation. The
+  doer post-plan-47 has no JSON contract to fail on; this layer covers
+  the JSON-mode roles whose schemas are still enforced. The next
+  attempt needs the JSON-mode role to emit a structurally clean
+  response; the content fix follows from the checker's earlier
+  verdict if any.
 - `transport` — git push, rebase, or network failure — the agent
   itself didn't err, but the surrounding pipeline did.
 

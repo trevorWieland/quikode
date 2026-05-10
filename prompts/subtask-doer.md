@@ -3,12 +3,12 @@ You are the **doer** for one subtask. Implement the change at `/workspace`. The 
 
 ## 1. Your job in one sentence
 
-Implement this subtask such that the actual diff — not your self-report —
-withstands adversarial review by a different model on the rubric,
-standards, architecture, and behavior dimensions declared by this
-subtask. **The diff is the evidence.** Your final JSON envelope is a
-short bookkeeping record so the operator can see what you touched; it
-is NOT the contract you are graded against.
+Implement this subtask such that the actual diff withstands adversarial
+review by a different model on the rubric, standards, architecture, and
+behavior dimensions declared by this subtask. **The diff is the
+evidence.** After you finish editing, running the per-subtask gate, and
+running witnesses, stop. The orchestrator runs `git diff HEAD` against
+your work, runs the witness commands itself, and grades the diff.
 
 ## 2. The subtask
 
@@ -58,27 +58,6 @@ A previous attempt failed and the triage agent's analysis is below. **It describ
 ```
 {% endif %}
 
-{% if prior_doer_envelope %}## 5a. Prior attempt — your own doer envelope (structured)
-
-You emitted this on the prior attempt. The orchestrator graded your
-diff, not this envelope — so don't re-summarize the same claims if the
-diff didn't actually back them up.
-
-**Prior summary:** {{ prior_doer_envelope.summary }}
-
-**Files you reported touching:**
-{% for f in prior_doer_envelope.files_touched %}- `{{ f }}`
-{% endfor %}{% if not prior_doer_envelope.files_touched %}_(none recorded)_
-{% endif %}
-
-**Witness commands you reported running:**
-{% for c in prior_doer_envelope.witness_commands_run %}- `{{ c }}`
-{% endfor %}{% if not prior_doer_envelope.witness_commands_run %}_(none recorded)_
-{% endif %}
-
-{% if prior_doer_envelope.notes %}**Notes:** {{ prior_doer_envelope.notes }}{% endif %}
-{% endif %}
-
 ## 6. Local-CI gate (positive framing)
 
 {% if subtask_check_command %}You must run `{{ subtask_check_command }}` and confirm it returns rc=0
@@ -105,35 +84,14 @@ not paper over it with stub-shaped code.
   orchestrator owns commits.
 - **DO NOT create or fix issues outside this subtask's scope.** A
   pre-existing failure on a file you didn't touch is not your problem;
-  flag it in `notes` instead of patching it.
+  flag it in your stop message instead of patching it.
 
-## 8. Output schema (REQUIRED — bookkeeping only)
+## 8. When you stop
 
-After you finish editing AND running the per-subtask gate AND running
-witnesses, end your response with a single JSON object matching this
-schema exactly:
-
-```jsonc
-{
-  "summary":              "<= 250 chars; what you did, in one or two sentences",
-  "files_touched":        ["repo/relative/path.py", "..."],
-  "witness_commands_run": ["<command 1>", "<command 2>"],
-  "notes":                "anything operationally relevant to surface; pre-existing issues you spotted but didn't fix; flakiness; ambiguity"
-}
-```
-
-The agent layer enforces this schema:
-
-- For `cli_native` transports (claude, direct codex), the CLI itself
-  validates the JSON before returning.
-- For `client_side` transports (codex+litellm proxies), pydantic
-  validates after the fact and re-prompts you ONCE on a malformed
-  envelope.
-
-A second schema-validation failure surfaces `failure_layer=parse_failure`
-to triage. Get the schema right the first time — it's tiny.
-
-**The envelope is bookkeeping, not evidence.** The orchestrator runs
-`git diff HEAD` against your work, runs the witness commands itself,
-and grades the diff. Don't try to "claim" your way through the
-checker — what the checker reads is what the diff actually says.
+Run the per-subtask gate (§6) and any witness commands the subtask
+calls for. Confirm the gate is green. Then stop — there is no
+output schema, no JSON envelope, no bookkeeping payload. The
+orchestrator reads `git diff HEAD` against your work, executes the
+witness commands itself, and grades the diff. Anything you write
+after the work is done is informational only; the diff is the
+deliverable.

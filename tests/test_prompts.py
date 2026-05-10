@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from quikode.agent_schemas import DoerEnvelope
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.evaluation_contract import build_for
@@ -158,13 +157,15 @@ def test_subtask_doer_prompt_includes_acceptance_and_files(tmp_path):
     assert "crates/foo/src/account.rs" in out
     assert "cargo check passes" in out
     assert "Domain crate only." in out
-    # Plan 38: doer emits a DoerEnvelope JSON object — bookkeeping only.
-    assert "DoerEnvelope" in out or "files_touched" in out
-    assert "summary" in out
+    # Plan 47: doer has no JSON envelope; the diff is the deliverable.
+    normalized = " ".join(out.lower().split())
+    assert "the diff is the evidence" in normalized
+    assert "no output schema" in normalized or "no json envelope" in normalized
 
 
 def test_subtask_doer_renders_triage_as_context(tmp_path):
-    """Plan 17 + Plan 33: triage feedback flows as context, not a fix recipe."""
+    """Plan 17 + Plan 33 + Plan 47: triage feedback is the canonical
+    carry-forward across attempts."""
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
     contract = build_for(dag.nodes["R-001"], cfg)
@@ -179,49 +180,23 @@ def test_subtask_doer_renders_triage_as_context(tmp_path):
     assert "missing field" in out
 
 
-def test_subtask_doer_renders_prior_doer_envelope_when_present(tmp_path):
-    """Plan 38 PR-B.5: structured `prior_doer_envelope` flows in as the
-    next attempt's bookkeeping context (DoerEnvelope replaces the prior
-    SELF_AUDIT carry-forward)."""
-    dag = _make_dag(tmp_path)
-    cfg = _cfg(tmp_path)
-    contract = build_for(dag.nodes["R-001"], cfg)
-    prior = DoerEnvelope(
-        summary="weak filter logic",
-        files_touched=["src/list.tsx"],
-        witness_commands_run=["npm test"],
-        notes="needs follow-up",
-    )
-    out = subtask_doer_prompt(
-        cfg,
-        dag.nodes["R-001"],
-        _subtask(),
-        contract,
-        prior_doer_envelope=prior,
-    )
-    assert "Prior attempt" in out
-    assert "weak filter logic" in out
-    assert "src/list.tsx" in out
-
-
 def test_subtask_checker_prompt_format(tmp_path):
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
     contract = build_for(dag.nodes["R-001"], cfg)
-    envelope = DoerEnvelope(summary="implemented filter", files_touched=["src/list.tsx"])
     out = subtask_checker_prompt(
         cfg,
         dag.nodes["R-001"],
         _subtask(),
         contract,
-        doer_envelope=envelope,
         diff_text="diff --git a/x b/x",
         witness_results={},
     )
     assert "S-01-domain" in out
     assert "Plan 14 preserved" in out
-    # The doer's self-report is in the prompt but labeled informational only.
-    assert "INFORMATIONAL" in out or "informational" in out
+    # Plan 47: no doer self-report block in the checker prompt.
+    assert "Doer's self-report" not in out
+    assert "INFORMATIONAL" not in out
 
 
 def test_conflict_resolver_prompt_renders_diffs(tmp_path):
@@ -245,28 +220,28 @@ def test_conflict_resolver_prompt_renders_diffs(tmp_path):
 
 
 def test_subtask_triage_prompt_senior_engineer_framing(tmp_path):
-    """Plan 38 PR-B.5: triage on the JsonAgent layer — senior-engineer-
+    """Plan 47: triage on the JsonAgent layer — senior-engineer-
     tutoring-junior framing preserved (Plan 14). The prompt surfaces
-    the targeted contract slice, the doer envelope (informational), the
-    checker's verdict, and the unified diff."""
+    the targeted contract slice, the checker's verdict, and the
+    unified diff. The doer self-report block is gone."""
     dag = _make_dag(tmp_path)
     cfg = _cfg(tmp_path)
     contract = build_for(dag.nodes["R-001"], cfg)
-    envelope = DoerEnvelope(summary="initial attempt", files_touched=["src/x.py"])
     out = subtask_triage_prompt(
         cfg,
         dag.nodes["R-001"],
         _subtask(),
         contract,
-        doer_envelope=envelope,
         checker_verdict="VERDICT: FAIL\n[FAIL] foo",
         diff_text="diff --git a/x b/x",
     )
     assert "S-01-domain" in out
     assert "VERDICT: FAIL" in out
     assert "senior engineer" in out.lower()
-    # Plan 38: closed enum on failure_layer drops self_audit_mismatch
+    # Plan 38 + 47: closed enum on failure_layer drops self_audit_mismatch
     # and adds parse_failure + architecture.
     assert "parse_failure" in out
     assert "architecture" in out
     assert "self_audit_mismatch" not in out
+    # Plan 47: no doer envelope / self-report block.
+    assert "doer's self-report" not in out.lower()
