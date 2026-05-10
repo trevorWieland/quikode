@@ -1,30 +1,10 @@
-"""v3.6 pre-PR pipeline: 5-stage gate before opening a PR.
+"""Pre-PR pipeline: local CI plus rubric, standards, architecture, behavior.
 
-Stage 0 (local_ci) runs `cfg.local_ci_command` and passes raw output
-through to triage. Stages 1-4 (rubric / standards / architecture /
-behavior) invoke JsonAgent roles `pre_pr_rubric` / `pre_pr_standards`
-/ `pre_pr_architecture` / `pre_pr_behavior`, each with a closed
-pydantic schema (`PrePR*AuditOutput`). Plan 35 PR-B added the
-architecture stage between standards and behavior.
-
-Failures merge into a `audit_findings` bundle → triage → fixup planner
-(kind="fixup-pre-pr-audit") → per-subtask doer/checker loop, then the
-pipeline re-runs. Cycles cap at `cfg.pre_pr_audit_max_cycles` (default
-3); beyond that the node is BLOCKED.
-
-Plan 38 PR-B.3: prose parsing (heuristic JSON extraction) is gone for
-all three audit stages. Each audit's outcome is built from the validated
-pydantic instance the JsonAgent layer hands back. A schema-validation
-failure (`parse_errors` non-empty) is retried in-place before it collapses
-to a synthetic FAIL labeled `parse_failure` — the plan-12/14 invariant
-(no fabrication) means downstream FIXUP planning sees this as "the audit
-couldn't run cleanly", NOT a real grading failure.
-
-Failures from this layer are *not* the same as a checker FAIL — the PR
-was *blocked from opening* because the system caught the issue before
-review. The merged report is an operator-readable artifact ("here's what
-we caught, here's how the doer fixed it") that sits on the eventual PR
-description for transparency.
+Each LLM-backed audit runs through the JsonAgent layer and consumes a
+closed pydantic schema; prose parsing and heuristic JSON extraction stay
+retired. Schema failures retry in-place before surfacing as synthetic
+`parse_failure` findings, which tell fixup planning the audit failed to
+run cleanly rather than inventing a content defect.
 """
 
 from __future__ import annotations

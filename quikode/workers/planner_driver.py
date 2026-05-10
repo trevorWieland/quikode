@@ -370,8 +370,7 @@ class PlannerDriverMixin:
         if result.rc != 0:
             if result.transient:
                 raise _PlannerTransientFailure(
-                    f"planner agent exited transient rc={result.rc}: "
-                    f"{(result.stderr_excerpt or '')[:500]}"
+                    f"planner agent exited transient rc={result.rc}: {(result.stderr_excerpt or '')[:500]}"
                 )
             raise RuntimeError(f"planner agent exited rc={result.rc}: {(result.stderr_excerpt or '')[:500]}")
         if result.parse_errors or result.structured is None:

@@ -368,9 +368,14 @@ def _write_workspace_with_config(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _isolate_host_orphan_detection(monkeypatch) -> None:
+    monkeypatch.setattr(daemon_mod, "detect_orphan_quikode_runs", lambda cfg: (None, []))
+
+
 def test_daemon_status_no_daemon(tmp_path, monkeypatch):
     ws = _write_workspace_with_config(tmp_path)
     monkeypatch.chdir(ws)
+    _isolate_host_orphan_detection(monkeypatch)
     runner = CliRunner()
     res = runner.invoke(app, ["daemon", "status"])
     assert res.exit_code == 1, res.output
@@ -379,6 +384,7 @@ def test_daemon_status_no_daemon(tmp_path, monkeypatch):
 def test_daemon_status_running_fresh_heartbeat_json(tmp_path, monkeypatch):
     ws = _write_workspace_with_config(tmp_path)
     monkeypatch.chdir(ws)
+    _isolate_host_orphan_detection(monkeypatch)
     state = ws / ".quikode"
     # Use *our own* PID so liveness check passes
     (state / "daemon.pid").write_text(f"{os.getpid()}@{time.time():.0f}\n")
@@ -404,6 +410,7 @@ def test_daemon_status_running_fresh_heartbeat_json(tmp_path, monkeypatch):
 def test_daemon_status_stale_heartbeat_returns_2(tmp_path, monkeypatch):
     ws = _write_workspace_with_config(tmp_path)
     monkeypatch.chdir(ws)
+    _isolate_host_orphan_detection(monkeypatch)
     state = ws / ".quikode"
     (state / "daemon.pid").write_text(f"{os.getpid()}@{time.time():.0f}\n")
     # Heartbeat 10 minutes old
@@ -418,6 +425,7 @@ def test_daemon_status_stale_heartbeat_returns_2(tmp_path, monkeypatch):
 def test_daemon_status_no_heartbeat_when_running_returns_2(tmp_path, monkeypatch):
     ws = _write_workspace_with_config(tmp_path)
     monkeypatch.chdir(ws)
+    _isolate_host_orphan_detection(monkeypatch)
     state = ws / ".quikode"
     (state / "daemon.pid").write_text(f"{os.getpid()}@{time.time():.0f}\n")
     # No heartbeat file

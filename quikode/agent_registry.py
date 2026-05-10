@@ -187,7 +187,9 @@ ROLES: dict[str, RoleSpec] = {
 }
 
 
-def _build_base_transport(spec: ModelSpec, *, quota_max_total_wait_s: int | None = None) -> JsonAgentTransport:
+def _build_base_transport(
+    spec: ModelSpec, *, quota_max_total_wait_s: int | None = None
+) -> JsonAgentTransport:
     """Construct the right transport shim for a model spec."""
     if spec.transport == "codex_direct":
         if spec.codex_profile is None:  # pragma: no cover — registry validates this

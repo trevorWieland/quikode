@@ -4,6 +4,7 @@ import json
 import time
 from concurrent.futures import Future
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from quikode.config import Config
@@ -44,7 +45,7 @@ def _make_dag(tmp_path: Path) -> DAG:
     return DAG.load(p)
 
 
-def _orch(tmp_path: Path, **cfg_kw: object) -> Orchestrator:
+def _orch(tmp_path: Path, **cfg_kw: Any) -> Orchestrator:
     dag = _make_dag(tmp_path)
     cfg = Config(
         repo_path=tmp_path,
