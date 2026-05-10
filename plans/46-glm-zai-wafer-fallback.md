@@ -21,10 +21,13 @@ quota backoff window instead of using Wafer Pass as the subscription fallback.
   before workers start.
 - The LiteLLM runbook now publishes both `127.0.0.1:4000` for host probes and
   `172.17.0.1:4000` for `host.docker.internal` traffic from task containers.
+- Client-side JSON validation now tolerates provider prose around a valid JSON
+  object, and malformed doer bookkeeping no longer short-circuits subtask
+  checking. The diff and witnesses remain the doer evidence.
 
-The fallback is intentionally narrow. Schema failures, empty diffs, and
-non-quota transport failures still surface through the normal JSON/subtask
-retry paths; only provider quota moves to the fallback model.
+The fallback is intentionally narrow. Checker/auditor schema failures, empty
+diffs, and non-quota transport failures still surface through the normal
+JSON/subtask retry paths; only provider quota moves to the fallback model.
 
 ## Verification
 
@@ -32,5 +35,10 @@ retry paths; only provider quota moves to the fallback model.
   primary and Wafer as fallback.
 - JSON protocol tests assert a 429 primary result invokes the fallback and
   preserves combined duration.
+- JSON protocol tests assert noisy proxy-routed output can still yield a valid
+  structured payload when it contains a schema-valid JSON object.
+- Subtask execution tests assert malformed doer bookkeeping continues to the
+  diff checker and witness runner instead of synthesizing a parse-failure
+  subtask rejection.
 - `_run_with_retry` has a regression test for immediate quota surfacing when a
   fallback wrapper is responsible for provider rotation.

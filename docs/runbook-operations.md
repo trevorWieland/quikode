@@ -41,7 +41,11 @@ proxy is healthy. The model registry gives it an automatic quota fallback to
 instead of sleeping inside the primary provider.
 
 Proxy-routed z.ai/Wafer profiles still use client-side JSON validation because
-LiteLLM drops Codex `output_schema` during Responses -> Chat translation.
+LiteLLM drops Codex `output_schema` during Responses -> Chat translation. The
+client-side layer accepts a schema-valid JSON object even when provider prose or
+markdown surrounds it. For doer roles, the envelope is bookkeeping only: if it
+is still malformed after repair, Quikode records that fact and grades the diff
+and witnesses instead of treating the envelope as the work.
 Watch for write-role transport failures that are not quota failures:
 
 - `quikode show <task-id>` shows repeated `doer_output_invalid` retries.

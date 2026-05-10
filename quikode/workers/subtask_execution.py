@@ -2,9 +2,10 @@
 
 The per-subtask loop runs the JsonAgent layer end-to-end:
 
-1. Doer (`subtask_doer`, writes-files) emits a `DoerEnvelope` (bookkeeping
-   only — never graded). Schema-validation failure surfaces a
-   `parse_failure` triage layer.
+1. Doer (`subtask_doer`, writes-files) may emit a `DoerEnvelope`
+   (bookkeeping only — never graded). Schema-validation failure is
+   preserved as telemetry but does not short-circuit diff grading; the
+   code diff and witnesses remain the evidence.
 2. The worker captures the actual evidence by reading the worktree diff
    via `git diff HEAD --no-color` (status excerpt + unified diff).
 3. Witness commands declared in `subtask.behavior_evidence_advanced` run
@@ -67,9 +68,9 @@ class _DoerCallResult:
     """Worker-side capture of one doer invocation.
 
     Carries the validated `DoerEnvelope` (or None on parse failure), the
-    raw envelope JSON for artifact storage, and the parse-error tuple so
-    the worker can surface `parse_failure` to triage if both attempts at
-    schema validation failed.
+    raw envelope JSON/prose for artifact storage, and the parse-error tuple
+    so the worker can report output-protocol drift while still grading the
+    diff.
     """
 
     envelope: DoerEnvelope | None
@@ -152,16 +153,20 @@ class SubtaskExecutionMixin:
         """Stash the validated envelope (or parse_errors), the worktree
         diff, and the witness results so `_check_subtask` and
         `_triage_subtask` read them without re-running the doer."""
-        self._last_doer_envelope = doer_result.envelope
+        self._last_doer_envelope = doer_result.envelope or self._fallback_doer_envelope(doer_result)
         self._last_doer_parse_errors = doer_result.parse_errors
         self._last_diff_text = self._compute_subtask_diff_excerpt()
-        if doer_result.envelope is None:
-            # Parse failure path: the JsonAgent layer already re-prompted
-            # once. Surface empty witness results; `_check_subtask` will
-            # synthesize a parse_failure FAIL outcome so triage runs.
-            self._last_witness_results = {}
-            return
         self._last_witness_results = self._run_scoped_witnesses(subtask)
+
+    def _fallback_doer_envelope(self: Any, doer_result: _DoerCallResult) -> DoerEnvelope:
+        details = "; ".join(doer_result.parse_errors or ("DoerEnvelope failed schema validation",))[:1200]
+        return DoerEnvelope(
+            summary="Doer bookkeeping envelope was invalid; grading the actual diff and witnesses.",
+            notes=(
+                "Doer output failed bookkeeping-envelope validation after retry. "
+                f"The envelope is informational only; parse details: {details}"
+            ),
+        )
 
     def _fetch_prior_doer_envelope(self: Any, subtask: Subtask, attempt: int) -> DoerEnvelope | None:
         """Plan 22 carry-forward: feed the next attempt the prior
@@ -251,19 +256,13 @@ class SubtaskExecutionMixin:
     def _check_subtask(self: Any, subtask: Subtask) -> _CheckerOutcome:
         """Plan 38 PR-B.5: always invoke the LLM checker against the diff.
 
-        Two paths:
-        * The doer's envelope failed schema validation twice → synthesize
-          a parse_failure FAIL outcome so triage runs without an LLM
-          checker call (no diff to grade against besides the structural
-          failure).
-        * Otherwise: invoke the JSON-mode checker against the diff +
-          witness output + DoerEnvelope (informational only).
+        The doer envelope is informational only. Even when the doer
+        emits malformed bookkeeping output, the worker still runs the
+        objective command and checker against the actual diff + witness
+        output.
         """
         fsm_runtime.enter_checking_subtask(self.store, self.node.id, note=subtask.id)
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.CHECKING.value)
-
-        if self._last_doer_envelope is None:
-            return self._synthesize_parse_failure_outcome(subtask)
 
         objective_outcome = self._run_subtask_check_command(subtask)
         if objective_outcome is not None:

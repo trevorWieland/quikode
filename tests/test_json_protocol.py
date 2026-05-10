@@ -237,6 +237,30 @@ def test_client_side_happy_path_returns_validated_instance() -> None:
     assert len(transport.invocations) == 1
 
 
+def test_client_side_accepts_trailing_json_envelope_in_noisy_output() -> None:
+    payload = json.dumps({"verdict": "progressing", "rationale": "trailing object"})
+    noisy = f"I ran the checks and here is the envelope:\n```json\n{payload}\n```"
+    transport = StubTransport(
+        name="codex-litellm-stub",
+        schema_enforcement="client_side",
+        responses=[
+            RawTransportResult(
+                raw_text=noisy,
+                structured=None,
+                rc=0,
+                transient=False,
+                duration_s=2.0,
+            )
+        ],
+    )
+    wrapper = JsonOutputAgent(transport=transport, output_schema=ProgressVerdict)
+    result = wrapper.invoke("hello", handle=object(), timeout=60)
+    assert isinstance(result.structured, ProgressVerdict)
+    assert result.structured.verdict == "progressing"
+    assert result.parse_errors == ()
+    assert len(transport.invocations) == 1
+
+
 # ---------- client_side: re-prompt-once on validation failure ----------
 
 
@@ -276,6 +300,37 @@ def test_client_side_validation_failure_triggers_one_reprompt_and_recovers() -> 
     assert "schema" in reprompt_text.lower()
     # The original prompt is preserved as preamble.
     assert "original prompt" in reprompt_text
+
+
+def test_client_side_reprompt_accepts_noisy_repair_output() -> None:
+    bad = "not even json"
+    good = json.dumps({"verdict": "uncertain", "rationale": "after re-prompt"})
+    transport = StubTransport(
+        name="codex-litellm-stub",
+        schema_enforcement="client_side",
+        responses=[
+            RawTransportResult(
+                raw_text=bad,
+                structured=None,
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+            ),
+            RawTransportResult(
+                raw_text=f"Done.\n{good}",
+                structured=None,
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+            ),
+        ],
+    )
+    wrapper = JsonOutputAgent(transport=transport, output_schema=ProgressVerdict)
+    result = wrapper.invoke("original prompt", handle=object(), timeout=60)
+    assert isinstance(result.structured, ProgressVerdict)
+    assert result.structured.verdict == "uncertain"
+    assert result.parse_errors == ()
+    assert len(transport.invocations) == 2
 
 
 def test_client_side_two_failures_surface_parse_errors() -> None:
@@ -410,7 +465,7 @@ def test_run_with_retry_retries_codex_auth_refresh_race(monkeypatch, tmp_path) -
             return (
                 99,
                 "",
-                'ERROR: Your access token could not be refreshed because your refresh token was already used. '
+                "ERROR: Your access token could not be refreshed because your refresh token was already used. "
                 '{"code":"refresh_token_reused"}',
             )
         return 0, '{"ok": true}', ""

@@ -3,8 +3,8 @@ triage pipeline on the JsonAgent layer.
 
 The doer / checker / triage agents are stubbed via `make_agent`; the
 witness runner and git helpers are mocked too. The tests verify wiring
-(envelope flows in, diff is captured, witnesses run, parse_failure
-synthesizes triage) rather than agent-CLI behavior.
+(envelope flows in, diff is captured, witnesses run, malformed doer
+bookkeeping does not replace diff grading) rather than agent-CLI behavior.
 """
 
 from __future__ import annotations
@@ -205,23 +205,39 @@ def test_clean_doer_envelope_runs_witnesses(tmp_path) -> None:
 # ---------- parse failure path ----------
 
 
-def test_doer_parse_failure_synthesizes_parse_failure_outcome(tmp_path) -> None:
-    """A doer envelope with parse_errors → checker synthesizes a
-    parse_failure FAIL outcome without invoking the LLM checker."""
+def test_doer_parse_failure_continues_to_diff_checker(tmp_path) -> None:
+    """Malformed doer bookkeeping is telemetry; the diff still gets checked."""
     cfg = _cfg(tmp_path)
     w = _build_worker(cfg)
-    w._last_doer_envelope = None
-    w._last_doer_parse_errors = ("summary: field required",)
-    with patch("quikode.workers.subtask_execution.fsm_runtime"):
+    with (
+        patch("quikode.workers.subtask_execution.run_scoped_witnesses", return_value={}),
+        patch.object(w, "_compute_subtask_diff_excerpt", return_value="diff --git a/x b/x"),
+    ):
+        w._cache_doer_state(
+            _S04_WEB_SUBTASK,
+            _DoerCallResult(envelope=None, raw_text="bad json", parse_errors=("summary: field required",)),
+        )
+    checker_out = SubtaskCheckerOutput(
+        verdict="pass",
+        findings=[SubtaskCheckerFinding(category="security", verdict="pass", rationale="diff is adequate")],
+        overall_assessment="diff passed",
+    )
+    stub = _StubAgent(_StubAgentResult(structured=checker_out, rc=0))
+    with (
+        patch("quikode.workers.subtask_execution.make_agent", return_value=stub),
+        patch("quikode.workers.subtask_execution.fsm_runtime"),
+    ):
         outcome = w._check_subtask(_S04_WEB_SUBTASK)
-    assert outcome.verdict is Verdict.FAIL
-    assert "parse_failure" in outcome.checker_text
-    assert "summary: field required" in outcome.checker_text
+    assert outcome.verdict is Verdict.PASS
+    assert "parse_failure" not in outcome.checker_text
+    assert w._last_doer_envelope is not None
+    assert "summary: field required" in w._last_doer_envelope.notes
+    assert stub.last_prompt is not None
+    assert "bookkeeping envelope was invalid" in stub.last_prompt
 
 
-def test_doer_parse_failure_skips_witness_run(tmp_path) -> None:
-    """When the envelope is None, `_cache_doer_state` skips the witness
-    runner — there's no validated bookkeeping to anchor the run."""
+def test_doer_parse_failure_still_runs_witnesses(tmp_path) -> None:
+    """Witnesses are evidence, so malformed bookkeeping must not suppress them."""
     cfg = _cfg(tmp_path)
     w = _build_worker(cfg)
     with (
@@ -232,8 +248,9 @@ def test_doer_parse_failure_skips_witness_run(tmp_path) -> None:
             _S04_WEB_SUBTASK,
             _DoerCallResult(envelope=None, raw_text="bad json", parse_errors=("err",)),
         )
-    mock_runner.assert_not_called()
-    assert w._last_witness_results == {}
+    mock_runner.assert_called_once()
+    assert w._last_doer_envelope is not None
+    assert "err" in w._last_doer_envelope.notes
 
 
 # ---------- checker happy + fail paths ----------

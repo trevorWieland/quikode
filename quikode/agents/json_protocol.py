@@ -319,14 +319,14 @@ Do not include any prose, markdown fences, or explanations. The output \
 must be parseable by `model_validate_json` directly."""
 
 
-def build_reprompt(prompt: str, error: ValidationError, schema: type[BaseModel]) -> str:
+def build_reprompt(prompt: str, error: ValidationError | str, schema: type[BaseModel]) -> str:
     """Build the structured re-prompt for `client_side` validation failure.
 
     Embeds the pydantic ValidationError repr (capped at 2000 chars) and
     the schema's `model_json_schema()` pretty-printed. The original
     prompt is preserved as preamble so the agent retains all task context.
     """
-    err_str = repr(error)[:2000]
+    err_str = (error if isinstance(error, str) else repr(error))[:2000]
     schema_str = json.dumps(schema.model_json_schema(), indent=2)
     feedback = _REPROMPT_TEMPLATE.format(error=err_str, schema=schema_str)
     return f"{prompt}\n\n---\n\n{feedback}"
@@ -512,8 +512,7 @@ def _validate_cli_native(
 
 def _missing_payload_error(raw: RawTransportResult) -> str:
     detail = (
-        "cli_native transport returned structured=None; "
-        "CLI envelope was missing the schema-validated payload"
+        "cli_native transport returned structured=None; CLI envelope was missing the schema-validated payload"
     )
     if raw.raw_text:
         detail += f"; raw output excerpt: {raw.raw_text[:1000]}"
@@ -617,14 +616,13 @@ def _validate_client_side(
 ) -> JsonAgentResult:
     """client_side enforcement — pydantic + structured re-prompt-once."""
     text = raw.raw_text or ""
-    try:
-        instance = output_schema.model_validate_json(text)
-    except ValidationError as first_err:
+    instance, first_errors = _validate_client_side_payload(text, output_schema)
+    if instance is None:
         return _retry_after_validation_error(
             transport,
             prompt,
             raw,
-            first_err=first_err,
+            first_errors=first_errors,
             output_schema=output_schema,
             handle=handle,
             log_path=log_path,
@@ -638,15 +636,14 @@ def _retry_after_validation_error(
     prompt: str,
     first: RawTransportResult,
     *,
-    first_err: ValidationError,
+    first_errors: tuple[str, ...],
     output_schema: type[BaseModel],
     handle: Any,
     log_path: Path | None,
     timeout: int,
 ) -> JsonAgentResult:
     """Re-prompt once after the first client-side parse failure."""
-    first_errors = tuple(_format_validation_errors(first_err))
-    reprompt_text = build_reprompt(prompt, first_err, output_schema)
+    reprompt_text = build_reprompt(prompt, "\n".join(first_errors), output_schema)
     second = transport.invoke(
         reprompt_text,
         output_schema=output_schema,
@@ -661,10 +658,8 @@ def _retry_after_validation_error(
             structured=None,
             parse_errors=first_errors,
         )
-    try:
-        instance = output_schema.model_validate_json(second.raw_text)
-    except ValidationError as second_err:
-        second_errors = tuple(_format_validation_errors(second_err))
+    instance, second_errors = _validate_client_side_payload(second.raw_text, output_schema)
+    if instance is None:
         return _result_from_two_raw(
             first,
             second,
@@ -672,6 +667,64 @@ def _retry_after_validation_error(
             parse_errors=first_errors + second_errors,
         )
     return _result_from_two_raw(first, second, structured=instance, parse_errors=())
+
+
+def _validate_client_side_payload(
+    text: str,
+    output_schema: type[BaseModel],
+) -> tuple[BaseModel | None, tuple[str, ...]]:
+    """Validate client-side JSON, tolerating provider prose around the object.
+
+    Some LiteLLM-routed providers ignore Codex's output schema and return a
+    final assistant message that contains planning prose plus a trailing JSON
+    envelope. Treat a schema-valid embedded object as the payload; otherwise
+    keep the original direct-parse error so callers can re-prompt or fail
+    closed without fabricating content.
+    """
+    try:
+        return output_schema.model_validate_json(text), ()
+    except ValidationError as direct_err:
+        direct_errors = tuple(_format_validation_errors(direct_err))
+
+    for candidate in _json_object_candidates(text):
+        try:
+            return output_schema.model_validate_json(candidate), ()
+        except ValidationError:
+            continue
+    return None, direct_errors
+
+
+def _json_object_candidates(text: str) -> tuple[str, ...]:
+    """Return balanced JSON-object substrings from newest to oldest."""
+    candidates: list[str] = []
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for idx, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(text[start : idx + 1])
+                start = None
+
+    return tuple(reversed(candidates[-20:]))
 
 
 def _invoke_with_validation(
