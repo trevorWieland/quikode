@@ -305,6 +305,18 @@ Respond ONLY with valid JSON matching this exact schema:
 Do not include any prose, markdown fences, or explanations. The output \
 must be parseable by `model_validate_json` directly."""
 
+_MISSING_PAYLOAD_REPROMPT_TEMPLATE = """Your previous response did not produce the required structured JSON payload.
+
+Reason:
+{error}
+
+Respond ONLY with valid JSON matching this exact schema:
+
+{schema}
+
+Do not include any prose, markdown fences, or explanations. The output \
+must be parseable by `model_validate_json` directly."""
+
 
 def build_reprompt(prompt: str, error: ValidationError, schema: type[BaseModel]) -> str:
     """Build the structured re-prompt for `client_side` validation failure.
@@ -316,6 +328,18 @@ def build_reprompt(prompt: str, error: ValidationError, schema: type[BaseModel])
     err_str = repr(error)[:2000]
     schema_str = json.dumps(schema.model_json_schema(), indent=2)
     feedback = _REPROMPT_TEMPLATE.format(error=err_str, schema=schema_str)
+    return f"{prompt}\n\n---\n\n{feedback}"
+
+
+def build_missing_payload_reprompt(prompt: str, error: str, schema: type[BaseModel]) -> str:
+    """Build a structured re-prompt when cli-native output produced no JSON.
+
+    Codex can occasionally exit rc=0 after editing files while leaving
+    `--output-last-message` empty. That is an output-protocol violation, not a
+    code failure, so retry it in-place before the worker burns subtask budget.
+    """
+    schema_str = json.dumps(schema.model_json_schema(), indent=2)
+    feedback = _MISSING_PAYLOAD_REPROMPT_TEMPLATE.format(error=error[:2000], schema=schema_str)
     return f"{prompt}\n\n---\n\n{feedback}"
 
 
@@ -460,13 +484,14 @@ def _validate_cli_native(
 ) -> JsonAgentResult:
     """cli_native enforcement with one repair prompt on Pydantic failure."""
     if raw.structured is None:
-        return _result_from_raw(
+        return _retry_after_cli_native_missing_payload(
+            transport,
+            prompt,
             raw,
-            structured=None,
-            parse_errors=(
-                "cli_native transport returned structured=None; "
-                "CLI envelope was missing the schema-validated payload",
-            ),
+            output_schema=output_schema,
+            handle=handle,
+            log_path=log_path,
+            timeout=timeout,
         )
     try:
         instance = output_schema.model_validate(raw.structured)
@@ -482,6 +507,60 @@ def _validate_cli_native(
             timeout=timeout,
         )
     return _result_from_raw(raw, structured=instance, parse_errors=())
+
+
+def _missing_payload_error(raw: RawTransportResult) -> str:
+    detail = (
+        "cli_native transport returned structured=None; "
+        "CLI envelope was missing the schema-validated payload"
+    )
+    if raw.raw_text:
+        detail += f"; raw output excerpt: {raw.raw_text[:1000]}"
+    if raw.stderr_excerpt:
+        detail += f"; stderr excerpt: {raw.stderr_excerpt[:1000]}"
+    return detail
+
+
+def _retry_after_cli_native_missing_payload(
+    transport: JsonAgentTransport,
+    prompt: str,
+    first: RawTransportResult,
+    *,
+    output_schema: type[BaseModel],
+    handle: Any,
+    log_path: Path | None,
+    timeout: int,
+) -> JsonAgentResult:
+    """Re-prompt once when cli_native exits cleanly with no structured output."""
+    first_error = _missing_payload_error(first)
+    reprompt_text = build_missing_payload_reprompt(prompt, first_error, output_schema)
+    second = transport.invoke(
+        reprompt_text,
+        output_schema=output_schema,
+        handle=handle,
+        log_path=log_path,
+        timeout=timeout,
+    )
+    if second.rc != 0 or second.structured is None:
+        errors = (first_error,)
+        if second.rc == 0 and second.structured is None:
+            errors += (_missing_payload_error(second),)
+        return _result_from_two_raw(
+            first,
+            second,
+            structured=None,
+            parse_errors=errors,
+        )
+    try:
+        instance = output_schema.model_validate(second.structured)
+    except ValidationError as second_err:
+        return _result_from_two_raw(
+            first,
+            second,
+            structured=None,
+            parse_errors=(first_error, *tuple(_format_validation_errors(second_err))),
+        )
+    return _result_from_two_raw(first, second, structured=instance, parse_errors=())
 
 
 def _retry_after_cli_native_validation_error(
@@ -611,7 +690,7 @@ def _invoke_with_validation(
         log_path=log_path,
         timeout=timeout,
     )
-    if raw.rc != 0 or (raw.raw_text is None and raw.structured is None):
+    if raw.rc != 0:
         return _result_from_raw(raw, structured=None, parse_errors=())
     if transport.schema_enforcement == "cli_native":
         return _validate_cli_native(

@@ -148,6 +148,66 @@ def test_cli_native_second_invalid_structured_dict_surfaces_parse_errors() -> No
     assert len(transport.invocations) == 2
 
 
+def test_cli_native_missing_payload_gets_one_reprompt_and_recovers() -> None:
+    transport = StubTransport(
+        name="codex-direct-stub",
+        schema_enforcement="cli_native",
+        responses=[
+            RawTransportResult(
+                raw_text=None,
+                structured=None,
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+                stderr_excerpt="[quikode] codex output was empty",
+            ),
+            RawTransportResult(
+                raw_text=None,
+                structured={"verdict": "uncertain", "rationale": "after repair"},
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+            ),
+        ],
+    )
+    wrapper = JsonOutputAgent(transport=transport, output_schema=ProgressVerdict)
+    result = wrapper.invoke("hello", handle=object(), timeout=60)
+    assert isinstance(result.structured, ProgressVerdict)
+    assert result.structured.verdict == "uncertain"
+    assert result.parse_errors == ()
+    assert len(transport.invocations) == 2
+    assert "did not produce the required structured JSON payload" in transport.invocations[1]
+
+
+def test_cli_native_second_missing_payload_surfaces_parse_errors() -> None:
+    transport = StubTransport(
+        name="codex-direct-stub",
+        schema_enforcement="cli_native",
+        responses=[
+            RawTransportResult(
+                raw_text=None,
+                structured=None,
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+            ),
+            RawTransportResult(
+                raw_text=None,
+                structured=None,
+                rc=0,
+                transient=False,
+                duration_s=1.0,
+            ),
+        ],
+    )
+    wrapper = JsonOutputAgent(transport=transport, output_schema=ProgressVerdict)
+    result = wrapper.invoke("hello", handle=object(), timeout=60)
+    assert result.structured is None
+    assert len(result.parse_errors) == 2
+    assert "CLI envelope was missing" in result.parse_errors[0]
+    assert len(transport.invocations) == 2
+
+
 # ---------- client_side: happy path on first try ----------
 
 
