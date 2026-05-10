@@ -165,6 +165,12 @@ class Config(BaseModel):
         le=10,
         description=desc.SUBTASK_TRANSPORT_STOP_LOSS,
     )
+    subtask_cannot_reproduce_stop_loss_count: int = Field(
+        default=2,
+        ge=2,
+        le=10,
+        description=desc.SUBTASK_CANNOT_REPRODUCE_STOP_LOSS,
+    )
     subtask_transient_max_retries: int = Field(
         default=5,
         ge=0,

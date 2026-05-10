@@ -267,6 +267,12 @@ def load_config(root: Path | None = None) -> Config:
                 defaults.subtask_transport_stop_loss_count,
             )
         ),
+        subtask_cannot_reproduce_stop_loss_count=int(
+            raw.get(
+                "subtask_cannot_reproduce_stop_loss_count",
+                defaults.subtask_cannot_reproduce_stop_loss_count,
+            )
+        ),
         subtask_transient_max_retries=int(
             raw.get("subtask_transient_max_retries", defaults.subtask_transient_max_retries)
         ),

@@ -380,14 +380,14 @@ def test_run_doer_agent_records_call_with_subtask_id(tmp_path) -> None:
     assert finished.kwargs["cost_usd"] == 0.05
 
 
-# ---------- plan 51: empty-diff transport-class failure ----------
+# ---------- plan 51 + 53: empty-diff branch dispatch ----------
 
 
-def test_check_subtask_empty_diff_short_circuits_to_synthesized_outcome(tmp_path) -> None:
-    """Plan 51: when the doer produced no diff (`_last_diff_text == ""`),
-    `_check_subtask` synthesizes a FAIL outcome with the fixed
-    transport-failure prefix and skips the LLM checker entirely. No
-    `make_agent("subtask_checker")` call should fire."""
+def test_check_subtask_empty_diff_with_green_gates_spec_kind_is_no_op_done(tmp_path) -> None:
+    """Plan 53: empty diff + green objective gate + green witnesses on
+    a `kind != "fixup_ci"` subtask synthesizes a PASS outcome (no-op
+    DONE path) without invoking the LLM checker. The dedicated
+    `subtask_no_op_done:<id>` artifact records the verification."""
     cfg = _cfg(tmp_path)
     w = _build_worker(cfg)
     w._last_diff_text = ""
@@ -404,16 +404,83 @@ def test_check_subtask_empty_diff_short_circuits_to_synthesized_outcome(tmp_path
     ):
         outcome = w._check_subtask(_S04_WEB_SUBTASK)
 
+    assert outcome.verdict is Verdict.PASS
+    assert outcome.transient is False
+    assert outcome.rc is None
+    assert outcome.checker_text.startswith("VERDICT: PASS\nROOT_CAUSE: subtask no-op DONE")
+    assert make_agent_calls == []
+    artifact_kinds = [c[0][1] for c in w.store.add_artifact.call_args_list]
+    assert f"subtask_checker:{_S04_WEB_SUBTASK.id}" in artifact_kinds
+    assert f"subtask_no_op_done:{_S04_WEB_SUBTASK.id}" in artifact_kinds
+
+
+def test_check_subtask_empty_diff_with_green_gates_fixup_ci_is_cannot_reproduce(tmp_path) -> None:
+    """Plan 53: empty diff + green objective gate + green witnesses on
+    a `kind="fixup_ci"` subtask synthesizes a FAIL outcome with the
+    cannot_reproduce prefix and persists the
+    `subtask_cannot_reproduce:<id>` artifact. The new K=2 stop-loss
+    fires on the second occurrence of this signature; the LLM checker
+    is never invoked."""
+    cfg = _cfg(tmp_path)
+    w = _build_worker(cfg)
+    w._last_diff_text = ""
+    w._last_witness_results = {}
+    make_agent_calls: list[str] = []
+
+    def fake_make_agent(role: str, _cfg: Config) -> Any:
+        make_agent_calls.append(role)
+        raise AssertionError(f"checker should be skipped on empty diff; got make_agent({role!r})")
+
+    fixup_ci_subtask = _S04_WEB_SUBTASK.model_copy(update={"kind": "fixup-ci"})
+    with (
+        patch("quikode.workers.subtask_execution.make_agent", side_effect=fake_make_agent),
+        patch("quikode.workers.subtask_execution.fsm_runtime"),
+    ):
+        outcome = w._check_subtask(fixup_ci_subtask)
+
     assert outcome.verdict is Verdict.FAIL
     assert outcome.transient is False
     assert outcome.rc is None
+    assert outcome.checker_text.startswith("VERDICT: FAIL\nROOT_CAUSE: cannot reproduce CI failure locally")
+    assert make_agent_calls == []
+    artifact_kinds = [c[0][1] for c in w.store.add_artifact.call_args_list]
+    assert f"subtask_checker:{fixup_ci_subtask.id}" in artifact_kinds
+    assert f"subtask_cannot_reproduce:{fixup_ci_subtask.id}" in artifact_kinds
+
+
+def test_check_subtask_empty_diff_with_failed_witness_is_transport(tmp_path) -> None:
+    """Plan 51 preserved: when the witnesses fail (rc != 0 or
+    classification == FAIL) the empty-diff path still routes through
+    the plan-51 transport-class FAIL prefix so the existing transport
+    stop-loss budget protects against doer-model regressions."""
+    cfg = _cfg(tmp_path)
+    w = _build_worker(cfg)
+    w._last_diff_text = ""
+    w._last_witness_results = {
+        "B-0061-test-positive": {
+            "rc": 1,
+            "classification": "FAIL",
+            "stdout_excerpt": "",
+            "stderr_excerpt": "ouch",
+            "runtime_ms": 50,
+            "note": "failed",
+        }
+    }
+    make_agent_calls: list[str] = []
+
+    def fake_make_agent(role: str, _cfg: Config) -> Any:
+        make_agent_calls.append(role)
+        raise AssertionError(f"checker should be skipped on empty diff; got make_agent({role!r})")
+
+    with (
+        patch("quikode.workers.subtask_execution.make_agent", side_effect=fake_make_agent),
+        patch("quikode.workers.subtask_execution.fsm_runtime"),
+    ):
+        outcome = w._check_subtask(_S04_WEB_SUBTASK)
+
+    assert outcome.verdict is Verdict.FAIL
     assert outcome.checker_text.startswith("VERDICT: FAIL\nROOT_CAUSE: doer produced no diff")
     assert make_agent_calls == []
-    # Both the synthesized checker artifact and the dedicated empty-diff
-    # artifact should land in the store for `qk show` visibility.
-    artifact_kinds = [c[0][1] for c in w.store.add_artifact.call_args_list]
-    assert f"subtask_checker:{_S04_WEB_SUBTASK.id}" in artifact_kinds
-    assert f"subtask_empty_diff:{_S04_WEB_SUBTASK.id}" in artifact_kinds
 
 
 def test_check_subtask_non_empty_diff_still_invokes_llm_checker(tmp_path) -> None:

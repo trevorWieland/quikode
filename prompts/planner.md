@@ -138,6 +138,36 @@ you if any fails:
    construction, but your earlier subtasks should also pin specificity
    where it adds value (e.g. give `security` to the api subtask, give
    `test-coverage` to the tests subtask, ...).
+
+   **Evidence-fit rule (hard).** Only declare a rubric target on a
+   subtask if that subtask's *actual scope* plausibly produces direct
+   evidence for that target. Coverage is satisfied as long as each
+   category appears on AT LEAST ONE earlier subtask + Z-99 — you do
+   NOT need to pile every target onto every slice. Common
+   anti-patterns to avoid:
+   - Surface work (CLI command wiring, route registration, error-type
+     declarations, config plumbing) does NOT produce `performance`
+     evidence. Performance evidence requires bounded traversal,
+     avoided I/O, batching, streaming, or a measurable cost claim
+     made tangible in the diff.
+   - Surface work does NOT produce `scalability` evidence. Scalability
+     wants pagination, indexed lookups, fan-out limits, cache
+     boundaries, or back-pressure.
+   - Test-only subtasks do NOT produce `extensibility` or
+     `type-strictness` evidence; those belong to the contract /
+     domain / app-services subtasks.
+   - "Adjacent good engineering" (clean factoring, typed errors)
+     does NOT carry a rubric target it isn't structurally responsible
+     for. A subtask that adds a typed error boundary earns
+     `type-strictness` and possibly `security` — it does not earn
+     `performance` even if the new code is fast.
+
+   The checker grades whether the diff substantively advances each
+   declared target. A rubric target that the subtask's scope cannot
+   produce evidence for is a checker FAIL waiting to happen — and
+   the doer cannot rescue it without overstepping the subtask
+   boundary. When in doubt, leave the target off this subtask and
+   let Z-99 pick it up; do not over-declare.
 2. **Every behavior evidence id** in `node.expected_evidence` must
    appear in **exactly one** subtask's `behavior_evidence_advanced`.
    This is a partition, not a cover — duplicates are an error.

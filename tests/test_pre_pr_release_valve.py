@@ -9,7 +9,12 @@ from quikode.config import Config
 from quikode.dag import Node
 from quikode.state import Store
 from quikode.workers.pr_lifecycle import PrLifecycleWorkerMixin
-from quikode.workers.pre_pr import _pre_pr_release_valve_report, _pre_pr_structural_failure_report
+from quikode.workers.pre_pr_reports import (
+    release_valve_report as _pre_pr_release_valve_report,
+)
+from quikode.workers.pre_pr_reports import (
+    structural_failure_report as _pre_pr_structural_failure_report,
+)
 
 
 def _cfg(tmp_path: Path, **overrides) -> Config:

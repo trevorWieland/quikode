@@ -91,6 +91,7 @@ def _wire_subtask_to_runtime_dict(spec: SubtaskSpec) -> dict[str, Any]:
             {"doc_path": r.doc_path, "section": r.section} for r in spec.architecture_referenced
         ],
         "behavior_evidence_advanced": list(spec.behavior_evidence_advanced),
+        "root_cause_hypothesis": spec.root_cause_hypothesis,
     }
 
 

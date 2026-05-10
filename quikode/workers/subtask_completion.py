@@ -8,6 +8,7 @@ from typing import Any, Literal
 from quikode.state import SubtaskState
 from quikode.subtask_schema import Subtask
 from quikode.workers.outcomes import SubtaskPassOutcome as _SubtaskPassOutcome
+from quikode.workers.subtask_execution import _NO_OP_DONE_CHECKER_PREFIX
 
 
 class _TaskWorkerGlobals:
@@ -22,14 +23,24 @@ class SubtaskCompletionMixin:
     def _mark_subtask_done(self: Any, subtask: Subtask) -> None:
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.DONE.value)
 
-    def _handle_subtask_pass(self: Any, subtask: Subtask) -> _SubtaskPassOutcome:
+    def _handle_subtask_pass(self: Any, subtask: Subtask, *, checker_text: str = "") -> _SubtaskPassOutcome:
+        # Plan 53: the no-op DONE path synthesizes a PASS outcome on an
+        # empty diff + green gates. There is nothing to commit and
+        # nothing to push — running the pre-commit gate / `git
+        # commit` / `git push` would either fail or produce a
+        # spurious empty commit. Mark the subtask DONE and short-
+        # circuit to "settled" without touching the branch.
+        if checker_text.startswith(_NO_OP_DONE_CHECKER_PREFIX):
+            self._mark_subtask_done(subtask)
+            return _SubtaskPassOutcome(kind="settled")
+
         gate_ok, gate_output = self._pre_commit_gate(subtask)
         if not gate_ok:
             self.store.increment_subtask_pre_commit_failures(self.node.id, subtask.id)
-            checker_text = (
+            checker_fail = (
                 f"VERDICT: FAIL\nROOT_CAUSE: pre-commit hook failed\nDETAILS:\n{gate_output[:4000]}"
             )
-            return _SubtaskPassOutcome(kind="fail", synthesized_checker_text=checker_text)
+            return _SubtaskPassOutcome(kind="fail", synthesized_checker_text=checker_fail)
 
         branch = str(self._row()["branch"])
         commit_msg = f"subtask({subtask.id}): {subtask.title}"

@@ -169,6 +169,16 @@ class Subtask(BaseModel):
             "validate_evidence_partition."
         ),
     )
+    root_cause_hypothesis: str = Field(
+        default="",
+        max_length=500,
+        description=(
+            "Plan 53: the fixup planner's per-subtask hypothesis about WHY "
+            "the gate failed (root-cause tracing), not just WHAT failed. "
+            "Required by the prompt for `kind='fixup-ci'` subtasks; default "
+            "empty preserves back-compat with pre-plan-53 artifacts."
+        ),
+    )
 
     @field_validator(
         "acceptance",

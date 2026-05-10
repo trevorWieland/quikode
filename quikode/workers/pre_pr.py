@@ -5,8 +5,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from quikode import fsm_runtime, pre_pr_audit, runtime_shutdown
-from quikode.config import Config
+from quikode import fsm_runtime, runtime_shutdown
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import FixupPlan
 from quikode.workers.fixup_coverage import (
@@ -17,6 +16,11 @@ from quikode.workers.fixup_coverage import (
 )
 from quikode.workers.outcomes import WorkerOutcome
 from quikode.workers.pre_pr_audit_stages import PrePrAuditStageMixin
+from quikode.workers.pre_pr_reports import (
+    DEFERRED_PRE_PR_FINDINGS_ARTIFACT,
+    release_valve_report,
+    structural_failure_report,
+)
 
 
 class _TaskWorkerGlobals:
@@ -25,84 +29,6 @@ class _TaskWorkerGlobals:
 
 
 _tw = _TaskWorkerGlobals()
-
-
-DEFERRED_PRE_PR_FINDINGS_ARTIFACT = "pre_pr_deferred_findings"
-_NON_DEFERABLE_FINDING_KINDS = {
-    "config_error",
-    "bootstrap_error",
-    "infra",
-    "parse_failure",
-    "render_failure",
-    "transport",
-}
-
-
-def _pre_pr_release_valve_report(cfg: Config, cycle_result: Any) -> str | None:
-    """Return the PR-body/artifact report when the release valve may open
-    a PR with deferred quality findings. None means the normal fixup loop
-    must continue.
-    """
-    after_cycles = int(cfg.pre_pr_release_valve_after_cycles)
-    failed = list(cycle_result.failed_stages)
-    if after_cycles < 0 or int(cycle_result.cycle) < after_cycles or not failed:
-        return None
-    failed_names = {s.name for s in failed}
-    if "local_ci" in failed_names or "behavior" in failed_names:
-        return None
-    deferable = set(cfg.pre_pr_release_valve_defer_stages)
-    if not failed_names.issubset(deferable):
-        return None
-
-    critical_count = 0
-    has_non_deferable_finding = False
-    for stage in failed:
-        if not stage.findings:
-            has_non_deferable_finding = True
-        for finding in list(stage.findings or []):
-            kind = str(finding.get("kind") or "")
-            if kind in _NON_DEFERABLE_FINDING_KINDS:
-                has_non_deferable_finding = True
-            if str(finding.get("severity") or "").lower() == "critical":
-                critical_count += 1
-    if has_non_deferable_finding or critical_count > int(cfg.pre_pr_release_valve_max_critical_findings):
-        return None
-
-    rendered = pre_pr_audit.merge_failed_stage_reports(failed)
-    return (
-        "## Deferred pre-PR audit findings\n\n"
-        f"quikode opened this PR after pre-PR audit cycle {cycle_result.cycle} "
-        f"because `local_ci` and `behavior` passed, and only configured "
-        "quality-audit content findings remained.\n\n"
-        f"Deferred stage(s): {', '.join(sorted(failed_names))}.\n\n"
-        "---\n\n"
-        f"{rendered}"
-    )
-
-
-def _pre_pr_structural_failure_report(cycle_result: Any) -> str | None:
-    """Return a block report when an audit stage failed structurally.
-
-    These are quikode/runtime failures, not code-review findings. Planning
-    fixup subtasks for them creates toxic work: the doer cannot fix an
-    auditor parse failure or transport/config failure in the target repo.
-    """
-    failed = list(cycle_result.failed_stages)
-    structural: list[str] = []
-    for stage in failed:
-        for finding in list(stage.findings or []):
-            kind = str(finding.get("kind") or "")
-            if kind in _NON_DEFERABLE_FINDING_KINDS:
-                structural.append(f"{stage.name}:{kind}")
-    if not structural:
-        return None
-    return (
-        "pre-PR audit stage failed structurally; blocking instead of "
-        "planning target-repo fixups: "
-        + ", ".join(structural)
-        + "\n\n"
-        + pre_pr_audit.merge_failed_stage_reports(failed)
-    )
 
 
 class PrePrWorkerMixin(PrePrAuditStageMixin):
@@ -117,6 +43,7 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
         review_threads_block: str | None = None,
         triage_root_cause: str | None = None,
         expected_finding_ids: list[str] | None = None,
+        local_ci_at_head: tuple[bool, str] | None = None,
     ) -> WorkerOutcome | None:
         """Plan a fixup round, append the slices to the subtasks table, and
         run them through the same per-subtask machinery as spec subtasks.
@@ -146,6 +73,7 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
             review_threads_block=review_threads_block,
             triage_root_cause=triage_root_cause,
             audit_findings=expected_finding_ids,
+            local_ci_at_head=local_ci_at_head,
         )
         # Completeness check (Plan 33 PR-B): for audit-driven fixup rounds,
         # every `expected_finding_ids` entry must be covered. The driver-
@@ -178,6 +106,7 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
                     review_threads_block=review_threads_block,
                     triage_root_cause=augmented_root,
                     audit_findings=expected_finding_ids,
+                    local_ci_at_head=local_ci_at_head,
                 )
                 if fixup_plan is not None and fixup_plan.subtasks:
                     still_missing = self._missing_finding_coverage(fixup_plan, expected_finding_ids)
@@ -262,6 +191,7 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
         review_threads_block: str | None,
         triage_root_cause: str | None,
         audit_findings: list[str] | None = None,
+        local_ci_at_head: tuple[bool, str] | None = None,
     ) -> FixupPlan | None:
         """Run the fixup planner agent (JsonAgent layer) + validate.
 
@@ -295,6 +225,7 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
             ci_excerpt=ci_excerpt,
             review_threads_block=review_threads_block,
             triage_root_cause=triage_root_cause,
+            local_ci_at_head=local_ci_at_head,
         )
         self._write_log_header(f"FIXUP PLANNER {kind} round {round_no}", prompt)
         return run_fixup_planner_loop(
@@ -468,12 +399,12 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
                 )
                 return None
 
-            release_valve_report = _pre_pr_release_valve_report(self.cfg, cycle_result)
-            if release_valve_report is not None:
+            valve_report = release_valve_report(self.cfg, cycle_result)
+            if valve_report is not None:
                 self.store.add_artifact(
                     self.node.id,
                     DEFERRED_PRE_PR_FINDINGS_ARTIFACT,
-                    release_valve_report,
+                    valve_report,
                 )
                 _tw.log.info(
                     "task %s: pre-pr release valve opened after cycle %d; deferred failed stage(s): %s",
@@ -483,19 +414,19 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
                 )
                 return None
 
-            structural_failure_report = _pre_pr_structural_failure_report(cycle_result)
-            if structural_failure_report is not None:
+            structural_report = structural_failure_report(cycle_result)
+            if structural_report is not None:
                 self.store.add_artifact(
                     self.node.id,
                     f"pre_pr_audit:cycle_{cycle}",
-                    structural_failure_report,
+                    structural_report,
                 )
                 note = f"pre-pr cycle {cycle} structural audit failure; blocked instead of fixup planning"
                 fsm_runtime.block_current(
                     self.store,
                     self.node.id,
                     note=note,
-                    last_error=structural_failure_report[:1000],
+                    last_error=structural_report[:1000],
                 )
                 return WorkerOutcome(State.BLOCKED, note)
 

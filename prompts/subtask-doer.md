@@ -66,6 +66,42 @@ verify that your work meets the targeted contract; if local CI is red,
 the diff is not done.{% else %}_(no per-subtask check command configured — verify the diff against the rubric / standards / behavior contract directly.)_
 {% endif %}
 
+{% if subtask.kind == "fixup_ci" or subtask.kind == "fixup-ci" %}
+### 6a. Reproduce-before-fix rule (Plan 53 — `kind="fixup_ci"`)
+
+Before declaring this CI-fix subtask done, you MUST attempt to
+reproduce the CI failure under fresh-state conditions:
+
+* **For dependency-graph-related fixes:** wipe the relevant build
+  caches before re-running the failing recipe. For Rust, that means
+  `cargo clean` (or at least removing the affected crate's `target/`
+  subdir). For TypeScript / pnpm, that means `rm -rf node_modules`
+  followed by `pnpm install --frozen-lockfile`. For Python with
+  build artifacts, wipe `.venv` / `__pycache__` / generated dirs.
+* **For codegen drift:** invoke the FULL chain producing the
+  generated artifact's inputs, NOT just the final-step generator.
+  Read the project's `justfile` / `Makefile` / `pnpm` scripts and
+  follow the recipe dependencies upward — the failing recipe almost
+  always sits at the end of a chain whose intermediate steps must
+  re-run for the regeneration to be honest.
+* **If the failure does NOT reproduce after a clean rebuild:** the
+  fix is environmental — local container caches mask drift the
+  GitHub CI runner detects from a fresh state. Running the CI
+  runner's suggested command alone will produce no diff and the
+  worker will detect that as `failure_layer=cannot_reproduce`. In
+  that case, write a short note in your stop message naming what
+  you tried (which caches you wiped, which chain you ran, what was
+  green) and stop — do NOT fabricate edits to look productive.
+{% if subtask.root_cause_hypothesis %}
+The fixup planner's hypothesis for THIS subtask was:
+
+> {{ subtask.root_cause_hypothesis }}
+
+Treat that as the starting investigation lane, but verify it before
+committing — the hypothesis is a guide, not a directive.
+{% endif %}
+{% endif %}
+
 Bring the work over the bar in this attempt — there is no
 "leave for follow-up" lane in this loop. If you cannot complete a
 piece, the next attempt's triage agent will name what's missing; do

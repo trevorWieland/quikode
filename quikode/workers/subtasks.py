@@ -13,10 +13,12 @@ from quikode.agent_schemas import PlannerOutput
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import PlanValidationError, Subtask
 from quikode.types import Verdict
+from quikode.workers import subtask_stop_loss
 from quikode.workers.outcomes import WorkerOutcome
 from quikode.workers.planner_driver import PlannerDriverMixin, _wire_to_runtime_plan
 from quikode.workers.subtask_completion import SubtaskCompletionMixin
 from quikode.workers.subtask_execution import (
+    _CANNOT_REPRODUCE_CHECKER_PREFIX,
     _EMPTY_DIFF_CHECKER_PREFIX,
     SubtaskExecutionMixin,
 )
@@ -323,7 +325,7 @@ class SubtaskWorkerMixin(
             consecutive_transients = 0
             checker_text = outcome.checker_text
             if outcome.verdict is Verdict.PASS:
-                settled, retry, checker_text = self._handle_passed_subtask(subtask)
+                settled, retry, checker_text = self._handle_passed_subtask(subtask, outcome.checker_text)
                 if settled:
                     return True, None
                 if retry:
@@ -338,8 +340,8 @@ class SubtaskWorkerMixin(
                 return False, progress_block
         return False, None
 
-    def _handle_passed_subtask(self: Any, subtask: Subtask) -> tuple[bool, bool, str]:
-        pass_outcome = self._handle_subtask_pass(subtask)
+    def _handle_passed_subtask(self: Any, subtask: Subtask, checker_text: str) -> tuple[bool, bool, str]:
+        pass_outcome = self._handle_subtask_pass(subtask, checker_text=checker_text)
         if pass_outcome.kind == "settled":
             fsm_runtime.enter_committing(self.store, self.node.id, note=f"{subtask.id} passed")
             fsm_runtime.enter_pushing(self.store, self.node.id, note=f"{subtask.id} committed and pushed")
@@ -389,6 +391,26 @@ class SubtaskWorkerMixin(
             )
             failure_layer: str | None = "transport"
             self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", triage_notes)
+        elif checker_text.startswith(_CANNOT_REPRODUCE_CHECKER_PREFIX):
+            # Plan 53: empty-diff + green-gates + kind=fixup_ci means
+            # the doer cannot reproduce the GitHub CI failure locally.
+            # Skip the LLM triage call (it has nothing to teach against
+            # — the local state is green) and stamp
+            # `failure_layer="cannot_reproduce"` directly so the new
+            # K=2 stop-loss fires on the second occurrence.
+            triage_notes = (
+                "TRIAGE CANNOT_REPRODUCE\n"
+                "failure_layer: cannot_reproduce\n"
+                "root_cause: GitHub CI failed but the local container's "
+                "objective gate and scoped witnesses are green on an "
+                "empty diff. Likely environmental drift (cached "
+                "intermediate artifacts, pinned-version divergence, or "
+                "missing checked-in generated file). No LLM triage "
+                "call needed; operator should investigate the "
+                "environmental delta."
+            )
+            failure_layer = "cannot_reproduce"
+            self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", triage_notes)
         else:
             triage_notes, failure_layer = self._triage_subtask(subtask, attempt, hard_max, checker_text)
         self.store.update_subtask(
@@ -422,73 +444,33 @@ class SubtaskWorkerMixin(
 
     def _maybe_signature_stop_loss(self: Any, subtask: Subtask) -> str | None:
         """Block when the last K non-transient retry_reasons indicate
-        a transport-class failure storm (plan 51), or when the last N
-        share the same `(category, signature)` tuple (plan 23).
-
-        The transport stop-loss runs first and at a much lower cap
-        (default K=3) because no amount of retry on a broken transport
-        will help — the doer model is silently producing empty diffs
-        and the right operator action is a model swap, not more
-        attempts. The same-signature stop-loss (plan 23) stays as-is
-        for non-transport layers, where productive retry IS possible
-        when the failure shifts category.
-
-        Both checks are independent of `_maybe_record_progress_block` —
-        that one relies on the progress-check agent's verdict, which
-        can rate different-but-equally-invalid output as 'progressing'
-        and so misses retry storms with stable failure signatures.
+        a cannot_reproduce / transport / same-signature storm. Each
+        check is delegated to a pure helper in
+        `quikode.workers.subtask_stop_loss` so the helpers stay
+        independently testable; ordering matters: cannot_reproduce
+        runs first (K=2), then transport (K=3), then same-signature
+        (K=N). All three checks are independent of
+        `_maybe_record_progress_block` — that one relies on the
+        progress-check agent's verdict, which can rate different-but-
+        equally-invalid output as 'progressing' and so misses retry
+        storms with stable failure signatures.
         """
-        transport_block = self._maybe_transport_stop_loss(subtask)
-        if transport_block is not None:
-            return transport_block
-        n = self.cfg.subtask_same_signature_block_count
-        if n < 2:
-            return None
-        sigs = self.store.last_n_retry_signatures(self.node.id, subtask.id, limit=n)
-        if len(sigs) < n:
-            return None
-        first = sigs[0]
-        if not all(s == first for s in sigs):
-            return None
-        cat, sig = first
-        sig_short = sig[:120]
-        return (
-            f"same-signature stop-loss: last {n} non-transient retries all "
-            f"share category={cat!r} signature={sig_short!r}"
+        cap_cr = self.cfg.subtask_cannot_reproduce_stop_loss_count
+        cap_tr = self.cfg.subtask_transport_stop_loss_count
+        cap_ss = self.cfg.subtask_same_signature_block_count
+        max_cap = max(cap_cr, cap_tr, cap_ss)
+        # One DB read covers all three checks; each helper slices the
+        # tail it needs.
+        sigs_all = self.store.last_n_retry_signatures(self.node.id, subtask.id, limit=max_cap)
+        block = subtask_stop_loss.maybe_cannot_reproduce_stop_loss(
+            subtask_id=subtask.id, sigs=sigs_all[:cap_cr], k=cap_cr
         )
-
-    def _maybe_transport_stop_loss(self: Any, subtask: Subtask) -> str | None:
-        """Plan 51: BLOCK after K consecutive non-transient retries
-        whose retry signature carries `,layer=transport` AND whose
-        category is a content-failure category (`checker_fail` or
-        `doer_output_invalid` — the two categories the empty-diff
-        synthesized outcome routes through `retry_classify`).
-
-        K is `cfg.subtask_transport_stop_loss_count` (default 3) and
-        is intentionally smaller than the same-signature cap. The
-        block message is operator-clear about the recommended action:
-        swap `subtask_doer_model` to a known-reliable model and
-        resume.
-        """
-        k = self.cfg.subtask_transport_stop_loss_count
-        if k < 2:
-            return None
-        sigs = self.store.last_n_retry_signatures(self.node.id, subtask.id, limit=k)
-        if len(sigs) < k:
-            return None
-        for cat, sig in sigs:
-            if cat not in ("checker_fail", "doer_output_invalid"):
-                return None
-            if ",layer=transport" not in sig:
-                return None
-        return (
-            f"transport stop-loss: last {k} non-transient retries had empty "
-            f"diffs (layer=transport). The doer model is not producing work "
-            f"product. Check `cfg.subtask_doer_model` and the underlying "
-            f"transport (litellm bridge, codex profile, provider quota). "
-            f"Operator action: swap subtask_doer_model to a known-reliable "
-            f"model and resume."
-        )
+        if block is not None:
+            return block
+        block = subtask_stop_loss.maybe_transport_stop_loss(sigs=sigs_all[:cap_tr], k=cap_tr)
+        if block is not None:
+            return block
+        return subtask_stop_loss.maybe_same_signature_stop_loss(sigs=sigs_all[:cap_ss], n=cap_ss)
 
     def _maybe_record_progress_block(self: Any, subtask: Subtask, attempt: int) -> str | None:
         if not self._should_run_progress_check(attempt):

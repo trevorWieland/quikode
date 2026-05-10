@@ -207,6 +207,7 @@ def fixup_planner_prompt(
     ci_excerpt: str | None = None,
     review_threads_block: str | None = None,
     triage_root_cause: str | None = None,
+    local_ci_at_head: tuple[bool, str] | None = None,
 ) -> str:
     """Render the fixup-planner prompt.
 
@@ -219,6 +220,12 @@ def fixup_planner_prompt(
     `fixup-pre-pr-audit`. `trigger` is a human-readable label echoed
     back into the prompt. All failure-context fields are optional —
     pass only what's available for the current trigger.
+
+    Plan 53: `local_ci_at_head` is the post-PR FSM's local-CI-at-HEAD
+    result captured BEFORE invoking the planner. `(passed, excerpt)`
+    where `passed` is the rc==0 truth and `excerpt` is a short
+    stderr/stdout snippet. None means we didn't run the local check
+    (e.g. trigger is not CI-failure-driven).
     """
     return render(
         cfg,
@@ -236,6 +243,8 @@ def fixup_planner_prompt(
         ci_excerpt=ci_excerpt,
         review_threads_block=review_threads_block,
         triage_root_cause=triage_root_cause,
+        local_ci_at_head=local_ci_at_head,
+        local_ci_command=cfg.local_ci_command,
     )
 
 

@@ -30,6 +30,17 @@ SUBTASK_SAME_SIGNATURE_BLOCK = (
     "the progress-check agent rates 'progressing'. Plan 23."
 )
 
+SUBTASK_CANNOT_REPRODUCE_STOP_LOSS = (
+    "Plan 53: K consecutive `kind=fixup_ci` subtask attempts that "
+    "produced empty diff + green local gates before BLOCKING. The "
+    "combination is the environmental-drift signal — GitHub CI "
+    "failed but the doer cannot reproduce locally — and no amount "
+    "of retry against a green-locally state will change the GitHub "
+    "outcome. Default 2 so the operator sees the divergence after "
+    "the second occurrence rather than burning the same-signature "
+    "budget."
+)
+
 SUBTASK_TRANSPORT_STOP_LOSS = (
     "Empty-diff transport-class failures before BLOCKING the "
     "subtask. Lower than the same-signature cap because no amount "

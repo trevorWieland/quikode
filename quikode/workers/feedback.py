@@ -133,11 +133,15 @@ class FeedbackWorkerMixin:
 
             round_no = int(_tw.cast(Any, row.get("ci_triage_retries") or 0)) + 1
             self.store.increment(self.node.id, "ci_triage_retries")
+            # Plan 53: capture local-CI-at-head before invoking the
+            # fixup planner so the planner sees the local-vs-CI signal.
+            local_ci_at_head = self._capture_local_ci_at_head()
             outcome = self._run_fixup_round(
                 kind="fixup-ci",
                 round_no=round_no,
                 trigger="ci",
                 ci_excerpt=ci_excerpt,
+                local_ci_at_head=local_ci_at_head,
             )
             if outcome and outcome.final_state == State.BLOCKED:
                 _tw.log.warning(

@@ -37,7 +37,6 @@ from typing import Any, ClassVar
 from quikode import fsm_runtime
 from quikode.agent_registry import make_agent
 from quikode.agent_schemas import (
-    SubtaskCheckerFinding,
     SubtaskCheckerOutput,
     SubtaskTriageOutput,
 )
@@ -46,6 +45,11 @@ from quikode.state import SubtaskState
 from quikode.subtask_schema import STABILIZATION_SUBTASK_ID, Subtask
 from quikode.types import Verdict
 from quikode.workers.outcomes import CheckerOutcome as _CheckerOutcome
+from quikode.workers.subtask_render import (
+    render_checker_output_for_artifact,
+    render_triage_output_for_artifact,
+    witnesses_all_passed,
+)
 from quikode.workers.witness_runner import run_scoped_witnesses
 
 
@@ -64,6 +68,27 @@ _DOER_ARTIFACT_MAX = 20000
 # skip the LLM triage call (an empty diff offers nothing to teach
 # against) and stamp `failure_layer="transport"` directly.
 _EMPTY_DIFF_CHECKER_PREFIX = "VERDICT: FAIL\nROOT_CAUSE: doer produced no diff"
+
+# Plan 53: empty-diff + green-gates + kind != "fixup_ci" → no-op DONE.
+# The synthesized checker artifact carries this prefix so the worker
+# can recognize the row on read (e.g. `qk show`) and the caller can
+# skip commit/push (no edits to commit).
+_NO_OP_DONE_CHECKER_PREFIX = "VERDICT: PASS\nROOT_CAUSE: subtask no-op DONE"
+
+# Plan 53: empty-diff + green-gates + kind == "fixup_ci" → environmental
+# drift signal. The synthesized checker artifact carries this prefix so
+# `_record_subtask_triage` can skip the LLM triage call and stamp
+# `failure_layer="cannot_reproduce"` directly. The new K=2 stop-loss
+# fires on the second occurrence.
+_CANNOT_REPRODUCE_CHECKER_PREFIX = "VERDICT: FAIL\nROOT_CAUSE: cannot reproduce CI failure locally"
+
+
+def _is_fixup_ci_subtask(subtask: Subtask) -> bool:
+    """Plan 53: kind labels in the wild use both `"fixup_ci"` (the
+    planning-cycle kind enum) and `"fixup-ci"` (the runtime
+    Subtask.kind value emitted by the fixup planner). Treat both as
+    the CI-fixup signal."""
+    return subtask.kind in ("fixup_ci", "fixup-ci")
 
 
 class SubtaskExecutionMixin:
@@ -205,26 +230,111 @@ class SubtaskExecutionMixin:
         there's nothing to short-circuit on except the empty-diff
         transport-class failure introduced by plan 51 — when the doer
         rc=0'd but produced no work product, we synthesize a FAIL
-        outcome rather than burning checker tokens on an empty diff."""
+        outcome rather than burning checker tokens on an empty diff.
+
+        Plan 53: empty-diff is reclassified depending on the gate
+        results AND the subtask kind. With green objective gate and
+        green witnesses:
+          * `kind != "fixup_ci"` → no-op DONE (subtask was already
+            satisfied by upstream commits; PASS without commit).
+          * `kind == "fixup_ci"` → environmental-drift signal; FAIL
+            with `failure_layer="cannot_reproduce"` and the new K=2
+            stop-loss fires on the second occurrence.
+        Failed gate or failed witnesses on empty diff still routes
+        through the plan-51 transport-class FAIL prefix.
+        """
         fsm_runtime.enter_checking_subtask(self.store, self.node.id, note=subtask.id)
         self.store.update_subtask(self.node.id, subtask.id, state=SubtaskState.CHECKING.value)
 
         objective_outcome = self._run_subtask_check_command(subtask)
         if objective_outcome is not None:
+            # Objective gate failed — transport classification doesn't
+            # apply (the doer's failure is content-class). Empty diff
+            # below is irrelevant; return the gate failure directly.
             return objective_outcome
 
-        # Plan 51: empty-diff is a transport-class failure, not a
-        # content-grading failure. Skip the LLM checker entirely — the
-        # diff is empty, there's nothing to grade. The synthesized
-        # outcome IS the verdict; `_record_subtask_triage` reads the
-        # prefix and skips the LLM triage call too, stamping
-        # `failure_layer="transport"` directly so the new transport
-        # stop-loss can fire after K (default 3) attempts instead of
-        # the same-signature default 5/10.
         if not self._last_diff_text:
-            return self._classify_empty_diff_outcome(subtask)
+            return self._classify_empty_diff_branch(subtask)
 
         return self._run_llm_subtask_checker(subtask)
+
+    def _classify_empty_diff_branch(self: Any, subtask: Subtask) -> _CheckerOutcome:
+        """Plan 53: dispatch the empty-diff path on subtask kind +
+        witness state. Three discriminators:
+
+        1. kind != "fixup_ci" AND witnesses green → no-op DONE PASS.
+        2. kind == "fixup_ci" AND witnesses green → cannot_reproduce
+           FAIL (environmental drift signal).
+        3. witnesses failed → existing plan-51 transport-class FAIL.
+
+        Witnesses are evaluated through `witnesses_all_passed` which
+        treats "no witnesses configured" as green (the objective gate
+        is the only signal in that case). When witnesses ran but at
+        least one was non-OK we keep the plan-51 transport behavior so
+        the stop-loss budget isn't burned on real signal."""
+        witnesses_green = witnesses_all_passed(self._last_witness_results)
+        if not witnesses_green:
+            return self._classify_empty_diff_outcome(subtask)
+        if _is_fixup_ci_subtask(subtask):
+            return self._classify_cannot_reproduce_outcome(subtask)
+        return self._classify_no_op_done_outcome(subtask)
+
+    def _classify_no_op_done_outcome(self: Any, subtask: Subtask) -> _CheckerOutcome:
+        """Plan 53: synthesize a PASS outcome for the no-op DONE path —
+        empty diff + objective gate green + witnesses green AND
+        kind != "fixup_ci". Persists a dedicated
+        `subtask_no_op_done:<id>` artifact so `qk show` surfaces the
+        no-op-PASS history. The caller (`_handle_passed_subtask`) sees
+        the prefix in the synthesized text and skips commit/push (no
+        edits to commit)."""
+        text = (
+            f"{_NO_OP_DONE_CHECKER_PREFIX}; objective gate green and "
+            "scoped witnesses green on an empty diff. Subtask was "
+            "already satisfied by upstream commits."
+        )
+        self.store.add_artifact(self.node.id, f"subtask_checker:{subtask.id}", text)
+        self.store.add_artifact(
+            self.node.id,
+            f"subtask_no_op_done:{subtask.id}",
+            "subtask settled with no edits: gate + witnesses green on empty diff.",
+        )
+        return _CheckerOutcome(
+            verdict=Verdict.PASS,
+            checker_text=text,
+            transient=False,
+            rc=None,
+            stderr="",
+        )
+
+    def _classify_cannot_reproduce_outcome(self: Any, subtask: Subtask) -> _CheckerOutcome:
+        """Plan 53: synthesize a FAIL outcome for the cannot_reproduce
+        path — empty diff + objective gate green + witnesses green AND
+        kind == "fixup_ci". Persists a dedicated
+        `subtask_cannot_reproduce:<id>` artifact;
+        `_record_subtask_triage` matches on the prefix and stamps
+        `failure_layer="cannot_reproduce"` directly so the new K=2
+        stop-loss fires on the second occurrence."""
+        text = (
+            f"{_CANNOT_REPRODUCE_CHECKER_PREFIX} (Plan 53 environmental-"
+            "drift signal). Doer ran the CI-fix recipe and produced no "
+            "diff while the local objective gate and scoped witnesses "
+            "are green. GitHub CI must be diverging on environment, not "
+            "code. Operator action: investigate environmental drift "
+            "between the local container and the CI runner."
+        )
+        self.store.add_artifact(self.node.id, f"subtask_checker:{subtask.id}", text)
+        self.store.add_artifact(
+            self.node.id,
+            f"subtask_cannot_reproduce:{subtask.id}",
+            "fixup_ci subtask: empty diff + green local gates ⇒ environmental drift.",
+        )
+        return _CheckerOutcome(
+            verdict=Verdict.FAIL,
+            checker_text=text,
+            transient=False,
+            rc=None,
+            stderr="",
+        )
 
     def _classify_empty_diff_outcome(self: Any, subtask: Subtask) -> _CheckerOutcome:
         """Synthesize a FAIL outcome for the empty-diff transport-class
@@ -287,7 +397,7 @@ class SubtaskExecutionMixin:
         )
         if result.parse_errors or not isinstance(result.structured, SubtaskCheckerOutput):
             return self._checker_parse_failure(subtask, result)
-        checker_text = _render_checker_output_for_artifact(result.structured)
+        checker_text = render_checker_output_for_artifact(result.structured)
         self.store.add_artifact(self.node.id, f"subtask_checker:{subtask.id}", checker_text)
         verdict = Verdict.PASS if result.structured.verdict == "pass" else Verdict.FAIL
         transient = bool(result.transient)
@@ -465,44 +575,6 @@ class SubtaskExecutionMixin:
             )
             self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", text)
             return text, None
-        triage_text = _render_triage_output_for_artifact(result.structured)
+        triage_text = render_triage_output_for_artifact(result.structured)
         self.store.add_artifact(self.node.id, f"subtask_triage:{subtask.id}", triage_text)
         return triage_text, result.structured.failure_layer
-
-
-def _render_checker_output_for_artifact(out: SubtaskCheckerOutput) -> str:
-    """Render the structured checker output to the artifact text
-    shape. Includes a `VERDICT: PASS|FAIL` line so the existing
-    `_parse_verdict` helper still resolves on store reads, plus a
-    `ROOT_CAUSE:` block for `_extract_root_cause` (used by the progress
-    agent's attempt history)."""
-    lines: list[str] = []
-    lines.append(f"VERDICT: {out.verdict.upper()}")
-    if out.overall_assessment:
-        lines.append(f"ROOT_CAUSE: {out.overall_assessment[:600]}")
-    if out.findings:
-        lines.append("FINDINGS:")
-        for f in out.findings:
-            lines.append(_render_finding(f))
-    return "\n".join(lines)
-
-
-def _render_finding(f: SubtaskCheckerFinding) -> str:
-    rationale = f" — {f.rationale}" if f.rationale else ""
-    return f"  - [{f.verdict.upper()}] {f.category}{rationale}"
-
-
-def _render_triage_output_for_artifact(out: SubtaskTriageOutput) -> str:
-    """Render the structured triage output to a human-readable artifact
-    string suitable for the next doer attempt's prompt context."""
-    lines: list[str] = []
-    lines.append(f"failure_layer: {out.failure_layer}")
-    lines.append(f"root_cause: {out.root_cause}")
-    if out.file_line_cites:
-        lines.append("file_line_cites:")
-        for cite in out.file_line_cites:
-            lines.append(f"  - {cite}")
-    if out.teaching_narrative:
-        lines.append("teaching_narrative:")
-        lines.append(out.teaching_narrative)
-    return "\n".join(lines)

@@ -10,6 +10,7 @@ from quikode.agent_registry import make_agent
 from quikode.agent_schemas import IntentReviewVerdict, PlannerOutput
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import PlanValidationError
+from quikode.workers.local_ci_capture import capture_local_ci_at_head
 from quikode.workers.outcomes import WorkerOutcome
 from quikode.workers.planner_driver import _wire_to_runtime_plan
 
@@ -254,16 +255,31 @@ class PrLifecycleWorkerMixin:
             self.cfg.repo_path,
             int(_tw.cast(Any, row["pr_number"])) if row.get("pr_number") else 0,
         )
+        # Plan 53: run `local_ci_command` against the worktree HEAD
+        # before invoking the fixup planner so the planner sees whether
+        # the failure reproduces locally. The result threads through
+        # to the prompt as `local_ci_at_head` and drives the three-case
+        # dispatch (GitHub fails AND local fails / passes / etc.).
+        local_ci_at_head = self._capture_local_ci_at_head()
         outcome = self._run_fixup_round(
             kind="fixup-ci",
             round_no=ci_attempts,
             trigger="ci",
             ci_excerpt=_tw._last_lines(ci_log, 80),
+            local_ci_at_head=local_ci_at_head,
         )
         self.store.increment(self.node.id, "ci_triage_retries")
         if outcome and outcome.final_state == State.BLOCKED:
             return outcome, ci_attempts, True
         return None, ci_attempts, True
+
+    def _capture_local_ci_at_head(self: Any) -> tuple[bool, str] | None:
+        """Plan 53: thin shim over
+        `quikode.workers.local_ci_capture.capture_local_ci_at_head`.
+        Kept on the mixin so call sites read as method calls; the body
+        lives in the standalone helper module so `pr_lifecycle.py`
+        stays under the 600-line architecture budget."""
+        return capture_local_ci_at_head(self, _tw)
 
     def _run_intent_review(self: Any) -> WorkerOutcome | None:
         """A dependency merged. Check if main has shifted under us in a way

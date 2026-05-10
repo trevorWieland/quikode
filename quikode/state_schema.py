@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from typing import Any
 
 log = logging.getLogger("quikode.state_schema")
 
@@ -322,11 +323,13 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
 # Plan 52 backfill heuristic: subtask-id naming convention encodes the
 # planner that emitted the row. `S-NN-*` and `Z-99-*` are initial-cycle.
 # `F-N-...-*` (where N is a digit) indicates fixup-cycle N+1 — the +1
-# offsets the initial planner's cycle 1. `F-CI-*` is CI-driven fixup;
-# we lump those into a synthetic `(2, "fixup_ci")` because we don't have
-# a per-task ordinal at backfill time. Anything that doesn't match falls
-# back to (1, "initial") so the field stays well-defined for the new
-# `qk replan-cycle` primitive without rewriting historical truth.
+# offsets the initial planner's cycle 1. `F-CI-*` is CI-driven fixup
+# and runs AFTER all pre-PR fixup cycles; plan 53 patches the heuristic
+# to compute its cycle as `MAX(non-F-CI cycle on this task) + 1` rather
+# than the prior hardcoded 2. The single-id helper retains the
+# hardcoded fallback for callers that lack task context, but the
+# migration's two-pass per-task path (`_apply_plan52_migration`) uses
+# the corrected MAX+1 semantics.
 _FIXUP_NUMERIC_RE = re.compile(r"^F-(\d+)-")
 _FIXUP_CI_RE = re.compile(r"^F-CI-")
 _INITIAL_PREFIX_RE = re.compile(r"^(S-\d+|Z-99|R-\d+)-?")
@@ -338,6 +341,11 @@ def _infer_planning_provenance(subtask_id: str) -> tuple[int, str]:
     Heuristic only — used for backfill of pre-plan-52 rows. New rows are
     populated explicitly by each planner call site so the CLI's cycle
     targeting stays exact.
+
+    Plan 53 note: F-CI-* rows get the per-task MAX+1 treatment via
+    `_infer_fixup_ci_cycle` in the migration path. This single-id
+    helper still returns the pre-plan-53 (2, "fixup_ci") fallback so callers
+    without task context (none in production) keep stable behavior.
     """
     if _INITIAL_PREFIX_RE.match(subtask_id):
         return (1, "initial")
@@ -351,6 +359,24 @@ def _infer_planning_provenance(subtask_id: str) -> tuple[int, str]:
     if _FIXUP_CI_RE.match(subtask_id):
         return (2, "fixup_ci")
     return (1, "initial")
+
+
+def _infer_planning_provenance_with_context(subtask_id: str, *, max_non_fci_cycle: int) -> tuple[int, str]:
+    """Plan 53 two-pass migration helper. Identical to
+    `_infer_planning_provenance` for non-F-CI rows; F-CI rows return
+    `(max(max_non_fci_cycle, 1) + 1, "fixup_ci")` so they sit one cycle
+    past the highest non-F-CI cycle the task has.
+
+    `max_non_fci_cycle` is computed in pass 1 (after every non-F-CI row
+    has been backfilled) and threaded into pass 2's per-row resolution.
+    A task with only `F-CI-*` rows (impossible in practice but
+    defensible at the migration level) lands at cycle 2 to preserve the
+    pre-plan-53 fallback.
+    """
+    if _FIXUP_CI_RE.match(subtask_id):
+        cycle = max(max_non_fci_cycle, 1) + 1
+        return (cycle, "fixup_ci")
+    return _infer_planning_provenance(subtask_id)
 
 
 def _apply_plan52_migration(conn: sqlite3.Connection) -> None:
@@ -374,29 +400,87 @@ def _apply_plan52_migration(conn: sqlite3.Connection) -> None:
         pass
     # Backfill: only rows that still hold the column defaults. Re-runs are
     # no-ops because the WHERE narrows to default rows only.
+    #
+    # Plan 53: do this in two passes. Pass 1 backfills every non-F-CI
+    # row using the pre-plan-53 helper. Pass 2 resolves F-CI rows by looking
+    # up the MAX(planning_cycle) for non-F-CI rows on the same task —
+    # F-CI subtasks come AFTER all pre-PR fixup cycles, so their cycle
+    # must be (max non-F-CI cycle) + 1, not a hardcoded 2.
     try:
         rows = conn.execute(
-            "SELECT id, subtask_id FROM subtasks WHERE planning_cycle = 1 AND planning_kind = 'initial'"
+            "SELECT id, task_id, subtask_id FROM subtasks "
+            "WHERE planning_cycle = 1 AND planning_kind = 'initial'"
         ).fetchall()
     except sqlite3.OperationalError:
         return
+    fci_pending = _backfill_non_fci_pass(conn, rows)
+    _backfill_fci_pass(conn, fci_pending)
+
+
+def _backfill_non_fci_pass(conn: sqlite3.Connection, rows: list[Any]) -> list[tuple[int, str, str]]:
+    """Plan 52 + 53 pass 1: backfill every non-F-CI row via the
+    single-id heuristic. Returns the list of F-CI rows deferred to
+    pass 2 — each tuple `(rowid, task_id, subtask_id)` so pass 2 can
+    look up the per-task MAX after pass 1's UPDATEs land."""
+    fci_pending: list[tuple[int, str, str]] = []
     for row in rows:
-        sid = row["subtask_id"] if isinstance(row, sqlite3.Row) else row[1]
+        sid = row["subtask_id"] if isinstance(row, sqlite3.Row) else row[2]
+        task_id = row["task_id"] if isinstance(row, sqlite3.Row) else row[1]
         rowid = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+        if _FIXUP_CI_RE.match(str(sid)):
+            fci_pending.append((rowid, str(task_id), str(sid)))
+            continue
+        _maybe_update_provenance(conn, rowid=rowid, sid=str(sid))
+    return fci_pending
+
+
+def _maybe_update_provenance(conn: sqlite3.Connection, *, rowid: int, sid: str) -> None:
+    """Pass-1 helper: resolve provenance for a non-F-CI row and UPDATE
+    when the resolved value differs from the column defaults. Failures
+    are logged and swallowed (the daemon must start)."""
+    try:
+        cycle, kind = _infer_planning_provenance(sid)
+    except Exception as exc:
+        log.warning(
+            "plan52 backfill: could not infer planning provenance for "
+            "subtask id %r (rowid=%s): %s — leaving defaults",
+            sid,
+            rowid,
+            exc,
+        )
+        return
+    if cycle == 1 and kind == "initial":
+        return
+    try:
+        conn.execute(
+            "UPDATE subtasks SET planning_cycle = ?, planning_kind = ? WHERE id = ?",
+            (cycle, kind, rowid),
+        )
+    except sqlite3.OperationalError as exc:
+        log.warning(
+            "plan52 backfill: UPDATE failed for subtask rowid=%s id=%r: %s",
+            rowid,
+            sid,
+            exc,
+        )
+
+
+def _backfill_fci_pass(conn: sqlite3.Connection, fci_pending: list[tuple[int, str, str]]) -> None:
+    """Plan 53 pass 2: resolve each F-CI row's cycle as MAX(non-F-CI
+    cycle for this task) + 1 AFTER pass 1's UPDATEs have landed."""
+    for rowid, task_id, sid in fci_pending:
+        max_cycle = _lookup_max_non_fci_cycle(conn, task_id=task_id, rowid=rowid, sid=sid)
+        if max_cycle is None:
+            continue
         try:
-            cycle, kind = _infer_planning_provenance(str(sid))
+            cycle, kind = _infer_planning_provenance_with_context(sid, max_non_fci_cycle=max_cycle)
         except Exception as exc:
             log.warning(
-                "plan52 backfill: could not infer planning provenance for "
-                "subtask id %r (rowid=%s): %s — leaving defaults",
-                sid,
+                "plan52 backfill (F-CI pass 2): provenance failed for rowid=%s id=%r: %s",
                 rowid,
+                sid,
                 exc,
             )
-            continue
-        if cycle == 1 and kind == "initial":
-            # Defaults already match — skip the UPDATE for ID-prefix
-            # matches that resolved to the default values.
             continue
         try:
             conn.execute(
@@ -405,8 +489,39 @@ def _apply_plan52_migration(conn: sqlite3.Connection) -> None:
             )
         except sqlite3.OperationalError as exc:
             log.warning(
-                "plan52 backfill: UPDATE failed for subtask rowid=%s id=%r: %s",
+                "plan52 backfill (F-CI pass 2): UPDATE failed for rowid=%s id=%r: %s",
                 rowid,
                 sid,
                 exc,
             )
+
+
+def _lookup_max_non_fci_cycle(conn: sqlite3.Connection, *, task_id: str, rowid: int, sid: str) -> int | None:
+    """Return MAX(planning_cycle) over non-F-CI subtasks on `task_id`.
+    Returns 0 when the task has no non-F-CI rows (preserves the pre-plan-53
+    fallback in `_infer_planning_provenance_with_context`); returns
+    None on a query failure so the caller skips the row."""
+    try:
+        r = conn.execute(
+            "SELECT MAX(planning_cycle) AS max_cycle FROM subtasks "
+            "WHERE task_id = ? AND subtask_id NOT LIKE 'F-CI-%'",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        log.warning(
+            "plan52 backfill (F-CI pass 2): MAX lookup failed for task_id=%r rowid=%s id=%r: %s",
+            task_id,
+            rowid,
+            sid,
+            exc,
+        )
+        return None
+    if r is None:
+        return 0
+    raw_max = r["max_cycle"] if isinstance(r, sqlite3.Row) else r[0]
+    if raw_max is None:
+        return 0
+    try:
+        return int(raw_max)
+    except (TypeError, ValueError):
+        return 0

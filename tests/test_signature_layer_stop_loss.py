@@ -176,6 +176,72 @@ def test_transport_stop_loss_fires_after_three_empty_diffs(tmp_path):
     worker.store.conn.close()
 
 
+def _cannot_reproduce_checker_outcome() -> _CheckerOutcome:
+    """Fixture: the FAIL outcome `_check_subtask` synthesizes when a
+    `kind="fixup_ci"` subtask returns empty diff + green local gates.
+    Mirrors the prefix consumed by `_record_subtask_triage` to skip
+    the LLM triage call and stamp `failure_layer="cannot_reproduce"`."""
+    return _CheckerOutcome(
+        verdict=Verdict.FAIL,
+        checker_text=(
+            "VERDICT: FAIL\nROOT_CAUSE: cannot reproduce CI failure locally "
+            "(Plan 53 environmental-drift signal)."
+        ),
+        transient=False,
+        rc=None,
+        stderr="",
+    )
+
+
+def test_cannot_reproduce_stop_loss_fires_at_two(tmp_path):
+    """Plan 53: 2 consecutive `(checker_fail, ,layer=cannot_reproduce)`
+    retries trip the new K=2 stop-loss with operator-clear messaging
+    naming the environmental-drift hypothesis. Triage agent is NEVER
+    invoked because the cannot_reproduce checker prefix short-circuits
+    triage; the cannot_reproduce stop-loss runs BEFORE the
+    transport / same-signature stop-losses."""
+    plan = _build_plan(["S-01"])
+    worker = _build_worker(
+        tmp_path,
+        plan,
+        hard_max=20,
+        progress_after=20,
+        progress_every=20,
+        flatline_block=10,
+        same_signature_block=10,
+    )
+    # Default cannot_reproduce cap is 2.
+    assert worker.cfg.subtask_cannot_reproduce_stop_loss_count == 2
+    do_calls: list[int] = []
+    triage_calls: list[int] = []
+
+    def fake_do(subtask, attempt, triage_notes):
+        do_calls.append(attempt)
+
+    def fake_triage(subtask, attempt, budget, checker_text):
+        triage_calls.append(attempt)
+        return "should not run", "rubric"
+
+    with (
+        patch.object(worker, "_do_subtask", side_effect=fake_do),
+        patch.object(worker, "_check_subtask", return_value=_cannot_reproduce_checker_outcome()),
+        patch.object(worker, "_triage_subtask", side_effect=fake_triage),
+    ):
+        outcome = worker._subtask_loop()
+
+    assert outcome is not None
+    assert outcome.final_state is State.BLOCKED
+    assert "cannot_reproduce stop-loss" in outcome.note
+    assert "environmental drift" in outcome.note
+    assert "transport stop-loss" not in outcome.note
+    assert "same-signature stop-loss" not in outcome.note
+    # Two doer attempts → block on the second.
+    assert do_calls == [1, 2]
+    # LLM triage path NEVER invoked on the cannot_reproduce branch.
+    assert triage_calls == []
+    worker.store.conn.close()
+
+
 def test_transport_stop_loss_does_not_fire_for_local_ci_layer(tmp_path):
     """Plan 51 negative control: 3 consecutive checker-fails with
     `layer=local_ci` (a content-class failure layer) must NOT trip the

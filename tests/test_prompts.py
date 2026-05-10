@@ -12,6 +12,7 @@ from quikode.prompts import (
     checker_prompt,
     conflict_resolver_prompt,
     doer_prompt,
+    fixup_planner_prompt,
     planner_prompt,
     subtask_checker_prompt,
     subtask_doer_prompt,
@@ -245,3 +246,153 @@ def test_subtask_triage_prompt_senior_engineer_framing(tmp_path):
     assert "self_audit_mismatch" not in out
     # Plan 47: no doer envelope / self-report block.
     assert "doer's self-report" not in out.lower()
+
+
+# ----- plan 53: fixup-planner local-CI-at-head + root-cause tracing -----
+
+
+def test_fixup_planner_includes_root_cause_tracing_rule(tmp_path):
+    """Plan 53: the fixup-planner prompt MUST contain the root-cause
+    tracing rule section (the §0 block telling the planner to walk up
+    the build graph instead of distilling the CI error verbatim)."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = fixup_planner_prompt(
+        cfg,
+        dag.nodes["R-001"],
+        contract,
+        kind="fixup-ci",
+        round_no=1,
+        max_rounds=3,
+        trigger="ci",
+        original_final_acceptance=["all gates pass"],
+        done_subtasks=[],
+        prior_fixup_subtasks=[],
+        ci_excerpt="Error: contracts out of date",
+    )
+    assert "root-cause tracing" in out.lower()
+    # The §0 block names the four-step trace explicitly.
+    assert "build graph upward" in out.lower() or "walk the build graph" in out.lower()
+    # Generator-chain guidance must be present.
+    assert "full build chain" in out.lower() or "full chain" in out.lower()
+    # Per-subtask root_cause_hypothesis field is required.
+    assert "root_cause_hypothesis" in out
+
+
+def test_fixup_planner_renders_local_ci_at_head_passed(tmp_path):
+    """Plan 53: when `local_ci_at_head=(True, excerpt)` is passed in,
+    the prompt renders the three-case dispatch section with the PASS
+    label and the excerpt visible to the planner."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = fixup_planner_prompt(
+        cfg,
+        dag.nodes["R-001"],
+        contract,
+        kind="fixup-ci",
+        round_no=1,
+        max_rounds=3,
+        trigger="ci",
+        original_final_acceptance=["all gates pass"],
+        done_subtasks=[],
+        prior_fixup_subtasks=[],
+        ci_excerpt="Error: contracts out of date",
+        local_ci_at_head=(True, "no failing tests; just check returned 0"),
+    )
+    # The PASS label is rendered.
+    assert "PASS" in out
+    # The three-case dispatch heading appears.
+    assert "GitHub fails AND local passes" in out
+    assert "environmental drift" in out.lower() or "cached-state" in out.lower()
+    # The excerpt is included.
+    assert "no failing tests" in out
+
+
+def test_fixup_planner_renders_local_ci_at_head_failed(tmp_path):
+    """Plan 53: when `local_ci_at_head=(False, excerpt)` is passed in,
+    the FAIL label appears and the planner is invited to emit a real
+    bug-fix subtask (case 1: GitHub fails AND local fails)."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = fixup_planner_prompt(
+        cfg,
+        dag.nodes["R-001"],
+        contract,
+        kind="fixup-ci",
+        round_no=1,
+        max_rounds=3,
+        trigger="ci",
+        original_final_acceptance=["all gates pass"],
+        done_subtasks=[],
+        prior_fixup_subtasks=[],
+        ci_excerpt="Error: contracts out of date",
+        local_ci_at_head=(False, "expected interface mismatch"),
+    )
+    assert "FAIL" in out
+    assert "GitHub fails AND local fails" in out
+    assert "real bug" in out.lower()
+
+
+def test_fixup_planner_omits_local_ci_section_when_none(tmp_path):
+    """Plan 53: when `local_ci_at_head` is None (e.g. trigger is not
+    CI), the local-CI three-case section is omitted entirely so we
+    don't render an empty heading."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = fixup_planner_prompt(
+        cfg,
+        dag.nodes["R-001"],
+        contract,
+        kind="fixup-pre-pr-audit",
+        round_no=1,
+        max_rounds=3,
+        trigger="pre_pr_audit",
+        original_final_acceptance=["all gates pass"],
+        done_subtasks=[],
+        prior_fixup_subtasks=[],
+        triage_root_cause="rubric:input-validation",
+        local_ci_at_head=None,
+    )
+    assert "Local CI at the same HEAD commit" not in out
+
+
+# ----- plan 53: subtask-doer reproduce-before-fix for fixup_ci -----
+
+
+def test_subtask_doer_renders_reproduce_before_fix_for_fixup_ci(tmp_path):
+    """Plan 53: a `kind="fixup-ci"` subtask gets the §6a
+    reproduce-before-fix block in the doer prompt."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    fixup_subtask = Subtask(
+        id="F-CI-1-build-fix",
+        title="Regenerate web contracts",
+        depends_on=(),
+        files_to_touch=("apps/web/generated-interface-contracts.ts",),
+        boundary="Regenerate, do not edit by hand.",
+        acceptance=("contracts:check passes",),
+        notes="",
+        kind="fixup-ci",
+        root_cause_hypothesis="stale node_modules cache hides regenerated TS drift",
+    )
+    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], fixup_subtask, contract)
+    assert "Reproduce-before-fix rule" in out
+    assert "fresh-state" in out.lower()
+    assert "cannot_reproduce" in out
+    # The planner's hypothesis is surfaced.
+    assert "stale node_modules cache" in out
+
+
+def test_subtask_doer_omits_reproduce_block_for_spec_kind(tmp_path):
+    """Plan 53 negative control: a regular `kind="spec"` subtask gets
+    no §6a block (the rule only applies to fixup_ci)."""
+    dag = _make_dag(tmp_path)
+    cfg = _cfg(tmp_path)
+    contract = build_for(dag.nodes["R-001"], cfg)
+    out = subtask_doer_prompt(cfg, dag.nodes["R-001"], _subtask(), contract)
+    assert "Reproduce-before-fix" not in out

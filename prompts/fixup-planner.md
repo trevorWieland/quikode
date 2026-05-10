@@ -7,6 +7,33 @@ read the failure context, investigate `/workspace`, and emit a JSON
 plan of additive fixup subtasks. **Do not write production code in
 this phase.**
 
+## 0. Root-cause tracing — not verbatim distillation (Plan 53)
+
+The CI error message is a **symptom**, not a root cause. Surfacing
+"the CI says run X" and emitting a subtask that runs X is verbatim
+distillation; do not do this. For every finding you must trace:
+
+1. **What did the CI runner actually fail on?** Read the log line.
+2. **What does that step depend on?** Walk the build graph upward —
+   the failed step has inputs (generated artifacts, generated types,
+   compiled binaries, lockfile checksums). The real cause is almost
+   always one or more levels up the dependency graph from the surfaced
+   error.
+3. **Why might those inputs have drifted?** Cached intermediate state,
+   stale lockfile, a previous subtask edited an upstream source
+   without re-running the generator chain, environment differences
+   between local container and the CI runner.
+4. **What is the smallest change that fixes the underlying cause?**
+   This is the subtask. It must include the FULL chain producing the
+   failed step's inputs, not just the final-step generator.
+
+If the CI error suggests running a generator (e.g. `pnpm
+contracts:generate`, `cargo run --bin codegen`, `make protobuf`), the
+subtask MUST invoke the FULL build chain producing the generator's
+inputs before running the generator itself. Do not assume cached
+intermediate artifacts (e.g. `target/`, `node_modules`,
+`dist/`) represent the canonical build state.
+
 The orchestrator will run your fixup subtasks through the same
 per-subtask doer/checker/triage loop as the original plan — so each
 fixup subtask must be independently verifiable, scoped to one tight
@@ -38,6 +65,41 @@ original spec subtasks.
 ```
 {{ ci_excerpt | truncate(4000) }}
 ```
+{% endif %}
+
+{% if local_ci_at_head is not none %}### Local CI at the same HEAD commit (Plan 53 environmental-drift signal)
+
+The post-PR FSM ran `{{ local_ci_command or 'just ci' }}` against the
+worktree HEAD before invoking you. Result: **{{ "PASS" if
+local_ci_at_head[0] else "FAIL" }}**.
+
+```
+{{ local_ci_at_head[1] | truncate(4000) }}
+```
+
+You MUST handle the three-case dispatch explicitly:
+
+* **GitHub fails AND local fails:** real bug. Emit the fix.
+* **GitHub fails AND local passes (THIS CASE if `local_ci_at_head` is
+  PASS above):** environmental drift OR cached-state masking. Do NOT
+  emit a one-liner running the CI runner's suggested command — local
+  already does (or would) run that command and it would be a no-op.
+  Emit an INVESTIGATION subtask that:
+  1. Reproduces the failure under fresh-state conditions (clean
+     rebuild — wipe `target/` / `node_modules` / equivalent caches —
+     then re-run the failing recipe).
+  2. Identifies which input or toolchain version diverges between the
+     local container and the GitHub CI runner.
+  3. Fixes the underlying input-or-toolchain divergence (often a
+     pinned version, a missing checked-in generated file, a build
+     order issue).
+  Each `root_cause_hypothesis` for an investigation subtask must
+  explicitly name the suspected divergence (e.g. "stale `target/`
+  cache hides regenerated `.ts` drift" rather than restating the CI
+  error).
+* **GitHub passes AND local passes:** the audit cycle should have
+  caught this before invoking you; if it didn't, refuse to plan and
+  emit an empty subtasks list with a `summary` explaining the skip.
 {% endif %}
 
 {% if review_threads_block %}### Unresolved review threads
@@ -165,11 +227,31 @@ finding-id to be matched by SOME subtask via the namespace dispatch.
       "behavior_evidence_advanced": [],
       "interfaces": [],
       "notes": "closes rubric:add-input-validation-on-org-name",
+      "root_cause_hypothesis": "POST /orgs accepts empty org-name because the API surface lacks zod input validation; the rubric category 'edge-case-handling' surfaces this as a missing boundary check",
       "kind": "{{ kind }}"
     }
   ]
 }
 ```
+
+### `root_cause_hypothesis` (Plan 53 — REQUIRED for `kind="fixup_ci"`)
+
+For every subtask, populate `root_cause_hypothesis` with a concise (≤500
+char) statement of WHY the gate failed at this slice's level. For
+`kind="fixup_ci"` subtasks the hypothesis must:
+
+* Name the suspected upstream cause (build-graph dependency, stale
+  cache, pinned-version drift, missing checked-in artifact), not
+  restate the CI error.
+* Be specific enough that a doer reading it can decide whether to
+  start with `cargo clean` / `rm -rf node_modules` / inspecting a
+  particular pinned version.
+* Be falsifiable: a diagnostic step in the doer's reproduce-before-fix
+  rule will either confirm or refute it.
+
+Empty string is acceptable for non-fixup-CI subtasks, but encouraged
+for any audit-driven slice where the planner has a hypothesis worth
+recording.
 
 ## 9. How to decompose well
 

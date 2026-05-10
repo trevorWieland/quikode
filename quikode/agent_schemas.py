@@ -82,6 +82,12 @@ class SubtaskSpec(BaseModel):
     standards_referenced: list[StandardsRefSchema] = Field(default_factory=list)
     architecture_referenced: list[ArchitectureRefSchema] = Field(default_factory=list)
     behavior_evidence_advanced: list[str] = Field(default_factory=list)
+    # Plan 53: per-subtask root-cause hypothesis. Required for fixup_ci
+    # subtasks at the prompt level, but kept optional on the wire schema
+    # (default "") so existing artifacts that pre-date plan 53 still
+    # parse cleanly. The fixup-planner prompt instructs the planner to
+    # populate it; the worker carries it forward into the doer prompt.
+    root_cause_hypothesis: str = Field(default="", max_length=500)
 
 
 # ---------- planner / fixup-planner / merge-planner ----------
@@ -255,6 +261,13 @@ SubtaskTriageFailureLayer = Literal[
     "behavior",
     "parse_failure",
     "transport",
+    # Plan 53: emitted by the worker (not the triage agent itself) when a
+    # `kind="fixup_ci"` subtask reports empty diff + green local gates.
+    # That combination is the environmental-drift signal: GitHub CI failed
+    # but the doer cannot reproduce locally. The new K=2 stop-loss fires
+    # after two such occurrences so the operator sees the divergence
+    # immediately instead of burning the same-signature budget.
+    "cannot_reproduce",
 ]
 
 
