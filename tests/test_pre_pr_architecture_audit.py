@@ -242,6 +242,7 @@ def test_run_architecture_audit_high_severity_fails(tmp_path):
 
 def test_run_architecture_audit_parse_failure_returns_synthetic_fail(tmp_path):
     cfg = _build_cfg(tmp_path)
+    cfg.pre_pr_audit_output_retries = 1
     arch = ArchitectureCorpus(root=Path("/tmp"), docs=(_make_arch_doc(),))
     contract = _make_contract(arch_corpus=arch, arch_source_text="arch toc")
     fake_agent = MagicMock()
@@ -263,6 +264,7 @@ def test_run_architecture_audit_parse_failure_returns_synthetic_fail(tmp_path):
     assert not outcome.passed
     assert "parse_failure" in outcome.summary
     assert outcome.findings[0]["kind"] == "parse_failure"
+    assert fake_agent.invoke.call_count == 2
 
 
 def test_run_architecture_audit_does_not_synthesize_path_map_findings(tmp_path):

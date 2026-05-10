@@ -276,6 +276,7 @@ def test_run_rubric_audit_all_pass_does_not_forward_reach_ten_gaps(tmp_path):
 
 def test_run_rubric_audit_parse_failure_returns_synthetic_fail(tmp_path):
     cfg = _build_cfg(tmp_path)
+    cfg.pre_pr_audit_output_retries = 2
     fake_agent = MagicMock()
     fake_agent.invoke.return_value = _make_json_result(
         structured=None,
@@ -299,6 +300,40 @@ def test_run_rubric_audit_parse_failure_returns_synthetic_fail(tmp_path):
     assert len(outcome.findings) == 1
     assert outcome.findings[0]["kind"] == "parse_failure"
     assert "Input should be a valid integer" in outcome.findings[0]["rationale"]
+    assert fake_agent.invoke.call_count == 3
+
+
+def test_run_rubric_audit_retries_parse_failure_before_succeeding(tmp_path):
+    cfg = _build_cfg(tmp_path)
+    cfg.pre_pr_audit_output_retries = 2
+    audit = PrePRRubricAuditOutput(
+        categories=[
+            RubricCategoryScore(name="security", score=7, rationale="ok"),
+            RubricCategoryScore(name="performance", score=7, rationale="ok"),
+        ]
+    )
+    fake_agent = MagicMock()
+    fake_agent.invoke.side_effect = [
+        _make_json_result(
+            structured=None,
+            parse_errors=("categories.0.score: Input should be a valid integer",),
+            raw_text="bad json",
+        ),
+        _make_json_result(structured=audit, raw_text="{...}"),
+    ]
+    with (
+        patch("quikode.pre_pr_audit.make_agent", return_value=fake_agent),
+        patch("quikode.pre_pr_audit.prompts_mod.render", return_value="prompt"),
+    ):
+        outcome = pre_pr_audit.run_rubric_audit(
+            cfg=cfg,
+            handle=_stub_handle(),
+            diff_excerpt="diff",
+            plan_text="plan",
+        )
+    assert outcome.passed
+    assert outcome.findings == []
+    assert fake_agent.invoke.call_count == 2
 
 
 def test_run_rubric_audit_agent_rc_nonzero_returns_infra_fail(tmp_path):
@@ -491,6 +526,7 @@ def test_run_standards_audit_serious_finding_fails(tmp_path):
 
 def test_run_standards_audit_parse_failure_returns_synthetic_fail(tmp_path):
     cfg = _build_cfg(tmp_path)
+    cfg.pre_pr_audit_output_retries = 1
     profile = _make_profile("rust-cargo", docs=(_make_standards_doc(),))
     contract = _make_contract(profiles=(profile,), standards_source_text="profile catalog")
     fake_agent = MagicMock()
@@ -512,6 +548,7 @@ def test_run_standards_audit_parse_failure_returns_synthetic_fail(tmp_path):
     assert not outcome.passed
     assert "parse_failure" in outcome.summary
     assert outcome.findings[0]["kind"] == "parse_failure"
+    assert fake_agent.invoke.call_count == 2
 
 
 def test_run_standards_audit_does_not_synthesize_uncited_profile_findings(tmp_path):
@@ -636,6 +673,7 @@ def test_run_behavior_audit_unverified_behavior_fails(tmp_path):
 
 def test_run_behavior_audit_parse_failure_returns_synthetic_fail(tmp_path):
     cfg = _build_cfg(tmp_path)
+    cfg.pre_pr_audit_output_retries = 1
     fake_agent = MagicMock()
     fake_agent.invoke.return_value = _make_json_result(
         structured=None,
@@ -655,6 +693,7 @@ def test_run_behavior_audit_parse_failure_returns_synthetic_fail(tmp_path):
     assert not outcome.passed
     assert "parse_failure" in outcome.summary
     assert outcome.findings[0]["kind"] == "parse_failure"
+    assert fake_agent.invoke.call_count == 2
 
 
 # ----- Outcome construction (preserved across rewrite) -----

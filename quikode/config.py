@@ -494,6 +494,17 @@ class Config(BaseModel):
         le=3600,
         description="Per-audit-agent timeout. Each of rubric / standards / behavior runs once per cycle.",
     )
+    pre_pr_audit_output_retries: int = Field(
+        default=5,
+        ge=0,
+        le=20,
+        description=(
+            "Driver-level retries when a pre-PR audit emits malformed JSON "
+            "or otherwise fails schema validation. Output violations are "
+            "retried in-place before parse_failure is used as the final "
+            "escape hatch."
+        ),
+    )
     pre_pr_release_valve_after_cycles: int = Field(
         default=5,
         ge=-1,

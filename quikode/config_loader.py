@@ -334,6 +334,9 @@ def load_config(root: Path | None = None) -> Config:
         ),
         pre_pr_audit_max_cycles=int(raw.get("pre_pr_audit_max_cycles", defaults.pre_pr_audit_max_cycles)),
         pre_pr_audit_timeout_s=int(raw.get("pre_pr_audit_timeout_s", defaults.pre_pr_audit_timeout_s)),
+        pre_pr_audit_output_retries=int(
+            raw.get("pre_pr_audit_output_retries", defaults.pre_pr_audit_output_retries)
+        ),
         pre_pr_release_valve_after_cycles=int(
             raw.get("pre_pr_release_valve_after_cycles", defaults.pre_pr_release_valve_after_cycles)
         ),

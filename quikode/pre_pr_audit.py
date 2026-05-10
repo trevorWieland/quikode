@@ -15,10 +15,10 @@ pipeline re-runs. Cycles cap at `cfg.pre_pr_audit_max_cycles` (default
 Plan 38 PR-B.3: prose parsing (heuristic JSON extraction) is gone for
 all three audit stages. Each audit's outcome is built from the validated
 pydantic instance the JsonAgent layer hands back. A schema-validation
-failure (`parse_errors` non-empty) collapses to a synthetic FAIL labeled
-`parse_failure` — the plan-12/14 invariant (no fabrication) means
-downstream FIXUP planning sees this as "the audit couldn't run cleanly",
-NOT a real grading failure.
+failure (`parse_errors` non-empty) is retried in-place before it collapses
+to a synthetic FAIL labeled `parse_failure` — the plan-12/14 invariant
+(no fabrication) means downstream FIXUP planning sees this as "the audit
+couldn't run cleanly", NOT a real grading failure.
 
 Failures from this layer are *not* the same as a checker FAIL — the PR
 was *blocked from opening* because the system caught the issue before
@@ -222,25 +222,38 @@ def _invoke_audit(
         empty = JsonAgentResult(structured=None, rc=0, transient=False, duration_s=0.0)
         return None, empty, _render_failure_outcome(stage, e)
     agent = make_agent(role, cfg)
-    result = agent.invoke(prompt, handle=handle, log_path=log_path, timeout=cfg.pre_pr_audit_timeout_s)
-    if result.rc != 0:
-        return None, result, _agent_failure_outcome(stage, result)
-    if result.parse_errors or result.structured is None:
-        return None, result, _parse_failure_outcome(stage, result)
-    if not isinstance(result.structured, expected_schema):
-        # Defensive: registry binds the role to its schema; only fires
-        # on a registry misconfiguration.
-        mismatch = StageOutcome(
-            name=stage,
-            passed=False,
-            summary=(
-                f"{stage} agent returned unexpected schema "
-                f"{type(result.structured).__name__}; expected {expected_schema.__name__}"
-            ),
-            findings=[{"kind": "infra", "message": "registry/schema mismatch"}],
-        )
-        return None, result, mismatch
-    return result.structured, result, None
+    attempts = cfg.pre_pr_audit_output_retries + 1
+    result: JsonAgentResult | None = None
+    for attempt_no in range(1, attempts + 1):
+        result = agent.invoke(prompt, handle=handle, log_path=log_path, timeout=cfg.pre_pr_audit_timeout_s)
+        if result.rc != 0:
+            return None, result, _agent_failure_outcome(stage, result)
+        if result.parse_errors or result.structured is None:
+            if attempt_no < attempts:
+                log.warning(
+                    "%s audit output failed schema validation on attempt %d/%d; retrying",
+                    stage,
+                    attempt_no,
+                    attempts,
+                )
+                continue
+            return None, result, _parse_failure_outcome(stage, result)
+        if not isinstance(result.structured, expected_schema):
+            # Defensive: registry binds the role to its schema; only fires
+            # on a registry misconfiguration.
+            mismatch = StageOutcome(
+                name=stage,
+                passed=False,
+                summary=(
+                    f"{stage} agent returned unexpected schema "
+                    f"{type(result.structured).__name__}; expected {expected_schema.__name__}"
+                ),
+                findings=[{"kind": "infra", "message": "registry/schema mismatch"}],
+            )
+            return None, result, mismatch
+        return result.structured, result, None
+    assert result is not None
+    return None, result, _parse_failure_outcome(stage, result)
 
 
 def _parse_failure_outcome(stage: StageName, result: JsonAgentResult) -> StageOutcome:
