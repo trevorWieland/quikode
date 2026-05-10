@@ -26,6 +26,7 @@ from ..widgets.header import HeaderSnapshot
 from ..widgets.resources_panel import ContainerSample, ResourcesSnapshot
 from ..widgets.tasks_table import TaskRowSnapshot
 from .host_metrics import _read_host_caps, _runtime_max_parallel, _worktree_recent_mtime
+from .pending_eligibility import count_pending_eligible
 
 # State -> short label that fits the table column without truncation.
 _SHORT_STATE = {
@@ -307,7 +308,7 @@ class StorePoller:
         counts: dict[str, int],
     ) -> HeaderSnapshot:
         total_tasks, dag_ready_unseeded = self._dag_progress(rows)
-        pending_eligible = self._pending_eligible_count(rows)
+        pending_eligible = self._pending_eligible_count(c, rows)
         tokens_row = c.execute("SELECT COALESCE(SUM(tokens_used), 0) AS t FROM agent_calls").fetchone()
         tokens_total = int(tokens_row["t"]) if tokens_row and tokens_row["t"] else None
         return HeaderSnapshot(
@@ -327,25 +328,12 @@ class StorePoller:
             orchestrator_running=False,
         )
 
-    def _pending_eligible_count(self, rows: list[sqlite3.Row]) -> int:
-        """Seeded tasks whose deps are all merged AND state is pending.
-
-        Approximates the "could run if slots opened" set. Doesn't model the
-        full stacking-readiness=settled gate (which gates on parent settle
-        time), so this is an upper bound for `stacking_readiness="settled"`
-        workspaces — still the right operator signal for "queue depth".
-        """
+    def _pending_eligible_count(self, c: sqlite3.Connection, rows: list[sqlite3.Row]) -> int:
         dag = self._load_dag_cached()
-        if dag is None:
+        cfg = self._cfg
+        if dag is None or cfg is None:
             return 0
-        merged_ids = {r["id"] for r in rows if r["state"] == State.MERGED.value}
-        return sum(
-            1
-            for r in rows
-            if r["state"] == State.PENDING.value
-            and r["id"] in dag.nodes
-            and all(dep in merged_ids for dep in dag.nodes[r["id"]].depends_on)
-        )
+        return count_pending_eligible(c=c, cfg=cfg, dag=dag, rows=rows)
 
     def _dag_progress(self, rows: list[sqlite3.Row]) -> tuple[int, int]:
         dag = self._load_dag_cached()
