@@ -240,6 +240,12 @@ class Config(BaseModel):
         description="Squash-merge automatically when a non-bot APPROVED review lands and the PR is clean.",
     )
 
+    # ----- plan 56: auto-detect merged-via-ancestry -----
+    auto_detect_merged_via_ancestry: bool = Field(
+        default=True,
+        description=desc.AUTO_DETECT_MERGED_VIA_ANCESTRY,
+    )
+
     # ----- plan 30: unified review-ready signal -----
     # Threshold serves two purposes: (1) ntfy notification fires once per
     # settled period; (2) stacked-diff dependents become eligible (in

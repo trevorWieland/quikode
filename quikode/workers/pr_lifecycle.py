@@ -8,6 +8,7 @@ from typing import Any
 from quikode import fsm_runtime
 from quikode.agent_registry import make_agent
 from quikode.agent_schemas import IntentReviewVerdict, PlannerOutput
+from quikode.ancestry import maybe_auto_merge_via_ancestry
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import PlanValidationError
 from quikode.workers.local_ci_capture import capture_local_ci_at_head
@@ -224,6 +225,20 @@ class PrLifecycleWorkerMixin:
                 pr_base_ref,
             )
             return self.run_rebase_to_main()
+        # Plan 56: before treating closed-not-merged as ABORTED, check
+        # whether the task's commits are already reachable from origin/main
+        # (release-batch integration pattern where the operator pushed an
+        # integration branch to main + closed PRs without GH's merge button).
+        # The shared helper handles the cfg-flag check, the branch-missing
+        # fall-through, the fetch+ancestry primitive, and the FSM dispatch.
+        if maybe_auto_merge_via_ancestry(
+            cfg=self.cfg,
+            store=self.store,
+            task_id=self.node.id,
+            row_now=row_now,
+            run_git=self._git_in_workspace,
+        ):
+            return WorkerOutcome(State.MERGED)
         fsm_runtime.pr_closed(self.store, self.node.id, note="PR was closed")
         return WorkerOutcome(State.ABORTED)
 

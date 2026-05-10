@@ -305,6 +305,12 @@ def load_config(root: Path | None = None) -> Config:
         ),
         preempt_yield_threshold=int(raw.get("preempt_yield_threshold", defaults.preempt_yield_threshold)),
         auto_merge_when_clean=bool(raw.get("auto_merge_when_clean", defaults.auto_merge_when_clean)),
+        auto_detect_merged_via_ancestry=bool(
+            raw.get(
+                "auto_detect_merged_via_ancestry",
+                defaults.auto_detect_merged_via_ancestry,
+            )
+        ),
         review_ready_settle_s=int(raw.get("review_ready_settle_s", defaults.review_ready_settle_s)),
         notify_ntfy_url=raw.get("notify_ntfy_url", defaults.notify_ntfy_url),
         notify_ntfy_topic=raw.get("notify_ntfy_topic", defaults.notify_ntfy_topic),

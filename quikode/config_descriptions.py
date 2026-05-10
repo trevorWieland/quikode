@@ -125,3 +125,16 @@ AUDIT_BOOTSTRAP_COMMAND = (
     "`audit-bootstrap: cycle <N>`. Bootstrap rc != 0 fails the task "
     "fast with `audit_bootstrap_failed`, distinct from audit failures."
 )
+
+AUTO_DETECT_MERGED_VIA_ANCESTRY = (
+    "Plan 56: when a polled PR is observed CLOSED-not-merged, run "
+    "`git merge-base --is-ancestor <branch_tip> origin/main` before "
+    "treating the task as aborted. If the task's commits are already "
+    "reachable from origin/main (release-batch integration pattern: "
+    "operator pulls N AWAITING_REVIEW PRs into an integration branch "
+    "then pushes to main and closes the constituent PRs without using "
+    "GitHub's merge button), auto-transition the task to MERGED. "
+    "Default on — safe because the ancestry check is a strict "
+    "guarantee. Disable for workflows where closed-without-merge "
+    "must ALWAYS block."
+)

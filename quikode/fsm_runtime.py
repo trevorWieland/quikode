@@ -144,14 +144,45 @@ def enter_addressing_feedback(store: Any, task_id: str, *, note: str | None = No
 def mark_merged(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
     """Plan 28: MERGED reached from PENDING (seed-from-base via MARK_MERGED),
     PENDING_CI (CI_PASSED → AWAITING_REVIEW → MERGED), or AWAITING_REVIEW
-    directly. The pre-plan-28 SETTLE_WINDOW_ELAPSED hop retired."""
+    directly. The pre-plan-28 SETTLE_WINDOW_ELAPSED hop retired.
+
+    Plan 56: when the auto-detect-merged-via-ancestry path runs against a
+    task that has drifted into a post-PR side state (ADDRESSING_FEEDBACK,
+    REBASING_TO_MAIN) or a terminal failure state (BLOCKED / FAILED /
+    ABORTED) — possible when the operator retroactively runs
+    `qk detect-merged --apply` against stale tasks — bridge through
+    PENDING via the existing RETRY/RESUME / explicit-rebase transitions
+    before firing MARK_MERGED. Idempotent: already-MERGED tasks return
+    immediately.
+    """
     state = current_state(store, task_id)
+    if state is State.MERGED:
+        return state
     if state is State.PENDING:
         return store.apply_event(task_id, Event.MARK_MERGED, note=note, **fields)
     if state is State.PENDING_CI:
         store.apply_event(task_id, Event.CI_PASSED, note=note)
         state = State.AWAITING_REVIEW
-    return store.apply_event(task_id, Event.MERGED, note=note, **fields)
+    if state is State.AWAITING_REVIEW:
+        return store.apply_event(task_id, Event.MERGED, note=note, **fields)
+    # Side states (ADDRESSING_FEEDBACK / REBASING_TO_MAIN / CONFLICT_RESOLVING)
+    # and terminal failure states (BLOCKED / FAILED / ABORTED) bridge through
+    # PENDING. ADDRESSING_FEEDBACK has no direct event-driven exit to MERGED
+    # (CI_PASSED would land us back at PENDING_CI → AWAITING_REVIEW → MERGED,
+    # but that fires FEEDBACK_PUSHED instead — wrong audit trail). BLOCK_TASK
+    # + RESUME / RETRY is the clean bridge: it preserves the audit trail
+    # ("blocked via auto-detect because of X" → "resumed to mark merged").
+    bridge_note = note or "auto-merge via ancestry: bridging side/terminal state to MERGED"
+    if state is State.CONFLICT_RESOLVING:
+        store.apply_event(task_id, Event.UNRESOLVED, note=bridge_note)
+        state = State.BLOCKED
+    elif state in {State.ADDRESSING_FEEDBACK, State.REBASING_TO_MAIN}:
+        store.apply_event(task_id, Event.BLOCK_TASK, note=bridge_note)
+        state = State.BLOCKED
+    if state in {State.BLOCKED, State.FAILED, State.ABORTED}:
+        store.apply_event(task_id, Event.RETRY_TASK, note=bridge_note)
+        return store.apply_event(task_id, Event.MARK_MERGED, note=note, **fields)
+    raise InvalidTransition(f"cannot mark merged from {state.value}")
 
 
 def enter_rebasing_to_main(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
