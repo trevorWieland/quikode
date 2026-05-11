@@ -20,6 +20,13 @@ Two unrelated-but-related crash paths fixed by plan 54:
    current state isn't a valid source for `enter_fixup_planning`.
 
 This file tests fix #2.
+
+Plan 57: the `enter_fixup_planning` helper now silently skips (returns
+None + INFO log) instead of raising `InvalidTransition` when the source
+state is invalid. The plan-54 call-site guard stays as defense-in-depth
+(cheaper, clearer rationale at the call site); the FSM-layer no-op is
+the safety net. The legacy "would raise without guard" sanity test is
+updated to assert the new return-None semantics.
 """
 
 from __future__ import annotations
@@ -29,12 +36,9 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from quikode import fsm_runtime
 from quikode.config import Config
 from quikode.dag import DAG
-from quikode.fsm import InvalidTransition
 from quikode.state import State, Store
 from quikode.subtask_schema import Plan, Subtask
 from quikode.worker import TaskWorker
@@ -199,11 +203,16 @@ def test_run_fixup_round_skips_enter_fixup_planning_when_already_addressing_feed
     worker.store.conn.close()
 
 
-def test_enter_fixup_planning_from_pending_ci_would_raise_without_guard(tmp_path):
-    """Sanity check: confirm the underlying FSM rejects
-    `pending_ci → fixup_planning`, so the guard added in plan 54 is
-    actually preventing a real `InvalidTransition`."""
+def test_enter_fixup_planning_from_pending_ci_returns_none_after_plan_57(tmp_path):
+    """Plan 57: `enter_fixup_planning` no longer raises from invalid
+    source states — it logs INFO and returns `None`. This confirms the
+    underlying FSM still doesn't allow `pending_ci → fixup_planning`
+    (so the plan-54 call-site guard still has a real risk to guard
+    against) but the helper now fails closed instead of crashing the
+    worker."""
     worker = _build_worker(tmp_path, initial_state=State.PENDING_CI)
-    with pytest.raises(InvalidTransition):
-        fsm_runtime.enter_fixup_planning(worker.store, "R-001", note="should fail")
+    result = fsm_runtime.enter_fixup_planning(worker.store, "R-001", note="should skip")
+    assert result is None
+    # State is unchanged: no transition occurred.
+    assert worker.store.get("R-001")["state"] == State.PENDING_CI.value
     worker.store.conn.close()

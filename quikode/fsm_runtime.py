@@ -1,10 +1,24 @@
-"""Runtime helpers for applying canonical FSM events."""
+"""Runtime helpers for applying canonical FSM events.
+
+Plan 57: every `enter_*` helper, plus `mark_merged` and `block_current`,
+returns `State | None` and silently skips (with an INFO log naming the
+helper + the current state) instead of raising `InvalidTransition` when
+the task's current state doesn't allow the helper's transition. The
+helpers are safe to call fire-and-forget from any worker/watcher path;
+the underlying `store.apply_event` still raises on invalid transitions
+(plan 57 only relaxes the helper layer). Plan-49 / plan-54 per-call-site
+guards remain as defense-in-depth — they short-circuit upstream and
+keep the call-site rationale explicit.
+"""
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from quikode.fsm import Event, InvalidTransition, State
+
+log = logging.getLogger("quikode.fsm_runtime")
 
 
 def current_state(store: Any, task_id: str) -> State:
@@ -22,7 +36,7 @@ def environment_ready(store: Any, task_id: str, *, note: str | None = None, **fi
     return store.apply_event(task_id, Event.ENVIRONMENT_READY, note=note, **fields)
 
 
-def enter_doing_subtask(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_doing_subtask(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State | None:
     state = current_state(store, task_id)
     if state is State.ADDRESSING_FEEDBACK:
         return state
@@ -36,46 +50,97 @@ def enter_doing_subtask(store: Any, task_id: str, *, note: str | None = None, **
     }
     event = event_by_state.get(state)
     if event is None:
-        raise InvalidTransition(f"cannot enter doing_subtask from {state.value}")
+        log.info(
+            "fsm_runtime.enter_doing_subtask: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, event, note=note, **fields)
 
 
-def enter_checking_subtask(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_checking_subtask(
+    store: Any, task_id: str, *, note: str | None = None, **fields: Any
+) -> State | None:
     state = current_state(store, task_id)
     if state in {State.ADDRESSING_FEEDBACK, State.CHECKING_SUBTASK}:
         return state
+    if state is not State.DOING_SUBTASK:
+        log.info(
+            "fsm_runtime.enter_checking_subtask: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.DOER_DONE, note=note, **fields)
 
 
-def enter_triaging_subtask(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
-    if current_state(store, task_id) is State.ADDRESSING_FEEDBACK:
+def enter_triaging_subtask(
+    store: Any, task_id: str, *, note: str | None = None, **fields: Any
+) -> State | None:
+    state = current_state(store, task_id)
+    if state is State.ADDRESSING_FEEDBACK:
         return State.ADDRESSING_FEEDBACK
+    if state is not State.CHECKING_SUBTASK:
+        log.info(
+            "fsm_runtime.enter_triaging_subtask: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.SUBTASK_FAILED, note=note, **fields)
 
 
-def enter_committing(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_committing(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State | None:
+    state = current_state(store, task_id)
+    if state is not State.CHECKING_SUBTASK:
+        log.info(
+            "fsm_runtime.enter_committing: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.SUBTASK_PASSED, note=note, **fields)
 
 
-def enter_pushing(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_pushing(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State | None:
+    state = current_state(store, task_id)
+    if state is not State.COMMITTING:
+        log.info(
+            "fsm_runtime.enter_pushing: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.COMMIT_CREATED, note=note, **fields)
 
 
-def enter_local_ci_checking(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_local_ci_checking(
+    store: Any, task_id: str, *, note: str | None = None, **fields: Any
+) -> State | None:
     state = current_state(store, task_id)
     if state is State.LOCAL_CI_CHECKING:
         return state
+    if state is not State.PUSHING:
+        log.info(
+            "fsm_runtime.enter_local_ci_checking: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.ALL_SUBTASKS_DONE, note=note, **fields)
 
 
-def enter_pre_pr_auditing(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_pre_pr_auditing(
+    store: Any, task_id: str, *, note: str | None = None, **fields: Any
+) -> State | None:
     state = current_state(store, task_id)
     if state is State.PRE_PR_AUDITING:
         return state
+    if state is not State.LOCAL_CI_CHECKING:
+        log.info(
+            "fsm_runtime.enter_pre_pr_auditing: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.LOCAL_CI_PASSED, note=note, **fields)
 
 
-def enter_fixup_planning(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_fixup_planning(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State | None:
     state = current_state(store, task_id)
     if state is State.FIXUP_PLANNING:
         return state
@@ -85,15 +150,26 @@ def enter_fixup_planning(store: Any, task_id: str, *, note: str | None = None, *
     }
     event = event_by_state.get(state)
     if event is None:
-        raise InvalidTransition(f"cannot enter fixup_planning from {state.value}")
+        log.info(
+            "fsm_runtime.enter_fixup_planning: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, event, note=note, **fields)
 
 
-def enter_pr_opening(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_pr_opening(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State | None:
+    state = current_state(store, task_id)
+    if state is not State.PRE_PR_AUDITING:
+        log.info(
+            "fsm_runtime.enter_pr_opening: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.AUDIT_PASSED, note=note, **fields)
 
 
-def enter_pending_ci(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_pending_ci(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State | None:
     """Plan 28: PENDING_CI is reached from PR_OPENING (PR_OPENED), from
     ADDRESSING_FEEDBACK after fixup-push (FEEDBACK_PUSHED), or from
     REBASING_TO_MAIN after rebase-push (REBASE_PUSHED). The pre-plan-28
@@ -109,21 +185,35 @@ def enter_pending_ci(store: Any, task_id: str, *, note: str | None = None, **fie
     }
     event = event_by_state.get(state)
     if event is None:
-        raise InvalidTransition(f"cannot enter pending_ci from {state.value}")
+        log.info(
+            "fsm_runtime.enter_pending_ci: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, event, note=note, **fields)
 
 
-def enter_awaiting_review(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_awaiting_review(
+    store: Any, task_id: str, *, note: str | None = None, **fields: Any
+) -> State | None:
     """Plan 28: AWAITING_REVIEW is reached from PENDING_CI on CI_PASSED. The
     pre-plan-28 MERGE_READY → AWAITING_REVIEW idempotency arm retired with
     the settle window."""
     state = current_state(store, task_id)
     if state is State.AWAITING_REVIEW:
         return state
+    if state is not State.PENDING_CI:
+        log.info(
+            "fsm_runtime.enter_awaiting_review: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.CI_PASSED, note=note, **fields)
 
 
-def enter_addressing_feedback(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_addressing_feedback(
+    store: Any, task_id: str, *, note: str | None = None, **fields: Any
+) -> State | None:
     """Plan 28: ADDRESSING_FEEDBACK reached directly from PENDING_CI (CI fail)
     or AWAITING_REVIEW (CI flake or CHANGES_REQUESTED). No intermediate
     classifier state — the bundled context (CI excerpt, threads, PR comments,
@@ -138,10 +228,14 @@ def enter_addressing_feedback(store: Any, task_id: str, *, note: str | None = No
         # CHANGES_REQUESTED since CI flake is the rarer case.
         event = fields.pop("event", None) or Event.CHANGES_REQUESTED_RECEIVED
         return store.apply_event(task_id, event, note=note, **fields)
-    raise InvalidTransition(f"cannot enter addressing_feedback from {state.value}")
+    log.info(
+        "fsm_runtime.enter_addressing_feedback: skipping (current state %r doesn't allow this transition)",
+        state.value,
+    )
+    return None
 
 
-def mark_merged(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def mark_merged(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State | None:
     """Plan 28: MERGED reached from PENDING (seed-from-base via MARK_MERGED),
     PENDING_CI (CI_PASSED → AWAITING_REVIEW → MERGED), or AWAITING_REVIEW
     directly. The pre-plan-28 SETTLE_WINDOW_ELAPSED hop retired.
@@ -154,6 +248,10 @@ def mark_merged(store: Any, task_id: str, *, note: str | None = None, **fields: 
     PENDING via the existing RETRY/RESUME / explicit-rebase transitions
     before firing MARK_MERGED. Idempotent: already-MERGED tasks return
     immediately.
+
+    Plan 57: any state outside the recognized bridge set returns None +
+    logs INFO (instead of raising InvalidTransition) so callers from
+    any worker/watcher path are safe.
     """
     state = current_state(store, task_id)
     if state is State.MERGED:
@@ -182,25 +280,55 @@ def mark_merged(store: Any, task_id: str, *, note: str | None = None, **fields: 
     if state in {State.BLOCKED, State.FAILED, State.ABORTED}:
         store.apply_event(task_id, Event.RETRY_TASK, note=bridge_note)
         return store.apply_event(task_id, Event.MARK_MERGED, note=note, **fields)
-    raise InvalidTransition(f"cannot mark merged from {state.value}")
+    log.info(
+        "fsm_runtime.mark_merged: skipping (current state %r doesn't allow this transition)",
+        state.value,
+    )
+    return None
 
 
-def enter_rebasing_to_main(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_rebasing_to_main(
+    store: Any, task_id: str, *, note: str | None = None, **fields: Any
+) -> State | None:
     state = current_state(store, task_id)
     if state is State.REBASING_TO_MAIN:
         return state
     if state is State.CONFLICT_RESOLVING:
         return store.apply_event(task_id, Event.RESOLVED, note=note, **fields)
-    return store.apply_event(task_id, Event.PARENT_MERGED_OR_CONFLICT, note=note, **fields)
+    # PARENT_MERGED_OR_CONFLICT is broadly applicable (see fsm.py: registered
+    # for ACTIVE_STATES | {PENDING_CI, AWAITING_REVIEW}); fire it iff the
+    # FSM accepts it from the current source state.
+    try:
+        return store.apply_event(task_id, Event.PARENT_MERGED_OR_CONFLICT, note=note, **fields)
+    except InvalidTransition:
+        log.info(
+            "fsm_runtime.enter_rebasing_to_main: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
 
 
-def enter_conflict_resolving(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def enter_conflict_resolving(
+    store: Any, task_id: str, *, note: str | None = None, **fields: Any
+) -> State | None:
+    state = current_state(store, task_id)
+    if state is not State.REBASING_TO_MAIN:
+        log.info(
+            "fsm_runtime.enter_conflict_resolving: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
     return store.apply_event(task_id, Event.CONFLICT, note=note, **fields)
 
 
-def block_current(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
+def block_current(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State | None:
     """Plan 28: TRIAGING_FEEDBACK retired. ADDRESSING_FEEDBACK can still
-    block via FEEDBACK_EXHAUSTED."""
+    block via FEEDBACK_EXHAUSTED.
+
+    Plan 57: if no BLOCK_TASK transition exists from the current state
+    (terminal states, or states the FSM doesn't allow BLOCK_TASK from),
+    log INFO + return None instead of letting `apply_event` raise.
+    """
     state = current_state(store, task_id)
     event_by_state = {
         State.TRIAGING_SUBTASK: Event.RETRY_EXHAUSTED,
@@ -208,10 +336,15 @@ def block_current(store: Any, task_id: str, *, note: str | None = None, **fields
         State.ADDRESSING_FEEDBACK: Event.FEEDBACK_EXHAUSTED,
         State.CONFLICT_RESOLVING: Event.UNRESOLVED,
     }
-    event = event_by_state.get(state)
-    if event is None:
-        return store.apply_event(task_id, Event.BLOCK_TASK, note=note, **fields)
-    return store.apply_event(task_id, event, note=note, **fields)
+    event = event_by_state.get(state, Event.BLOCK_TASK)
+    try:
+        return store.apply_event(task_id, event, note=note, **fields)
+    except InvalidTransition:
+        log.info(
+            "fsm_runtime.block_current: skipping (current state %r doesn't allow this transition)",
+            state.value,
+        )
+        return None
 
 
 def crash_current(store: Any, task_id: str, *, note: str | None = None, **fields: Any) -> State:
