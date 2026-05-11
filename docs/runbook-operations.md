@@ -37,27 +37,32 @@ tmux new-session -d -s qk-health-loop \
 
 `GLM-5.1-zai` is the preferred write-heavy profile when the local LiteLLM
 proxy is healthy. The model registry gives it an automatic quota fallback to
-`GLM-5.1-wafer`, then direct `gpt-5.3-codex`: a Z.ai 429 is surfaced
-immediately to the fallback wrapper instead of sleeping inside the primary
-provider, and a Wafer 429 falls through to Codex so doer work can continue.
-When both subscription providers are exhausted, keep a five-hour reset probe
-running; every new call still retries Z.ai first because the primary model
-remains `GLM-5.1-zai`.
+`GLM-5.1-wafer`, then direct `gpt-5.3-codex`. Plan 59 reframed quota handling:
+the chain is fast-fail at the transport layer (no in-transport sleep — plan
+19A's design is RETIRED), so a Z.ai 429 cascades through Wafer to direct
+Codex in seconds, not minutes. If ALL THREE return quota, the worker layer
+sleeps `cfg.transient_retry_delays_s["quota_exhausted"]` (default 600s)
+before the next full chain re-attempt. Tune that key in `.quikode/config.toml`
+if 10 min is too aggressive or too patient for the operator's preferred
+re-attempt cadence; see `runbook-incident-response.md` § "Plan 59
+transient_retry_delays_s tuning".
 
-Proxy-routed z.ai/Wafer profiles still use client-side JSON validation because
-LiteLLM drops Codex `output_schema` during Responses -> Chat translation. The
-client-side layer accepts a schema-valid JSON object even when provider prose or
-markdown surrounds it. For doer roles, the envelope is bookkeeping only: if it
-is still malformed after repair, Quikode records that fact and grades the diff
-and witnesses instead of treating the envelope as the work.
+Plan 47 retired the doer envelope: doer transports run plain apply-patch
+(no `--output-schema` / `--json-schema` flag). The diff is the sole evidence;
+no envelope-shape repair failures. Read-only roles (planner / checker /
+triage / fixup-planner / merge-planner / progress / audit) still run in
+JSON output mode; on proxy-routed transports the client-side layer accepts a
+schema-valid JSON object even when provider prose or markdown surrounds it.
+
 Watch for write-role transport failures that are not quota failures:
 
-- `quikode show <task-id>` shows repeated `doer_output_invalid` retries.
-- The doer produced an empty diff.
+- `quikode show <task-id>` shows repeated `,layer=transport` retries (plan 48 / 51 — the structured retry signature; the legacy `doer_output_invalid` shape is retired).
+- The doer produced an empty diff. Plan 51's transport stop-loss BLOCKs after `cfg.subtask_transport_stop_loss_count` (default 3) consecutive empty diffs with an operator-clear message; a new `subtask_empty_diff:<id>` artifact appears in `qk show`.
 - Raw task logs include `stream disconnected before completion: error sending request for url (http://host.docker.internal:4000/v1/responses)`.
 - In a corrected host probe (`127.0.0.1` base URL), Wafer returned a shell
-  command in a code block instead of issuing a tool call, created no file, and
-  ignored `--output-schema`.
+  command in a code block instead of issuing a tool call, created no file.
+  (Schema enforcement no longer applies to doer transports per plan 47 — the
+  diff is the evidence; an empty diff is the signal.)
 
 For host-side manual proxy probes on Linux, use `127.0.0.1:4000`. The
 `host.docker.internal:4000` provider URL is for task containers, where quikode
@@ -81,17 +86,21 @@ reset/resume the blocked tasks.
 
 ## Post-PR state meanings
 
-Plan 28 streamlined the post-PR slice to three states:
+Plan 28 streamlined the post-PR slice; plan 58 flattened it further. Post-cutover:
 
 - **`pending_ci`** — PR open, CI running. Daemon polls only `gh pr view` for CI rollup.
 - **`awaiting_review`** — CI is green; daemon polls formal GitHub Reviews. The "needs human" state.
-- **`addressing_feedback`** — daemon detected CI failure or a non-bot `CHANGES_REQUESTED` review; worker is running the fixup-decomposition path with bundled context.
+- (Plan 58: `addressing_feedback` is REMOVED.) A detected CI failure or non-bot `CHANGES_REQUESTED` review now fires `CI_FIXUP_START` or `REVIEW_FIXUP_START`, transitioning the task to `AUDIT_LOCAL_CI` and entering the unified `_run_audit_cycle` driver. The 5 audit-stage states (`AUDIT_LOCAL_CI` / `AUDIT_RUBRIC` / `AUDIT_STANDARDS` / `AUDIT_ARCHITECTURE` / `AUDIT_BEHAVIOR`) walk in order; on any stage failure the task enters `FIXUP_PLANNING` → `DOING_SUBTASK` etc. and re-enters `AUDIT_LOCAL_CI` after fixup commits land.
 
-Plan 30 adds a derived signal on top of `awaiting_review`:
+Plan 58 also adds a lifecycle phase/cycle layer on top of the state. Every task carries `phase ∈ {INITIAL, PRE_PR_REVIEW, PR_REVIEW}` + `cycle_in_phase: int` + `pr_review_trigger ∈ {NONE, CI_FAILURE, REVIEW_FEEDBACK}`. The TUI / state-log / `qk briefing` render `phase · cycle X · state` so the operator sees both "where in the lifecycle is this task" and "what state is it in right now." The `release_valve_*` config keys (renamed from `pre_pr_release_valve_*`) apply per-phase: PRE_PR_REVIEW cycle 5 → open PR with deferred findings; PR_REVIEW cycle 5 per trigger → push + let GitHub + reviewer decide.
+
+Plan 30's derived signal on `awaiting_review`:
 
 - **review-ready-settled** — task has been in `awaiting_review` for ≥ `cfg.review_ready_settle_s` (default 900s = 15 min). Triggers two things: (1) ntfy push to `cfg.notify_ntfy_topic`; (2) stacked-diff dependents whose only un-met dep is this task become eligible to start.
 
-(Retired by plan 28: `merge_ready`, `triaging_feedback`. Bot/AI-reviewer line comments are no longer polling triggers — they bundle as context for the fixup planner when a real review fires.)
+(Retired by plan 28: `merge_ready`, `triaging_feedback`. Retired by plan 58: `pre_pr_auditing`, `addressing_feedback`. Bot/AI-reviewer line comments are not polling triggers — they bundle as context for the fixup planner when a real review fires.)
+
+Plan 56: if a PR ends up CLOSED-not-merged on GitHub but every commit is reachable from `origin/<base>` (the release-batch flow), the daemon auto-transitions the task to MERGED via ancestry check. `qk detect-merged` is the operator-facing dry-run / `--apply` sweep for retroactive catch-up.
 
 ## Stacking-gate behavior at startup
 
@@ -123,7 +132,9 @@ If you've **just tightened the stacking gate** (e.g. flipped `stacking_readiness
 
 `mark-merged <id>` — marks already-landed upstream work as merged.
 
-For decision rules on which intervention to use, see `orientation.md` §3 (Resolving blockers — the intervention decision framework). Escalation order: resume / reset-retries → rewind → replan-cycle → retry.
+`detect-merged` — plan 56 sweep. Dry-run by default; prints which tasks' commits are reachable from `origin/<base>` (i.e. were absorbed into main via release-batch push even though the PR was closed-not-merged on GitHub). `--apply` auto-merges every such task via the same FSM call `qk mark-merged` uses. Idempotent; safe to run at any time, even with the daemon up.
+
+For decision rules on which intervention to use, see `orientation.md` §3 (Resolving blockers — the intervention decision framework). Escalation order: resume / reset-retries → rewind → replan-cycle → retry. Retry is genuinely reserved for tasks where even the initial planner output was wrong-shape; for cycle-level non-convergence in fixup / replan / merge cycles, `replan-cycle` preserves every earlier-cycle commit.
 
 ## ntfy review-ready notifications
 

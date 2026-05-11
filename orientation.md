@@ -153,6 +153,16 @@ qk daemon stop
 qk daemon start --detach --max-parallel 12 --retry-failed
 ```
 
+**Plan 58 migration (one-shot, already applied to the tanren workspace on 2026-05-10).** The plan-58 FSM flatten + lifecycle-phase columns ship as a hard cutover; the deprecated `PRE_PR_AUDITING` / `ADDRESSING_FEEDBACK` states are removed and three new columns (`tasks.phase`, `tasks.cycle_in_phase`, `tasks.pr_review_trigger`) are added. The migration script is `plans/58-migration.sql`; the operator runs it between `qk daemon stop` and `qk daemon start`:
+
+```bash
+qk daemon stop
+sqlite3 .quikode/quikode.db < /home/trevor/github/quikode/plans/58-migration.sql
+qk daemon start --detach --max-parallel 12 --retry-failed
+```
+
+The script backs the prior `tasks` table up to `tasks_backup_plan58` before reshaping, derives `phase` from the old state, and remaps `pre_pr_auditing` / `addressing_feedback` rows to `pending` with a resume marker so the unified `_run_audit_cycle` driver re-enters cleanly. After verifying `qk briefing`'s phase tier breakdown looks right, the backup table can be dropped. Future operators picking up a stale workspace (one that ran daemon < plan 58) MUST run the migration before starting the daemon; the schema check will refuse to start otherwise. See `docs/runbook-incident-response.md` § "Plan 58 cutover incident" for the rollback path if anything looks wrong post-migration.
+
 **LiteLLM proxy (plan 38).** Codex 0.128+ only speaks the OpenAI Responses API. For non-OpenAI providers (z.ai, Wafer Pass, etc.) a local LiteLLM proxy bridges Responses -> Chat Completions on `127.0.0.1:4000` for host probes and `172.17.0.1:4000` for task containers. Codex provider configs at `~/.codex/config.toml` use `base_url = "http://host.docker.internal:4000/v1"` for tanren task containers (via the `--add-host=host.docker.internal:host-gateway` flag plan-38 PR-A added to `quikode/docker_env.py`). On the Linux host itself, `host.docker.internal` may not resolve; host-side manual probes should use `127.0.0.1:4000` or override the provider base URL with `-c 'model_providers.<provider>.base_url="http://127.0.0.1:4000/v1"'`. API keys live in `~/.codex/.env` (mode 600), sourced by `~/.bashrc` for every interactive shell. Litellm config at `~/.codex/litellm_config.yaml`. Start:
 
 ```bash
@@ -242,9 +252,11 @@ Operator-mediated worktree fixes (open the file, write the correct content, `qk 
 - `qk tail <task>` — task log tail.
 - `qk resume <id>` — drop a BLOCKED/FAILED task back to PENDING with a resume marker.
 - `qk rewind <id> <subtask_id>` — surgical recovery (plan 27). Use `--dry-run` first.
+- `qk replan-cycle <id>` — cycle-scoped recovery (plan 52). Deletes only the most-recent planning cycle's subtasks, force-pushes the branch back to before that cycle's first commit, and sets a marker so the worker re-fires the matching planner (fixup / replan / merge / initial) on the next scheduling tick. Earlier cycles' commits + retry counters survive. Requires BLOCKED/FAILED. Use `--dry-run` first. **Default escalation between rewind and retry when the failing subtask is in a non-initial cycle (`F-…`, `F-CI-…`, replan output, merge-integration).**
 - `qk retry <id>` — fresh restart: clears worktree + branch + subtask rows.
 - `qk reset-retries <id> [<subtask>]` — zero retry counters on BLOCKED subtasks of a BLOCKED/FAILED task without discarding committed work.
 - `qk unblock <id>` — forensics for a blocked task.
+- `qk detect-merged` — plan 56 operator-facing ancestry sweep. Dry-run by default; prints which tasks' commits are reachable from `origin/<base>` (i.e. were absorbed into main via a release-batch push even though the PR was closed-not-merged on GitHub). `--apply` fires the auto-merge for every such task via the same FSM call `qk mark-merged` uses. Useful for (a) verifying behavior of the new auto-detect-merged hook before trusting it, (b) catching up retroactively after a release-batch push the daemon wasn't running for. Works whether or not the daemon is up; safe to run as often as the operator wants.
 - `qk mark-merged <id> ...` — declares a node already-merged in the upstream repo so it doesn't get attempted. **Race caveat:** mark-merged requires the task in PENDING; if the daemon picked it up first (now in PROVISIONING/PLANNING), stop the daemon, kill any docker-exec subprocesses, force-remove the task's containers, and direct-DB-reset the row to PENDING (`UPDATE tasks SET state='pending', plan_text=NULL, branch=NULL, worktree_path=NULL, container_id=NULL ...; DELETE FROM subtasks WHERE task_id=...`). Then mark-merged. Direct SQL is acceptable in fresh-seed setup mode; not in normal operation.
 - `qk daemon status` / `start` / `stop`. **Plan 34**: stop now SIGTERMs the supervisor + every descendant, waits 30s, SIGKILLs survivors in (supervisor → ordinary → docker exec) order, unconditionally cleans `orchestrator.pid` + `orchestrator.heartbeat`. status WARNs + exits nonzero when an orphaned `quikode.cli run` child is alive without supervisor (was the May 8 incident). **Edge case still uncovered:** docker-exec → bash → codex/opencode descendants spawned by the orchestrator's child can outlive a stop call when the kernel's reparenting takes longer than the SIGKILL window. If you hit a "ghost agent inside container" after a stop, `docker rm -f $(docker ps -aq --filter name=qk-)` clears them.
 - `qk reset` — wipes containers/branches/state/worktrees. **Plan 34**: refuses to run when a supervisor or orphan child is alive (`--force` to override after a manual `kill -9`).
@@ -265,8 +277,9 @@ These live in the bundled prompts and are the contract every agent role honors. 
 - **Every upstream agent sees the audit's actual rubric (plan 33 + plan 35).** A single `EvaluationContract` is built at PROVISIONING and persisted at `<workspace>/state/<task_id>/evaluation_contract.json`. Planner / doer / checker / triage / fixup-planner / merge-planner all load it and render scoped excerpts via `prompts/_evaluation_context.md.j2` (`ec_full` / `ec_stage_card` / `ec_targeted` macros). The contract has five stages: `local_ci`, `rubric`, `standards`, `architecture`, `behavior` (plan 35 split standards into language/framework profile docs vs. project-architecture docs). The standards rubric carries the loaded profile catalog; the architecture rubric carries the loaded architecture-doc corpus. `ec_targeted` inlines cited section bodies for both `standards_referenced[]` and `architecture_referenced[]` so doer/checker/triage see the actual rule prose, not just the citations.
 - **Every decision-making structured-output agent runs in JSON output mode (plan 38).** The `JsonAgent` layer (`quikode/agents/json_protocol.py` + three transport shims) is the SOLE agent path. Schema enforcement: cli-native (claude `--json-schema`, codex `--output-schema`) for direct-OpenAI / claude transports; client-side pydantic validation for proxy-routed transports. Both tiers still pydantic-validate the role schema and issue one structured repair prompt on validation failure; cli-native is a transport promise, not a reason to trust sibling-role-shaped JSON. Client-side transports may recover a balanced JSON object from provider prose only after exact schema validation. NO regex parsing of agent stdout. Every retired prose-parsing call site stays retired: `extract_json`, `parse_self_audit`, three pre_pr_audit heuristic JSON extracts, `progress.py`'s `_JSON_OBJECT_RE`, the codex/generic token regexes.
 - **Role-MODEL binding only (plan 38).** The role-binding axis is MODEL, never CLI. `cfg.<role>_model` selects from `MODELS` (in `model_registry.py`); the CLI is derived from `MODELS[<model>].transport`. Adding a new model is a one-line edit to `MODELS`. Adding a new provider is: register upstream in `~/.codex/litellm_config.yaml`, add codex profile in `~/.codex/config.toml`, add `MODELS` entry. NO ROLE EVER REFERENCES A CLI BY NAME.
-- **Doer may emit a `DoerEnvelope` JSON envelope (plan 38/46).** Bookkeeping only — never graded. The diff is the evidence. The checker reads `git -C <worktree> status --porcelain` + `git diff HEAD --stat` and grades the diff against the contract; the envelope is shown for context only, labeled "doer's self-report — informational only." If a proxy-routed doer produces malformed bookkeeping after repair, Quikode records a fallback envelope and still runs witnesses/checkers against the diff. Plan 22 carry-forward remains best-effort when a valid prior envelope exists. NO SELF_AUDIT — `quikode/self_audit.py` is deleted.
-- **Triage tutors, doesn't prescribe (plan 33 / 38).** Senior-engineer-tutoring-junior framing: concrete file:line cites, teach the concept the doer missed, leave the next attempt's autonomy intact. Failure-layer enum: `{local_ci, rubric, standards, architecture, behavior, parse_failure, transport}`. NO `self_audit_mismatch` (gone with SELF_AUDIT); NEW `parse_failure` (when the JsonAgent's structured re-prompt-once also fails); NEW `architecture` (plan 35 dual-bucket). (`subtask-triage.md`.)
+- **Doer envelope is retired — the diff is the sole evidence (plan 47).** Doer transports run in plain apply-patch mode: NO `--output-schema` / `--json-schema`, NO bookkeeping envelope, NO fallback envelope record. `WritesFilesAgent` now accepts `envelope_schema=None` and dispatches to `transport.invoke_raw` (one per shim — `json_codex_direct.py`, `json_codex_litellm.py`, `json_claude.py`, plus the chain wrapper in `json_fallback.py`). The `DoerEnvelope` pydantic schema is removed from the registry, the prompt, and tests. Plan 22's prior-output carry-forward flows through `triage_notes` only — there is no envelope to carry. `ConflictResolverEnvelope` and `IntentReviewVerdict` are unaffected (those roles aren't writes-files-without-grading). The checker reads `git -C <worktree> status --porcelain` + `git diff HEAD --stat` and grades the diff against the contract; no envelope ever feeds back into a witness command (plan 33's "envelope-derived witness command" path is gone with the envelope). NO SELF_AUDIT — `quikode/self_audit.py` was deleted by plan 38.
+- **Triage tutors, doesn't prescribe (plan 33 / 38).** Senior-engineer-tutoring-junior framing: concrete file:line cites, teach the concept the doer missed, leave the next attempt's autonomy intact. Failure-layer enum: `{local_ci, rubric, standards, architecture, behavior, parse_failure, transport, cannot_reproduce}`. NO `self_audit_mismatch` (gone with SELF_AUDIT); `parse_failure` fires when the JsonAgent's structured re-prompt-once also fails; `architecture` covers plan 35's dual-bucket; `transport` covers plan 51's empty-diff stop-loss; `cannot_reproduce` covers plan 53's environmental-drift signal on `kind="fixup_ci"`. (`subtask-triage.md`.)
+- **Stop-loss signature is structured, not regex-scraped (plan 48).** `retry_classify.classify_retry` consumes the structured `Verdict` and `SubtaskTriageOutput.failure_layer` directly; the legacy `_CHECKER_VERDICT_RE` rendered-text scrape is removed. Same-signature stop-loss (plan 23) therefore distinguishes `verdict=FAIL,layer=local_ci` from `verdict=FAIL,layer=rubric` from `…,layer=transport` etc. — five attempts in a row at the SAME layer trip the block, but a real layer shift resets the counter. `_triage_subtask` returns `(text, failure_layer)`; `_record_subtask_triage` plumbs both through `_append_retry_reason`. `qk resume` additionally clears `retry_reasons`/`retries`/`transient_retries`/`flatline_count`/`progress_check_count` on subtasks whose original state was `blocked`, so a manual resume gives a fresh stop-loss budget. No backwards-compat shims.
 - **Checker grades the diff (plan 38).** Output: `SubtaskCheckerOutput` (verdict pass|fail + findings + overall_assessment) — pydantic-validated. Plan-12/14 invariants preserved: no fabrication, no out-of-scope findings; verdict is structured, not regex-extracted from prose. (`subtask-checker.md`.)
 - **Standards / architecture dual-bucket (plan 35).** `standards_referenced` cites only standards-profile docs (under `cfg.standards_profiles_dir`, validated via `validate_standards_refs`). `architecture_referenced` cites only project-architecture docs (under `cfg.architecture_docs_dir`, validated via `validate_architecture_refs`). Wrong-bucket placement triggers a planner re-prompt with a structured bucket-correction message; second mis-route → BLOCK. Adding a new project profile = `qk standards seed --to <path>` to copy starter content + edit the workspace's `quikode.yaml` to point at it.
 - **Audit fixup coverage is five-stage aware.** Audit-driven fixup planning validates `rubric:`, `standards:`, `architecture:`, and `behavior:` finding ids against the matching stage-typed fields (`rubric_targets`, `standards_referenced`, `architecture_referenced`, `behavior_evidence_advanced`) plus `findings_addressed`. If architecture audit findings reappear as "missing coverage", inspect `quikode/workers/fixup_coverage.py` before assuming the task branch is at fault.
@@ -284,7 +297,16 @@ These live in the bundled prompts and are the contract every agent role honors. 
 - **PR CLOSED-not-merged is auto-detected as MERGED when commits are reachable from main (plan 56).** The operator's sustained release-batch workflow pulls N AWAITING_REVIEW PRs into a local integration branch, pushes that branch to main, then closes each constituent PR with `gh pr close` — GitHub reports `state=CLOSED, merged=false` even though every commit is in main. The PR-state poll handler runs `git merge-base --is-ancestor <task_branch_tip> origin/<base_branch>` (in the task's container, after a refresh fetch) BEFORE the existing closed-without-merge handling: if commits ARE reachable, the task auto-transitions to MERGED via the same FSM call `qk mark-merged` uses, and stacked descendants unblock naturally on the next scheduling tick. Knob: `cfg.auto_detect_merged_via_ancestry` (default on; opt out for regulated workflows where every CLOSED-not-merged PR must be operator-acknowledged). Companion CLI: `qk detect-merged` (dry-run report) / `qk detect-merged --apply` (one-shot retroactive sweep) for verifying behavior + catching up after a release-batch push the daemon wasn't running for. The release-batch workflow no longer requires per-PR `qk mark-merged`. (`quikode/ancestry.py`, `quikode/workers/pr_lifecycle.py` `_maybe_auto_merge_via_ancestry`, `quikode/cli_detect_merged.py`.)
 - **Pre-PR audit cycles run against a fresh dev container when opted in (plan 55).** With `cfg.audit_fresh_container=true`, the orchestrator discards the existing dev container at the start of every pre-PR audit cycle and re-provisions a clean one from `cfg.image_tag`. Then `cfg.audit_bootstrap_command` (project-defined "match what GitHub does" command, e.g. `pnpm install --frozen-lockfile && just regenerate-all`) runs inside that fresh container; if it produces a worktree diff, the orchestrator auto-commits + pushes it as `audit-bootstrap: cycle <N>` BEFORE the gauntlet stages run. Bootstrap rc != 0 BLOCKs with a distinct `audit_bootstrap_failed` reason — distinguishable from audit-content failures so the operator routes to env-bootstrap repair, not subtask retry. Empty `audit_bootstrap_command` skips the bootstrap step but still re-provisions. Resumed cycles (with already-passed stages) skip the re-provision so partial work isn't invalidated. The doer prompt's §6a paragraph names `cfg.audit_bootstrap_command` so a `kind="fixup_ci"` doer can re-run the bootstrap inside the container when its own intermediate edits drifted the cache from the orchestrator's audit-cycle-start state. (`quikode/workers/audit_bootstrap.py`, `quikode/workers/pre_pr.py`, `prompts/subtask-doer.md` §6a.)
 - **Fixup-CI subtasks must reproduce-before-fix (plan 53).** The doer for a `kind="fixup_ci"` subtask cannot declare done by running the CI error's suggested command alone — it must first reproduce the failure under fresh-state conditions (clean rebuild + full chain producing the failed step's inputs, not just the final-step generator). Empty-diff + green-local-gates on a fixup-CI subtask is interpreted as `failure_layer="cannot_reproduce"` (environmental drift signal), not as no-op DONE; the new K=2 `subtask_cannot_reproduce_stop_loss_count` BLOCKs after the second occurrence with operator-clear messaging naming the suspected divergence (cache state, pinned versions, missing checked-in generated file). Empty-diff + green-local-gates on `kind != "fixup_ci"` IS a positive no-op DONE — the subtask was already satisfied by upstream commits and the worker advances without committing or pushing. The fixup planner sees `local_ci_at_head=(passed, excerpt)` captured BEFORE its invocation and dispatches on three cases (GitHub fails AND local fails / passes / etc.) instead of distilling the CI error verbatim. (`prompts/fixup-planner.md` §0 + §2 local-CI block; `prompts/subtask-doer.md` §6a; `quikode/workers/subtask_execution.py` `_classify_empty_diff_branch`.)
-- **`fsm_runtime.enter_*` helpers never raise on invalid source state (plan 57).** Every `enter_*` helper — plus `mark_merged` and `block_current` — returns `State | None` and silently skips (INFO log on `quikode.fsm_runtime` naming the helper + the current state) when the task's current state doesn't allow the requested transition. Safe to call fire-and-forget from any worker/watcher path; the prior per-call-site state-check pattern (plans 49 / 54) stays as defense-in-depth (cheaper, clearer at the call site) and the FSM-layer no-op is the safety net. The underlying `store.apply_event` still raises `InvalidTransition` — the relaxation is helper-layer only. (`quikode/fsm_runtime.py`.)
+- **`fsm_runtime.enter_*` helpers never raise on invalid source state (plans 49 + 54 + 57).** Every `enter_*` helper — plus `mark_merged` and `block_current` — returns `State | None` and silently skips (INFO log on `quikode.fsm_runtime` naming the helper + the current state) when the task's current state doesn't allow the requested transition. Plans 49 and 54 first introduced per-call-site state-check guards (`_handle_post_pr_ci_failure` / `_handle_changes_requested` / `_handle_passed_subtask` / `_run_fixup_round` after `InvalidTransition` crashes on `blocked → addressing_feedback`, `addressing_feedback → committing`, etc.); plan 57 generalized the pattern by pushing the guard INTO the helpers. Both layers stay: per-call-site checks are cheaper and clearer; the FSM-layer no-op is the safety net. The underlying `store.apply_event` still raises `InvalidTransition` — the relaxation is helper-layer only. `task_worker.py:_safe_crash_current` keeps its `except InvalidTransition` (plan 20's terminal-state guard; `crash_current` is intentionally not relaxed). Safe to call fire-and-forget from any worker/watcher path. (`quikode/fsm_runtime.py`.)
+- **Config-loader orphan-field audit at startup (plan 50).** `load_config` post-construction calls `_warn_orphan_overrides`, which walks `Config.model_fields` for any top-level TOML key whose final cfg value still equals the Field default — i.e. the TOML override didn't actually take effect because `load_config` is missing the read. Logs `WARNING` per orphan key so future drift can't hide silently. (Originally caught five missing reads — `subtask_same_signature_block_count`, `subtask_witness_timeout_seconds`, `fixup_planner_timeout_s`, `fixup_planner_retries_on_transient`, `pre_pr_architecture_model` — where a workspace TOML bump claimed to take effect and `_log_int_overrides` cheerfully audited the bump but the daemon still used the default.) When you add a new `Config` field, also add the corresponding `cfg["…"] = toml.get(…)` to `load_config`; the audit will fire at next daemon start if you forget.
+- **Empty-diff is transport-class, not content-class (plan 51).** `subtasks._check_subtask` detects `not self._last_diff_text` BEFORE invoking the LLM checker, synthesizes a FAIL outcome with a fixed prefix, and skips the checker entirely (no tokens spent grading nothing). `_record_subtask_triage` sniffs the prefix and skips the LLM triage call too, stamping `failure_layer="transport"` directly. New `_maybe_transport_stop_loss` runs BEFORE plan 23's same-signature check; after K (`cfg.subtask_transport_stop_loss_count`, default 3, ge=2, le=10) consecutive `,layer=transport` retries the subtask BLOCKs with an operator-clear message naming the doer model swap as the recommended fix. New `subtask_empty_diff:<id>` artifact for `qk show` visibility. The `kind="fixup_ci"` empty-diff branch routes to `cannot_reproduce` per plan 53 instead.
+- **Planning cycle + kind on every subtask (plan 52).** Two new columns on `subtasks`: `planning_cycle: int` (cycle ordinal; cycle 1 is the initial planner's output, cycle 2+ is fixup/replan output) and `planning_kind: str` (`initial` / `fixup` / `replan` / `merge` / `fixup_ci`). Each planner emit-site stamps these as it inserts rows. A migration backfills pre-plan-52 rows by parsing the subtask-id heuristic (`S-*`/`Z-99-*` → cycle 1, `F-N-*` → cycle N+1, etc.). `qk replan-cycle` uses the columns to identify "the latest planning cycle" without naming-convention sleuthing. When a worker re-fires a planner after `replan-cycle` sets `tasks.replan_cycle_marker`, the new subtasks are emitted at the SAME cycle number (replacement, not new cycle) — there is no proliferation of phantom cycles even if the operator runs replan-cycle twice on the same task.
+- **Fixup-CI subtasks must reproduce-before-fix (plan 53).** The doer for a `kind="fixup_ci"` subtask cannot declare done by running the CI error's suggested command alone — it must first reproduce the failure under fresh-state conditions (clean rebuild + full chain producing the failed step's inputs, not just the final-step generator). Empty-diff + green-local-gates on a fixup-CI subtask is interpreted as `failure_layer="cannot_reproduce"` (environmental drift signal), not as no-op DONE; the K=2 `cfg.subtask_cannot_reproduce_stop_loss_count` BLOCKs after the second occurrence with operator-clear messaging naming the suspected divergence (cache state, pinned versions, missing checked-in generated file). Empty-diff + green-local-gates on `kind != "fixup_ci"` IS a positive no-op DONE — the subtask was already satisfied by upstream commits and the worker advances without committing or pushing. The fixup planner sees `local_ci_at_head=(passed, excerpt)` captured BEFORE its invocation and dispatches on three cases (GitHub fails AND local fails / passes / etc.) instead of distilling the CI error verbatim. (`prompts/fixup-planner.md` §0 + §2 local-CI block; `prompts/subtask-doer.md` §6a; `quikode/workers/subtasks.py` `_classify_empty_diff_branch`.)
+- **No-op-DONE is FSM-context-aware (plan 54).** The plan-53 no-op-DONE path returns `kind="settled"` from `_handle_subtask_pass`, but `_handle_passed_subtask` only fires `enter_committing` (`SUBTASK_PASSED`) + `enter_pushing` (`COMMIT_CREATED`) when the parent task is in the per-subtask-loop state set (`{DOING_SUBTASK, CHECKING_SUBTASK, TRIAGING_SUBTASK}`). When the parent is in a non-loop state (e.g. an audit-stage state mid-cycle, or formerly `ADDRESSING_FEEDBACK`) the events are skipped — the subtask DB row is already DONE; the caller (audit driver / `run_ci_fix_response` / `run_changes_requested_response`) owns the outer transition. Companion: `_run_fixup_round`'s `enter_fixup_planning` call re-reads task state right before the FSM call to close the dispatcher-vs-now TOCTOU window; the event only fires when the source state is actually valid. Plan 57's typed-guards layer makes both checks defense-in-depth.
+- **Fresh container per audit cycle (plan 55).** With `cfg.audit_fresh_container=true`, the orchestrator discards the dev container at the start of every pre-PR audit cycle and re-provisions from `cfg.image_tag`. `cfg.audit_bootstrap_command` (project-defined; e.g. `pnpm install --frozen-lockfile && just regenerate-all`) runs inside the fresh container with a 15-minute timeout; any worktree diff is auto-committed + pushed as `audit-bootstrap: cycle <N>` BEFORE gauntlet stages run. Bootstrap rc != 0 BLOCKs with a distinct `audit_bootstrap_failed` reason — distinguishable from audit-content failures so the operator routes to env-bootstrap repair, not subtask retry. Empty `audit_bootstrap_command` skips the bootstrap step but still re-provisions. Resumed cycles (with already-passed stages) skip the re-provision so partial work isn't invalidated. The doer prompt §6a names `cfg.audit_bootstrap_command` so a `kind="fixup_ci"` doer can re-run the bootstrap inside the container when its own intermediate edits drifted the cache.
+- **PR CLOSED-not-merged auto-detects MERGED via ancestry (plan 56).** See the existing invariant above. `qk detect-merged` is the operator-facing dry-run / `--apply` sweep for retroactive catch-up.
+- **FSM is flattened — audit stages are first-class states (plan 58).** The two umbrella states `PRE_PR_AUDITING` and `ADDRESSING_FEEDBACK` are REMOVED. The 5-stage audit gauntlet exposes each stage as a first-class state: `AUDIT_LOCAL_CI` → `AUDIT_RUBRIC` → `AUDIT_STANDARDS` → `AUDIT_ARCHITECTURE` → `AUDIT_BEHAVIOR`. Three divergent fixup drivers (`_run_pre_pr_pipeline`, `_run_ci_fix_response`, `run_changes_requested_response`) are consolidated into ONE `workers/audit_driver.py:_run_audit_cycle(trigger_source)` driver; the trigger source (`INITIAL_AUDIT` / `CI_FAILURE` / `REVIEW_FEEDBACK`) only branches at the OUTER wrapping (where the task lands after the cycle settles: PR_OPENING vs. PENDING_CI). The shared inner machinery (`FIXUP_PLANNING` → `DOING_SUBTASK` → `CHECKING_SUBTASK` → `TRIAGING_SUBTASK` → `COMMITTING` → `PUSHING`) is unified across all triggers. New lifecycle columns on `tasks`: `phase` ∈ `{INITIAL, PRE_PR_REVIEW, PR_REVIEW}`, `cycle_in_phase: int`, `pr_review_trigger` ∈ `{NONE, CI_FAILURE, REVIEW_FEEDBACK}`. The TUI / state-log / `qk briefing` render `phase · cycle X · state` everywhere. The pre-plan-58 config keys `pre_pr_release_valve_*` are renamed `release_valve_*` (now applies per-phase: PRE_PR_REVIEW cycle 5 → open PR with deferred findings; PR_REVIEW cycle 5 per trigger → push + let GitHub + reviewer decide). Plan-54's `_PER_SUBTASK_LOOP_STATES` no-op hack is gone — the doer/checker/triage states are natural per-subtask-loop contexts regardless of trigger now that the umbrella is removed. New supervisor escape hatch: `fsm_runtime.force_recover_to_pending_ci`. Hard cutover via `plans/58-migration.sql` — see §5.3.
+- **Quota handling: chain-walk-fast + worker-layer category-aware sleep (plan 59).** Plan 19A's in-transport exponential-backoff sleep-and-retry is RETIRED. `_run_with_retry` in `agents/json_protocol.py` no longer sleeps on quota detection; quota at the transport level returns IMMEDIATELY with a transient result carrying `category="quota_exhausted"`. `QuotaFallbackJsonAgent` cascades through providers in seconds (every transport is built with `quota_max_total_wait_s=0`; the cumulative-wait knob + `QUIKODE_QUOTA_MAX_TOTAL_WAIT_S` env var are deleted). If ALL providers in a chain return quota, the transport returns transient — and the WORKER LAYER handles the re-attempt cadence via `cfg.transient_retry_delays_s: dict[str, int]` (default: `{"quota_exhausted": 600, "container_vanished": 15, "auth_refresh": 60}`). Container-vanished and auth-refresh retry loops remain in-transport (legitimately brief); during those sleeps, `agent_calls.status` flips to `backoff_auth` / `backoff_container` so `Store.agent_in_flight_status` reports the actual state and the TUI renders "subtask_doer backoff_auth 45s" instead of falsely claiming "in flight". The TUI's pending-eligible count calls `collect_pick_candidates` (refactored into `quikode/orchestration/stacking_helpers.py` so both the orchestrator and the TUI controller import it) and then applies `prefer_primary_candidates` — same function the scheduler's `_pick_next` uses. The TUI's pending count is by definition exact, not an upper bound.
 
 ---
 
@@ -308,6 +330,12 @@ These live in the bundled prompts and are the contract every agent role honors. 
 | `qk daemon status` warns "orphaned quikode child detected pid=N" | `kill -9 N` + `docker rm -f $(docker ps -aq --filter name=qk-)` + `rm <state_dir>/orchestrator.{pid,heartbeat,lock}` | Plan 34 — supervisor died but child outlived. The recovery is destructive and one-shot; the new `qk daemon stop` should make this rare. |
 | `qk reset` refuses with "found running quikode child" | First `kill -9 <pid>`, verify `ps -ef \| grep quikode` is empty, then re-run | Plan 34's guard — never proceed with `--force` without the kill. |
 | Post-PR FSM stuck in PROVISIONING/PLANNING after fresh seed; mark-merged failing with `InvalidTransition: event 'merged' not valid from state 'planning'` | Stop daemon, kill any docker-exec subprocesses + `qk-*` containers, direct-DB-reset the rows to `pending`, mark-merged | Setup-mode race: daemon picked up the to-be-marked-merged tasks faster than the operator. See §6 mark-merged caveat. |
+| Subtask BLOCKED with `failure_layer=transport` after 3 consecutive empty-diff retries (plan 51 stop-loss) | `qk show <id>` shows `subtask_empty_diff:<id>` artifact + transport-class retry signature | Doer model is silently returning rc=0 with empty stdout (typical: proxy-routed GLM/Wafer transport hiccup). Swap the doer model to direct `gpt-5.3-codex`, `reset-retries` + `resume`. See `docs/runbook-operations.md` § "Provider routing". |
+| Subtask BLOCKED with `failure_layer=cannot_reproduce` on a `kind="fixup_ci"` row (plan 53 stop-loss, K=2) | `qk show <id>` for the empty-diff signature; check `audit_bootstrap` artifact + worktree cache state | Environmental drift between the doer's container and the GitHub CI runner — typically stale cache (`target/`, `node_modules`) or a missing generator step. Confirm `cfg.audit_fresh_container=true` + `cfg.audit_bootstrap_command` exists and produces clean state; iterate the bootstrap command project-side until it matches GitHub. After the bootstrap is patched, `replan-cycle` or `retry` per §3. |
+| Task BLOCKED with reason `audit_bootstrap_failed` (plan 55) | `qk show <id>` shows the bootstrap command's stderr | `cfg.audit_bootstrap_command` rc != 0 inside the fresh container. NOT a subtask-retry case — fix the project-side bootstrap script (missing dep, lockfile drift, wrong working dir), then `qk resume`. |
+| Worker idle but `qk briefing` / TUI shows "subtask_doer in flight 45m+" (pre-plan-59 symptom) | `qk show <id>` agent_call's `status` column | Plan 59 retired in-transport quota sleep; if you still see this, check that `transient_retry_delays_s` is being respected at the worker layer and that `agent_calls.status` is one of `running` / `backoff_auth` / `backoff_container`. A genuinely-running call has `status=running`; a backoff has the matching `backoff_*` label and the TUI renders it accordingly. |
+| All in-flight workers stuck after a quota cascade; `qk briefing` shows no progress for >10min | Daemon log for `category=quota_exhausted` lines; `agent_calls` table for recent transient outcomes | All providers in the fallback chain (e.g. `GLM-zai → GLM-wafer → gpt-5.3-codex`) are exhausted simultaneously. Worker layer is now sleeping `cfg.transient_retry_delays_s["quota_exhausted"]` (default 600s) between full-chain re-attempts; let it ride for one cycle then check briefing. If subscriptions are genuinely all out for hours, see `docs/runbook-incident-response.md` § "Quota cascade". |
+| Phase stuck on cycle 5 (release-valve criteria not met); `qk briefing` shows `PRE_PR_REVIEW cycle 5` or `PR_REVIEW cycle 5` for the same task across multiple poll ticks | `qk show <id>` for the latest fixup-planner output + stage-pass map | The release valve only fires when local CI + behavior pass and only deferable quality stages remain failing. If a non-deferable stage (local_ci / behavior / config / transport / parse / critical findings) is failing on cycle 5, the valve refuses to fire — the task stays in the audit loop. Either fix the non-deferable failure or escalate per §3 (replan-cycle the cycle, or retry if cycle 1 is wrong-shape). See `docs/runbook-incident-response.md` § "Audit gauntlet stuck on a cycle". |
 
 ### 8.2 Resource sizing
 
@@ -328,9 +356,11 @@ Persistent memory at `/home/trevor/.claude/projects/-home-trevor-github-quikode/
 
 ---
 
-## 9. Quick state-of-the-world (sweep complete, 2026-05-08 PM)
+## 9. Quick state-of-the-world (cutover complete, 2026-05-10 PM)
 
-The plan-35 + plan-38 sweep landed. Every queued PR shipped. Pipeline is now: JSON-mode agent layer + role-MODEL binding + SELF_AUDIT retired + dual-bucket standards/architecture + 5-stage pre-PR gauntlet + TUI live-state correctness + config audit log. Read this section if you're picking up post-sweep — it tells you what's shipped, the operational state, and the deploy sequence.
+Plans 47–59 shipped over the May 9–10 window. This is the largest single-day batch landed on `optimizations`: it retires the doer envelope (47), splits the same-signature stop-loss by failure layer (48), guards every FSM `enter_*` against invalid source state (49 + 54 + 57), audits config-loader orphan fields (50), reframes empty-diff as transport-class (51), adds the `qk replan-cycle` primitive between rewind and retry (52), teaches the fixup planner to trace root causes + reproduce-before-fix (53), opts pre-PR audits into a fresh dev container per cycle (55), auto-detects MERGED via ancestry for the release-batch flow (56), flattens the FSM into 5 first-class audit states + unifies the fixup driver + adds phase/cycle lifecycle columns (58), and reframes quota handling as chain-walk-fast + worker-layer category-aware sleep (59).
+
+The pipeline as of HEAD: JSON-mode agent layer + role-MODEL binding + SELF_AUDIT retired + dual-bucket standards/architecture + 5-stage pre-PR gauntlet (now first-class audit states) + unified `_run_audit_cycle` driver + explicit lifecycle phase/cycle columns + typed FSM `enter_*` guards + structured retry signatures + plan-52 cycle-scoped recovery + plan-53 root-cause-tracing fixup + plan-55 fresh-container audits + plan-56 ancestry auto-merge + plan-59 fast-fail quota chain. Read this section if you're picking up post-cutover.
 
 ### 9.1 Plans index
 
@@ -357,23 +387,35 @@ All sweep PRs shipped:
 - **Plan 38 PR-C** (commit `794ac56`): TUI live-state correctness + config audit log + template-vs-default invariant. `agent_calls` schema gains `started_at`; new `record_agent_call_started` / `record_agent_call_finished` pair. New `Store.agent_in_flight_status(task_id)` returns `("running", phase, ago) | ("idle", phase, ago, rc) | ("never", None, None)`. TUI + briefing read this directly — no more synthesized "running per-subtask doer". `config_loader._log_int_overrides` emits `INFO` for every TOML override of an int Field default at daemon-start. New regression test asserts template seeds match Field defaults.
 - **Plan 35 PR-B** (commit `c6d2670`, amended later on `optimizations`): architecture-alignment auditor. New 5th gauntlet stage `architecture` between `standards` and `behavior`. New `prompts/pre-pr-architecture.md`; `prompts/pre-pr-standards.md` retargeted to profile catalog + cited section bodies. New audit modules `quikode/pre_pr_audit_architecture.py`, `pre_pr_audit_standards.py`, `pre_pr_audit_refs.py` (shared helpers). The original synthetic `unreferenced-applicable-{standard,architecture}` detectors were removed because missing planner citations are planning quality signals, not audit findings; standards/architecture gates now report only checker findings. `pre_pr_architecture` role + `cfg.pre_pr_architecture_model` knob. `SubtaskTriageFailureLayer` enum gains `"architecture"`. `_GAUNTLET_STAGES` in TUI grew to five.
 
+Plans 47–59 (the May 9–10 batch — comprehensive refactor):
+- **Plan 47** — `DoerEnvelope` retired. Doer transports run plain apply-patch via `transport.invoke_raw`; the diff is the sole evidence. Plan 22 carry-forward flows through `triage_notes` only. `WritesFilesAgent` accepts `envelope_schema=None`.
+- **Plan 48** — same-signature stop-loss signature granularity. `retry_classify.classify_retry` consumes structured `Verdict` + `failure_layer` directly; signatures become `verdict=FAIL,layer=<local_ci|rubric|standards|architecture|behavior|transport|cannot_reproduce|parse_failure>`. `qk resume` clears `retry_reasons`/`retries`/`transient_retries`/`flatline_count`/`progress_check_count` on subtasks originally BLOCKED.
+- **Plan 49** — `_handle_post_pr_ci_failure` + `_handle_changes_requested` state-check before firing `enter_addressing_feedback`; review cursor not advanced when blocked so the next poll re-picks the review.
+- **Plan 50** — `_warn_orphan_overrides` audit at config load surfaces TOML keys whose Field default was never overridden (caught 5 missing reads).
+- **Plan 51** — empty-diff is transport-class. `_check_subtask` skips LLM checker on empty diff; `_record_subtask_triage` stamps `failure_layer="transport"` directly. `cfg.subtask_transport_stop_loss_count` (default 3) BLOCKs after K transport retries.
+- **Plan 52** — `qk replan-cycle <task>` primitive; `subtasks.planning_cycle` + `planning_kind` columns; `tasks.replan_cycle_marker` worker re-fire.
+- **Plan 53** — fixup planner root-cause tracing. `local_ci_at_head` threaded into prompt; doer §6a reproduce-before-fix for `kind="fixup_ci"`; `failure_layer="cannot_reproduce"` enum + `cfg.subtask_cannot_reproduce_stop_loss_count` (default 2); positive no-op-DONE for `kind != "fixup_ci"`.
+- **Plan 54** — no-op-DONE FSM-context guard. `_handle_passed_subtask` checks parent state ∈ `{DOING_SUBTASK, CHECKING_SUBTASK, TRIAGING_SUBTASK}` before firing commit/push events; `_run_fixup_round` TOCTOU re-read.
+- **Plan 55** — `cfg.audit_fresh_container` + `cfg.audit_bootstrap_command`; fresh container per audit cycle; `audit-bootstrap: cycle <N>` auto-commit; `audit_bootstrap_failed` BLOCK reason.
+- **Plan 56** — `cfg.auto_detect_merged_via_ancestry` (default on); `git merge-base --is-ancestor` in `_handle_closed_polled_pr`; `qk detect-merged` CLI; `fsm_runtime.mark_merged` side-state / terminal-state bridges.
+- **Plan 57** — typed FSM `enter_*` guards. Helpers return `State | None` and silently skip with INFO log on invalid source state.
+- **Plan 58** — FSM flatten + lifecycle phases. `PRE_PR_AUDITING` + `ADDRESSING_FEEDBACK` removed; 5 audit-stage states added (`AUDIT_LOCAL_CI` / `AUDIT_RUBRIC` / `AUDIT_STANDARDS` / `AUDIT_ARCHITECTURE` / `AUDIT_BEHAVIOR`); unified `workers/audit_driver.py:_run_audit_cycle(trigger_source)`; `tasks.phase` / `cycle_in_phase` / `pr_review_trigger` columns; `pre_pr_release_valve_*` → `release_valve_*`; `fsm_runtime.force_recover_to_pending_ci`; hard cutover via `plans/58-migration.sql`.
+- **Plan 59** — quota handling refactor. In-transport quota sleep retired (plan 19A's design dead); chain returns fast; `cfg.transient_retry_delays_s` at worker layer; `agent_calls.status` ∈ `{running, backoff_auth, backoff_container}` for TUI honesty; TUI pending-eligible calls `collect_pick_candidates` directly (refactored to `quikode/orchestration/stacking_helpers.py`) → exact count, not upper bound.
+
 Plans `01–27` and `29` are pre-`optimizations`-branch context; see `plans/00-INDEX.md` for the full historical list.
 
-### 9.2 Workspace state
+### 9.2 Workspace state (2026-05-10 PM, post-migration)
 
-- **Daemon: STOPPED.** Will restart only after the §9.3 deploy sequence runs (re-seed + start).
-- **Workspace: WIPED clean.** `qk reset --yes --close-prs` ran cleanly. SQLite DB dropped, all `qk-*` containers removed, all `quikode/*` branches purged (local + remote), worktrees cleaned.
-- **LiteLLM proxy: RUNNING** in docker as `litellm-bridge` on `127.0.0.1:4000`, with `ZAI_API_KEY` and `WAFER_API_KEY` from `~/.codex/.env` mounted via `-e`. Health probe returns `status: healthy`. `--add-host=host.docker.internal:host-gateway` is wired into tanren container provisioning so task containers can reach the proxy via `host.docker.internal:4000`; host-side probes should use `127.0.0.1:4000` unless the host has its own `host.docker.internal` mapping.
-- **Codex profiles:** 7 in `~/.codex/config.toml`. Direct OpenAI: `gpt5` (gpt-5.5), `codex` (gpt-5.3-codex). Proxy-routed (via `together_ai/<MODEL>` litellm prefix): `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen`. All seven verified via hello-world `--output-schema` test. CLI-native enforcement on the two direct profiles; client-side pydantic validation on the five proxy-routed profiles.
-- **z.ai** has a 5-hour usage window. `GLM-5.1-zai` now declares
-  `GLM-5.1-wafer`, then `gpt-5.3-codex`, as its quota fallback chain in
-  `model_registry.py`, so a 429 swaps to Wafer and then direct Codex for that
-  agent call instead of sleeping the worker inside Z.ai.
+- **Daemon: STOPPED.** Plan-58 migration has been applied (`plans/58-migration.sql`); `tasks_backup_plan58` is intact in the SQLite DB until the operator verifies the cutover and drops it. Ready to start — see §9.3.
+- **LiteLLM proxy: RUNNING** in docker as `litellm-bridge` on `127.0.0.1:4000` and `172.17.0.1:4000`, with `ZAI_API_KEY` and `WAFER_API_KEY` from `~/.codex/.env` mounted via `-e`. Health probe returns `status: healthy`.
+- **Codex profiles:** 7 in `~/.codex/config.toml`. Direct OpenAI: `gpt5` (gpt-5.5), `codex` (gpt-5.3-codex). Proxy-routed (via `together_ai/<MODEL>` litellm prefix): `glm-zai`, `glm-wafer`, `minimax`, `deepseek`, `qwen`. CLI-native enforcement on the two direct profiles; client-side pydantic validation on the five proxy-routed profiles.
+- **GLM-Z.ai + GLM-Wafer quota status (2026-05-10 PM):** Z.ai is on its 5-hour usage window — usually has capacity at start-of-window. Wafer is the secondary fallback. The chain is now fast-fail per plan 59: a Z.ai 429 returns immediately, the wrapper invokes Wafer, a Wafer 429 returns immediately, the wrapper invokes direct `gpt-5.3-codex`. No worker sleeps inside a single provider. If ALL THREE return quota, the worker layer sleeps `cfg.transient_retry_delays_s["quota_exhausted"]` (default 600s) before the next full chain re-attempt. With plan 47 retiring the doer envelope, write-role transport reliability under proxy routing is also tightened (no envelope-shape repair failures masquerading as content issues).
+- **Doer envelope: retired (plan 47).** Doer transports run plain apply-patch with no `--output-schema` flag; the diff is the evidence. `WritesFilesAgent.invoke_raw` is the path.
 - **API keys:** `~/.codex/.env` (mode 600) + `~/.bashrc` sources via `set -a; . ~/.codex/.env; set +a`. NEVER commit these or echo them.
 
-### 9.3 Deploy sequence (executed; recipe preserved for next sweep)
+### 9.3 Deploy sequence (2026-05-10 cutover; recipe preserved for next sweep)
 
-The post-sweep deploy ran at 2026-05-08 PM. Sequence:
+The plan 57 + 58 + 59 cutover ran at 2026-05-10 PM. Sequence:
 
 ```bash
 # 1. Verify ladder green at HEAD.
@@ -392,119 +434,56 @@ curl -sS http://127.0.0.1:4000/health/readiness
 docker exec <qk-dev-container> curl -sS http://host.docker.internal:4000/health/readiness
 # both expect status: healthy
 
-# 4. Migrate the live workspace's config.toml off the retired
-#    [agents.<phase>] sections — config_loader REJECTS them with a
-#    ValueError per plan 38 PR-B.7's hard cutover. Add top-level
-#    <role>_model knobs (one per ROLES entry; see
-#    quikode/agent_registry.py for the canonical list).
-
-# 5. Re-seed the workspace. seed-from-base only marks merged nodes that
-#    have a verifiable upstream commit; F-* fixture nodes that don't
-#    correspond to upstream commits need an explicit qk mark-merged.
+# 4. Stop daemon if running, then apply the plan-58 migration.
 cd /home/trevor/github/quikode-runs/tanren
-cat > /tmp/merged.json <<'EOF'
-[{"node_id": "R-0001"}]
-EOF
-qk seed-from-base --merged-nodes-file /tmp/merged.json
-qk mark-merged F-0001 F-0002
+qk daemon stop
+sqlite3 .quikode/quikode.db < /home/trevor/github/quikode/plans/58-migration.sql
+
+# 5. Rename pre-plan-58 config keys: pre_pr_release_valve_* → release_valve_*
+#    in .quikode/config.toml. Plan 50's _warn_orphan_overrides will surface
+#    any orphan keys at next daemon-start as WARNING — if you see warnings,
+#    address them before continuing.
 
 # 6. Restart daemon.
 qk daemon start --detach --max-parallel 12 --retry-failed
 
-# 7. Watch first wave.
-qk monitor --keywords "attempt 4,attempt 5"
+# 7. Verify the cutover: qk briefing's phase tier breakdown
+#    (INITIAL N · PRE_PR_REVIEW M · PR_REVIEW K) reflects expected state.
+#    Once verified and a few tasks have moved through transitions cleanly,
+#    drop the backup:
+#    sqlite3 .quikode/quikode.db 'DROP TABLE IF EXISTS tasks_backup_plan58;'
+
+# 8. Watch first wave for unexpected InvalidTransition skip-logs.
+qk monitor --keywords "skip,InvalidTransition,attempt 4,attempt 5,cannot_reproduce,audit_bootstrap_failed,quota_exhausted"
 ```
 
-### 9.4 Deploy lessons (calibration findings, 2026-05-08 PM)
+### 9.4 Calibration windows for the 2026-05-10 cutover
 
-Several issues surfaced during first deploy; the schema/write-path issues are
-fixed in code, while provider routing remains operationally constrained:
+The plan 47 + 48 + 49 + 50 + 51 + 52 + 53 + 54 + 55 + 56 + 57 + 58 + 59 batch is wide. The first 5–10 tasks landing post-cutover are the calibration window. Watch:
 
-- **Codex shim schema-write hotfix (commit `9240255`).** The original
-  `CodexDirectJsonAgent` / `CodexLitellmJsonAgent` shim wrote the schema
-  via `python3 -c 'import sys; open({path!r}, "w").write(...)' <<EOF`.
-  The Python repr (`!r`) added single quotes around the path inside an
-  already-single-quoted shell context, so bash split at the inner quote
-  and the path passed to python was bare → `SyntaxError`. Symptom: every
-  task's planner call failed with `bash: line 3: warning: here-document
-  ... wanted '__QK_SCHEMA_EOF__'` + `SyntaxError: invalid syntax`.
-  Replaced with a clean `cat > {path} <<'__QK_SCHEMA_EOF__'` heredoc.
-  Tests stayed green during PR-A because they mock `exec_in` and don't
-  shell-evaluate the constructed cmd; the bug only surfaced under real
-  subprocess execution.
-  **Lesson:** any new agent shim that constructs a shell pipeline MUST
-  have at least one integration test that actually invokes `bash -lc`
-  against the constructed command. Mocking `exec_in` is fine for
-  contract tests but doesn't catch shell-level mistakes.
+- **Phase tier breakdown.** `qk briefing` should report `INITIAL N · PRE_PR_REVIEW M · PR_REVIEW K`. If `M` or `K` look off relative to actual PR state (e.g. tasks with an open PR not showing PR_REVIEW), inspect the plan-58 migration's `phase` derivation against the live `tasks` rows and patch the migration SQL.
+- **Typed-guard skip-logs.** Plan 57 means `enter_*` helpers log INFO + return None on invalid source state instead of crashing. A high-frequency `quikode.fsm_runtime` skip-log for the same helper + state pair indicates a transition the FSM event table doesn't yet cover; the path warrants a plan to either add the transition or fix the caller's state-check.
+- **Empty-diff transport stop-loss firings (plan 51).** A K=3 cascade is the operator-clear "swap doer model" signal. Frequent firings on a non-proxy doer indicates either a prompt regression or a real transport-class regression in the direct-OpenAI path.
+- **Cannot_reproduce stop-loss firings (plan 53).** K=2 fires when a `kind="fixup_ci"` subtask empty-diffs with green local gates. Pre-cutover, `cfg.audit_fresh_container=true` + a complete `cfg.audit_bootstrap_command` should prevent most occurrences; persistent firings suggest the bootstrap is still missing a project-side step.
+- **Quota chain walk timing (plan 59).** With in-transport quota sleep retired, a single 429 should propagate through `GLM-zai → GLM-wafer → gpt-5.3-codex` in <5s wall-clock. If you observe minute-long stalls in agent_calls during a 429, plan 59's transport `quota_max_total_wait_s=0` propagation regressed somewhere; check `agent_registry.py:_build_base_transport`.
+- **Pending-eligible TUI count parity (plan 59 fix C).** TUI's pending count should exactly match what `_pick_next` would actually pick. A discrepancy means `quikode/orchestration/stacking_helpers.py` and the orchestrator drifted out of sync.
+- **agent_calls.status visibility (plan 59 fix B).** During auth-refresh / container-vanished retries, the agent_call row's status flips to `backoff_auth` / `backoff_container` and the TUI renders it. If the TUI still says "in flight" with no progress, check that `update_agent_call_status` is being called from `_run_with_retry`.
 
-- **Task failure schema hotfix (commit `035d743`).** Plan 38's planner
-  failure path started recording `failure_reason`, but the SQLite `tasks`
-  table did not have that column yet. Symptom: all initial tasks failed
-  while trying to fail, with `OperationalError: no such column:
-  failure_reason`. The fix adds `tasks.failure_reason`, a migration,
-  `TaskRow` typing, and clears the field on recovery flows (`retry`,
-  `resume`, `rewind`, orphan recovery). **Lesson:** any new FSM field
-  written by generic transition code needs a schema migration before the
-  daemon is allowed back onto a clean store.
+Persistent operational lessons (still apply):
 
-- **Codex strict JSON schema normalization (commit `035d743`).** OpenAI's
-  Responses strict schema path rejected raw pydantic schemas when fields had
-  defaults: `invalid_json_schema ... Missing 'title'`. Pydantic marks defaulted
-  fields optional in JSON Schema, but strict Responses schemas require every
-  object property to appear in `required` and reject `default`. The fix added
-  `codex_output_schema()` so both Codex transports normalize schemas before
-  writing `--output-schema`: strip `default`, set
-  `additionalProperties: false`, and require all object properties
-  recursively. **Lesson:** treat the CLI schema file as an OpenAI strict-schema
-  artifact, not a raw pydantic dump.
+- **Proxy-routed transport reliability.** Litellm still drops Codex `output_schema`, so JSON-mode read-only roles still rely on pydantic validation + one structured re-prompt. With plan 47 the doer role is no longer in this client-side-validation set — doers run plain apply-patch. Quota 429s are handled by the chain; non-quota transport failures (stream disconnects, repeated empty diffs) are now plan 51's transport stop-loss territory.
+- **Codex strict JSON schema normalization.** `codex_output_schema()` normalizes schemas before writing `--output-schema` (strip `default`, set `additionalProperties: false`, require all properties). Don't bypass it when adding a new role.
+- **Project bootstrap-command obligation (plan 55).** When `cfg.audit_fresh_container=true`, the project owns the bootstrap command. Iterate it project-side until it produces the same state GitHub Actions does from a fresh checkout. Plan 53's `cannot_reproduce` stop-loss is the diagnostic when the bootstrap is incomplete.
+- **Fruit-of-rotten-tree wipe** after any stacking-gate tightening. See §3 decision table.
 
-- **`[agents.<phase>]` config migration is operator-driven.** Plan 38
-  PR-B.7's hard cutover means workspaces with the legacy
-  `[agents.planner] cli="codex" model="gpt-5.5"` shape get `ValueError`
-  at load. The migration is mechanical (delete the sections, add
-  top-level `<role>_model = "..."` keys for every entry in
-  `agent_registry.ROLES`) but a fresh manager session won't know to do
-  this until it tries to seed/start. The error message names the
-  replacement keys so it's diagnosable, but worth knowing in advance.
+### 9.5 Operational invariants under the cutover
 
-- **`qk seed-from-base --merged-nodes-file` only marks merged nodes that
-  resolve to an upstream commit.** Tanren has F-0001 and F-0002 as
-  fixture/scaffolding nodes that don't have corresponding `main` commits
-  (they were marked merged in prior runs as a setup convention). The
-  seeder silently skipped them; only R-0001 (which does have an
-  upstream commit per its task title) got marked. The fix is post-seed
-  `qk mark-merged F-0001 F-0002` to declare them merged regardless.
-  **Lesson:** if you're seeing fewer merged nodes than expected after
-  `seed-from-base`, check `qk briefing`'s merged count vs. your
-  expectation; the diff is fixture nodes that need explicit
-  `mark-merged` follow-up.
-
-- **Proxy-routed z.ai/Wafer write roles use client-side schema validation.**
-  Litellm still drops Codex `output_schema`, so `WritesFilesAgent` relies on
-  pydantic validation plus one structured re-prompt. A schema-valid JSON object
-  may be recovered from surrounding provider prose; malformed doer bookkeeping
-  is telemetry and must not replace diff grading. Quota 429s are handled by the
-  GLM-Z.ai -> GLM-Wafer -> direct Codex fallback. Non-quota transport failures
-  such as repeated empty diffs or stream disconnects are still
-  operator-actionable: temporarily move write-heavy roles to direct
-  `gpt-5.3-codex`, reset the affected subtask retries, and resume.
-
-After hotfix + reinstall, daemon stable at pid (varies per restart);
-8 tasks in PROVISIONING, first wave running fresh under the new
-contract. Remaining calibration windows: cycle-1 audit pass rate,
-client-side schema validation re-prompt frequency on proxy-routed JSON/read-only
-roles, write-role provider transport reliability, behavior of the new
-architecture stage on real diffs.
-
-The first 5–10 spec plans landing under the new flow are the calibration window. Watch:
-- Whether the JsonAgent client-side re-prompt-once fires (parse-fail + retry). Frequent fires = a prompt/schema mismatch worth investigating.
-- Whether validators are rejecting plans for bucket-routing mistakes (`standards_referenced` vs `architecture_referenced`). Frequent rejections = the planner prompt's hard rule needs tightening.
-- Whether the architecture stage (when plan 35 PR-B lands) over-fires or under-fires findings. Calibrate `architecture_path_map` and finding severity in early cycles.
-
-### 9.4 Operational invariants under the sweep
-
-- **Validation ladder** stays green at every commit. As of HEAD `0fb20ca`: 1014 tests passing.
-- **No CLI hardcoded to a role.** Every place that today resolved a CLI by role uses `make_agent(role, cfg)` instead. Operator overrides per-role via `cfg.<role>_model = "gpt-5.5"` / `"GLM-5.1-zai"` / `"claude-opus-4-7"` / etc.
-- **No prose parsing of agent stdout.** The grep `parse_self_audit\|extract_json\|_JSON_OBJECT_RE\|parse_tokens\|_CODEX_TOKENS_RE\|_GENERIC_TOKENS_RE` returns ZERO production-code hits at the end of PR-B.7. Plan files (historical) and test docstrings asserting absence are fine.
+- **Validation ladder** stays green at every commit. Sentinel: `bf237c3 Restore local validation health` (the most recent green-restore on `optimizations`).
+- **No CLI hardcoded to a role.** Every place that resolved a CLI by role uses `make_agent(role, cfg)`. Operator overrides per-role via `cfg.<role>_model = "gpt-5.5"` / `"GLM-5.1-zai"` / `"claude-opus-4-7"` / etc.
+- **No prose parsing of agent stdout.** `parse_self_audit\|extract_json\|_JSON_OBJECT_RE\|parse_tokens\|_CODEX_TOKENS_RE\|_GENERIC_TOKENS_RE\|_CHECKER_VERDICT_RE` returns ZERO production-code hits. (Plan 48 retired the last one — `_CHECKER_VERDICT_RE`.)
+- **No `enter_*` crashes.** Plans 49 + 54 + 57 together mean invalid-source-state transitions are logged + skipped, never crashed. The only intentional non-relaxed helper is `_safe_crash_current` (plan 20).
+- **No `DoerEnvelope`.** Plan 47 retired the bookkeeping envelope entirely; the diff is the evidence.
+- **No in-transport quota sleep.** Plan 59 retired plan 19A's design; quota retry cadence is at the worker layer via `cfg.transient_retry_delays_s`.
+- **No `PRE_PR_AUDITING` / `ADDRESSING_FEEDBACK` states.** Plan 58 retired the umbrellas; audit-stage states are first-class.
 - **Tanren workspace** runs `max_parallel=12, mem_per_task_gb=10` (capped by coding-agent subscription, not host capacity).
 - **Restart cost** is unchanged from plan 34: per-task ~10–30 min lost (one in-flight agent call); subtask-level commits preserved on the branch.

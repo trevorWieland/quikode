@@ -4,6 +4,8 @@ Quikode is organized around a single task FSM, a fresh-schema SQLite store, prof
 
 ## FSM
 
+Plan 58 (2026-05-10) flattened the FSM: the umbrella states `PRE_PR_AUDITING` and `ADDRESSING_FEEDBACK` are removed; the 5-stage audit gauntlet (`AUDIT_LOCAL_CI` → `AUDIT_RUBRIC` → `AUDIT_STANDARDS` → `AUDIT_ARCHITECTURE` → `AUDIT_BEHAVIOR`) is first-class. The shared inner fixup machinery (`FIXUP_PLANNING` → `DOING_SUBTASK` → `CHECKING_SUBTASK` → `TRIAGING_SUBTASK` → `COMMITTING` → `PUSHING`) is reused across all triggers (initial audit, CI failure, review feedback); the trigger source only branches at the OUTER wrapping (PR_OPENING vs. PENDING_CI after the cycle settles). A unified `workers/audit_driver.py:_run_audit_cycle(trigger_source)` drives the cycle. Lifecycle phase + cycle (`tasks.phase`, `tasks.cycle_in_phase`, `tasks.pr_review_trigger`) live alongside state for operator-visible "where in the broader lifecycle is this task." Plan 57's typed-helper guards mean `fsm_runtime.enter_*` invocations silently skip on invalid source state instead of crashing — the FSM event table below is authoritative.
+
 ```mermaid
 stateDiagram-v2
   [*] --> pending

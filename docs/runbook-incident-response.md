@@ -106,6 +106,110 @@ First look: DAG metadata, configured base-branch commit subjects, and any explic
 
 Recovery: correct the evidence source and rerun seeding in a fresh workspace.
 
+## Quota cascade (plan 59 model)
+
+Plan 19A's in-transport sleep-and-retry is RETIRED. With plan 59 the fallback chain is fast-fail at the transport layer and the worker layer owns re-attempt cadence.
+
+**What the operator sees when all providers in a chain are exhausted:**
+
+- `qk show <task-id>` shows recent transient outcomes with `category=quota_exhausted`.
+- `qk briefing` shows no forward progress for any in-flight task across multiple poll ticks — the workers are sleeping at the worker layer, not stuck.
+- The `agent_calls` table's most-recent rows have `status=running` but rc set + a `quota_exhausted` outcome; new agent_call rows aren't being created because workers are between attempts.
+- Daemon log: `category=quota_exhausted` + the worker layer logging the configured sleep duration (`cfg.transient_retry_delays_s["quota_exhausted"]`, default 600s).
+
+**Diagnose:**
+
+1. `qk show <task-id>` for any in-flight task and confirm the most recent transient outcomes are `category=quota_exhausted` across multiple agent_calls.
+2. Check the chain configuration: `model_registry.MODELS["GLM-5.1-zai"].quota_fallbacks` should list `["GLM-5.1-wafer", "gpt-5.3-codex"]` (or current chain). Confirm every link's `quota_max_total_wait_s=0` (plan 59 fix A) by inspecting `agent_registry._build_base_transport` call sites.
+3. If a single 429 takes minutes instead of seconds to propagate through the chain, the in-transport sleep crept back in — re-check `agents/json_protocol.py:_run_with_retry` to confirm the quota retry loop is GONE (only container-vanished and auth-refresh loops remain).
+
+**Intervene:**
+
+- If subscriptions are genuinely exhausted across all providers, let the worker-layer cadence ride for one cycle (default 10 min). If the chain re-attempt then succeeds (e.g. a usage window reset), normal operation resumes.
+- If wait is excessive and the operator has a backup provider, tune `cfg.transient_retry_delays_s["quota_exhausted"]` lower (e.g. 300) or swap the doer model temporarily to a non-quota-limited path (`subtask_doer_model = "gpt-5.3-codex"`), `qk daemon stop` + restart.
+- If the cascade is masking a real bug (e.g. all transports falsely returning quota), pull the transient outcomes from `agent_calls` and inspect the underlying stderr/stdout.
+
+## Audit gauntlet stuck on a cycle (plan 58 vocabulary)
+
+Post-plan-58, "stuck on the gauntlet" means a phase is on `cycle_in_phase ≥ 5` with the release-valve criteria not being met. The release valve fires when local CI + behavior pass and only deferable quality stages remain failing — it does NOT fire when a non-deferable stage (local_ci / behavior / config / transport / parse / critical findings) is failing.
+
+**Symptom:** `qk briefing` shows `PRE_PR_REVIEW cycle 5+` or `PR_REVIEW cycle 5+` for the same task across multiple poll ticks; the task is in `FIXUP_PLANNING` or `AUDIT_LOCAL_CI` and not advancing.
+
+**Diagnose:**
+
+1. `qk show <task-id>` to see the latest fixup-planner output + which audit stages are passing vs. failing.
+2. Check the per-stage outcomes (`pre_pr_audit_summary` or the per-stage artifacts). Identify the lowest-numbered failing stage.
+3. If the failing stage is `local_ci`, `behavior`, or a critical finding from `rubric`/`standards`/`architecture` — the valve is correctly refusing to fire. The task needs an actual fix.
+4. If the failing stage is medium/low severity in a deferable category — the valve SHOULD have fired. Check `cfg.release_valve_after_cycles`, `cfg.release_valve_defer_stages`, `cfg.release_valve_max_critical_findings`. Confirm the post-plan-58 rename took effect (a stale `pre_pr_release_valve_*` key will be surfaced by plan 50's `_warn_orphan_overrides` audit at daemon start).
+
+**Intervene:**
+
+- **`qk replan-cycle <task>`** when the cycle's fixup-planner decomposition itself is wrong-shape (over-scoping the findings, asking the doer for too much per subtask). Earlier cycles' commits survive; the fixup planner re-fires for THIS cycle with the same audit findings as input, and the new emission may decompose more granularly. This is the default escalation for cycle-level non-convergence in a non-initial cycle.
+- **`qk retry <task>`** only when the failing subtask is in cycle 1 (initial planner output) AND the diagnosis is that the very first plan was wrong-shape. For fixup cycles, prefer `replan-cycle` — `retry` would torch every passing earlier-cycle commit.
+- **Plan-50 audit-warns first.** If you see WARN logs at daemon start about `release_valve_*` orphans, the rename didn't fully take effect and the valve config isn't actually being honored. Fix the workspace TOML and restart before intervening.
+
+## Plan 58 cutover incident (rollback path)
+
+The plan-58 migration ships hard cutover via `plans/58-migration.sql`:
+1. Backs up the existing `tasks` table to `tasks_backup_plan58`.
+2. Adds `phase`, `cycle_in_phase`, `pr_review_trigger` columns.
+3. Derives phase from existing state.
+4. Maps deprecated states `pre_pr_auditing` / `addressing_feedback` to `pending` with a resume marker.
+
+**If anything looks wrong post-cutover** — phase derivation produces unexpected counts, a task's cycle_in_phase doesn't match its history, the daemon refuses to start due to schema inconsistency — the backup table is the safety net.
+
+**Inspect first:**
+
+```bash
+sqlite3 .quikode/quikode.db
+.headers on
+SELECT id, state, phase, cycle_in_phase, pr_review_trigger FROM tasks WHERE id = 'R-NNNN';
+SELECT id, state FROM tasks_backup_plan58 WHERE id = 'R-NNNN';
+```
+
+**Restore from backup** (destructive — only after the daemon is stopped):
+
+```bash
+qk daemon stop
+sqlite3 .quikode/quikode.db <<'SQL'
+DROP TABLE tasks;
+ALTER TABLE tasks_backup_plan58 RENAME TO tasks;
+SQL
+```
+
+The restore reverts the schema reshape. The daemon at HEAD will then refuse to start because the `tasks` table no longer has `phase` etc. — that's the expected guardrail. To run the post-plan-58 daemon you MUST re-apply `plans/58-migration.sql`; the restore path is for diagnosing the migration itself, not for running long-term on the legacy schema.
+
+**Drop the backup** once the cutover has been verified across several tasks moving through transitions cleanly:
+
+```bash
+sqlite3 .quikode/quikode.db 'DROP TABLE IF EXISTS tasks_backup_plan58;'
+```
+
+## Plan 59 transient_retry_delays_s tuning
+
+`cfg.transient_retry_delays_s: dict[str, int]` is the worker-layer cadence for retryable transient failures. Default: `{"quota_exhausted": 600, "container_vanished": 15, "auth_refresh": 60}`.
+
+**When to adjust which category:**
+
+- **`quota_exhausted`** — the operator's preferred re-attempt cadence when all providers in the fallback chain return quota. 600s (10 min) is the default; tune down to 300 if the operator wants more aggressive retries on quota recovery (e.g. Z.ai's 5-hour usage window reset is observably faster than 10 min), tune up to 1800 if the operator wants to conserve API calls while quota windows are wide open.
+- **`container_vanished`** — the very-short cadence for retrying after a Docker host hiccup. 15s default is correct under normal load; bump to 30 if the host is consistently slow to re-attach a container post-incident (e.g. WSL hypervisor under heavy churn).
+- **`auth_refresh`** — the cadence between auth-refresh-race retries (plan 44). 60s default is correct for codex-direct OAuth refresh; the codex CLI typically re-uses the new token on the next invocation, so the operator rarely needs to tune this.
+
+**How to tune:**
+
+Edit `.quikode/config.toml`:
+
+```toml
+[transient_retry_delays_s]
+quota_exhausted = 300
+container_vanished = 30
+auth_refresh = 60
+```
+
+Restart the daemon. Plan 50's orphan-field audit catches typos at daemon start.
+
+**Don't** add categories beyond the three above unless `subtasks._record_transient_subtask_failure` actually classifies a fourth category — the dict is consulted by category name, and a misspelled or extraneous key is silently ignored (but does generate a plan-50 orphan-warning if it's a top-level TOML key, which is the wrong shape anyway — this is a nested dict).
+
 ## Fruit-of-rotten-tree wipe
 
 Triggered after **any change that tightens the stacking gate** — flipping `cfg.stacking_readiness` from `"speculative"` to `"settled"`, raising `cfg.review_ready_settle_s`, or shipping a plan that adds a new readiness predicate.
@@ -114,7 +218,7 @@ The new gate only governs FUTURE picks. Tasks already on disk with worktrees + b
 
 - Still in PROVISIONING / PLANNING / DOING_SUBTASK (no real branch yet)
 - In PENDING_CI but with CI not yet green
-- In ADDRESSING_FEEDBACK with the parent's behavior actively churning
+- Mid-audit-cycle (any of the AUDIT_LOCAL_CI / AUDIT_RUBRIC / AUDIT_STANDARDS / AUDIT_ARCHITECTURE / AUDIT_BEHAVIOR states, or in FIXUP_PLANNING) with the parent's behavior actively churning
 
 Children that built atop those foundations were building on broken, half-formed, or actively-shifting bases. Every behavior they wired up against the parent's incomplete contract may need to be redone once the parent settles. Symptoms include doer attempts that struggle with "the type/method I need doesn't exist" or "this trait shape contradicts what I'm assembling" — patterns that no amount of doer-prompt strengthening can fix, because the foundation is wrong.
 
@@ -132,7 +236,8 @@ con.row_factory = sqlite3.Row
 running_states = {
     'doing_subtask', 'checking_subtask', 'triaging_subtask', 'committing',
     'pushing', 'pr_opening', 'planning', 'provisioning', 'fixup_planning',
-    'addressing_feedback', 'pre_pr_auditing', 'local_ci_checking',
+    'audit_local_ci', 'audit_rubric', 'audit_standards', 'audit_architecture',
+    'audit_behavior', 'local_ci_checking',
     'rebasing_to_main', 'conflict_resolving', 'pending_ci', 'awaiting_review',
 }
 for r in con.execute("SELECT id, state, branch FROM tasks").fetchall():
