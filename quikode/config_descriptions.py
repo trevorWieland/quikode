@@ -138,3 +138,16 @@ AUTO_DETECT_MERGED_VIA_ANCESTRY = (
     "guarantee. Disable for workflows where closed-without-merge "
     "must ALWAYS block."
 )
+
+TRANSIENT_RETRY_DELAYS_S = (
+    "Plan 59 fix E': worker-layer sleep (seconds) between transient "
+    "subtask retries, keyed by the outcome `category` produced by "
+    "`_run_with_retry`. Defaults: `quota_exhausted=600` (operator's "
+    "10-min cadence so the whole fallback chain has time to "
+    "recover), `container_vanished=15` (matches the prior fast "
+    "retry), `auth_refresh=60` (longer than the in-transport auth "
+    "backoff to avoid colliding with the transport's own retry "
+    "loop). Worker-level transients without a transport category "
+    "(carry-over `none`) fall back to a generic 15s so existing "
+    "retry storms don't quietly multiply by 40x."
+)

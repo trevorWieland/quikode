@@ -135,6 +135,11 @@ def _combine(first: RawTransportResult | None, second: RawTransportResult) -> Ra
         tokens_output=_sum_int_opt(first.tokens_output, second.tokens_output),
         cost_usd=_sum_float_opt(first.cost_usd, second.cost_usd),
         stderr_excerpt=stderr[-2000:],
+        # Plan 59 fix E': preserve category from the most recent (and
+        # last-walked) transport. After the chain returns the worker
+        # checks `category == "quota_exhausted"` to pick the longer
+        # category-aware sleep.
+        category=second.category,
     )
 
 
@@ -180,6 +185,7 @@ def _normalize_for_primary_schema(
         tokens_output=raw.tokens_output,
         cost_usd=raw.cost_usd,
         stderr_excerpt=raw.stderr_excerpt,
+        category=raw.category,
     )
 
 

@@ -130,6 +130,7 @@ def _result_from_raw(
         parse_errors=parse_errors,
         raw_text=raw.raw_text,
         stderr_excerpt=raw.stderr_excerpt,
+        category=raw.category,
     )
 
 
@@ -152,6 +153,7 @@ def _result_from_two_raw(
         parse_errors=parse_errors,
         raw_text=second.raw_text,
         stderr_excerpt=second.stderr_excerpt,
+        category=second.category,
     )
 
 

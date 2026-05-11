@@ -176,6 +176,11 @@ class Config(BaseModel):
         ge=0,
         le=50,
     )
+    # Plan 59 fix E': category-aware sleep between transient retries.
+    transient_retry_delays_s: dict[str, int] = Field(
+        default_factory=lambda: {"quota_exhausted": 600, "container_vanished": 15, "auth_refresh": 60},
+        description=desc.TRANSIENT_RETRY_DELAYS_S,
+    )
     pre_commit_runner: Literal["auto", "lefthook", "pre-commit", "none"] = Field(
         default="auto",
     )

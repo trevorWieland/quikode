@@ -63,10 +63,14 @@ def test_make_agent_planner_override_to_glm_zai() -> None:
     assert isinstance(agent.transport, QuotaFallbackJsonAgent)
     assert isinstance(agent.transport.primary, CodexLitellmJsonAgent)
     assert agent.transport.primary.profile == "glm-zai"
-    assert agent.transport.primary.quota_max_total_wait_s == 0
+    # Plan 59 fix A + E': no `quota_max_total_wait_s` attribute on
+    # transports anymore — quota fast-fails inside `_run_with_retry`
+    # and the worker layer handles the cross-attempt cadence.
+    assert not hasattr(agent.transport.primary, "quota_max_total_wait_s")
     assert len(agent.transport.fallbacks) == 3
     assert isinstance(agent.transport.fallbacks[0], CodexLitellmJsonAgent)
     assert agent.transport.fallbacks[0].profile == "glm-wafer"
+    assert not hasattr(agent.transport.fallbacks[0], "quota_max_total_wait_s")
     assert isinstance(agent.transport.fallbacks[1], ClaudeJsonAgent)
     assert agent.transport.fallbacks[1].model_id == "claude-sonnet-4-6"
     assert isinstance(agent.transport.fallbacks[2], CodexDirectJsonAgent)
@@ -84,10 +88,13 @@ def test_make_agent_subtask_doer_returns_writes_files_without_envelope_schema() 
     assert isinstance(agent.transport, QuotaFallbackJsonAgent)
     assert isinstance(agent.transport.primary, CodexLitellmJsonAgent)
     assert agent.transport.primary.profile == "glm-zai"
-    assert agent.transport.primary.quota_max_total_wait_s == 0
+    # Plan 59 fix A + E': no in-transport quota cap; every transport
+    # in the chain fast-fails on quota.
+    assert not hasattr(agent.transport.primary, "quota_max_total_wait_s")
     assert len(agent.transport.fallbacks) == 3
     assert isinstance(agent.transport.fallbacks[0], CodexLitellmJsonAgent)
     assert agent.transport.fallbacks[0].profile == "glm-wafer"
+    assert not hasattr(agent.transport.fallbacks[0], "quota_max_total_wait_s")
     assert isinstance(agent.transport.fallbacks[1], ClaudeJsonAgent)
     assert agent.transport.fallbacks[1].model_id == "claude-sonnet-4-6"
     assert isinstance(agent.transport.fallbacks[2], CodexDirectJsonAgent)

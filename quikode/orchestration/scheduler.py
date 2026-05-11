@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from quikode.fsm import STACK_READY_STATES as FSM_STACK_READY_STATES
 from quikode.state import State
@@ -20,7 +20,25 @@ from quikode.state import State
 if TYPE_CHECKING:
     from quikode.config import Config
     from quikode.dag import DAG
-    from quikode.state import Store, TaskRow
+    from quikode.state import TaskRow
+
+
+@runtime_checkable
+class _SchedulerStore(Protocol):
+    """Plan 59 fix C: minimal Store-like interface the scheduler needs.
+
+    Production `Store` satisfies it; the TUI's `_ReadOnlyStoreAdapter`
+    (read-only sqlite3 connection) also satisfies it so the TUI's
+    `pending` count is computed by the same `collect_pick_candidates`
+    pipeline as the orchestrator's `_pick_next`.
+    """
+
+    def completed_ids(self) -> set[str]: ...
+    def active_ids(self) -> set[str]: ...
+    def get(self, task_id: str) -> Any: ...
+    def most_recent_awaiting_review_entry_ts(self, task_id: str) -> float | None: ...
+    def subtask_progress(self, task_id: str) -> tuple[int, int]: ...
+
 
 log = logging.getLogger("quikode.scheduler")
 
@@ -52,7 +70,7 @@ def is_parent_stack_ready(
     cfg: Config,
     parent_state: str | None,
     parent_id: str,
-    store: Store,
+    store: _SchedulerStore,
     now: float | None = None,
 ) -> bool:
     """Predicate: is this parent eligible to act as a stack base for children?
@@ -148,7 +166,7 @@ def prefer_primary_candidates(candidates: list[dict]) -> list[dict]:
     return candidates
 
 
-def _resume_signals(row: TaskRow | None, store: Store) -> tuple[bool, int, int]:
+def _resume_signals(row: TaskRow | None, store: _SchedulerStore) -> tuple[bool, int, int]:
     """Pull (has_open_pr, subtask_done, subtask_total) for a candidate row.
 
     Cheap: one indexed SUM over the subtasks table. Returns zeros when the
@@ -165,7 +183,7 @@ def collect_pick_candidates(
     *,
     cfg: Config,
     dag: DAG,
-    store: Store,
+    store: _SchedulerStore,
     scope: set[str],
     in_flight: set[str],
     stack_depth_fn,
@@ -264,7 +282,7 @@ def best_queued_priority(
     *,
     cfg: Config,
     dag: DAG,
-    store: Store,
+    store: _SchedulerStore,
     scope: set[str] | None = None,
     in_flight: set[str] | None = None,
     stack_depth_fn=None,

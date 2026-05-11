@@ -37,11 +37,12 @@ def _store(tmp_path) -> Store:
 
 def test_agent_in_flight_status_never(tmp_path):
     s = _store(tmp_path)
-    status, phase, age, rc = s.agent_in_flight_status("R-1")
+    status, phase, age, rc, sub_status = s.agent_in_flight_status("R-1")
     assert status == "never"
     assert phase is None
     assert age is None
     assert rc is None
+    assert sub_status is None
 
 
 def test_agent_in_flight_status_running_after_start_marker(tmp_path):
@@ -56,11 +57,14 @@ def test_agent_in_flight_status_running_after_start_marker(tmp_path):
     assert isinstance(call_id, int)
     # Pretend now is 5 seconds after the start.
     now = time.time() + 5
-    status, phase, age, rc = s.agent_in_flight_status("R-1", now=now)
+    status, phase, age, rc, sub_status = s.agent_in_flight_status("R-1", now=now)
     assert status == "running"
     assert phase == "subtask_doer"
     assert age is not None and 4.5 <= age <= 5.5
     assert rc is None
+    # Plan 59 fix B: default sub-status is `running` on a fresh
+    # start-marker; auth/container backoff loops flip it transiently.
+    assert sub_status == "running"
 
 
 def test_agent_in_flight_status_idle_after_finish(tmp_path):
@@ -81,12 +85,15 @@ def test_agent_in_flight_status_idle_after_finish(tmp_path):
         cost_usd=0.42,
     )
     now = time.time() + 30
-    status, phase, age, rc = s.agent_in_flight_status("R-1", now=now)
+    status, phase, age, rc, sub_status = s.agent_in_flight_status("R-1", now=now)
     assert status == "idle"
     assert phase == "subtask_doer"
     # last returned ~30s ago
     assert age is not None and 25.0 <= age <= 35.0
     assert rc == 124
+    # sub_status is None on idle rows — backoff visibility only applies
+    # while the agent is still mid-call.
+    assert sub_status is None
 
 
 def test_agent_in_flight_picks_latest_row_only(tmp_path):
@@ -95,7 +102,7 @@ def test_agent_in_flight_picks_latest_row_only(tmp_path):
     call_a = s.record_agent_call_started("R-1", phase="subtask_doer", cli="json_agent", model="m")
     s.record_agent_call_finished(call_a, rc=0, duration_s=120.0)
     s.record_agent_call_started("R-1", phase="subtask_checker", cli="json_agent", model="m")
-    status, phase, _, rc = s.agent_in_flight_status("R-1")
+    status, phase, _, rc, _ = s.agent_in_flight_status("R-1")
     assert status == "running"
     assert phase == "subtask_checker"
     assert rc is None
@@ -115,7 +122,7 @@ def test_record_agent_call_single_call_path_marks_finished(tmp_path):
         duration_s=42.0,
         tokens_used=None,
     )
-    status, phase, _, rc = s.agent_in_flight_status("R-1")
+    status, phase, _, rc, _ = s.agent_in_flight_status("R-1")
     assert status == "idle"
     assert phase == "planner"
     assert rc == 0
@@ -130,18 +137,19 @@ def test_detail_agent_in_flight_idle(tmp_path):
     call_id = s.record_agent_call_started("R-1", phase="subtask_doer", cli="json_agent", model="m")
     s.record_agent_call_finished(call_id, rc=124, duration_s=1305.0)
     now = time.time() + 30
-    status, phase, age, rc = _detail_agent_in_flight(s.conn, "R-1", now=now)
+    status, phase, age, rc, sub_status = _detail_agent_in_flight(s.conn, "R-1", now=now)
     assert status == "idle"
     assert phase == "subtask_doer"
     assert age is not None and 25.0 <= age <= 35.0
     assert rc == 124
+    assert sub_status is None
 
 
 def test_detail_agent_in_flight_running(tmp_path):
     s = _store(tmp_path)
     s.record_agent_call_started("R-1", phase="subtask_checker", cli="json_agent", model="m")
     now = time.time() + 12
-    status, phase, age, _ = _detail_agent_in_flight(s.conn, "R-1", now=now)
+    status, phase, age, _, _ = _detail_agent_in_flight(s.conn, "R-1", now=now)
     assert status == "running"
     assert phase == "subtask_checker"
     assert age is not None and 11.0 <= age <= 13.0

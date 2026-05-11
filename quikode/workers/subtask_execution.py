@@ -44,6 +44,7 @@ from quikode.agents.transient_quota import _is_transient_container_failure
 from quikode.state import SubtaskState
 from quikode.subtask_schema import STABILIZATION_SUBTASK_ID, Subtask
 from quikode.types import Verdict
+from quikode.workers.agent_call_status import agent_call_status_scope_for
 from quikode.workers.outcomes import CheckerOutcome as _CheckerOutcome
 from quikode.workers.subtask_render import (
     render_checker_output_for_artifact,
@@ -130,12 +131,13 @@ class SubtaskExecutionMixin:
             model=self.cfg.subtask_doer_model,
             subtask_id=subtask.id,
         )
-        result = agent.invoke(
-            prompt,
-            handle=self._h,
-            log_path=self.log_path,
-            timeout=self.cfg.subtask_doer_timeout_s,
-        )
+        with agent_call_status_scope_for(self.store, call_id):
+            result = agent.invoke(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.subtask_doer_timeout_s,
+            )
         self.store.record_agent_call_finished(
             call_id,
             rc=result.rc,
@@ -381,12 +383,13 @@ class SubtaskExecutionMixin:
             model=self.cfg.subtask_checker_model,
             subtask_id=subtask.id,
         )
-        result = agent.invoke(
-            prompt,
-            handle=self._h,
-            log_path=self.log_path,
-            timeout=self.cfg.subtask_checker_timeout_s,
-        )
+        with agent_call_status_scope_for(self.store, call_id):
+            result = agent.invoke(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.subtask_checker_timeout_s,
+            )
         self.store.record_agent_call_finished(
             call_id,
             rc=result.rc,
@@ -409,6 +412,10 @@ class SubtaskExecutionMixin:
             transient=transient,
             rc=int(result.rc) if result.rc is not None else None,
             stderr=getattr(result, "stderr_excerpt", "") or "",
+            # Plan 59 fix E': propagate transport-level category so the
+            # worker's transient-retry handler picks the category-aware
+            # sleep (e.g. 600s for quota, 60s for auth refresh).
+            category=getattr(result, "category", "none") or "none",
         )
 
     def _checker_parse_failure(self: Any, subtask: Subtask, result: Any) -> _CheckerOutcome:
@@ -433,6 +440,10 @@ class SubtaskExecutionMixin:
             transient=transient,
             rc=int(result.rc) if result.rc is not None else None,
             stderr=getattr(result, "stderr_excerpt", "") or "",
+            # Plan 59 fix E': propagate the transport category so a
+            # parse-failure on top of a quota outcome still routes
+            # through the worker's category-aware retry sleep.
+            category=getattr(result, "category", "none") or "none",
         )
 
     def _run_subtask_check_command(self: Any, subtask: Subtask) -> _CheckerOutcome | None:
@@ -538,12 +549,13 @@ class SubtaskExecutionMixin:
             model=self.cfg.subtask_triage_model,
             subtask_id=subtask.id,
         )
-        result = agent.invoke(
-            prompt,
-            handle=self._h,
-            log_path=self.log_path,
-            timeout=self.cfg.subtask_triage_timeout_s,
-        )
+        with agent_call_status_scope_for(self.store, call_id):
+            result = agent.invoke(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.subtask_triage_timeout_s,
+            )
         self.store.record_agent_call_finished(
             call_id,
             rc=result.rc,

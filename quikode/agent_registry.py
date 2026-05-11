@@ -190,10 +190,14 @@ ROLES: dict[str, RoleSpec] = {
 }
 
 
-def _build_base_transport(
-    spec: ModelSpec, *, quota_max_total_wait_s: int | None = None
-) -> JsonAgentTransport:
-    """Construct the right transport shim for a model spec."""
+def _build_base_transport(spec: ModelSpec) -> JsonAgentTransport:
+    """Construct the right transport shim for a model spec.
+
+    Plan 59 fix A + E': no `quota_max_total_wait_s` knob — every
+    transport fast-fails on quota detection. The fallback chain
+    (`QuotaFallbackJsonAgent`) cascades to the next provider in
+    seconds; cross-attempt cadence lives at the worker layer.
+    """
     if spec.transport == "codex_direct":
         if spec.codex_profile is None:  # pragma: no cover — registry validates this
             raise ValueError(f"model {spec.name!r}: codex_direct missing codex_profile")
@@ -201,10 +205,7 @@ def _build_base_transport(
     if spec.transport == "codex_litellm":
         if spec.codex_profile is None:  # pragma: no cover
             raise ValueError(f"model {spec.name!r}: codex_litellm missing codex_profile")
-        return CodexLitellmJsonAgent(
-            profile=spec.codex_profile,
-            quota_max_total_wait_s=quota_max_total_wait_s,
-        )
+        return CodexLitellmJsonAgent(profile=spec.codex_profile)
     if spec.transport == "claude":
         if spec.claude_model_id is None:  # pragma: no cover
             raise ValueError(f"model {spec.name!r}: claude missing claude_model_id")
@@ -213,10 +214,19 @@ def _build_base_transport(
 
 
 def _build_transport(spec: ModelSpec) -> JsonAgentTransport:
-    """Construct transport, including configured quota fallbacks."""
+    """Construct transport, including configured quota fallbacks.
+
+    Plan 59 fix A: every transport in the chain (primary AND fallbacks)
+    fast-fails on quota — the chain walker cascades in seconds rather
+    than burning hours inside a secondary's quota-retry loop. Prior to
+    plan 59 only the primary had `quota_max_total_wait_s=0`; fallbacks
+    used the default (~8h cap) which stalled workers when the
+    secondary was ALSO quota-exhausted. With plan 59 fix E' the knob
+    is gone entirely and nothing sleeps in-transport on quota.
+    """
     if not spec.quota_fallbacks:
         return _build_base_transport(spec)
-    primary = _build_base_transport(spec, quota_max_total_wait_s=0)
+    primary = _build_base_transport(spec)
     fallbacks = tuple(_build_base_transport(MODELS[name]) for name in spec.quota_fallbacks)
     return QuotaFallbackJsonAgent(primary=primary, fallbacks=fallbacks)
 

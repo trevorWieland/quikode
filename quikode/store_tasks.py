@@ -316,8 +316,8 @@ class StoreTaskMixin:
         with self.tx() as c:
             cur = c.execute(
                 "INSERT INTO agent_calls "
-                "(task_id, phase, cli, model, subtask_id, started_at, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(task_id, phase, cli, model, subtask_id, started_at, ts, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'running')",
                 (task_id, phase, cli, model, subtask_id, now, now),
             )
             row_id = cur.lastrowid
@@ -365,41 +365,60 @@ class StoreTaskMixin:
                 ),
             )
 
+    def update_agent_call_status(self: Any, call_id: int, status: str) -> None:
+        """Plan 59 fix B: set fine-grained in-flight status on the agent_call.
+
+        Used by `_run_with_retry` to mark a call as `backoff_auth` /
+        `backoff_container` while the transport is sleeping between
+        retries, and back to `running` when the retry actually fires.
+
+        The column is constrained by convention (no CHECK at the SQL
+        level) — accepted values are `running`, `backoff_auth`,
+        `backoff_container`. Unknown values pass through; the TUI
+        renders them verbatim so a future status surfaces immediately
+        rather than being silently dropped.
+        """
+        with self.tx() as c:
+            c.execute("UPDATE agent_calls SET status = ? WHERE id = ?", (status, call_id))
+
     def agent_in_flight_status(
         self: Any, task_id: str, *, now: float | None = None
-    ) -> tuple[str, str | None, float | None, int | None]:
-        """Plan 38 PR-C: 'agent in-flight' status for the TUI / briefing.
+    ) -> tuple[str, str | None, float | None, int | None, str | None]:
+        """Plan 38 PR-C / plan 59 fix B: 'agent in-flight' status for the
+        TUI / briefing.
 
-        Reads the LATEST `agent_calls` row for `task_id` and returns one
-        of:
+        Reads the LATEST `agent_calls` row for `task_id` and returns
+        the 5-tuple `(status_class, phase, age_s, last_rc, sub_status)`:
 
-        * `("running", phase, started_at_ago_seconds, None)` —
-          the most recent row has `rc IS NULL` (agent invocation in
-          flight; the start-marker hasn't been finished yet).
-        * `("idle", last_phase, last_returned_ago_seconds, last_rc)` —
-          the most recent row has `rc` set (agent has returned;
-          orchestrator is post-processing or stalled). `last_rc`
-          surfaces a non-zero return code so operators see "rc=124"
-          on a recent timeout.
-        * `("never", None, None, None)` — no agent_call rows for the
-          task yet.
+        * `status_class` ∈ {`running`, `idle`, `never`} — the high-level
+          state class (matches plan 38 PR-C semantics).
+        * `phase` — the agent phase (`subtask_doer`, `subtask_checker`,
+          …) or `None` when no row exists.
+        * `age_s` — seconds since `started_at` for `running`, or since
+          `ts` for `idle`. `None` when no row exists.
+        * `last_rc` — set on `idle` so operators see a recent rc=124
+          timeout. `None` on `running` and `never`.
+        * `sub_status` — plan 59 fine-grained status for `running`
+          rows: `running` (subprocess executing), `backoff_auth` (60s
+          auth-refresh sleep), `backoff_container` (rare container
+          recovery sleep). `None` on `idle` / `never`.
 
-        This is the structured signal that replaces the old TUI
-        synthesis "running per-subtask doer" derived purely from FSM
-        state. The display reads observed reality: when the latest
-        call returned, the agent is NOT running (the FSM hasn't
-        advanced yet, but the agent is done).
+        The TUI / detail panel renders "subtask_doer backoff_auth 45s"
+        when `sub_status != "running"` so the operator sees the worker
+        is actively waiting on auth refresh, not silently stalled.
         """
         wall = time.time() if now is None else now
         row = self.conn.execute(
-            "SELECT phase, rc, started_at, ts FROM agent_calls WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            "SELECT phase, rc, started_at, ts, status FROM agent_calls "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         if row is None:
-            return ("never", None, None, None)
+            return ("never", None, None, None, None)
         phase = str(row["phase"]) if row["phase"] is not None else None
         if row["rc"] is None:
             started = float(row["started_at"]) if row["started_at"] is not None else float(row["ts"])
-            return ("running", phase, max(0.0, wall - started), None)
+            sub_status = str(row["status"]) if row["status"] is not None else "running"
+            return ("running", phase, max(0.0, wall - started), None, sub_status)
         finished = float(row["ts"])
-        return ("idle", phase, max(0.0, wall - finished), int(row["rc"]))
+        return ("idle", phase, max(0.0, wall - finished), int(row["rc"]), None)

@@ -46,9 +46,12 @@ class CodexLitellmJsonAgent:
     name = "codex_litellm"
     schema_enforcement: str = "client_side"
 
-    def __init__(self, *, profile: str, quota_max_total_wait_s: int | None = None):
+    def __init__(self, *, profile: str):
+        # Plan 59 fix E': the prior `quota_max_total_wait_s` knob is
+        # gone. Quota exhaustion now fast-fails inside
+        # `_run_with_retry` (no in-transport sleep), so there is no
+        # cumulative-wait budget to thread through.
         self.profile = profile
-        self.quota_max_total_wait_s = quota_max_total_wait_s
 
     def invoke(
         self,
@@ -101,7 +104,6 @@ class CodexLitellmJsonAgent:
             stdin=prompt,
             log_path=log_path,
             timeout=timeout,
-            quota_max_total_wait_s=self.quota_max_total_wait_s,
         )
         duration_s = time.time() - t0
         return _build_raw_result(
@@ -147,7 +149,6 @@ class CodexLitellmJsonAgent:
             stdin=prompt,
             log_path=log_path,
             timeout=timeout,
-            quota_max_total_wait_s=self.quota_max_total_wait_s,
         )
         duration_s = time.time() - t0
         return _build_raw_result(
@@ -188,6 +189,7 @@ def _build_raw_result(
         tokens_output=tokens_output,
         cost_usd=cost_usd,
         stderr_excerpt=(outcome.stderr or "")[-2000:],
+        category=outcome.category,
     )
 
 

@@ -227,6 +227,7 @@ def _build_raw_result(
         tokens_output=tokens_output,
         cost_usd=cost_usd,
         stderr_excerpt=stderr_excerpt,
+        category=outcome.category,
     )
 
 
@@ -272,6 +273,7 @@ def _build_raw_text_result(
         tokens_output=tokens_output,
         cost_usd=cost_usd,
         stderr_excerpt=(outcome.stderr or "")[-2000:],
+        category=outcome.category,
     )
 
 

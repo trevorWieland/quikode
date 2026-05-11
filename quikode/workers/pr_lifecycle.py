@@ -12,6 +12,7 @@ from quikode.ancestry import maybe_auto_merge_via_ancestry
 from quikode.state import State, SubtaskState
 from quikode.state_types import Phase, PrReviewTrigger
 from quikode.subtask_schema import PlanValidationError
+from quikode.workers.agent_call_status import agent_call_status_scope_for
 from quikode.workers.local_ci_capture import capture_local_ci_at_head
 from quikode.workers.outcomes import WorkerOutcome
 from quikode.workers.planner_driver import _wire_to_runtime_plan
@@ -367,12 +368,13 @@ class PrLifecycleWorkerMixin:
             cli="json_agent",
             model=self.cfg.intent_reviewer_model,
         )
-        result = agent.invoke(
-            prompt,
-            handle=self._h,
-            log_path=self.log_path,
-            timeout=self.cfg.intent_reviewer_timeout_s,
-        )
+        with agent_call_status_scope_for(self.store, call_id):
+            result = agent.invoke(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.intent_reviewer_timeout_s,
+            )
         self.store.record_agent_call_finished(
             call_id,
             rc=result.rc,
@@ -382,10 +384,8 @@ class PrLifecycleWorkerMixin:
             cost_usd=result.cost_usd,
         )
         if result.rc != 0 or result.parse_errors or not isinstance(result.structured, IntentReviewVerdict):
-            # Plan 38 PR-B.7: a parse failure or transport error here is the
-            # safe-no-op equivalent of the prior `default → NO_DRIFT` path —
-            # the reviewer is advisory; we surface a synthetic no_drift
-            # verdict so the worker continues polling instead of BLOCKing.
+            # Plan 38 PR-B.7: parse/transport failure → synthetic no_drift
+            # (advisory reviewer; worker keeps polling rather than BLOCKing).
             errs = "; ".join(result.parse_errors) if result.parse_errors else f"rc={result.rc}"
             _tw.log.warning(
                 "task %s: intent reviewer call failed (%s); defaulting to no_drift",
@@ -493,12 +493,13 @@ class PrLifecycleWorkerMixin:
             cli="json_agent",
             model=self.cfg.replan_planner_model,
         )
-        result = agent.invoke(
-            prompt,
-            handle=self._h,
-            log_path=self.log_path,
-            timeout=self.cfg.replan_planner_timeout_s,
-        )
+        with agent_call_status_scope_for(self.store, call_id):
+            result = agent.invoke(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.replan_planner_timeout_s,
+            )
         self.store.record_agent_call_finished(
             call_id,
             rc=result.rc,

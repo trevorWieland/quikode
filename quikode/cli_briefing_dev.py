@@ -177,9 +177,13 @@ def _briefing_json_payload(
 
 
 def _briefing_in_flight_row(store: Store, r: Mapping[str, Any], now: float) -> dict:
-    in_flight_status, in_flight_phase, in_flight_age_s, in_flight_last_rc = store.agent_in_flight_status(
-        r["id"], now=now
-    )
+    (
+        in_flight_status,
+        in_flight_phase,
+        in_flight_age_s,
+        in_flight_last_rc,
+        in_flight_sub_status,
+    ) = store.agent_in_flight_status(r["id"], now=now)
     return {
         "id": r["id"],
         "state": r["state"],
@@ -189,12 +193,15 @@ def _briefing_in_flight_row(store: Store, r: Mapping[str, Any], now: float) -> d
         "pr_number": r.get("pr_number"),
         # Plan 38 PR-C: agent in-flight observed reality (start-marker
         # vs finish-update on `agent_calls`). Replaces the prior
-        # FSM-derived "running ..." synthesis.
+        # FSM-derived "running ..." synthesis. Plan 59 fix B adds
+        # `sub_status` so the briefing distinguishes `backoff_auth` /
+        # `backoff_container` from a subprocess-active `running`.
         "agent_in_flight": {
             "status": in_flight_status,
             "phase": in_flight_phase,
             "age_seconds": in_flight_age_s,
             "last_rc": in_flight_last_rc,
+            "sub_status": in_flight_sub_status,
         },
     }
 
@@ -267,9 +274,14 @@ def _print_active_tasks(store: Store, actives: Sequence[Mapping[str, Any]], now:
 
 
 def _briefing_agent_in_flight_line(store: Store, task_id: str, now: float) -> str:
-    status, phase, age_s, last_rc = store.agent_in_flight_status(task_id, now=now)
+    status, phase, age_s, last_rc, sub_status = store.agent_in_flight_status(task_id, now=now)
     age = _humanize_secs(age_s)
     if status == "running":
+        # Plan 59 fix B: surface `backoff_auth` / `backoff_container`
+        # so the operator sees the worker is sleeping between retries
+        # rather than actively running a subprocess.
+        if sub_status and sub_status != "running":
+            return f"[yellow]agent {sub_status}[/]: [b]{phase or '?'}[/] ({age})"
         return f"[cyan]agent in-flight[/]: [b]{phase or '?'}[/] ({age})"
     if status == "idle":
         rc_label = f"rc={last_rc}" if last_rc is not None else "rc=?"

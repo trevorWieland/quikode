@@ -366,6 +366,19 @@ class SubtaskWorkerMixin(
     def _record_transient_subtask_failure(
         self: Any, subtask: Subtask, attempt: int, outcome: Any, consecutive_transients: int
     ) -> tuple[int, str | None]:
+        """Plan 59 fix E': category-aware transient sleep.
+
+        The outcome's `category` (set by the agent transport layer)
+        selects the sleep duration from `cfg.transient_retry_delays_s`.
+        Known categories — `quota_exhausted` (default 600s — the
+        operator's preferred 10-min cadence so the WHOLE fallback
+        chain has time to recover), `container_vanished` (15s),
+        `auth_refresh` (60s) — use their configured values. Generic
+        / unknown categories (including the pre-plan-59 `none` default for
+        worker-level transients not tagged by the transport) fall
+        through to the pre-plan-59 generic 15s sleep so existing
+        retry storms don't quietly multiply by 40x.
+        """
         consecutive_transients += 1
         if consecutive_transients > self.cfg.subtask_transient_max_retries:
             return consecutive_transients, (
@@ -376,7 +389,22 @@ class SubtaskWorkerMixin(
         fsm_runtime.enter_triaging_subtask(
             self.store, self.node.id, note=f"{subtask.id} transient checker failure"
         )
-        _tw.time.sleep(15)
+        delays = self.cfg.transient_retry_delays_s or {}
+        category = str(getattr(outcome, "category", "none") or "none")
+        # Worker-level transients without a transport category fall
+        # through to the pre-plan-59 generic 15s sleep — the long
+        # delays are reserved for transport-classified transients
+        # (quota / auth / container) that the operator explicitly
+        # signs up for via `transient_retry_delays_s`.
+        sleep_s = int(delays.get(category, 15))
+        _tw.log.info(
+            "subtask %s/%s: transient retry category=%s; sleeping %ds",
+            self.node.id,
+            subtask.id,
+            category,
+            sleep_s,
+        )
+        _tw.time.sleep(sleep_s)
         return consecutive_transients, None
 
     def _record_subtask_triage(

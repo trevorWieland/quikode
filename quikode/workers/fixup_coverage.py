@@ -41,6 +41,7 @@ from quikode.planner_validators import (
 )
 from quikode.standards_profiles import find_doc
 from quikode.subtask_schema import FixupPlan, PlanValidationError
+from quikode.workers.agent_call_status import agent_call_status_scope_for
 
 if TYPE_CHECKING:
     from quikode.dag import Node
@@ -378,12 +379,13 @@ def run_fixup_planner_loop(
             cli="json_agent",
             model=cfg.fixup_planner_model,
         )
-        result = agent.invoke(
-            cur_prompt,
-            handle=worker._h,
-            log_path=worker.log_path,
-            timeout=cfg.fixup_planner_timeout_s,
-        )
+        with agent_call_status_scope_for(worker.store, call_id):
+            result = agent.invoke(
+                cur_prompt,
+                handle=worker._h,
+                log_path=worker.log_path,
+                timeout=cfg.fixup_planner_timeout_s,
+            )
         worker.store.record_agent_call_finished(
             call_id,
             rc=result.rc,

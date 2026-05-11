@@ -49,6 +49,7 @@ from quikode.subtask_schema import (
     PlanValidationError,
     validate_and_build_plan,
 )
+from quikode.workers.agent_call_status import agent_call_status_scope_for
 
 
 class _TaskWorkerGlobals:
@@ -349,12 +350,13 @@ class PlannerDriverMixin:
             cli="json_agent",
             model=self.cfg.planner_model,
         )
-        result = agent.invoke(
-            prompt,
-            handle=self._h,
-            log_path=self.log_path,
-            timeout=self.cfg.planner_timeout_s,
-        )
+        with agent_call_status_scope_for(self.store, call_id):
+            result = agent.invoke(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.planner_timeout_s,
+            )
         self.store.record_agent_call_finished(
             call_id,
             rc=result.rc,

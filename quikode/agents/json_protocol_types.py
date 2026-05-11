@@ -11,7 +11,15 @@ from pydantic import BaseModel
 
 @dataclass(frozen=True)
 class RawTransportResult:
-    """One transport invocation result before pydantic validation."""
+    """One transport invocation result before pydantic validation.
+
+    `category` (plan 59 fix E') propagates the transient failure
+    classification from `_run_with_retry` so the worker layer can pick
+    the matching `cfg.transient_retry_delays_s[category]` sleep.
+    `"none"` (the default) means no transient category applies.
+    Accepted values: `none`, `quota_exhausted`, `container_vanished`,
+    `auth_refresh`.
+    """
 
     raw_text: str | None
     structured: dict[str, Any] | None
@@ -22,11 +30,17 @@ class RawTransportResult:
     tokens_output: int | None = None
     cost_usd: float | None = None
     stderr_excerpt: str = ""
+    category: str = "none"
 
 
 @dataclass(frozen=True)
 class JsonAgentResult:
-    """One role-layer invocation result."""
+    """One role-layer invocation result.
+
+    `category` (plan 59 fix E') mirrors `RawTransportResult.category`
+    — propagated up so the worker can look up the category-aware
+    transient sleep without re-deriving from rc / stderr text.
+    """
 
     structured: BaseModel | None
     rc: int
@@ -38,6 +52,7 @@ class JsonAgentResult:
     parse_errors: tuple[str, ...] = field(default_factory=tuple)
     raw_text: str | None = None
     stderr_excerpt: str = ""
+    category: str = "none"
 
 
 @runtime_checkable

@@ -9,6 +9,7 @@ from quikode import fsm_runtime
 from quikode.agent_registry import make_agent
 from quikode.agent_schemas import ConflictResolverEnvelope
 from quikode.state import State
+from quikode.workers.agent_call_status import agent_call_status_scope_for
 from quikode.workers.outcomes import WorkerOutcome
 
 
@@ -227,12 +228,13 @@ class RebaseConflictMixin:
             cli="json_agent",
             model=self.cfg.conflict_resolver_model,
         )
-        result = agent.invoke(
-            prompt,
-            handle=self._h,
-            log_path=self.log_path,
-            timeout=self.cfg.conflict_resolver_timeout_s,
-        )
+        with agent_call_status_scope_for(self.store, call_id):
+            result = agent.invoke(
+                prompt,
+                handle=self._h,
+                log_path=self.log_path,
+                timeout=self.cfg.conflict_resolver_timeout_s,
+            )
         self.store.record_agent_call_finished(
             call_id,
             rc=result.rc,

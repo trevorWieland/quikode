@@ -276,6 +276,14 @@ def load_config(root: Path | None = None) -> Config:
         subtask_transient_max_retries=int(
             raw.get("subtask_transient_max_retries", defaults.subtask_transient_max_retries)
         ),
+        # Plan 59 fix E': worker-layer category-aware transient sleep
+        # table. TOML override merges atop the defaults so an operator
+        # can tune only the values they care about (e.g. set
+        # quota_exhausted = 900) without re-specifying the full map.
+        transient_retry_delays_s={
+            **defaults.transient_retry_delays_s,
+            **{k: int(v) for k, v in (raw.get("transient_retry_delays_s") or {}).items()},
+        },
         subtask_witness_timeout_seconds=int(
             raw.get(
                 "subtask_witness_timeout_seconds",

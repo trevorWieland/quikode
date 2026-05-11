@@ -158,6 +158,14 @@ CREATE TABLE IF NOT EXISTS agent_calls (
     -- newest row per task. Single-call inserts (no start-marker) set
     -- started_at = ts so the rollup queries stay unaffected.
     started_at REAL,
+    -- Plan 59 (fix B): fine-grained in-flight status. `running` is the
+    -- default — subprocess executing. `backoff_auth` is set while the
+    -- agent transport is sleeping between auth-refresh retries.
+    -- `backoff_container` covers the rare container-vanished retry
+    -- sleep. With plan 59 fix E' removing the in-transport quota
+    -- retry, no `backoff_quota` status is needed — quota delays live
+    -- entirely at the worker layer (`workers/subtasks.py`).
+    status TEXT NOT NULL DEFAULT 'running',
     ts REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_calls_task ON agent_calls(task_id, ts);
@@ -319,6 +327,13 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass
     conn.execute("UPDATE agent_calls SET started_at = ts WHERE started_at IS NULL")
+    # Plan 59 fix B: backoff-visibility status column on agent_calls.
+    # Existing rows backfill to 'running' (the prior implicit assumption
+    # — when rc was NULL the agent was running). Idempotent on re-run.
+    try:
+        conn.execute("ALTER TABLE agent_calls ADD COLUMN status TEXT NOT NULL DEFAULT 'running'")
+    except sqlite3.OperationalError:
+        pass
     # Plan 38 calibration: planner validator/parse failures pass a compact
     # machine-readable failure reason through the generic transition path.
     try:

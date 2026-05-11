@@ -505,6 +505,10 @@ def test_quota_fallback_can_end_on_cli_native_codex(tmp_path) -> None:
 
 
 def test_run_with_retry_can_surface_quota_immediately(monkeypatch) -> None:
+    """Plan 59 fix E': quota detection fast-fails inside `_run_with_retry`
+    with no in-transport sleep. The outcome carries the original rc +
+    stderr plus `category="quota_exhausted"` so the worker layer picks
+    the category-aware sleep."""
     calls = {"n": 0}
 
     def fake_exec_in(*args: Any, **kwargs: Any) -> tuple[int, str, str]:
@@ -519,13 +523,13 @@ def test_run_with_retry_can_surface_quota_immediately(monkeypatch) -> None:
         stdin="prompt",
         log_path=None,
         timeout=60,
-        quota_max_total_wait_s=0,
     )
 
     assert calls["n"] == 1
     assert out.rc == 1
     assert out.timed_out is False
-    assert "quota wait exceeded 0s" in out.stderr
+    assert out.category == "quota_exhausted"
+    assert "fast-fail" in out.stderr
 
 
 def test_run_with_retry_retries_codex_auth_refresh_race(monkeypatch, tmp_path) -> None:

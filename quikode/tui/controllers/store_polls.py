@@ -377,9 +377,13 @@ class StorePoller:
         sub_rows, active_idx = self._detail_subtasks(c, selected_task_id)
         review_round, review_threads_count = _detail_review_context(match)
         pre_pr_audit_cycle, pre_pr_audit_stages = _detail_pre_pr_audit(match)
-        in_flight_status, in_flight_phase, in_flight_age_s, in_flight_last_rc = _detail_agent_in_flight(
-            c, selected_task_id
-        )
+        (
+            in_flight_status,
+            in_flight_phase,
+            in_flight_age_s,
+            in_flight_last_rc,
+            in_flight_sub_status,
+        ) = _detail_agent_in_flight(c, selected_task_id)
 
         return DetailSnapshot(
             task_id=selected_task_id,
@@ -399,6 +403,7 @@ class StorePoller:
             agent_in_flight_phase=in_flight_phase,
             agent_in_flight_age_s=in_flight_age_s,
             agent_in_flight_last_rc=in_flight_last_rc,
+            agent_in_flight_sub_status=in_flight_sub_status,
         )
 
     def _detail_phase(self, task_id: str, row: sqlite3.Row) -> tuple[str, str, str]:
@@ -485,24 +490,28 @@ def _detail_review_context(row: sqlite3.Row) -> tuple[int | None, int | None]:
 
 def _detail_agent_in_flight(
     conn: sqlite3.Connection, task_id: str, *, now: float | None = None
-) -> tuple[str, str | None, float | None, int | None]:
-    """Plan 38 PR-C: read the latest `agent_calls` row to derive the
-    structured in-flight status. Mirrors `Store.agent_in_flight_status`
-    but operates on the TUI's read-only SQLite connection (the TUI does
-    not import Store)."""
+) -> tuple[str, str | None, float | None, int | None, str | None]:
+    """Plan 38 PR-C / plan 59 fix B: read the latest `agent_calls` row
+    to derive the structured in-flight status. Mirrors
+    `Store.agent_in_flight_status` but operates on the TUI's read-only
+    SQLite connection (the TUI does not import Store). The 5th element
+    is the plan 59 sub-status (`running` / `backoff_auth` /
+    `backoff_container`) for `running` rows; `None` otherwise."""
     row = conn.execute(
-        "SELECT phase, rc, started_at, ts FROM agent_calls WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        "SELECT phase, rc, started_at, ts, status FROM agent_calls "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if row is None:
-        return ("never", None, None, None)
+        return ("never", None, None, None, None)
     wall = time.time() if now is None else now
     phase = str(row["phase"]) if row["phase"] is not None else None
     if row["rc"] is None:
         started = float(row["started_at"]) if row["started_at"] is not None else float(row["ts"])
-        return ("running", phase, max(0.0, wall - started), None)
+        sub_status = str(row["status"]) if row["status"] is not None else "running"
+        return ("running", phase, max(0.0, wall - started), None, sub_status)
     finished = float(row["ts"])
-    return ("idle", phase, max(0.0, wall - finished), int(row["rc"]))
+    return ("idle", phase, max(0.0, wall - finished), int(row["rc"]), None)
 
 
 def _detail_pre_pr_audit(row: sqlite3.Row) -> tuple[int | None, list[dict]]:

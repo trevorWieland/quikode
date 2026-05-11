@@ -18,7 +18,7 @@ from quikode import docker_env, github, github_graphql, triage
 from quikode.config import Config
 from quikode.dag import DAG
 from quikode.github_graphql import ReviewThread
-from quikode.orchestration import scheduler
+from quikode.orchestration import scheduler, stacking_helpers
 from quikode.orchestration.candidates import CandidatesMixin
 from quikode.orchestration.merge_watch import MergeWatchMixin
 from quikode.orchestration.rebase_watch import RebaseWatchMixin
@@ -291,115 +291,32 @@ class Orchestrator(SupervisionMixin, ReviewWatchMixin, MergeWatchMixin, RebaseWa
             self.store.set_parent_merge_base(nid, branch=None, sha=None)
 
     def _stack_depth(self, task_id: str) -> int:
-        """Compute how deep the stacking DAG is starting from `task_id`.
+        """Plan 59 fix C: delegates to `stacking_helpers.stack_depth`.
 
-        v3.5 Phase 2 follow-up: walks the multi-parent DAG via
-        `parent_task_ids`, taking the **maximum** depth across all paths
-        upward. A child with two parents at depths 3 and 5 returns 5 (the
-        deepest path), so the caller's `depth >= stacking_max_depth`
-        check rejects when *any* path is too deep. Falls back to the
-        older scalar parent data when present.
-
-        Defensive: a parent-DAG cycle would otherwise loop forever. The
-        `visited` set short-circuits; on cycle detection we return a
-        sentinel above max-depth so the caller refuses.
+        The stacking-walk helpers live in `stacking_helpers.py` now so
+        the TUI's pending-eligibility controller can use them too. This
+        method stays as a thin shim so existing callers (mixins) keep
+        working without churn.
         """
-        # `on_stack` tracks the *current* recursion path so a cycle (a→b→a)
-        # is detected. We don't memoize cross-path visits — the same node
-        # reached via different paths can have different depths if the
-        # graph has DAG-shape diamonds, but our caller only cares about
-        # max-depth so memoizing-then-reusing is also correct. We pick the
-        # simpler stack-only variant since DAG depth maxes don't change
-        # from re-traversal cost in practice (workspaces are small).
-        # Match stored stack-chain semantics: depth counts nodes in the
-        # chain *inclusive* of the starting task. A root returns 1; B
-        # stacked on A returns 2; etc. Critical so existing callers'
-        # `depth >= cfg.stacking_max_depth` checks reject at the same
-        # boundary they always have.
-        on_stack: set[str] = set()
-        cycle_detected = [False]
-
-        def _depth(node: str) -> int:
-            if node in on_stack:
-                cycle_detected[0] = True
-                return 0
-            on_stack.add(node)
-            try:
-                parents = self._parents_of(node)
-                if not parents:
-                    return 1
-                return 1 + max(_depth(p) for p in parents)
-            finally:
-                on_stack.discard(node)
-
-        depth = _depth(task_id)
-        if cycle_detected[0]:
-            log.warning("stacking cycle detected from %s — refusing further stacking", task_id)
-            return max(depth, self.cfg.stacking_max_depth + 1)
-        return depth
+        return stacking_helpers.stack_depth(
+            self.store, self.dag, task_id, max_depth_sentinel=self.cfg.stacking_max_depth
+        )
 
     def _parents_of(self, task_id: str) -> list[str]:
-        """Return the multi-parent list for `task_id` — single source of
-        truth for the stack-walk helpers."""
-        return self.store.get_parent_task_ids(task_id)
+        """Plan 59 fix C: delegates to `stacking_helpers.parents_of`."""
+        return stacking_helpers.parents_of(self.store, task_id)
 
     def _would_form_cycle(self, child_id: str, prospective_parent_id: str) -> bool:
-        """Multi-parent cycle detection. Walking the parent DAG from
-        `prospective_parent_id` upward, would we re-encounter `child_id`?
-        If so, stacking on this parent forms a cycle and must be refused.
-        BFS over `parent_task_ids` so a multi-path cycle (a→b, b→c, c→a)
-        is caught even when the cycle isn't on the lowest-id path.
-        """
-        if child_id == prospective_parent_id:
-            return True
-        seen: set[str] = set()
-        frontier = [prospective_parent_id]
-        while frontier:
-            cur = frontier.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            if cur == child_id:
-                return True
-            for p in self._parents_of(cur):
-                if p not in seen:
-                    frontier.append(p)
-        return False
+        """Plan 59 fix C: delegates to `stacking_helpers.would_form_cycle`."""
+        return stacking_helpers.would_form_cycle(self.store, self.dag, child_id, prospective_parent_id)
 
     def _stack_root(self, task_id: str) -> str:
-        """Find a stacking root for `task_id` — the topmost non-stacked
-        ancestor. With multi-parent stacking, the DAG can have multiple
-        roots; we return the lexicographically lowest one for
-        determinism (callers use this only for the breadth-cap key).
-        Cycle-safe."""
-        seen: set[str] = set()
-        frontier = [task_id]
-        roots: list[str] = []
-        while frontier:
-            cur = frontier.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            parents = self._parents_of(cur)
-            if not parents:
-                roots.append(cur)
-                continue
-            for p in parents:
-                if p not in seen:
-                    frontier.append(p)
-        if not roots:
-            return task_id
-        return min(roots)
+        """Plan 59 fix C: delegates to `stacking_helpers.stack_root`."""
+        return stacking_helpers.stack_root(self.store, self.dag, task_id)
 
     def _stack_size_under_root(self, root_task_id: str) -> int:
-        """How many tasks (across the whole tree) are stacked off this
-        root, including the root itself? Used for the breadth-cap check."""
-        # Defensive linear scan — workspaces usually have <300 tasks total.
-        count = 0
-        for r in self.store.all_tasks():
-            if self._stack_root(str(r["id"])) == root_task_id:
-                count += 1
-        return count
+        """Plan 59 fix C: delegates to `stacking_helpers.stack_size_under_root`."""
+        return stacking_helpers.stack_size_under_root(self.store, self.dag, root_task_id)
 
     def _all_done(self, scope: set[str]) -> bool:
         """All tasks reached a TRULY terminal state (no orchestrator work left).

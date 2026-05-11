@@ -83,6 +83,12 @@ class DetailSnapshot:
     agent_in_flight_phase: str | None = None
     agent_in_flight_age_s: float | None = None
     agent_in_flight_last_rc: int | None = None
+    # Plan 59 fix B: fine-grained status for `running` rows
+    # (`running` / `backoff_auth` / `backoff_container`). `None` on
+    # `idle` / `never`. Surfaces transport-layer waits so the operator
+    # sees "subtask_doer backoff_auth 45s" instead of an undifferentiated
+    # "in-flight 45s" when the worker is actually sleeping on retry.
+    agent_in_flight_sub_status: str | None = None
 
 
 class DetailPanel(Container):
@@ -170,6 +176,7 @@ class DetailPanel(Container):
             snap.agent_in_flight_phase,
             int(snap.agent_in_flight_age_s) if snap.agent_in_flight_age_s is not None else None,
             snap.agent_in_flight_last_rc,
+            snap.agent_in_flight_sub_status,
         )
         if phase_fp != self._phase_fp:
             phase_text = _phase_line(snap)
@@ -392,16 +399,27 @@ def _humanize_age_seconds(s: float | None) -> str:
 def _agent_in_flight_line(snap: DetailSnapshot) -> str | None:
     """Render the structured in-flight status line.
 
-    Three shapes (matching `Store.agent_in_flight_status`):
+    Four shapes (matching `Store.agent_in_flight_status` post plan 59
+    fix B):
 
       agent in-flight: subtask_doer (12s)
+      agent backoff_auth: subtask_doer (45s)   ← plan 59 fix B
       agent idle (last subtask_doer returned 30s ago, rc=124)
       no agent call yet
+
+    The `backoff_*` line fires when the latest agent_call row's
+    `status` column is set to `backoff_auth` / `backoff_container` by
+    `_run_with_retry`. With plan 59 fix E' removing the in-transport
+    quota retry entirely, there is no `backoff_quota` status — quota
+    delays live at the worker layer instead.
     """
     status = snap.agent_in_flight_status
     phase = snap.agent_in_flight_phase or "?"
     age = _humanize_age_seconds(snap.agent_in_flight_age_s)
     if status == "running":
+        sub = snap.agent_in_flight_sub_status
+        if sub and sub != "running":
+            return f"[yellow]agent {sub}[/]: [b]{phase}[/] ({age})"
         return f"[cyan]agent in-flight[/]: [b]{phase}[/] ({age})"
     if status == "idle":
         rc = snap.agent_in_flight_last_rc
