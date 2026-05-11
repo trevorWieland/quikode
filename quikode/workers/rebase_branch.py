@@ -64,12 +64,14 @@ class RebaseBranchMixin:
         branch = row.get("branch")
         if not branch or self.handle is None:
             return None
-        active_fixup_review = self.store.conn.execute(
-            "SELECT 1 FROM subtasks WHERE task_id = ? AND kind LIKE 'fixup-review%' "
-            "AND state IN ('doing','checking','triaging') LIMIT 1",
-            (self.node.id,),
-        ).fetchone()
-        return None if active_fixup_review else str(branch)
+        # Plan 60 follow-up: go through the Store API (thread-safe via
+        # `_tx_lock`), not raw `self.store.conn.execute` — the latter
+        # raced with orchestrator main-thread writes and surfaced as
+        # `sqlite3.InterfaceError: bad parameter or other API misuse`
+        # under load. R-0025 hit this on 2026-05-11 AM during planning.
+        if self.store.has_active_fixup_review_subtask(self.node.id):
+            return None
+        return str(branch)
 
     def _branch_ahead_behind(self: Any, branch: str) -> tuple[int, int] | None:
         rc_fetch, _out = self._git_in_workspace(["fetch", self.cfg.pr_remote, branch])

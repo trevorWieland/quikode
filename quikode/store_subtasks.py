@@ -531,3 +531,22 @@ class StoreSubtaskMixin:
                 "UPDATE tasks SET block_forensics = ?, updated_at = ? WHERE id = ?",
                 (blob, time.time(), task_id),
             )
+
+    def has_active_fixup_review_subtask(self: Any, task_id: str) -> bool:
+        """Predicate: does this task have any `kind LIKE 'fixup-review%'`
+        subtask in an active state? Used by `RebaseBranchMixin` to defer
+        branch-divergence rebases until the post-PR feedback loop has
+        settled.
+
+        Goes through `_tx_lock` like every other Store query — workers
+        run in threads and must not hit `self.conn.execute` directly
+        (sqlite3 raises `InterfaceError: bad parameter or other API
+        misuse` when the orchestrator main thread is mid-write).
+        """
+        with self._tx_lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM subtasks WHERE task_id = ? AND kind LIKE 'fixup-review%' "
+                "AND state IN ('doing','checking','triaging') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return row is not None
