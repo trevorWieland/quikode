@@ -9,7 +9,7 @@ Validators that run after the planner emits a parsed Plan:
 * Plan 35 split: `validate_standards_refs` and
   `validate_architecture_refs` live in `test_planner_validators_refs.py`.
 
-Plus `validate_gauntlet_strategy` (length 200-2000 chars).
+Plus `validate_gauntlet_strategy` (length 200-2500 chars).
 """
 
 from __future__ import annotations
@@ -282,11 +282,11 @@ def test_gauntlet_strategy_fails_when_too_short():
 
 
 def test_gauntlet_strategy_fails_when_too_long():
-    plan = _plan(_subtask("S-01"), gauntlet_strategy="x" * 2001)
+    plan = _plan(_subtask("S-01"), gauntlet_strategy="x" * 2501)
     with pytest.raises(PlannerValidationError) as exc_info:
         validate_gauntlet_strategy(plan)
     assert exc_info.value.which == "gauntlet_strategy"
-    assert "<= 2000" in exc_info.value.message
+    assert "<= 2500" in exc_info.value.message
 
 
 # ----- validate_finding_coverage (Plan 33 calibration: fixup-only) -----

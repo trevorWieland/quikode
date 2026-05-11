@@ -186,7 +186,7 @@ subtasks (test-only, infrastructure, generic refactor) legitimately
 cite none. But when the work touches a subsystem boundary, cite the
 governing architecture doc + section.
 
-## 6. The `gauntlet_strategy` field (200-2000 chars)
+## 6. The `gauntlet_strategy` field (200-2500 chars)
 
 Every plan emits a top-level `gauntlet_strategy` string: a 200-500 word
 section explaining how this plan is positioned to pass each stage on
@@ -204,7 +204,7 @@ cycle 1. Specifically address:
   shape?) and how Z-99 stabilization mops them up.
 
 This field is NOT optional. Below 200 chars → the orchestrator will
-re-prompt you. Above 2000 chars → tightens the prose.
+re-prompt you. Above 2500 chars → tightens the prose.
 
 ## 7. Output schema (JSON)
 
@@ -216,7 +216,7 @@ the fenced block is parsed.
 {
   "node_id": "{{ node.id }}",
   "summary": "1-3 sentence overview of the approach",
-  "gauntlet_strategy": "200-2000 char prose section explaining how the plan passes each of the five audit stages on cycle 1...",
+  "gauntlet_strategy": "200-2500 char prose section explaining how the plan passes each of the five audit stages on cycle 1...",
   "subtasks": [
     {
       "id": "S-01-domain",

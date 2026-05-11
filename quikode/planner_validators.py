@@ -218,13 +218,21 @@ def validate_evidence_partition(plan: Plan | FixupPlan, node: Node) -> None:
 
 
 def validate_gauntlet_strategy(plan: Plan) -> None:
-    """Plan 33 §4.3: `gauntlet_strategy` must be 200-2000 chars on real
-    planner output. Missing/below-200 → re-prompt. Above-2000 raises here
+    """Plan 33 §4.3: `gauntlet_strategy` must be 200-2500 chars on real
+    planner output. Missing/below-200 → re-prompt. Above-2500 raises here
     (the spec calls for "truncate with WARN" but truncation is properly
     a render-time concern; for a planner-level validator we treat it as a
     re-prompt-able error). Unit-tests construct minimal Plan objects with
     `gauntlet_strategy=""` and never run this validator — it fires only
     on the parsed-from-agent path in `subtasks.py`.
+
+    Plan 59 follow-up: cap raised 2000 → 2500 on 2026-05-10 PM after
+    plan 47-59 cutover. claude-opus-4-7 on the planner tier produces
+    longer, more thorough strategic prose than gpt-5.5 did; the 2000
+    cap was calibrated for the prior tier and caused recurring
+    validator-block class today (R-0011 / R-0016 / R-0038 each
+    overran by 30-250 chars). 2500 gives Opus room to be thorough
+    while still bounding prompt growth downstream.
     """
     s = plan.gauntlet_strategy or ""
     n = len(s)
@@ -232,17 +240,17 @@ def validate_gauntlet_strategy(plan: Plan) -> None:
         raise PlannerValidationError(
             "gauntlet_strategy",
             f"validate_gauntlet_strategy: `gauntlet_strategy` is "
-            f"{n} chars (need >= 200). Write a 200-2000 char section "
+            f"{n} chars (need >= 200). Write a 200-2500 char section "
             f"explaining how the plan passes each of the four audit "
             f"stages on cycle 1 (which subtasks carry rubric weight, "
             f"how standards alignment is preserved, where witnesses "
             f"come from, what local-CI risks Z-99 mops up).",
         )
-    if n > 2000:
+    if n > 2500:
         raise PlannerValidationError(
             "gauntlet_strategy",
             f"validate_gauntlet_strategy: `gauntlet_strategy` is "
-            f"{n} chars (need <= 2000). Tighten the prose.",
+            f"{n} chars (need <= 2500). Tighten the prose.",
         )
 
 
