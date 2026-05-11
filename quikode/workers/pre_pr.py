@@ -40,6 +40,54 @@ class _TaskWorkerGlobals:
 _tw = _TaskWorkerGlobals()
 
 
+def _stamp_planning_cycle_prefix(plan: FixupPlan, cycle: int) -> FixupPlan:
+    """Plan 60 fix 3: rewrite the fixup planner's subtask ids to carry
+    the emission cycle as an `F-c<CYCLE>-` prefix.
+
+    The fixup planner emits ids like `F-2-3-rust-bdd-...` numbered per
+    its own internal counter; across cycles the same numeric pair can
+    repeat (R-0019 had two `F-2-3-*` subtasks across cycles 3 and 8).
+    Prefixing with the cycle-of-origin makes the collision impossible
+    going forward and keeps the within-cycle internal index for
+    planner-output stability.
+
+    Idempotent: ids already prefixed (e.g. on retry-loop re-emissions
+    after a transport blip) pass through unchanged. `depends_on`
+    references to siblings emitted in the same plan are rewritten
+    consistently; cross-cycle references (to done spec rows `S-*` /
+    `Z-99-*` or to earlier fixup rows the planner correctly cited by
+    their persisted id) are left intact.
+    """
+    prefix = f"F-c{cycle}-"
+    id_map: dict[str, str] = {}
+    for s in plan.subtasks:
+        if s.id.startswith(prefix):
+            continue
+        if s.id.startswith("F-c"):
+            # Already prefixed with some cycle (potential planner echo
+            # of a prior emission's id); rebind to the current cycle to
+            # preserve the cycle-of-origin invariant.
+            stripped = s.id.split("-", 2)[2] if s.id.count("-") >= 2 else s.id
+            id_map[s.id] = prefix + stripped
+            continue
+        if s.id.startswith("F-"):
+            stripped = s.id[2:]
+            id_map[s.id] = prefix + stripped
+            continue
+        # Non-fixup id (shouldn't normally happen from the fixup
+        # planner, but a defensive identity mapping keeps the rewrite
+        # total).
+        id_map[s.id] = s.id
+    if not any(old != new for old, new in id_map.items()):
+        return plan
+    new_subtasks = []
+    for s in plan.subtasks:
+        new_id = id_map.get(s.id, s.id)
+        new_deps = tuple(id_map.get(d, d) for d in s.depends_on)
+        new_subtasks.append(s.model_copy(update={"id": new_id, "depends_on": new_deps}))
+    return plan.model_copy(update={"subtasks": tuple(new_subtasks)})
+
+
 class PrePrWorkerMixin(PrePrAuditStageMixin):
     def _run_fixup_round(
         self: Any,
@@ -176,6 +224,16 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
         # right behavior here AND on `qk replan-cycle` re-fire (the
         # CLI deleted cycle-N rows first, so MAX = N-1 and the next
         # emission lands at N as required by plan 52).
+        #
+        # Plan 60 fix 3: stamp the cycle-of-origin into the subtask id
+        # itself with an `F-c<CYCLE>-` prefix so cross-cycle collisions
+        # (R-0019 had two `F-2-3-*` subtasks across cycle 3 and cycle 8)
+        # become impossible going forward. Only NEW emissions get the
+        # prefix; existing rows keep their current ids per Plan 60's
+        # explicit "no rewrites to history" rule.
+        existing_max_cycle, _kind_at_max = self.store.latest_planning_cycle(self.node.id)
+        emission_cycle = int(existing_max_cycle) + 1
+        fixup_plan = _stamp_planning_cycle_prefix(fixup_plan, emission_cycle)
         self.store.append_subtasks(
             self.node.id,
             [
@@ -191,13 +249,15 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
                 }
                 for s in fixup_plan.subtasks
             ],
+            planning_cycle=emission_cycle,
             planning_kind="fixup_ci" if kind == "fixup-ci" else "fixup",
         )
         _tw.log.info(
-            "fixup round %d (%s): planned %d subtask(s): %s",
+            "fixup round %d (%s): planned %d subtask(s) at cycle %d: %s",
             round_no,
             kind,
             len(fixup_plan.subtasks),
+            emission_cycle,
             ", ".join(s.id for s in fixup_plan.subtasks),
         )
         return self._run_subtask_set(list(fixup_plan.subtasks))

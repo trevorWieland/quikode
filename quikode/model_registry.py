@@ -128,6 +128,16 @@ def _build_models() -> dict[str, ModelSpec]:
             transport="claude",
             schema_enforcement="cli_native",
             claude_model_id="claude-opus-4-7[1m]",
+            # Plan 60 fix 2: Claude tier needs its own fallback chain so a
+            # provider-side auth/quota outage (cf. 2026-05-11 overnight
+            # incident) doesn't fast-fail every checker call on the
+            # claude transport. Sonnet first (same tier, same provider —
+            # handles capacity-only outages), then gpt-5.5 as the
+            # cross-provider floor that's still strong on cli-native
+            # JSON enforcement. The fallback walker (`json_fallback.py`)
+            # now treats provider-unavailable signatures as chain-walk
+            # triggers alongside the existing quota signals.
+            quota_fallbacks=("claude-sonnet-4-6", "gpt-5.5"),
         ),
         ModelSpec(
             name="claude-haiku-4-5",
@@ -140,6 +150,13 @@ def _build_models() -> dict[str, ModelSpec]:
             transport="claude",
             schema_enforcement="cli_native",
             claude_model_id="claude-sonnet-4-6",
+            # Plan 60 fix 2: Sonnet falls back to gpt-5.5 (cross-provider
+            # OpenAI direct, cli-native schema) first because it's the
+            # strongest non-Claude option for the analytical roles
+            # Sonnet runs (checker / triage / audit); gpt-5.3-codex
+            # follows as a writes-files-aware floor when the role is
+            # the doer.
+            quota_fallbacks=("gpt-5.5", "gpt-5.3-codex"),
         ),
     ]
     out: dict[str, ModelSpec] = {}

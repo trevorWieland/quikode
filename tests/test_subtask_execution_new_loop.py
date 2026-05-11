@@ -420,8 +420,14 @@ def test_check_subtask_empty_diff_with_green_gates_fixup_ci_is_cannot_reproduce(
     cannot_reproduce prefix and persists the
     `subtask_cannot_reproduce:<id>` artifact. The new K=2 stop-loss
     fires on the second occurrence of this signature; the LLM checker
-    is never invoked."""
-    cfg = _cfg(tmp_path)
+    is never invoked.
+
+    Plan 60 fix 1: fixup_ci subtasks now route their objective gate
+    through `local_ci_command`. To keep this test focused on the
+    empty-diff branch (no objective-gate execution), the worker cfg
+    explicitly clears both `subtask_check_command` (already empty via
+    `_cfg`) and `local_ci_command`."""
+    cfg = _cfg(tmp_path).model_copy(update={"local_ci_command": ""})
     w = _build_worker(cfg)
     w._last_diff_text = ""
     w._last_witness_results = {}

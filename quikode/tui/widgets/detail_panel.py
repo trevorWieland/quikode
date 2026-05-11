@@ -127,7 +127,16 @@ class DetailPanel(Container):
             yield Static("", id="detail-phase")
         with TabbedContent(initial="subtasks-tab", id="detail-tabs"):
             with TabPane("Subtasks", id="subtasks-tab"):
-                yield DataTable(id="subtasks-table", zebra_stripes=True, cursor_type="row")
+                # Plan 60 fix 4: tasks with 40+ subtasks (R-0041's 44
+                # rows) couldn't reach the bottom of the table — the
+                # DataTable's internal viewport was clipped by the
+                # surrounding TabPane height and the table's
+                # `height: 1fr` couldn't claim enough space for its
+                # virtual content. Wrap in VerticalScroll so the host
+                # scrolls the table as a single tall element when its
+                # row content exceeds the available pane height.
+                with VerticalScroll(id="subtasks-scroll"):
+                    yield DataTable(id="subtasks-table", zebra_stripes=True, cursor_type="row")
             with TabPane("Agent calls", id="calls-tab"):
                 # Soft buffer cap (RichLog drops oldest when exceeded). Display
                 # is bounded by the panel's proportional height; this controls

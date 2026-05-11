@@ -9,9 +9,23 @@ an already-migrated DB is a no-op.
 from __future__ import annotations
 
 import logging
-import re
 import sqlite3
 from typing import Any
+
+# Plan 60 fix 3: id-parsing heuristics live in `planning_provenance.py`
+# so this module stays under the 600-line architecture budget. We
+# re-export them under the prior `_infer_planning_provenance` /
+# `_infer_planning_provenance_with_context` names so existing call
+# sites and tests keep working without a sweep of every import.
+from quikode.planning_provenance import (
+    infer_planning_provenance as _infer_planning_provenance,
+)
+from quikode.planning_provenance import (
+    infer_planning_provenance_with_context as _infer_planning_provenance_with_context,
+)
+from quikode.planning_provenance import (
+    is_fixup_ci_id as _is_fixup_ci_id,
+)
 
 log = logging.getLogger("quikode.state_schema")
 
@@ -349,63 +363,12 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     _apply_plan58_migration(conn)
 
 
-# Plan 52 backfill heuristic: subtask-id naming convention encodes the
-# planner that emitted the row. `S-NN-*` and `Z-99-*` are initial-cycle.
-# `F-N-...-*` (where N is a digit) indicates fixup-cycle N+1 — the +1
-# offsets the initial planner's cycle 1. `F-CI-*` is CI-driven fixup
-# and runs AFTER all pre-PR fixup cycles; plan 53 patches the heuristic
-# to compute its cycle as `MAX(non-F-CI cycle on this task) + 1` rather
-# than the prior hardcoded 2. The single-id helper retains the
-# hardcoded fallback for callers that lack task context, but the
-# migration's two-pass per-task path (`_apply_plan52_migration`) uses
-# the corrected MAX+1 semantics.
-_FIXUP_NUMERIC_RE = re.compile(r"^F-(\d+)-")
-_FIXUP_CI_RE = re.compile(r"^F-CI-")
-_INITIAL_PREFIX_RE = re.compile(r"^(S-\d+|Z-99|R-\d+)-?")
-
-
-def _infer_planning_provenance(subtask_id: str) -> tuple[int, str]:
-    """Map a subtask id to (planning_cycle, planning_kind).
-
-    Heuristic only — used for backfill of pre-plan-52 rows. New rows are
-    populated explicitly by each planner call site so the CLI's cycle
-    targeting stays exact.
-
-    Plan 53 note: F-CI-* rows get the per-task MAX+1 treatment via
-    `_infer_fixup_ci_cycle` in the migration path. This single-id
-    helper still returns the pre-plan-53 (2, "fixup_ci") fallback so callers
-    without task context (none in production) keep stable behavior.
-    """
-    if _INITIAL_PREFIX_RE.match(subtask_id):
-        return (1, "initial")
-    m = _FIXUP_NUMERIC_RE.match(subtask_id)
-    if m:
-        try:
-            cycle = int(m.group(1)) + 1
-        except ValueError:
-            return (1, "initial")
-        return (max(cycle, 2), "fixup")
-    if _FIXUP_CI_RE.match(subtask_id):
-        return (2, "fixup_ci")
-    return (1, "initial")
-
-
-def _infer_planning_provenance_with_context(subtask_id: str, *, max_non_fci_cycle: int) -> tuple[int, str]:
-    """Plan 53 two-pass migration helper. Identical to
-    `_infer_planning_provenance` for non-F-CI rows; F-CI rows return
-    `(max(max_non_fci_cycle, 1) + 1, "fixup_ci")` so they sit one cycle
-    past the highest non-F-CI cycle the task has.
-
-    `max_non_fci_cycle` is computed in pass 1 (after every non-F-CI row
-    has been backfilled) and threaded into pass 2's per-row resolution.
-    A task with only `F-CI-*` rows (impossible in practice but
-    defensible at the migration level) lands at cycle 2 to preserve the
-    pre-plan-53 fallback.
-    """
-    if _FIXUP_CI_RE.match(subtask_id):
-        cycle = max(max_non_fci_cycle, 1) + 1
-        return (cycle, "fixup_ci")
-    return _infer_planning_provenance(subtask_id)
+def _is_fixup_ci_match(subtask_id: str) -> bool:
+    """Plan 53 / 60 thin wrapper: kept so the existing migration call
+    sites (`_backfill_non_fci_pass`, `_backfill_fci_pass`,
+    `_lookup_max_non_fci_cycle`) can stay literal `_FIXUP_CI_RE.match`-
+    shaped after the parsing helpers moved to `planning_provenance.py`."""
+    return _is_fixup_ci_id(subtask_id)
 
 
 def _apply_plan52_migration(conn: sqlite3.Connection) -> None:
@@ -456,7 +419,7 @@ def _backfill_non_fci_pass(conn: sqlite3.Connection, rows: list[Any]) -> list[tu
         sid = row["subtask_id"] if isinstance(row, sqlite3.Row) else row[2]
         task_id = row["task_id"] if isinstance(row, sqlite3.Row) else row[1]
         rowid = row["id"] if isinstance(row, sqlite3.Row) else row[0]
-        if _FIXUP_CI_RE.match(str(sid)):
+        if _is_fixup_ci_match(str(sid)):
             fci_pending.append((rowid, str(task_id), str(sid)))
             continue
         _maybe_update_provenance(conn, rowid=rowid, sid=str(sid))

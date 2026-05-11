@@ -53,6 +53,30 @@ _AGENT_AUTH_TRANSIENT_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+# Plan 60 fix 2: provider-unavailable detector — distinct from
+# `_is_quota_exhausted` (subscription quota) and `_is_transient_agent_auth_failure`
+# (codex OAuth refresh race). This catches the class of failures where
+# the provider's API itself is rejecting the call — invalid keys,
+# session-expired tokens, 401/403 responses. The 2026-05-11 overnight
+# Claude outage fast-failed rc=1 in 3-4 seconds with auth-shaped stderr
+# that matched none of the existing patterns, so the chain walker never
+# fired. Treating these as chain-walk triggers means a provider-side
+# auth outage routes to the next configured fallback model instead of
+# stalling the task.
+_PROVIDER_UNAVAILABLE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"invalid api key", re.IGNORECASE),
+    re.compile(r"authentication failed", re.IGNORECASE),
+    re.compile(r"authentication error", re.IGNORECASE),
+    re.compile(r"session expired", re.IGNORECASE),
+    re.compile(r"\b401\s+unauthorized\b", re.IGNORECASE),
+    re.compile(r"\b401\b[^\n]{0,40}unauthorized", re.IGNORECASE),
+    re.compile(r"\b403\s+forbidden\b", re.IGNORECASE),
+    re.compile(r"\b403\b[^\n]{0,40}forbidden", re.IGNORECASE),
+    re.compile(r"please run /login", re.IGNORECASE),
+    re.compile(r"credit balance is too low", re.IGNORECASE),
+)
+
+
 def _is_transient_container_failure(rc: int, stderr: str) -> bool:
     """True when a non-zero exit looks like a container-infra glitch.
 
@@ -90,6 +114,28 @@ def _is_quota_exhausted(rc: int, stdout: str, stderr: str) -> bool:
     return False
 
 
+def _is_provider_unavailable(rc: int, stdout: str, stderr: str) -> bool:
+    """Plan 60 fix 2: True when the agent CLI failure looks like a
+    provider-side auth/availability issue distinct from subscription
+    quota.
+
+    Triggers a chain walk in `QuotaFallbackJsonAgent` so today's
+    overnight-Claude class of outage cascades to the next configured
+    fallback model instead of stalling. Only fires on rc != 0; the
+    patterns are common enough in agent stdout (discussing auth code)
+    that requiring a non-zero exit avoids false positives.
+    """
+    if rc == 0:
+        return False
+    for blob in (stderr, stdout):
+        if not blob:
+            continue
+        for pat in _PROVIDER_UNAVAILABLE_PATTERNS:
+            if pat.search(blob):
+                return True
+    return False
+
+
 def _is_transient_agent_auth_failure(rc: int, stdout: str, stderr: str) -> bool:
     """True when an agent CLI failure looks like a retryable auth race.
 
@@ -110,6 +156,7 @@ def _is_transient_agent_auth_failure(rc: int, stdout: str, stderr: str) -> bool:
 
 
 __all__ = [
+    "_is_provider_unavailable",
     "_is_quota_exhausted",
     "_is_transient_agent_auth_failure",
     "_is_transient_container_failure",

@@ -105,8 +105,17 @@ def test_make_agent_subtask_doer_override_to_claude_opus() -> None:
     cfg = _cfg(subtask_doer_model="claude-opus-4-7")
     agent = make_agent("subtask_doer", cfg)
     assert isinstance(agent, WritesFilesAgent)
-    assert isinstance(agent.transport, ClaudeJsonAgent)
-    assert agent.transport.model_id == "claude-opus-4-7[1m]"
+    # Plan 60 fix 2: claude-opus-4-7 declares a quota fallback chain
+    # (claude-sonnet-4-6 → gpt-5.5), so the make_agent layer wraps the
+    # primary `ClaudeJsonAgent` in a `QuotaFallbackJsonAgent`. Drill in
+    # one level to assert the primary transport.
+    assert isinstance(agent.transport, QuotaFallbackJsonAgent)
+    assert isinstance(agent.transport.primary, ClaudeJsonAgent)
+    assert agent.transport.primary.model_id == "claude-opus-4-7[1m]"
+    assert isinstance(agent.transport.fallbacks[0], ClaudeJsonAgent)
+    assert agent.transport.fallbacks[0].model_id == "claude-sonnet-4-6"
+    assert isinstance(agent.transport.fallbacks[1], CodexDirectJsonAgent)
+    assert agent.transport.fallbacks[1].profile == "gpt5"
     assert agent.envelope_schema is None
 
 

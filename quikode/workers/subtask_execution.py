@@ -447,7 +447,13 @@ class SubtaskExecutionMixin:
         )
 
     def _run_subtask_check_command(self: Any, subtask: Subtask) -> _CheckerOutcome | None:
-        if subtask.id == STABILIZATION_SUBTASK_ID:
+        # Plan 60 fix 1: fixup_ci subtasks exist specifically to repair
+        # what GitHub CI broke. `just check` is too narrow — it can miss
+        # Playwright BDD scenarios that `just ci` catches. Promote
+        # fixup_ci / fixup-ci subtasks to `local_ci_command` alongside
+        # Z-99 stabilization; reuses the existing `_is_fixup_ci_subtask`
+        # helper (plan 53) covering both kind-label forms.
+        if subtask.id == STABILIZATION_SUBTASK_ID or _is_fixup_ci_subtask(subtask):
             cmd_str = (self.cfg.local_ci_command or "").strip()
             timeout_s = self.cfg.local_ci_timeout_s
         else:

@@ -516,11 +516,19 @@ def force_recover_to_pending_ci(
     an out-of-band recovery: there's no FSM event that maps "any state
     → PENDING_CI", so we delegate to the store's raw `transition` helper
     with a clear note recording the supervisor's rationale. The
-    architecture guard explicitly allows this single call site."""
+    architecture guard explicitly allows this single call site.
+
+    Plan 60 fix 5: clear `last_error` + `failure_reason` by default so a
+    stale audit-stage error message doesn't linger on the task row after
+    the supervisor has explicitly forgiven the stall. The caller can
+    override either field by passing it in `fields` (the kwargs win over
+    the defaults applied here)."""
     state = current_state(store, task_id)
     if state is State.PENDING_CI:
         return state
     bridge_note = note or "supervisor force-recovery: bridging to PENDING_CI"
+    fields.setdefault("last_error", None)
+    fields.setdefault("failure_reason", None)
     store.transition(task_id, State.PENDING_CI, note=bridge_note, **fields)
     return State.PENDING_CI
 

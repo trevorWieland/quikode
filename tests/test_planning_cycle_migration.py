@@ -30,10 +30,18 @@ def test_infer_planning_provenance_known_prefixes():
     assert _infer_planning_provenance("R-1-1-replan-foo") == (1, "initial")
     assert _infer_planning_provenance("F-1-1-fix") == (2, "fixup")
     assert _infer_planning_provenance("F-3-7-something") == (4, "fixup")
-    # Plan 53: single-id helper retains the legacy fallback for callers
-    # without per-task context. The migration's two-pass path uses the
-    # MAX+1 helper instead.
+    # Plan 53: single-id helper retains the pre-plan-53 fallback for
+    # callers without per-task context. The migration's two-pass path
+    # uses the MAX+1 helper instead.
     assert _infer_planning_provenance("F-CI-1-build-fix") == (2, "fixup_ci")
+    # Plan 60 fix 3: cycle-prefixed shape returns the cycle directly
+    # (no +1 offset — the prefix is stamped against the actual emission
+    # cycle).
+    assert _infer_planning_provenance("F-c8-2-3-rust-bdd-fix") == (8, "fixup")
+    assert _infer_planning_provenance("F-c3-1-1-coverage-fix") == (3, "fixup")
+    # Cycle 1 in the explicit prefix still floors to 2 (the
+    # post-initial-cycle convention).
+    assert _infer_planning_provenance("F-c1-1-1-x") == (2, "fixup")
     # Unknown shape → safe default.
     assert _infer_planning_provenance("weird-id") == (1, "initial")
 

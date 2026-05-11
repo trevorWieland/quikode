@@ -93,9 +93,17 @@ Screen {
 }
 
 /* Detail-panel inner tables. `1fr` lets them claim whatever vertical space
-   the detail panel itself was given by its own `2fr` weight. */
-#subtasks-table {
+   the detail panel itself was given by its own `2fr` weight.
+   Plan 60 fix 4: the DataTable lives inside a VerticalScroll
+   (`#subtasks-scroll`) so the scrollbar lives on the outer container
+   and the table itself can claim its natural full-content height. */
+#subtasks-scroll {
     height: 1fr;
+    overflow-y: auto;
+}
+#subtasks-table {
+    height: auto;
+    max-height: 100%;
     overflow-y: auto;
 }
 

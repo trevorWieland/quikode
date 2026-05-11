@@ -9,14 +9,33 @@ from typing import Any
 from pydantic import BaseModel
 
 from .json_protocol import JsonAgentTransport, RawTransportResult
-from .transient_quota import _is_quota_exhausted
+from .transient_quota import _is_provider_unavailable, _is_quota_exhausted
+
+
+def _should_walk_chain(raw: RawTransportResult) -> bool:
+    """Plan 60 fix 2: chain-walk on EITHER subscription quota exhaustion
+    OR provider-side unavailability (invalid key / 401 / 403 / session
+    expired). The 2026-05-11 overnight Claude outage emitted auth-shaped
+    rc=1 stderr that didn't match the quota regexes, so the chain
+    walker never fired and 145 calls fast-failed across 13 tasks. The
+    operator's stated intent is "any provider unavailability triggers
+    the chain walk," so quota + provider-unavailable share the same
+    cascade path here.
+    """
+    blob_out = raw.raw_text or ""
+    blob_err = raw.stderr_excerpt or ""
+    return _is_quota_exhausted(raw.rc, blob_out, blob_err) or _is_provider_unavailable(
+        raw.rc, blob_out, blob_err
+    )
 
 
 class QuotaFallbackJsonAgent:
-    """Try fallback transports when the primary reports quota exhaustion.
+    """Try fallback transports when the primary reports quota exhaustion
+    or provider-side unavailability.
 
     This is intentionally narrow: parse/schema failures still belong to the
-    normal JSON wrapper, while provider quota failures can move to another
+    normal JSON wrapper. Provider quota AND provider-unavailable signatures
+    (invalid keys, 401/403, session expired) both move the call to another
     configured model without burning subtask retry budget.
     """
 
@@ -55,7 +74,7 @@ class QuotaFallbackJsonAgent:
             )
             raw = _normalize_for_primary_schema(raw, primary_schema_enforcement=self.schema_enforcement)
             combined = _combine(prior, raw) if prior is not None else raw
-            if not _is_quota_exhausted(raw.rc, raw.raw_text or "", raw.stderr_excerpt):
+            if not _should_walk_chain(raw):
                 return combined
             if index == len(transports) - 1:
                 return combined
@@ -89,7 +108,7 @@ class QuotaFallbackJsonAgent:
                 timeout=timeout,
             )
             combined = _combine(prior, raw) if prior is not None else raw
-            if not _is_quota_exhausted(raw.rc, raw.raw_text or "", raw.stderr_excerpt):
+            if not _should_walk_chain(raw):
                 return combined
             if index == len(transports) - 1:
                 return combined

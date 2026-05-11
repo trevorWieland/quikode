@@ -35,6 +35,7 @@ from ..execution import exec_in
 from .json_protocol_types import JsonAgentResult, JsonAgentTransport, RawTransportResult
 from .json_validation import build_reprompt, codex_output_schema, invoke_with_validation
 from .transient_quota import (
+    _is_provider_unavailable,
     _is_quota_exhausted,
     _is_transient_agent_auth_failure,
     _is_transient_container_failure,
@@ -272,14 +273,20 @@ def _run_with_retry(
                 timed_out=True,
                 category=_CATEGORY_CONTAINER_VANISHED,
             )
-        if _is_quota_exhausted(rc, out, err):
-            # Plan 59 fix E': fast-fail. No in-transport sleep. The
-            # fallback chain cascades to the next provider in seconds;
-            # if every provider returns quota, the worker layer handles
-            # the cross-attempt cadence (default 600s) via
+        if _is_quota_exhausted(rc, out, err) or _is_provider_unavailable(rc, out, err):
+            # Plan 59 fix E' + Plan 60 fix 2: fast-fail. No in-transport
+            # sleep. The fallback chain cascades to the next provider in
+            # seconds; if every provider returns quota / provider-
+            # unavailable, the worker layer handles the cross-attempt
+            # cadence (default 600s) via
             # `cfg.transient_retry_delays_s["quota_exhausted"]`.
+            # Provider-unavailable shares the same downstream path
+            # (chain-walk + worker-layer sleep) as quota since the
+            # operator intent is identical: don't burn retry budget on a
+            # provider that can't answer.
+            kind = "quota exhausted" if _is_quota_exhausted(rc, out, err) else "provider unavailable"
             annotation = (
-                f"\n[quikode] quota exhausted (rc={rc}); fast-fail to chain walker / "
+                f"\n[quikode] {kind} (rc={rc}); fast-fail to chain walker / "
                 f"worker-layer retry (no in-transport sleep)"
             )
             log.info(annotation.strip())
