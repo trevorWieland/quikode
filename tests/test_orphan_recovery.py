@@ -148,7 +148,7 @@ def test_addressing_feedback_goes_to_pending_ci(tmp_path):
     """The watcher will re-detect the open thread on the next poll tick
     and submit a fresh review-response future."""
     s = _store(tmp_path)
-    _seed(s, "T-1", State.ADDRESSING_FEEDBACK, pr_number=42)
+    _seed(s, "T-1", State.AUDIT_LOCAL_CI, pr_number=42)
     s.recover_orphan_tasks()
     assert s.get("T-1")["state"] == State.PENDING_CI.value
     s.conn.close()

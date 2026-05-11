@@ -136,8 +136,22 @@ def _briefing_json_payload(
         "awaiting_review": [
             _briefing_row_summary(r) for r in rows if r["state"] == State.AWAITING_REVIEW.value
         ],
+        # Plan 58: ADDRESSING_FEEDBACK retired. Surface tasks in any
+        # audit-stage state under the same operator-friendly label;
+        # `qk briefing` semantics ("what's actively addressing feedback?")
+        # remain stable.
         "addressing_feedback": [
-            _briefing_row_summary(r) for r in rows if r["state"] == State.ADDRESSING_FEEDBACK.value
+            _briefing_row_summary(r)
+            for r in rows
+            if r["state"]
+            in (
+                State.AUDIT_LOCAL_CI.value,
+                State.AUDIT_RUBRIC.value,
+                State.AUDIT_STANDARDS.value,
+                State.AUDIT_ARCHITECTURE.value,
+                State.AUDIT_BEHAVIOR.value,
+                State.FIXUP_PLANNING.value,
+            )
         ],
         "rebasing_to_main": [
             _briefing_row_summary(r) for r in rows if r["state"] == State.REBASING_TO_MAIN.value
@@ -189,7 +203,16 @@ def _post_pr_groups(store: Store) -> dict[str, list]:
     return {
         "pending_ci": store.in_state(State.PENDING_CI),
         "awaiting_review": store.in_state(State.AWAITING_REVIEW),
-        "addressing_feedback": store.in_state(State.ADDRESSING_FEEDBACK),
+        # Plan 58: aggregate the new audit-stage + fixup-planning states
+        # under the operator-friendly label.
+        "addressing_feedback": store.in_state(
+            State.AUDIT_LOCAL_CI,
+            State.AUDIT_RUBRIC,
+            State.AUDIT_STANDARDS,
+            State.AUDIT_ARCHITECTURE,
+            State.AUDIT_BEHAVIOR,
+            State.FIXUP_PLANNING,
+        ),
         "rebasing": store.in_state(State.REBASING_TO_MAIN),
         "blocked": store.in_state(State.BLOCKED),
         "failed": store.in_state(State.FAILED),
@@ -198,14 +221,26 @@ def _post_pr_groups(store: Store) -> dict[str, list]:
 
 def _print_state_summary(rows: Sequence[Mapping[str, Any]]) -> None:
     by_state: dict[str, int] = {}
+    by_phase: dict[str, int] = {}
     for r in rows:
         by_state[r["state"]] = by_state.get(r["state"], 0) + 1
+        phase = str(r.get("phase") or "initial")
+        by_phase[phase] = by_phase.get(phase, 0) + 1
     if not by_state:
         console.print("\n[dim]No tasks recorded yet.[/]")
         return
     console.print("\n[bold]Task states[/]")
     for s, n in sorted(by_state.items()):
         console.print(f"  {s}: {n}")
+    # Plan 58: phase tier breakdown.
+    if by_phase:
+        phase_summary = " · ".join(
+            f"{name.upper()} {by_phase.get(name, 0)}"
+            for name in ("initial", "pre_pr_review", "pr_review")
+            if by_phase.get(name)
+        )
+        if phase_summary:
+            console.print(f"\n[bold]Phase tier[/] {phase_summary}")
 
 
 def _print_active_tasks(store: Store, actives: Sequence[Mapping[str, Any]], now: float) -> None:

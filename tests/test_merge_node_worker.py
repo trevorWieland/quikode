@@ -149,7 +149,9 @@ def _build_worker(
         # Real pipeline leaves the row in PRE_PR_AUDITING on pass; stub
         # mimics that so the merge_node_built event has a valid source.
         if audit_outcome is None:
-            fsm_runtime.enter_pre_pr_auditing(self.store, self.node.id, note="stub: pipeline pass")
+            # Plan 58: merge_node_built fires from AUDIT_BEHAVIOR. Stub the
+            # row state directly so the source matches.
+            self.store.transition(self.node.id, State.AUDIT_BEHAVIOR, note="stub: pipeline pass")
         return audit_outcome
 
     monkeypatch.setattr(MergeNodeWorker, "_run_pre_pr_pipeline", fake_audit, raising=False)
@@ -369,7 +371,8 @@ def test_audit_gauntlet_invoked_with_merge_node_mode(tmp_path, monkeypatch):
 
     def fake_audit(self, *, merge_node_mode):
         captured["merge_node_mode"] = merge_node_mode
-        fsm_runtime.enter_pre_pr_auditing(self.store, self.node.id, note="stub")
+        # Plan 58: merge_node_built fires from AUDIT_BEHAVIOR.
+        self.store.transition(self.node.id, State.AUDIT_BEHAVIOR, note="stub")
 
     monkeypatch.setattr(MergeNodeWorker, "_run_pre_pr_pipeline", fake_audit, raising=False)
     git_calls: list[list[str]] = []
@@ -489,10 +492,18 @@ def _build_pipeline_worker(tmp_path, store, mn_id, parent_ev_lists, monkeypatch)
     monkeypatch.setattr(pre_pr_audit, "run_architecture_audit", fake_architecture)
     monkeypatch.setattr(pre_pr_audit, "run_behavior_audit", fake_behavior)
     monkeypatch.setattr(pre_pr_audit, "collect_standards_text", lambda cfg, **kw: "STANDARDS")
-    # The audit-stage helper transitions to PRE_PR_AUDITING per stage as
+    # Plan 58: per-stage helpers transition through the audit gauntlet as
     # a TUI-progress signal; the store is in PENDING in unit tests so we
-    # stub the transition to a no-op.
-    monkeypatch.setattr(fsm_runtime, "enter_pre_pr_auditing", lambda *a, **k: None)
+    # stub the transitions to no-ops.
+    for helper_name in (
+        "enter_audit_local_ci",
+        "enter_audit_rubric",
+        "enter_audit_standards",
+        "enter_audit_architecture",
+        "enter_audit_behavior",
+        "audit_behavior_passed",
+    ):
+        monkeypatch.setattr(fsm_runtime, helper_name, lambda *a, **k: None)
     # The store also receives `update_pre_pr_audit_stage` calls. The
     # default implementation is fine, but it requires a live audit-cycle
     # row; for unit tests we no-op it.

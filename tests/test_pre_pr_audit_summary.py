@@ -106,7 +106,7 @@ def test_gauntlet_block_renders_pass_fail_queued_icons():
         # plan 26: gauntlet only renders when current state is in the
         # pipeline-relevant set; pre_pr_auditing is the canonical "render"
         # state.
-        task_state="pre_pr_auditing",
+        task_state="audit_local_ci",
         pre_pr_audit_cycle=2,
         pre_pr_audit_stages=[
             {"name": "local_ci", "passed": True, "summary": "rc=0"},
@@ -135,7 +135,7 @@ def test_gauntlet_block_handles_missing_stage_gracefully():
     still render without raising — missing stages are simply skipped."""
     snap = DetailSnapshot(
         task_id="R-001",
-        task_state="pre_pr_auditing",  # plan 26: pipeline-relevant state
+        task_state="audit_local_ci",  # plan 26: pipeline-relevant state
         pre_pr_audit_cycle=1,
         pre_pr_audit_stages=[
             {"name": "local_ci", "passed": True, "summary": "rc=0"},
@@ -179,7 +179,7 @@ def test_gauntlet_block_hides_when_state_is_not_pipeline_relevant():
 
     # Pipeline / terminal states — should render.
     for show_state in (
-        "pre_pr_auditing",
+        "audit_local_ci",
         "local_ci_checking",
         "fixup_planning",
         "pending_ci",

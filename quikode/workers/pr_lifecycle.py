@@ -10,6 +10,7 @@ from quikode.agent_registry import make_agent
 from quikode.agent_schemas import IntentReviewVerdict, PlannerOutput
 from quikode.ancestry import maybe_auto_merge_via_ancestry
 from quikode.state import State, SubtaskState
+from quikode.state_types import Phase, PrReviewTrigger
 from quikode.subtask_schema import PlanValidationError
 from quikode.workers.local_ci_capture import capture_local_ci_at_head
 from quikode.workers.outcomes import WorkerOutcome
@@ -27,22 +28,15 @@ _DEFERRED_PRE_PR_FINDINGS_ARTIFACT = "pre_pr_deferred_findings"
 
 class PrLifecycleWorkerMixin:
     def _open_pr(self: Any) -> WorkerOutcome | None:
-        # v3 stacked-diffs fix: prefer the explicit flag set by the
-        # orchestrator over the ls-remote race below. When the flag is set
-        # we know with certainty the parent merged; do the rebase + clear
-        # parent metadata before attempting to open the PR against main.
+        # v3 stacked-diffs fix: rebase + clear parent metadata when the
+        # orchestrator flagged a parent-merge before attempting to open the PR.
         rebase_outcome = self._handle_parent_rebase_if_needed()
         if rebase_outcome:
             return rebase_outcome
         fsm_runtime.enter_pr_opening(self.store, self.node.id)
-        # Idempotent re-entry: if this task already has a PR row in the
-        # store (from a prior run that pushed but crashed before
-        # transitioning to PENDING_CI, or from a daemon restart that
-        # orphan-recovered the task post-PR-open), skip `gh pr create`
-        # and reuse the existing PR. Without this, the second pass fails
-        # with `gh: a pull request for branch X already exists` and the
-        # task BLOCKs unnecessarily — observed live on R-0015 after the
-        # 2026-05-04 daemon restart.
+        # Idempotent re-entry: reuse the existing PR if one already exists
+        # (prior run that pushed but crashed before transitioning, or
+        # daemon orphan-recovery).
         row = self._row()
         if row.get("pr_number") and row.get("pr_url"):
             _tw.log.info(
@@ -82,6 +76,18 @@ class PrLifecycleWorkerMixin:
         m = _tw.re.search(r"/pull/(\d+)", url)
         pr_number = int(m.group(1)) if m else 0
         self.store.set_field(self.node.id, pr_url=url, pr_number=pr_number)
+        # Plan 58: PRE_PR_REVIEW → PR_REVIEW at PR open.
+        try:
+            if str(self._row().get("phase") or "") == Phase.PRE_PR_REVIEW.value:
+                self.store.enter_phase(
+                    self.node.id,
+                    Phase.PR_REVIEW,
+                    cycle_in_phase=0,
+                    pr_review_trigger=PrReviewTrigger.NONE,
+                    note=f"PR opened (#{pr_number}); entering PR_REVIEW phase",
+                )
+        except Exception as exc:
+            _tw.log.warning("phase enter PR_REVIEW failed: %s; continuing", exc)
         return None
 
     def _remote_branch_exists(self: Any, branch: str) -> bool:
@@ -263,28 +269,24 @@ class PrLifecycleWorkerMixin:
         ci_attempts: int,
         budget: int,
     ) -> tuple[WorkerOutcome | None, int, bool]:
+        """Plan 58: post-PR CI failure detected via the poll loop. Delegate
+        to the unified audit driver via the FeedbackWorkerMixin entry
+        point (`run_ci_fix_response`) — same code path as the daemon's
+        review-watcher tick uses.
+
+        Returns `(outcome, ci_attempts, handled)`. When `handled=True` and
+        `outcome=None` the poll loop continues; when `outcome` is set
+        the loop exits with that outcome.
+        """
         if status.checks_status != "failure" or ci_attempts >= budget:
             return None, ci_attempts, False
         ci_attempts += 1
-        ci_log = _tw.github.fetch_failed_check_logs(
-            self.cfg.repo_path,
-            int(_tw.cast(Any, row["pr_number"])) if row.get("pr_number") else 0,
-        )
-        # Plan 53: run `local_ci_command` against the worktree HEAD
-        # before invoking the fixup planner so the planner sees whether
-        # the failure reproduces locally. The result threads through
-        # to the prompt as `local_ci_at_head` and drives the three-case
-        # dispatch (GitHub fails AND local fails / passes / etc.).
-        local_ci_at_head = self._capture_local_ci_at_head()
-        outcome = self._run_fixup_round(
-            kind="fixup-ci",
-            round_no=ci_attempts,
-            trigger="ci",
-            ci_excerpt=_tw._last_lines(ci_log, 80),
-            local_ci_at_head=local_ci_at_head,
-        )
-        self.store.increment(self.node.id, "ci_triage_retries")
-        if outcome and outcome.final_state == State.BLOCKED:
+        # The unified audit driver handles the full fixup → re-audit →
+        # commit + push → PENDING_CI cycle. After it returns we're back
+        # at PENDING_CI (or BLOCKED) — the poll loop's caller treats
+        # PENDING_CI as "keep polling".
+        outcome = self.run_ci_fix_response(status)
+        if outcome.final_state == State.BLOCKED:
             return outcome, ci_attempts, True
         return None, ci_attempts, True
 
@@ -449,17 +451,17 @@ class PrLifecycleWorkerMixin:
         return self._replan_and_resume(outcome.explanation, affected)
 
     def _replan_and_resume(self: Any, prior_explanation: str, affected: str) -> WorkerOutcome | None:
-        """Phase B.5: re-run the planner with augmented context (prior plan +
-        what landed on main), update subtasks, then restart the subtask loop
-        from any pending/blocked subtasks.
-
-        Plan 38 PR-B.7: migrated onto the JsonAgent layer via the dedicated
-        `replan_planner` role. The same `PlannerOutput` wire schema is
-        emitted and translated through `_wire_to_runtime_plan` (the same
-        helper the spec planner uses), so the runtime `Plan` carries the
-        Z-99 stabilization injection + topo validators uniformly.
-        """
-        fsm_runtime.enter_addressing_feedback(
+        """Plan 58: enter the audit cycle (so block events have a valid
+        source state); then replan the spec subtasks."""
+        _tw.log.info(
+            "task %s: replan-and-resume triggered by intent conflict: %s",
+            self.node.id,
+            affected[:120],
+        )
+        # Plan 58: bridge to AUDIT_LOCAL_CI so block_current has a valid source.
+        # Intent reviewer fires from PENDING_CI or AWAITING_REVIEW; CI_FIXUP
+        # entry accepts both.
+        fsm_runtime.enter_audit_cycle_for_ci_fixup(
             self.store,
             self.node.id,
             note=f"replan triggered by intent conflict: {affected[:120]}",

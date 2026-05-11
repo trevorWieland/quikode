@@ -5,10 +5,14 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from quikode import fsm_runtime, runtime_shutdown
+from quikode import fsm_runtime
 from quikode.state import State, SubtaskState
 from quikode.subtask_schema import FixupPlan
 from quikode.workers.audit_bootstrap import prepare_audit_cycle
+from quikode.workers.audit_driver import (
+    AuditTriggerSource,
+    run_audit_cycle,
+)
 from quikode.workers.fixup_coverage import (
     build_coverage_gap_addendum,
     missing_finding_coverage,
@@ -22,6 +26,10 @@ from quikode.workers.pre_pr_reports import (
     release_valve_report,
     structural_failure_report,
 )
+
+# Re-export the trigger-source enum so callers (workers/feedback.py) can
+# import it from this module's namespace.
+__all__ = ["AuditTriggerSource", "PrePrWorkerMixin"]
 
 
 class _TaskWorkerGlobals:
@@ -59,34 +67,34 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
                 fixup planner failed AND the fallback also can't
                 make progress (which the caller surfaces as task BLOCKED).
         """
-        # Plan 54 (plan-49 follow-up): re-read state right before the
-        # FSM call. The dispatcher upstream may have read state at an
-        # earlier tick and the parent task may have transitioned (e.g.
-        # `ADDRESSING_FEEDBACK → PENDING_CI` via the feedback caller's
-        # exception handler) between then and now. `enter_fixup_planning`
-        # is only valid from `LOCAL_CI_CHECKING` / `PRE_PR_AUDITING`
-        # (and a no-op from `FIXUP_PLANNING`); any other source state
-        # raises `InvalidTransition`. Skip the FSM event when the
-        # current state isn't one we can transition from — the next
-        # FSM tick will re-evaluate.
-        current = fsm_runtime.current_state(self.store, self.node.id)
-        if current is not State.ADDRESSING_FEEDBACK:
-            if current in (State.LOCAL_CI_CHECKING, State.PRE_PR_AUDITING, State.FIXUP_PLANNING):
-                fsm_runtime.enter_fixup_planning(
-                    self.store,
-                    self.node.id,
-                    note=f"{kind} round {round_no} ({trigger})",
-                )
-            else:
-                _tw.log.info(
-                    "task %s: %s round %d (%s) requested but parent state is %s; "
-                    "skipping enter_fixup_planning (no valid transition)",
-                    self.node.id,
-                    kind,
-                    round_no,
-                    trigger,
-                    current.value,
-                )
+        # Plan 58: ADDRESSING_FEEDBACK retired. `enter_fixup_planning` is
+        # typed-guarded (plan 57) — silently skips when the current state
+        # is not a valid source (LOCAL_CI_CHECKING / any AUDIT_* stage /
+        # FIXUP_PLANNING itself). Safe to call fire-and-forget. Each
+        # entry into FIXUP_PLANNING bumps `cycle_in_phase` on the row
+        # so the operator sees lifecycle depth.
+        fsm_runtime.enter_fixup_planning(
+            self.store,
+            self.node.id,
+            note=f"{kind} round {round_no} ({trigger})",
+        )
+        # Plan 58: each fixup-planner emission is a new cycle in the
+        # current phase. The store-level helper handles the PR-review
+        # trigger source when applicable; for INITIAL/PRE_PR_REVIEW
+        # phases it leaves the trigger untouched.
+        try:
+            new_cycle = self.store.increment_cycle_in_phase(
+                self.node.id, note=f"fixup-planner round {round_no} ({trigger})"
+            )
+            _tw.log.info(
+                "task %s: phase cycle_in_phase=%d after %s round %d",
+                self.node.id,
+                new_cycle,
+                kind,
+                round_no,
+            )
+        except Exception as exc:
+            _tw.log.warning("increment_cycle_in_phase raised %s; continuing", exc)
         fixup_plan = self._invoke_fixup_planner(
             kind=kind,
             round_no=round_no,
@@ -430,132 +438,28 @@ class PrePrWorkerMixin(PrePrAuditStageMixin):
         return None
 
     def _run_pre_pr_pipeline(self: Any, *, merge_node_mode: bool = False) -> WorkerOutcome | None:
-        """5-stage gate before opening a PR. Returns None on pass,
-        WorkerOutcome(BLOCKED) after `cfg.pre_pr_audit_max_cycles` fails.
-        Each cycle runs all stages, merges failed-stage findings into a
-        triage bundle, hands them to the fixup planner
-        (`kind="fixup-pre-pr-audit"`), and re-runs from the top.
+        """Plan 58 thin wrapper around the unified audit driver. Drives the
+        INITIAL_AUDIT trigger source — the first audit gauntlet after the
+        spec planner emitted subtasks and the doer/checker landed every
+        slice cleanly.
 
-        Plan 32 PR-B / Plan 35 PR-B: `merge_node_mode=True` adapts for a
-        merge-node — `local_ci` + `behavior` always run; `rubric` +
-        `standards` + `architecture` are skipped unless the cycle's
-        subtasks include `kind="merge-integration"` (the merge-doer
-        emitted real new code). The `behavior` audit's
-        `expected_evidence` is the union of source parents'
-        `expected_evidence`.
-        """
-        resume_summary = self._resumable_pre_pr_audit_summary()
-        start_cycle = int(resume_summary["cycle"]) if resume_summary else 1
-        for cycle in range(start_cycle, self.cfg.pre_pr_audit_max_cycles + 1):
-            _tw.log.info(
-                "task %s: pre-pr pipeline cycle %d/%d", self.node.id, cycle, self.cfg.pre_pr_audit_max_cycles
-            )
-            cycle_resume_summary, bootstrap_outcome = self._enter_audit_cycle(cycle, resume_summary)
-            if bootstrap_outcome is not None:
-                return bootstrap_outcome
-            if not self._pre_pr_stage_passed(cycle_resume_summary, "local_ci"):
-                fsm_runtime.enter_local_ci_checking(
-                    self.store,
-                    self.node.id,
-                    note=f"pre-pr cycle {cycle}: local-ci ({self.cfg.local_ci_command})",
-                )
-
-            # Build the diff excerpt against the base branch — every audit
-            # consumes this. Compute once per cycle (commits may have
-            # changed during the prior cycle's fixup loop).
-            diff_excerpt = self._compute_branch_diff_excerpt()
-            plan_text = str(self._row().get("plan_text") or "")
-
-            try:
-                stages = self._execute_audit_stages(
-                    cycle=cycle,
-                    diff_excerpt=diff_excerpt,
-                    plan_text=plan_text,
-                    merge_node_mode=merge_node_mode,
-                    resume_summary=cycle_resume_summary,
-                )
-            except runtime_shutdown.ShutdownRequested:
-                note = "shutdown requested during pre-pr audit; discarding partial audit result"
-                _tw.log.info("task %s: %s", self.node.id, note)
-                return WorkerOutcome(fsm_runtime.current_state(self.store, self.node.id), note)
-            cycle_result = _tw.pre_pr_audit.PipelineCycleResult(cycle=cycle, stages=stages)
-            for s in cycle_result.stages:
-                _tw.log.info(
-                    "task %s pre-pr cycle %d stage `%s`: %s",
-                    self.node.id,
-                    cycle,
-                    s.name,
-                    "PASS" if s.passed else "FAIL",
-                )
-
-            settled = self._settle_pre_pr_cycle(cycle, cycle_result)
-            if settled is not None:
-                return settled[0]
-
-            # Failure path: merge findings → triage → fixup planner.
-            fsm_runtime.enter_fixup_planning(
-                self.store,
-                self.node.id,
-                note=(
-                    f"pre-pr cycle {cycle} failed: " + ", ".join(s.name for s in cycle_result.failed_stages)
-                ),
-            )
-            findings_block = _tw.pre_pr_audit.merge_failed_stage_reports(cycle_result.failed_stages)
-            expected_finding_ids = _tw.pre_pr_audit.collect_finding_ids(cycle_result.failed_stages)
-            self.store.add_artifact(
-                self.node.id,
-                f"pre_pr_audit:cycle_{cycle}",
-                findings_block,
-            )
-            # Completeness-augmented findings block: prepend an explicit
-            # "every id below MUST appear in your `findings_addressed`"
-            # instruction so the planner cannot drop findings to fit a
-            # smaller subtask count.
-            if expected_finding_ids:
-                augmented = (
-                    "## Required finding coverage\n\n"
-                    "Every id below MUST appear in your output's "
-                    "`findings_addressed` array AND be addressed by at "
-                    "least one subtask's stage-typed coverage "
-                    "(`rubric_targets`, `standards_referenced`, "
-                    "`architecture_referenced`, or `behavior_evidence_advanced` "
-                    "matching the finding's namespace). The per-subtask `addresses_findings` "
-                    "field is gone (Plan 33 D2). Dropping ids is forbidden.\n\n"
-                    + "\n".join(f"- `{fid}`" for fid in expected_finding_ids)
-                    + "\n\n---\n\n"
-                    + findings_block
-                )
-            else:
-                augmented = findings_block
-            outcome = self._run_fixup_round(
-                kind="fixup-pre-pr-audit",
-                round_no=cycle,
-                trigger="pre_pr_audit",
-                triage_root_cause=augmented[:16000],
-                expected_finding_ids=expected_finding_ids,
-            )
-            if outcome and outcome.final_state == State.BLOCKED:
-                # Fixup ceiling exhausted on the audit round — surface as
-                # a task BLOCK with the merged findings as the operator
-                # context. The block-forensics dump (separate path) picks
-                # this up automatically since the artifact is on the row.
-                return outcome
-            # Loop back to the top — re-run the full pipeline against
-            # whatever the doer just landed.
-            resume_summary = None
-
-        # Exhausted cycles.
-        note = (
-            f"pre-PR audit pipeline exhausted {self.cfg.pre_pr_audit_max_cycles} "
-            "cycle(s) without a clean pass — manual review required"
+        Returns None on a clean pass (caller proceeds to open PR), or a
+        BLOCKED outcome when the audit budget exhausts."""
+        return self._run_audit_cycle(
+            trigger_source=AuditTriggerSource.INITIAL_AUDIT,
+            merge_node_mode=merge_node_mode,
         )
-        fsm_runtime.block_current(
-            self.store,
-            self.node.id,
-            note=note,
-            last_error=note[:1000],
-        )
-        return WorkerOutcome(State.BLOCKED, note)
+
+    def _run_audit_cycle(
+        self: Any,
+        *,
+        trigger_source: AuditTriggerSource,
+        merge_node_mode: bool = False,
+    ) -> WorkerOutcome | None:
+        """Plan 58: delegate to the unified audit driver in
+        `workers.audit_driver`. Thin shim — preserved on the mixin so
+        feedback.py / pr_lifecycle.py call `self._run_audit_cycle(...)`."""
+        return run_audit_cycle(self, trigger_source=trigger_source, merge_node_mode=merge_node_mode)
 
     def _fast_forward_to_local_ci_if_subtasks_done(self: Any) -> bool:
         cur = fsm_runtime.current_state(self.store, self.node.id)

@@ -103,16 +103,25 @@ class SupervisionMixin:
             )
             warned[row["id"]] = now
 
-        # Stalled review-response detector. Triggered by direct observation
-        # of the leak: future submitted, no agent_call ever fires, task sits
-        # in addressing_feedback for 30+ min holding a pool slot.
+        # Stalled review-response detector. Plan 58: ADDRESSING_FEEDBACK
+        # retired — a stalled review response now sits in one of the
+        # audit-stage states (most likely AUDIT_LOCAL_CI since that's the
+        # entry point for both CI_FIXUP_START and REVIEW_FIXUP_START).
         if futures is None or review_response_futures is None:
             return
+        review_stuck_states = {
+            State.AUDIT_LOCAL_CI.value,
+            State.AUDIT_RUBRIC.value,
+            State.AUDIT_STANDARDS.value,
+            State.AUDIT_ARCHITECTURE.value,
+            State.AUDIT_BEHAVIOR.value,
+            State.FIXUP_PLANNING.value,
+        }
         for tid in list(review_response_futures):
             row = self.store.get(tid)
             if row is None:
                 continue
-            if row["state"] != State.ADDRESSING_FEEDBACK.value:
+            if row["state"] not in review_stuck_states:
                 continue  # not stalled — task moved on
             # Most-recent agent_call timestamp for this task.
             last_call = self.store.conn.execute(
@@ -121,10 +130,10 @@ class SupervisionMixin:
             ).fetchone()
             last_ts = float(last_call[0]) if last_call and last_call[0] else 0.0
             # last_ts may be from a PRIOR review-response cycle. Compare
-            # against when this task last entered ADDRESSING_FEEDBACK.
+            # against when this task last entered the audit gauntlet.
             entered = self.store.conn.execute(
                 "SELECT MAX(ts) FROM state_log WHERE task_id = ? AND to_state = ?",
-                (tid, State.ADDRESSING_FEEDBACK.value),
+                (tid, State.AUDIT_LOCAL_CI.value),
             ).fetchone()
             entered_ts = float(entered[0]) if entered and entered[0] else 0.0
             # Effective "silence start" = max(entered, last agent_call). If
@@ -153,33 +162,52 @@ class SupervisionMixin:
                 # to is presumably already dead.
                 futures.pop(tid, None)
             review_response_futures.discard(tid)
-            # Reset to PENDING_CI so the watcher's next tick re-dispatches.
-            fsm_runtime.enter_pending_ci(
+            # Plan 58: force-recover via the dedicated fsm_runtime escape
+            # hatch. No FSM event maps "audit-stage → PENDING_CI" cleanly;
+            # the helper records the supervisor rationale + uses the
+            # raw transition path under an architecture-guard allowlist.
+            fsm_runtime.force_recover_to_pending_ci(
                 self.store,
                 tid,
                 note=(
-                    f"orchestrator force-recovery: review-response stalled "
+                    f"orchestrator force-recovery: audit-stage stalled "
                     f"{int(silence // 60)}min, slot freed for re-dispatch"
                 ),
             )
 
-    def _write_heartbeat(self: Any, in_flight: int, addressing_feedback_futures: int) -> None:
+    def _write_heartbeat(self: Any, in_flight: int, audit_futures: int) -> None:
         """Write a small JSON liveness blob to `state_dir/orchestrator.heartbeat`.
 
-        Light touch — the supervisor loop in batch 8 will use this for
-        crash-restart, and the TUI may read it for liveness display. For now
-        this just records the file every tick.
+        Plan 58: post-PR fixup work no longer collapses into
+        ADDRESSING_FEEDBACK; we count tasks across the audit-stage states
+        + FIXUP_PLANNING for the heartbeat. `audit_futures` is the
+        review-response futures count (kept as a backward-compatible
+        field name in the JSON for now).
         """
         try:
             self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
             pending_ci = len(self.store.in_state(State.PENDING_CI))
-            responding = len(self.store.in_state(State.ADDRESSING_FEEDBACK))
+            responding = len(
+                self.store.in_state(
+                    State.AUDIT_LOCAL_CI,
+                    State.AUDIT_RUBRIC,
+                    State.AUDIT_STANDARDS,
+                    State.AUDIT_ARCHITECTURE,
+                    State.AUDIT_BEHAVIOR,
+                    State.FIXUP_PLANNING,
+                )
+            )
             payload = {
                 "ts": _rt.time.time(),
                 "in_flight": in_flight,
                 "pending_ci": pending_ci,
+                # Plan 58: keep the pre-plan-58 key for any operator scripts
+                # that grep the heartbeat; semantics now = "tasks in any
+                # audit-stage or fixup-planning state".
                 "addressing_feedback": responding,
-                "addressing_feedback_futures": addressing_feedback_futures,
+                "addressing_feedback_futures": audit_futures,
+                "audit_in_flight": responding,
+                "audit_futures": audit_futures,
                 "max_parallel": int(self.cfg.max_parallel),
             }
             (self.cfg.state_dir / "orchestrator.heartbeat").write_text(_rt.json.dumps(payload))

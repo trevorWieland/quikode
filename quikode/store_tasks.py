@@ -5,7 +5,7 @@ import time
 from typing import Any, cast
 
 from quikode.fsm import Event, InvalidTransition, target_for_event
-from quikode.state_types import State, TaskRow
+from quikode.state_types import Phase, PrReviewTrigger, State, TaskRow
 
 log = logging.getLogger("quikode.state")
 
@@ -159,6 +159,78 @@ class StoreTaskMixin:
                     "SELECT id FROM tasks WHERE state = ?", (State.MERGED.value,)
                 ).fetchall()
             }
+
+    def enter_phase(
+        self: Any,
+        task_id: str,
+        phase: Phase,
+        *,
+        cycle_in_phase: int = 1,
+        pr_review_trigger: PrReviewTrigger = PrReviewTrigger.NONE,
+        note: str | None = None,
+    ) -> None:
+        """Plan 58: phase-transition writer.
+
+        Sets `phase`, `cycle_in_phase`, `pr_review_trigger` atomically and
+        records a synthetic state_log entry (same row state, note carrying
+        the phase change) so historical context is preserved alongside the
+        FSM trail.
+        """
+        now = time.time()
+        with self.tx() as c:
+            r = c.execute("SELECT state FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            current_state = r["state"] if r else None
+            c.execute(
+                "UPDATE tasks SET phase = ?, cycle_in_phase = ?, "
+                "pr_review_trigger = ?, updated_at = ? WHERE id = ?",
+                (phase.value, cycle_in_phase, pr_review_trigger.value, now, task_id),
+            )
+            c.execute(
+                "INSERT INTO state_log (task_id, from_state, to_state, note, ts) VALUES (?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    current_state,
+                    current_state,
+                    note or f"phase→{phase.value} cycle={cycle_in_phase} trigger={pr_review_trigger.value}",
+                    now,
+                ),
+            )
+
+    def increment_cycle_in_phase(
+        self: Any,
+        task_id: str,
+        *,
+        pr_review_trigger: PrReviewTrigger | None = None,
+        note: str | None = None,
+    ) -> int:
+        """Plan 58: bump `cycle_in_phase` by 1; optionally stamp a new
+        `pr_review_trigger` (PR-review fixup trigger source). Returns the
+        new cycle value."""
+        now = time.time()
+        with self.tx() as c:
+            r = c.execute(
+                "SELECT state, phase, cycle_in_phase, pr_review_trigger FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if r is None:
+                raise InvalidTransition(f"task does not exist: {task_id}")
+            new_cycle = int(r["cycle_in_phase"] or 0) + 1
+            new_trigger = pr_review_trigger.value if pr_review_trigger is not None else r["pr_review_trigger"]
+            c.execute(
+                "UPDATE tasks SET cycle_in_phase = ?, pr_review_trigger = ?, updated_at = ? WHERE id = ?",
+                (new_cycle, new_trigger, now, task_id),
+            )
+            c.execute(
+                "INSERT INTO state_log (task_id, from_state, to_state, note, ts) VALUES (?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    r["state"],
+                    r["state"],
+                    note or f"cycle_in_phase→{new_cycle} trigger={new_trigger}",
+                    now,
+                ),
+            )
+        return new_cycle
 
     def active_ids(self: Any) -> set[str]:
         with self._tx_lock:

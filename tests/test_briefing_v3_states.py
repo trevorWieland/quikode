@@ -68,7 +68,7 @@ def _seed_one_per_state(tmp_path):
     store.upsert_pending("R-RR")
     store.transition(
         "R-RR",
-        State.ADDRESSING_FEEDBACK,
+        State.AUDIT_LOCAL_CI,
         pr_url="https://github.com/foo/bar/pull/2",
         pr_number=2,
         branch="quikode/r-rr",

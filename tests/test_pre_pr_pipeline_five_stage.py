@@ -307,7 +307,7 @@ def test_execute_audit_stages_discards_stage_result_after_shutdown(tmp_path):
     """
     cfg = _build_cfg(tmp_path)
     store = MagicMock()
-    store.get.return_value = {"state": State.PRE_PR_AUDITING.value}
+    store.get.return_value = {"state": State.AUDIT_LOCAL_CI.value}
 
     class FakeWorker:
         _execute_audit_stages = PrePrWorkerMixin._execute_audit_stages

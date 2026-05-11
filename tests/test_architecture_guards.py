@@ -73,6 +73,10 @@ def test_runtime_code_uses_apply_event_not_direct_transitions():
         ROOT / "quikode" / "store_tasks.py",
         ROOT / "quikode" / "store_review.py",
         ROOT / "quikode" / "workspace.py",
+        # Plan 58: fsm_runtime.force_recover_to_pending_ci is the
+        # supervisor's escape hatch — an out-of-band recovery for stalled
+        # audit-stage tasks that has no clean FSM-event mapping.
+        ROOT / "quikode" / "fsm_runtime.py",
     }
     for path in (ROOT / "quikode").rglob("*.py"):
         if "__pycache__" in path.parts or path in allowed:

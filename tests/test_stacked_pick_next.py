@@ -122,7 +122,7 @@ def test_pick_next_addressing_feedback_is_stack_ready(tmp_path):
     o = _orch(tmp_path, dag, stacking_strategy=StackingStrategy.WITHIN_MILESTONE)
     o.store.upsert_pending("A")
     o.store.upsert_pending("B")
-    o.store.transition("A", State.ADDRESSING_FEEDBACK, branch="quikode/a-resp")
+    o.store.transition("A", State.AUDIT_LOCAL_CI, branch="quikode/a-resp")
 
     nxt = o._pick_next({"A", "B"}, set())
     assert nxt == "B"

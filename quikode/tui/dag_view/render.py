@@ -54,7 +54,13 @@ _IN_FLIGHT_STATES = {
     "rebasing_to_main",
     "conflict_resolving",
     "fixup_planning",
-    "addressing_feedback",
+    # Plan 58: audit-stage states replace ADDRESSING_FEEDBACK.
+    "audit_local_ci",
+    "audit_rubric",
+    "audit_standards",
+    "audit_architecture",
+    "audit_behavior",
+    "local_ci_checking",
 }
 
 # State -> single-character glyph painted at the start of the node cell.

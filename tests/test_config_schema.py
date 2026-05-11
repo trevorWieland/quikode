@@ -104,7 +104,7 @@ def test_config_extra_fields_forbidden():
 
 def test_release_valve_defer_stages_are_quality_stage_names():
     with pytest.raises(ValidationError):
-        _cfg(pre_pr_release_valve_defer_stages=["local_ci"])
+        _cfg(release_valve_defer_stages=["local_ci"])
 
 
 def test_config_validate_assignment_enforces_bounds():

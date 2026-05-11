@@ -82,8 +82,29 @@ class PrePrAuditStageMixin:
                 summary=oc.summary,
             )
 
-        def enter(label: str) -> None:
-            fsm_runtime.enter_pre_pr_auditing(self.store, self.node.id, note=f"pre-pr cycle {cycle}: {label}")
+        # Plan 58: each stage is its own first-class FSM state. The helpers
+        # are typed-guarded (plan 57); they advance the FSM from
+        # AUDIT_<prev> to AUDIT_<next> when the prior stage actually
+        # passed. Failed stages keep the FSM parked at AUDIT_<failed>,
+        # which is the source state for `enter_fixup_planning` later.
+        stage_enter_helpers = {
+            "rubric": fsm_runtime.enter_audit_rubric,
+            "standards": fsm_runtime.enter_audit_standards,
+            "architecture": fsm_runtime.enter_audit_architecture,
+            "behavior": fsm_runtime.enter_audit_behavior,
+        }
+
+        def advance_to(stage_name: str, label: str, prior_outcome: Any) -> bool:
+            """Fire the advance event for the previous stage only if it
+            passed. Returns True iff the advance fired (caller proceeds
+            to the next stage); False means short-circuit."""
+            if not getattr(prior_outcome, "passed", False):
+                return False
+            helper = stage_enter_helpers.get(stage_name)
+            if helper is None:
+                return False
+            helper(self.store, self.node.id, note=f"audit cycle {cycle}: {label}")
+            return True
 
         def run_or_reuse(stage_name: str, runner: Any | None = None, **kwargs: Any) -> Any:
             reused = self._stage_outcome_from_summary(resume_summary, stage_name)
@@ -112,11 +133,24 @@ class PrePrAuditStageMixin:
             handle=self._h,
             log_path=self.log_path,
         )
+        # Plan 58: after local_ci passes, advance LOCAL_CI_CHECKING → AUDIT_LOCAL_CI
+        # so subsequent stages run in a stage-typed state. Typed-guarded
+        # helper: silently no-ops if we're not in LOCAL_CI_CHECKING (e.g.
+        # post-PR fixup paths that entered AUDIT_LOCAL_CI directly).
+        if getattr(local_ci, "passed", False):
+            fsm_runtime.enter_audit_local_ci(
+                self.store, self.node.id, note=f"audit cycle {cycle}: local_ci passed"
+            )
         stages: list[Any] = [local_ci]
+        # Plan 58: even if a stage fails, we continue running every later
+        # stage to give the fixup planner the richest possible signal.
+        # The FSM-state-advance helpers only fire when the prior stage
+        # passed — failed stages park the FSM at AUDIT_<failed> until
+        # the fixup-planner divert fires from there.
         if (not merge_node_mode) or self._merge_integration_subtasks_present():
             contract = self._evaluation_contract()
             cited_standards, cited_architecture = self._collect_cited_refs()
-            enter("rubric audit")
+            advance_to("rubric", "rubric audit", local_ci)
             rubric = run_or_reuse(
                 "rubric",
                 _tw.pre_pr_audit.run_rubric_audit,
@@ -126,7 +160,7 @@ class PrePrAuditStageMixin:
                 plan_text=plan_text,
                 log_path=self.log_path,
             )
-            enter("standards audit")
+            advance_to("standards", "standards audit", rubric)
             standards = run_or_reuse(
                 "standards",
                 _tw.pre_pr_audit.run_standards_audit,
@@ -137,7 +171,7 @@ class PrePrAuditStageMixin:
                 cited_refs=cited_standards,
                 log_path=self.log_path,
             )
-            enter("architecture audit")
+            advance_to("architecture", "architecture audit", standards)
             architecture = run_or_reuse(
                 "architecture",
                 _tw.pre_pr_audit.run_architecture_audit,
@@ -149,7 +183,11 @@ class PrePrAuditStageMixin:
                 log_path=self.log_path,
             )
             stages.extend([rubric, standards, architecture])
-        enter("behavior audit")
+            advance_to("behavior", "behavior audit", architecture)
+        else:
+            # Merge-node path skips rubric/standards/architecture; advance
+            # directly from local_ci to behavior when local_ci passed.
+            advance_to("behavior", "behavior audit", local_ci)
         behavior = run_or_reuse(
             "behavior",
             _tw.pre_pr_audit.run_behavior_audit,

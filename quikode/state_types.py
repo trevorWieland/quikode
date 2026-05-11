@@ -54,10 +54,19 @@ class TaskRow(TypedDict):
     # `cfg.auto_merge_when_clean`. Audit-only — does not change state-machine
     # behavior.
     auto_merged: NotRequired[int | None]
-    # Plan 28: tracks the most recent GitHub Review id we've already routed to
-    # ADDRESSING_FEEDBACK so we don't re-trigger on the same CHANGES_REQUESTED
-    # after a daemon restart. NULL until the first non-bot review arrives.
+    # Plan 28: tracks the most recent GitHub Review id we've already routed
+    # into a post-PR fixup audit cycle so we don't re-trigger on the same
+    # CHANGES_REQUESTED after a daemon restart. NULL until the first
+    # non-bot review arrives.
     last_processed_review_id: NotRequired[str | None]
+    # Plan 58: lifecycle phase + cycle within phase + most recent PR-review
+    # fixup trigger source. Phase is one of `initial` / `pre_pr_review` /
+    # `pr_review`; cycle_in_phase is 1-based; pr_review_trigger is one of
+    # `none` / `ci_failure` / `review_feedback` (meaningful only when phase
+    # is `pr_review`).
+    phase: NotRequired[str | None]
+    cycle_in_phase: NotRequired[int | None]
+    pr_review_trigger: NotRequired[str | None]
     # Plan 32: row kind. 'spec' for regular DAG-seeded tasks, 'merge' for
     # synthetic merge-nodes integrating multiple parents.
     kind: NotRequired[str]
@@ -180,9 +189,13 @@ ACTIVE = {
     State.REBASING_TO_MAIN,
     State.CONFLICT_RESOLVING,
     State.FIXUP_PLANNING,
-    State.ADDRESSING_FEEDBACK,
     State.LOCAL_CI_CHECKING,
-    State.PRE_PR_AUDITING,
+    # Plan 58: per-stage audit states.
+    State.AUDIT_LOCAL_CI,
+    State.AUDIT_RUBRIC,
+    State.AUDIT_STANDARDS,
+    State.AUDIT_ARCHITECTURE,
+    State.AUDIT_BEHAVIOR,
 }
 
 # Convenience set: any state where the PR is open and waiting on something
@@ -190,6 +203,33 @@ ACTIVE = {
 # — the worker just opened the PR and CI is running. Plan 28 retired
 # MERGE_READY (the settle window died with the per-thread classifier).
 POST_PR_STATES = {State.PENDING_CI, State.AWAITING_REVIEW}
+
+
+class Phase(StrEnum):
+    """Plan 58: lifecycle phase of a task. A higher-level layer above the
+    FSM state — gives operator visibility into "where in the broader
+    lifecycle is this task."
+
+    - INITIAL: task created → first audit (always 1 cycle by definition).
+    - PRE_PR_REVIEW: first audit start → PR opens on GitHub. Cycle
+      increments at each new fixup-planner emission.
+    - PR_REVIEW: PR opens → MERGED / CLOSED. Cycle resets to 0 at phase
+      entry and increments on each CI-failure or CHANGES_REQUESTED fixup
+      trigger.
+    """
+
+    INITIAL = "initial"
+    PRE_PR_REVIEW = "pre_pr_review"
+    PR_REVIEW = "pr_review"
+
+
+class PrReviewTrigger(StrEnum):
+    """Plan 58: most recent trigger that drove a PR_REVIEW fixup cycle.
+    Meaningful only when `phase == PR_REVIEW`."""
+
+    NONE = "none"
+    CI_FAILURE = "ci_failure"
+    REVIEW_FEEDBACK = "review_feedback"
 
 
 class SubtaskState(StrEnum):

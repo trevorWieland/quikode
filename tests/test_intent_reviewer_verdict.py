@@ -205,7 +205,7 @@ def test_intent_reviewer_intent_conflict_blocks_when_replan_budget_exhausted(tmp
     worker.store.set_field("R-001", replan_count=worker.cfg.intent_max_replans)
     # Move to ADDRESSING_FEEDBACK so the BLOCK_TASK transition is valid
     # (the prior call site lived in an active state when this branch fired).
-    worker.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+    worker.store.transition("R-001", State.AUDIT_LOCAL_CI)
     stub = _stub_agent("intent_conflict")
     with patch("quikode.workers.pr_lifecycle.make_agent", return_value=stub):
         verdict = worker._run_intent_reviewer(

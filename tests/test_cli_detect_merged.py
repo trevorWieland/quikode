@@ -193,7 +193,7 @@ def test_apply_bridges_blocked_task_to_merged(tmp_path, monkeypatch):
         pr_number=21,
     )
     store.transition("R-BLK", State.AWAITING_REVIEW)
-    store.transition("R-BLK", State.ADDRESSING_FEEDBACK)
+    store.transition("R-BLK", State.AUDIT_LOCAL_CI)
     store.transition("R-BLK", State.BLOCKED, last_error="feedback exhausted")
     store.conn.close()
     _patch_subprocess(monkeypatch, ancestor_branches={"quikode/r-blk-abc"})

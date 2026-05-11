@@ -47,12 +47,15 @@ _VALID_TRANSITIONS: list[tuple[str, State, State]] = [
     ("enter_committing", State.CHECKING_SUBTASK, State.COMMITTING),
     ("enter_pushing", State.COMMITTING, State.PUSHING),
     ("enter_local_ci_checking", State.PUSHING, State.LOCAL_CI_CHECKING),
-    ("enter_pre_pr_auditing", State.LOCAL_CI_CHECKING, State.PRE_PR_AUDITING),
+    # Plan 58: PRE_PR_AUDITING / ADDRESSING_FEEDBACK retired; the
+    # audit-stage helpers and trigger-source entry helpers replace them.
+    ("enter_audit_local_ci", State.LOCAL_CI_CHECKING, State.AUDIT_LOCAL_CI),
     ("enter_fixup_planning", State.LOCAL_CI_CHECKING, State.FIXUP_PLANNING),
-    ("enter_pr_opening", State.PRE_PR_AUDITING, State.PR_OPENING),
+    ("enter_pr_opening", State.AUDIT_BEHAVIOR, State.PR_OPENING),
     ("enter_pending_ci", State.PR_OPENING, State.PENDING_CI),
     ("enter_awaiting_review", State.PENDING_CI, State.AWAITING_REVIEW),
-    ("enter_addressing_feedback", State.PENDING_CI, State.ADDRESSING_FEEDBACK),
+    ("enter_audit_cycle_for_ci_fixup", State.PENDING_CI, State.AUDIT_LOCAL_CI),
+    ("enter_audit_cycle_for_review_fixup", State.AWAITING_REVIEW, State.AUDIT_LOCAL_CI),
     ("enter_rebasing_to_main", State.PENDING_CI, State.REBASING_TO_MAIN),
     ("enter_conflict_resolving", State.REBASING_TO_MAIN, State.CONFLICT_RESOLVING),
 ]
@@ -69,7 +72,7 @@ _INVALID_SOURCES: list[tuple[str, State]] = [
     ("enter_committing", State.MERGED),
     ("enter_pushing", State.MERGED),
     ("enter_local_ci_checking", State.MERGED),
-    ("enter_pre_pr_auditing", State.MERGED),
+    ("enter_audit_local_ci", State.MERGED),
     # `enter_fixup_planning`: PENDING_CI is a real-world invalid source
     # (plan 54's regression) — keep it here so the test mirrors the
     # production crash path.
@@ -77,9 +80,9 @@ _INVALID_SOURCES: list[tuple[str, State]] = [
     ("enter_pr_opening", State.MERGED),
     ("enter_pending_ci", State.MERGED),
     ("enter_awaiting_review", State.MERGED),
-    # `enter_addressing_feedback`: MERGED is invalid (one of today's
-    # production crash paths).
-    ("enter_addressing_feedback", State.MERGED),
+    # Plan 58: post-PR fixup entry helpers — MERGED is invalid.
+    ("enter_audit_cycle_for_ci_fixup", State.MERGED),
+    ("enter_audit_cycle_for_review_fixup", State.MERGED),
     ("enter_rebasing_to_main", State.MERGED),
     ("enter_conflict_resolving", State.MERGED),
 ]
@@ -197,14 +200,15 @@ def test_block_current_from_active_state_fires_block_task(tmp_path: Path) -> Non
     store.conn.close()
 
 
-def test_block_current_from_addressing_feedback_lands_in_blocked(
+def test_block_current_from_audit_stage_lands_in_blocked(
     tmp_path: Path,
 ) -> None:
-    """Sanity: ADDRESSING_FEEDBACK has a state-specific exhaustion event
-    (FEEDBACK_EXHAUSTED). The result must still be BLOCKED — verifies
-    the state-specific event path inside `block_current`."""
-    store = _store_with_task(tmp_path, state=State.ADDRESSING_FEEDBACK)
-    result = fsm_runtime.block_current(store, "R-1", note="feedback exhausted")
+    """Plan 58: ADDRESSING_FEEDBACK retired. Audit-stage states use the
+    generic BLOCK_TASK transition (no state-specific exhaustion event).
+    The result must still be BLOCKED — verifies the generic event path
+    inside `block_current`."""
+    store = _store_with_task(tmp_path, state=State.AUDIT_LOCAL_CI)
+    result = fsm_runtime.block_current(store, "R-1", note="audit blocked")
     assert result is State.BLOCKED
     assert store.get("R-1")["state"] == State.BLOCKED.value
     store.conn.close()

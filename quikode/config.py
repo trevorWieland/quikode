@@ -465,21 +465,16 @@ class Config(BaseModel):
         le=20,
         description=desc.PRE_PR_AUDIT_OUTPUT_RETRIES,
     )
-    pre_pr_release_valve_after_cycles: int = Field(
-        default=5,
-        ge=-1,
-        le=20,
-        description=desc.PRE_PR_RELEASE_VALVE_AFTER_CYCLES,
+    # Plan 58: renamed from `pre_pr_release_valve_*` — applies to both phases.
+    release_valve_after_cycles: int = Field(
+        default=5, ge=-1, le=20, description=desc.PRE_PR_RELEASE_VALVE_AFTER_CYCLES
     )
-    pre_pr_release_valve_defer_stages: list[PrePrQualityStage] = Field(
+    release_valve_defer_stages: list[PrePrQualityStage] = Field(
         default_factory=_default_pre_pr_release_valve_defer_stages,
         description="Quality audit stages whose content findings may be deferred to PR review.",
     )
-    pre_pr_release_valve_max_critical_findings: int = Field(
-        default=0,
-        ge=0,
-        le=100,
-        description="Maximum critical findings the release valve may defer.",
+    release_valve_max_critical_findings: int = Field(
+        default=0, ge=0, le=100, description="Maximum critical findings the release valve may defer."
     )
     # Plan 55: fresh-container provisioning + bootstrap per audit cycle.
     audit_fresh_container: bool = Field(default=False, description=desc.AUDIT_FRESH_CONTAINER)

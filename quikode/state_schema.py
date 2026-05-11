@@ -75,10 +75,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- column-drop requires a table rebuild so the name was retained and
     -- repurposed. See `store_review.get_last_review_ready_notified_ts`.
     last_notified_settled_ts REAL,
-    -- Plan 28: most recent GitHub Review id we've already routed into
-    -- ADDRESSING_FEEDBACK. Prevents re-trigger on the same CHANGES_REQUESTED
-    -- after a daemon restart. NULL until first non-bot review observed.
+    -- Plan 28: most recent GitHub Review id we've already routed into a
+    -- post-PR fixup audit cycle. Prevents re-trigger on the same
+    -- CHANGES_REQUESTED after a daemon restart. NULL until first
+    -- non-bot review observed.
     last_processed_review_id TEXT,
+    -- Plan 58: lifecycle phase + cycle within phase + most recent
+    -- PR_REVIEW trigger source. `phase` ∈ {initial, pre_pr_review,
+    -- pr_review}; `cycle_in_phase` resets to 1 at phase transitions;
+    -- `pr_review_trigger` ∈ {none, ci_failure, review_feedback} —
+    -- meaningful only when phase = pr_review.
+    phase TEXT NOT NULL DEFAULT 'initial',
+    cycle_in_phase INTEGER NOT NULL DEFAULT 1,
+    pr_review_trigger TEXT NOT NULL DEFAULT 'none',
     -- Plan 32: row kind. 'spec' = regular DAG-seeded task (default).
     -- 'merge' = synthetic merge-node integrating multiple parents into a
     -- shared base branch. Merge-nodes have no PR; their lifecycle ends in
@@ -318,6 +327,11 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
         pass
     # Plan 52: subtask planning provenance + per-task replan marker.
     _apply_plan52_migration(conn)
+    # Plan 58: lifecycle phase + cycle + PR-review trigger columns. Default
+    # values backfill cleanly for pre-plan-58 rows (manager runs a one-shot
+    # SQL migration ad-hoc at deploy time to set non-default phase values
+    # for in-flight tasks; that lives at `plans/58-migration.sql`).
+    _apply_plan58_migration(conn)
 
 
 # Plan 52 backfill heuristic: subtask-id naming convention encodes the
@@ -494,6 +508,40 @@ def _backfill_fci_pass(conn: sqlite3.Connection, fci_pending: list[tuple[int, st
                 sid,
                 exc,
             )
+
+
+def _apply_plan58_migration(conn: sqlite3.Connection) -> None:
+    """Plan 58: add `phase`, `cycle_in_phase`, `pr_review_trigger` columns to
+    tasks. Idempotent — re-runs on an already-migrated DB are no-ops.
+
+    Existing rows backfill to (`initial`, 1, `none`); deployed workspaces
+    requiring richer phase derivation run the ad-hoc SQL at
+    `plans/58-migration.sql` once at the migration deploy boundary
+    (daemon stop → SQL → daemon start). The migration also renames any
+    pre-plan-58 `pre_pr_auditing` / `addressing_feedback` state values to
+    `pending` with `resume_from_existing_subtasks=1`, so post-plan-58
+    workers re-enter the unified driver cleanly."""
+    for col, ddl in (
+        ("phase", "ALTER TABLE tasks ADD COLUMN phase TEXT NOT NULL DEFAULT 'initial'"),
+        ("cycle_in_phase", "ALTER TABLE tasks ADD COLUMN cycle_in_phase INTEGER NOT NULL DEFAULT 1"),
+        (
+            "pr_review_trigger",
+            "ALTER TABLE tasks ADD COLUMN pr_review_trigger TEXT NOT NULL DEFAULT 'none'",
+        ),
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            # Column already exists.
+            pass
+        _ = col
+    # Rename deprecated state values to PENDING + resume marker so the
+    # post-plan-58 worker re-enters the unified driver cleanly. Idempotent:
+    # rows already migrated to PENDING are no-ops.
+    conn.execute(
+        "UPDATE tasks SET state='pending', resume_from_existing_subtasks=1 "
+        "WHERE state IN ('pre_pr_auditing', 'addressing_feedback')"
+    )
 
 
 def _lookup_max_non_fci_cycle(conn: sqlite3.Connection, *, task_id: str, rowid: int, sid: str) -> int | None:

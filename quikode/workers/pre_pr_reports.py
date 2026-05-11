@@ -37,14 +37,14 @@ def release_valve_report(cfg: Config, cycle_result: Any) -> str | None:
     """Return the PR-body/artifact report when the release valve may
     open a PR with deferred quality findings. None means the normal
     fixup loop must continue."""
-    after_cycles = int(cfg.pre_pr_release_valve_after_cycles)
+    after_cycles = int(cfg.release_valve_after_cycles)
     failed = list(cycle_result.failed_stages)
     if after_cycles < 0 or int(cycle_result.cycle) < after_cycles or not failed:
         return None
     failed_names = {s.name for s in failed}
     if "local_ci" in failed_names or "behavior" in failed_names:
         return None
-    deferable = set(cfg.pre_pr_release_valve_defer_stages)
+    deferable = set(cfg.release_valve_defer_stages)
     if not failed_names.issubset(deferable):
         return None
 
@@ -59,7 +59,7 @@ def release_valve_report(cfg: Config, cycle_result: Any) -> str | None:
                 has_non_deferable_finding = True
             if str(finding.get("severity") or "").lower() == "critical":
                 critical_count += 1
-    if has_non_deferable_finding or critical_count > int(cfg.pre_pr_release_valve_max_critical_findings):
+    if has_non_deferable_finding or critical_count > int(cfg.release_valve_max_critical_findings):
         return None
 
     rendered = pre_pr_audit.merge_failed_stage_reports(failed)

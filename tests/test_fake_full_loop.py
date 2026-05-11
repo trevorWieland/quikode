@@ -20,7 +20,12 @@ def test_fake_project_full_lifecycle_without_docker_or_github(tmp_path):
         Event.COMMIT_CREATED,
         Event.ALL_SUBTASKS_DONE,
         Event.LOCAL_CI_PASSED,
-        Event.AUDIT_PASSED,
+        # Plan 58: AUDIT_PASSED retired in favor of per-stage advance events.
+        Event.AUDIT_LOCAL_CI_PASSED,
+        Event.AUDIT_RUBRIC_PASSED,
+        Event.AUDIT_STANDARDS_PASSED,
+        Event.AUDIT_ARCHITECTURE_PASSED,
+        Event.AUDIT_BEHAVIOR_PASSED,
         Event.PR_OPENED,
         Event.CI_PASSED,
         Event.MERGED,
@@ -47,12 +52,22 @@ def test_fake_project_feedback_and_rebase_branches_without_providers(tmp_path):
         Event.COMMIT_CREATED,
         Event.ALL_SUBTASKS_DONE,
         Event.LOCAL_CI_PASSED,
-        Event.AUDIT_PASSED,
+        # Plan 58: per-stage events advance through the gauntlet, then
+        # PR_OPENED → PENDING_CI → CI_FIXUP_START enters AUDIT_LOCAL_CI
+        # → ... → AUDIT_BEHAVIOR_PASSED → PR_OPENING → PR_OPENED → PENDING_CI.
+        Event.AUDIT_LOCAL_CI_PASSED,
+        Event.AUDIT_RUBRIC_PASSED,
+        Event.AUDIT_STANDARDS_PASSED,
+        Event.AUDIT_ARCHITECTURE_PASSED,
+        Event.AUDIT_BEHAVIOR_PASSED,
         Event.PR_OPENED,
-        # Plan 28: CI_FAILED routes PENDING_CI → ADDRESSING_FEEDBACK directly,
-        # bypassing the retired TRIAGING_FEEDBACK / ACTIONABLE_FEEDBACK pair.
-        Event.CI_FAILED,
-        Event.FEEDBACK_PUSHED,
+        Event.CI_FIXUP_START,
+        Event.AUDIT_LOCAL_CI_PASSED,
+        Event.AUDIT_RUBRIC_PASSED,
+        Event.AUDIT_STANDARDS_PASSED,
+        Event.AUDIT_ARCHITECTURE_PASSED,
+        Event.AUDIT_BEHAVIOR_PASSED,
+        Event.PR_OPENED,
         Event.PARENT_MERGED_OR_CONFLICT,
         Event.REBASE_PUSHED,
     ]:

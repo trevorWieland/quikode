@@ -37,7 +37,10 @@ def test_recovery_policy_covers_active_states():
 
 
 def test_pr_aware_recovery_returns_pending_ci():
-    assert fsm.recover_after_crash(fsm.State.ADDRESSING_FEEDBACK, has_pr=True)[0] is fsm.State.PENDING_CI
+    # Plan 58: ADDRESSING_FEEDBACK retired; the audit-stage states inherit
+    # the same PR-aware recovery behavior.
+    assert fsm.recover_after_crash(fsm.State.AUDIT_LOCAL_CI, has_pr=True)[0] is fsm.State.PENDING_CI
+    assert fsm.recover_after_crash(fsm.State.AUDIT_BEHAVIOR, has_pr=True)[0] is fsm.State.PENDING_CI
 
 
 def test_mermaid_contains_states_and_events():

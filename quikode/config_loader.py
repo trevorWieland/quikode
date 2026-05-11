@@ -411,16 +411,18 @@ def load_config(root: Path | None = None) -> Config:
         pre_pr_audit_output_retries=int(
             raw.get("pre_pr_audit_output_retries", defaults.pre_pr_audit_output_retries)
         ),
-        pre_pr_release_valve_after_cycles=int(
-            raw.get("pre_pr_release_valve_after_cycles", defaults.pre_pr_release_valve_after_cycles)
+        # Plan 58: release valve config renamed from `pre_pr_release_valve_*`.
+        # Manager updates the workspace TOML at deploy alongside the SQL migration.
+        release_valve_after_cycles=int(
+            raw.get("release_valve_after_cycles", defaults.release_valve_after_cycles)
         ),
-        pre_pr_release_valve_defer_stages=list(
-            raw.get("pre_pr_release_valve_defer_stages", defaults.pre_pr_release_valve_defer_stages)
+        release_valve_defer_stages=list(
+            raw.get("release_valve_defer_stages", defaults.release_valve_defer_stages)
         ),
-        pre_pr_release_valve_max_critical_findings=int(
+        release_valve_max_critical_findings=int(
             raw.get(
-                "pre_pr_release_valve_max_critical_findings",
-                defaults.pre_pr_release_valve_max_critical_findings,
+                "release_valve_max_critical_findings",
+                defaults.release_valve_max_critical_findings,
             )
         ),
         # Plan 55: fresh-container provisioning per audit cycle + bootstrap.

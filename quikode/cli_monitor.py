@@ -34,8 +34,14 @@ INTERESTING_STATES: frozenset[str] = frozenset(
         "merged",
         "blocked",
         "failed",
-        "triaging_feedback",
-        "addressing_feedback",
+        # Plan 58: ADDRESSING_FEEDBACK retired; audit-stage states surface
+        # the same kind of post-PR fixup activity.
+        "audit_local_ci",
+        "audit_rubric",
+        "audit_standards",
+        "audit_architecture",
+        "audit_behavior",
+        "fixup_planning",
         "rebasing_to_main",
     }
 )

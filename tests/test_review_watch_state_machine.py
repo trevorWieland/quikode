@@ -231,7 +231,7 @@ def test_post_pr_ci_failure_skips_when_task_blocked(tmp_path):
     futures: dict[str, Future] = {}
     review_response_futures: set[str] = set()
 
-    with patch("quikode.orchestration.review_watch.fsm_runtime.enter_addressing_feedback") as enter_af:
+    with patch("quikode.orchestration.review_watch.fsm_runtime.enter_audit_cycle_for_ci_fixup") as enter_af:
         handled = o._handle_post_pr_ci_failure(
             row,
             _failed_pr(),
@@ -261,7 +261,7 @@ def test_post_pr_ci_failure_skips_when_task_failed(tmp_path):
     futures: dict[str, Future] = {}
     review_response_futures: set[str] = set()
 
-    with patch("quikode.orchestration.review_watch.fsm_runtime.enter_addressing_feedback") as enter_af:
+    with patch("quikode.orchestration.review_watch.fsm_runtime.enter_audit_cycle_for_ci_fixup") as enter_af:
         handled = o._handle_post_pr_ci_failure(
             row,
             _failed_pr(),
@@ -299,7 +299,9 @@ def test_post_pr_ci_failure_proceeds_for_normal_state(tmp_path):
     assert handled is True
     # Existing behavior: FSM transitioned to ADDRESSING_FEEDBACK and a worker
     # was submitted.
-    assert o.store.get("PARENT")["state"] == State.ADDRESSING_FEEDBACK.value
+    # Plan 58: orchestrator no longer transitions FSM; worker does on entry.
+    # State is unchanged here; the worker submission is the contract.
+    assert o.store.get("PARENT")["state"] == State.AWAITING_REVIEW.value
     assert "PARENT" in futures
     assert "PARENT" in review_response_futures
     pool.submit.assert_called_once()
@@ -318,7 +320,7 @@ def test_changes_requested_skips_when_task_blocked(tmp_path):
     review = _changes_requested_review("R-99")
 
     with (
-        patch("quikode.orchestration.review_watch.fsm_runtime.enter_addressing_feedback") as enter_af,
+        patch("quikode.orchestration.review_watch.fsm_runtime.enter_audit_cycle_for_ci_fixup") as enter_af,
         patch(
             "quikode.orchestrator.github_graphql.bundle_pr_context",
             return_value="bundled",
@@ -349,7 +351,7 @@ def test_changes_requested_skips_when_task_failed(tmp_path):
     review = _changes_requested_review("R-100")
 
     with (
-        patch("quikode.orchestration.review_watch.fsm_runtime.enter_addressing_feedback") as enter_af,
+        patch("quikode.orchestration.review_watch.fsm_runtime.enter_audit_cycle_for_ci_fixup") as enter_af,
         patch(
             "quikode.orchestrator.github_graphql.bundle_pr_context",
             return_value="bundled",
@@ -381,7 +383,9 @@ def test_changes_requested_proceeds_for_normal_state(tmp_path):
 
     # Existing behavior preserved: FSM advanced to ADDRESSING_FEEDBACK, review
     # cursor stamped, worker scheduled.
-    assert o.store.get("PARENT")["state"] == State.ADDRESSING_FEEDBACK.value
+    # Plan 58: orchestrator no longer transitions FSM; worker does on entry.
+    # State is unchanged here; the worker submission is the contract.
+    assert o.store.get("PARENT")["state"] == State.AWAITING_REVIEW.value
     assert o.store.get_last_processed_review_id("PARENT") == "R-7"
     assert "PARENT" in futures
     assert "PARENT" in review_response_futures

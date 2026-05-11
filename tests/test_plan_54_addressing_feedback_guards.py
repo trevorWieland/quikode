@@ -178,13 +178,13 @@ def test_run_fixup_round_fires_enter_fixup_planning_from_local_ci_checking(tmp_p
     worker.store.conn.close()
 
 
-def test_run_fixup_round_skips_enter_fixup_planning_when_already_addressing_feedback(tmp_path):
-    """Plan 54 + plan-49 prior behavior: when the parent task is in
-    ADDRESSING_FEEDBACK, the worker is running inside the feedback flow
-    (post-PR CI fix or review response). The fixup planner runs without
-    an additional FSM transition; the feedback caller will transition
-    ADDRESSING_FEEDBACK → PENDING_CI on completion."""
-    worker = _build_worker(tmp_path, initial_state=State.ADDRESSING_FEEDBACK)
+def test_run_fixup_round_enters_fixup_planning_from_audit_stage(tmp_path):
+    """Plan 58: ADDRESSING_FEEDBACK retired. Post-PR fixup flows now
+    enter the audit gauntlet at AUDIT_LOCAL_CI → ... → fixup planner
+    diverts to FIXUP_PLANNING via AUDIT_<STAGE>_FAILED. The helper is
+    typed-guarded; the test verifies the post-divert state is
+    FIXUP_PLANNING regardless of which audit stage diverted."""
+    worker = _build_worker(tmp_path, initial_state=State.AUDIT_LOCAL_CI)
 
     captured: dict[str, Any] = {}
 
@@ -197,9 +197,8 @@ def test_run_fixup_round_skips_enter_fixup_planning_when_already_addressing_feed
     ):
         worker._run_fixup_round(kind="fixup-ci", round_no=1, trigger="ci")
 
-    # State unchanged: the worker recognized the feedback context and
-    # skipped the FSM event.
-    assert captured["state_during_planner"] == State.ADDRESSING_FEEDBACK.value
+    # Plan 58: the helper transitions AUDIT_LOCAL_CI → FIXUP_PLANNING.
+    assert captured["state_during_planner"] == State.FIXUP_PLANNING.value
     worker.store.conn.close()
 
 

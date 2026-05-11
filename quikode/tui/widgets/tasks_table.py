@@ -27,7 +27,6 @@ _STATE_STYLE = {
     "triaging_subtask": "state-rebasing",
     "rebasing_to_main": "state-rebasing",
     "conflict_resolving": "state-failed",
-    "fixup_planning": "state-doing",
     "blocked": "state-blocked",
     "failed": "state-failed",
     "aborted": "state-failed",
@@ -38,7 +37,15 @@ _STATE_STYLE = {
     "awaiting_review": "state-awaiting",
     "merged": "state-merged",
     "pending": "state-pending",
-    "addressing_feedback": "state-responding",
+    # Plan 58: ADDRESSING_FEEDBACK retired; mirror its styling onto the
+    # new per-stage audit states + fixup_planning so the operator-visible
+    # color remains stable for "task is fixing things up".
+    "audit_local_ci": "state-responding",
+    "audit_rubric": "state-responding",
+    "audit_standards": "state-responding",
+    "audit_architecture": "state-responding",
+    "audit_behavior": "state-responding",
+    "fixup_planning": "state-responding",
 }
 
 

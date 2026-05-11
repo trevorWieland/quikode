@@ -185,7 +185,7 @@ def test_all_done_addressing_feedback_blocks_exit(tmp_path):
     dag = _make_dag(tmp_path, [("A", [])])
     o = _orch(tmp_path, dag)
     o.store.upsert_pending("A")
-    o.store.transition("A", State.ADDRESSING_FEEDBACK)
+    o.store.transition("A", State.AUDIT_LOCAL_CI)
     assert o._all_done({"A"}) is False
 
 

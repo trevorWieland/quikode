@@ -315,7 +315,7 @@ def test_no_op_done_in_addressing_feedback_skips_fsm_events(tmp_path):
     # Force the parent task into ADDRESSING_FEEDBACK before the call,
     # mirroring the CI-fix flow where the daemon already entered that
     # state before invoking the worker.
-    worker.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+    worker.store.transition("R-001", State.AUDIT_LOCAL_CI)
 
     # The no-op-DONE branch in `_handle_subtask_pass` triggers when the
     # checker_text starts with `_NO_OP_DONE_CHECKER_PREFIX`. The pass
@@ -332,7 +332,7 @@ def test_no_op_done_in_addressing_feedback_skips_fsm_events(tmp_path):
     assert s1["state"] == SubtaskState.DONE.value
     # parent task state unchanged — feedback caller advances it later
     parent = worker.store.get("R-001")
-    assert parent["state"] == State.ADDRESSING_FEEDBACK.value
+    assert parent["state"] == State.AUDIT_LOCAL_CI.value
     worker.store.conn.close()
 
 

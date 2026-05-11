@@ -55,7 +55,13 @@ _IN_FLIGHT = {
     State.REBASING_TO_MAIN.value,
     State.CONFLICT_RESOLVING.value,
     State.FIXUP_PLANNING.value,
-    State.ADDRESSING_FEEDBACK.value,
+    # Plan 58: ADDRESSING_FEEDBACK retired; surface audit-stage states.
+    State.AUDIT_LOCAL_CI.value,
+    State.AUDIT_RUBRIC.value,
+    State.AUDIT_STANDARDS.value,
+    State.AUDIT_ARCHITECTURE.value,
+    State.AUDIT_BEHAVIOR.value,
+    State.LOCAL_CI_CHECKING.value,
     State.REBASING_TO_MAIN.value,
 }
 

@@ -33,7 +33,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from quikode import fsm_runtime, notify
-from quikode.fsm import Event
 from quikode.github_graphql import Review
 from quikode.state import State, TaskRow
 
@@ -298,12 +297,10 @@ class ReviewWatchMixin:
                 fresh_state.upper(),
             )
             return
-        fsm_runtime.enter_addressing_feedback(
-            self.store,
-            task_id,
-            note=f"CHANGES_REQUESTED by {review.author}",
-            event=Event.CHANGES_REQUESTED_RECEIVED,
-        )
+        # Plan 58: ADDRESSING_FEEDBACK retired. The unified audit driver
+        # transitions PENDING_CI/AWAITING_REVIEW → AUDIT_LOCAL_CI via
+        # REVIEW_FIXUP_START at worker entry. Here we just record the
+        # review as processed and dispatch the worker.
         self.store.mark_review_processed(task_id, review.review_id)
         _rt.log.info(
             "scheduling changes-requested response for task %s (review by %s)",
@@ -488,26 +485,9 @@ class ReviewWatchMixin:
         futures: dict[str, Future],
         review_response_futures: set[str],
     ) -> None:
-        """Plan 28: route CI failure straight to ADDRESSING_FEEDBACK via
-        either CI_FAILED (from PENDING_CI) or CI_FAILED (from AWAITING_REVIEW
-        — CI flake after pass). No TRIAGING_FEEDBACK intermediate.
-        """
-        # Use the right event depending on current state.
-        row = self.store.get(task_id)
-        current = State(str(row["state"])) if row else None
-        if current is State.AWAITING_REVIEW:
-            fsm_runtime.enter_addressing_feedback(
-                self.store,
-                task_id,
-                note=f"daemon scheduled CI-fix for {len(pr_status.failed_checks)} failed check(s)",
-                event=Event.CI_FAILED,
-            )
-        else:
-            fsm_runtime.enter_addressing_feedback(
-                self.store,
-                task_id,
-                note=f"daemon scheduled CI-fix for {len(pr_status.failed_checks)} failed check(s)",
-            )
+        """Plan 58: dispatch a CI-fix worker. ADDRESSING_FEEDBACK retired;
+        the unified audit driver enters AUDIT_LOCAL_CI via CI_FIXUP_START
+        at worker entry."""
         _rt.log.info(
             "scheduling CI-fix for task %s (%d failed checks)",
             task_id,

@@ -76,11 +76,11 @@ def test_stalled_review_response_force_recovers_after_threshold(tmp_path):
     o.store.transition("R-001", State.PENDING_CI, pr_number=42)
     # Advance state into ADDRESSING_FEEDBACK with a backdated state_log
     # entry so the silence window appears > 60s.
-    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+    o.store.transition("R-001", State.AUDIT_LOCAL_CI)
     long_ago = time.time() - 120
     o.store.conn.execute(
         "UPDATE state_log SET ts = ? WHERE task_id = ? AND to_state = ?",
-        (long_ago, "R-001", State.ADDRESSING_FEEDBACK.value),
+        (long_ago, "R-001", State.AUDIT_LOCAL_CI.value),
     )
     o.store.conn.commit()
 
@@ -112,11 +112,11 @@ def test_stalled_review_response_skipped_if_recent_agent_call(tmp_path):
     o = _orch(tmp_path, stall_warn_seconds=60)
     o.store.upsert_pending("R-001")
     o.store.transition("R-001", State.PENDING_CI, pr_number=42)
-    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+    o.store.transition("R-001", State.AUDIT_LOCAL_CI)
     long_ago = time.time() - 120
     o.store.conn.execute(
         "UPDATE state_log SET ts = ? WHERE task_id = ? AND to_state = ?",
-        (long_ago, "R-001", State.ADDRESSING_FEEDBACK.value),
+        (long_ago, "R-001", State.AUDIT_LOCAL_CI.value),
     )
     # Recent agent_call (10s ago) — proves the worker is alive.
     o.store.record_agent_call(
@@ -140,7 +140,7 @@ def test_stalled_review_response_skipped_if_recent_agent_call(tmp_path):
 
     # Recovery did NOT fire — the task is making progress.
     row = o.store.get("R-001")
-    assert row["state"] == State.ADDRESSING_FEEDBACK.value
+    assert row["state"] == State.AUDIT_LOCAL_CI.value
     assert "R-001" in futures
     assert "R-001" in rrf
     o.store.conn.close()
@@ -152,12 +152,12 @@ def test_stalled_check_skipped_when_no_pool_args(tmp_path):
     Calling without futures + review_response_futures must not crash."""
     o = _orch(tmp_path)
     o.store.upsert_pending("R-001")
-    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+    o.store.transition("R-001", State.AUDIT_LOCAL_CI)
     # Should be a no-op for the review-response path; only the worktree-
     # quiet check runs (which won't fire since R-001 has no worktree_path).
     o._check_stalls({})  # no futures/rrf passed
     row = o.store.get("R-001")
-    assert row["state"] == State.ADDRESSING_FEEDBACK.value
+    assert row["state"] == State.AUDIT_LOCAL_CI.value
     o.store.conn.close()
 
 
@@ -187,11 +187,11 @@ def test_stalled_review_recovery_uses_max_of_entered_and_last_call(tmp_path):
         (time.time() - 30, "R-001"),
     )
     # New cycle: enters ADDRESSING_FEEDBACK > 60s ago.
-    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+    o.store.transition("R-001", State.AUDIT_LOCAL_CI)
     long_ago = time.time() - 120
     o.store.conn.execute(
         "UPDATE state_log SET ts = ? WHERE task_id = ? AND to_state = ?",
-        (long_ago, "R-001", State.ADDRESSING_FEEDBACK.value),
+        (long_ago, "R-001", State.AUDIT_LOCAL_CI.value),
     )
     o.store.conn.commit()
 
@@ -205,5 +205,5 @@ def test_stalled_review_recovery_uses_max_of_entered_and_last_call(tmp_path):
     # second cycle of the same task is preferable to false-positive
     # recoveries that cancel legitimate work.
     row = o.store.get("R-001")
-    assert row["state"] == State.ADDRESSING_FEEDBACK.value
+    assert row["state"] == State.AUDIT_LOCAL_CI.value
     o.store.conn.close()

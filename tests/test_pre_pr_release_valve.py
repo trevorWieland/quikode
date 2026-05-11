@@ -61,7 +61,7 @@ def test_release_valve_defers_quality_content_after_default_cycle_budget(tmp_pat
 
 
 def test_release_valve_can_be_disabled(tmp_path):
-    cfg = _cfg(tmp_path, pre_pr_release_valve_after_cycles=-1)
+    cfg = _cfg(tmp_path, release_valve_after_cycles=-1)
     result = _cycle(_pass("local_ci"), _fail("standards"), _pass("behavior"))
 
     assert _pre_pr_release_valve_report(cfg, result) is None
@@ -139,7 +139,7 @@ def test_release_valve_rejects_critical_findings_by_default(tmp_path):
 
 
 def test_release_valve_respects_configured_deferable_stages(tmp_path):
-    cfg = _cfg(tmp_path, pre_pr_release_valve_defer_stages=["standards"])
+    cfg = _cfg(tmp_path, release_valve_defer_stages=["standards"])
     result = _cycle(_pass("local_ci"), _fail("rubric"), _pass("behavior"))
 
     assert _pre_pr_release_valve_report(cfg, result) is None

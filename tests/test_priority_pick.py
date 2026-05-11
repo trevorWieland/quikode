@@ -260,7 +260,7 @@ def test_speculative_readiness_picks_child_in_addressing_feedback(tmp_path):
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
     o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
-    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+    o.store.transition("R-001", State.AUDIT_LOCAL_CI)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt == "R-002"
 
@@ -280,7 +280,7 @@ def test_settled_readiness_skips_addressing_feedback_parent(tmp_path):
     o.store.upsert_pending("R-001")
     o.store.upsert_pending("R-002")
     o.store.transition("R-001", State.PENDING_CI, branch="quikode/r-001-abc")
-    o.store.transition("R-001", State.ADDRESSING_FEEDBACK)
+    o.store.transition("R-001", State.AUDIT_LOCAL_CI)
     nxt = o._pick_next({"R-001", "R-002"}, set())
     assert nxt is None  # neither eligible: R-001 active, R-002 has un-settled parent
 

@@ -16,12 +16,15 @@ stateDiagram-v2
   state committing
   state pushing
   state local_ci_checking
-  state pre_pr_auditing
+  state audit_local_ci
+  state audit_rubric
+  state audit_standards
+  state audit_architecture
+  state audit_behavior
   state fixup_planning
   state pr_opening
   state pending_ci
   state awaiting_review
-  state addressing_feedback
   state rebasing_to_main
   state conflict_resolving
   state merged
@@ -41,21 +44,27 @@ stateDiagram-v2
   committing --> pushing: commit_created
   pushing --> doing_subtask: more_subtasks
   pushing --> local_ci_checking: all_subtasks_done
-  local_ci_checking --> pre_pr_auditing: local_ci_passed
+  local_ci_checking --> audit_local_ci: local_ci_passed
   local_ci_checking --> fixup_planning: local_ci_failed
-  pre_pr_auditing --> pr_opening: audit_passed
-  pre_pr_auditing --> fixup_planning: audit_failed
+  audit_local_ci --> audit_rubric: audit_local_ci_passed
+  audit_local_ci --> fixup_planning: audit_local_ci_failed
+  audit_rubric --> audit_standards: audit_rubric_passed
+  audit_rubric --> fixup_planning: audit_rubric_failed
+  audit_standards --> audit_architecture: audit_standards_passed
+  audit_standards --> fixup_planning: audit_standards_failed
+  audit_architecture --> audit_behavior: audit_architecture_passed
+  audit_architecture --> fixup_planning: audit_architecture_failed
+  audit_behavior --> pr_opening: audit_behavior_passed
+  audit_behavior --> fixup_planning: audit_behavior_failed
+  pending_ci --> audit_local_ci: ci_fixup_start
+  awaiting_review --> audit_local_ci: ci_fixup_start
+  awaiting_review --> audit_local_ci: review_fixup_start
   fixup_planning --> doing_subtask: fixup_plan_valid
   fixup_planning --> blocked: fixup_exhausted
   pr_opening --> pending_ci: pr_opened
   pending_ci --> awaiting_review: ci_passed
-  pending_ci --> addressing_feedback: ci_failed
-  awaiting_review --> addressing_feedback: changes_requested_received
-  awaiting_review --> addressing_feedback: ci_failed
   awaiting_review --> merged: merged
-  addressing_feedback --> pending_ci: feedback_pushed
-  addressing_feedback --> blocked: feedback_exhausted
-  pre_pr_auditing --> merge_node_ready: merge_node_built
+  audit_behavior --> merge_node_ready: merge_node_built
   merge_node_ready --> pending: parent_advanced
   merge_node_ready --> merge_node_retired: all_parents_merged
   pending_ci --> rebasing_to_main: parent_merged_or_conflict
@@ -73,10 +82,13 @@ stateDiagram-v2
   committing --> failed: crash
   pushing --> failed: crash
   local_ci_checking --> failed: crash
-  pre_pr_auditing --> failed: crash
+  audit_local_ci --> failed: crash
+  audit_rubric --> failed: crash
+  audit_standards --> failed: crash
+  audit_architecture --> failed: crash
+  audit_behavior --> failed: crash
   fixup_planning --> failed: crash
   pr_opening --> failed: crash
-  addressing_feedback --> failed: crash
   rebasing_to_main --> failed: crash
   conflict_resolving --> failed: crash
   blocked --> pending: retry_task
@@ -87,32 +99,38 @@ stateDiagram-v2
   pending --> merged: mark_merged
   pending_ci --> aborted: pr_closed
   awaiting_review --> aborted: pr_closed
+  doing_subtask --> blocked: block_task
+  checking_subtask --> blocked: block_task
+  provisioning --> blocked: block_task
+  triaging_subtask --> blocked: block_task
   committing --> blocked: block_task
   pr_opening --> blocked: block_task
-  pushing --> blocked: block_task
-  checking_subtask --> blocked: block_task
-  pre_pr_auditing --> blocked: block_task
-  fixup_planning --> blocked: block_task
-  addressing_feedback --> blocked: block_task
-  triaging_subtask --> blocked: block_task
   local_ci_checking --> blocked: block_task
-  rebasing_to_main --> blocked: block_task
+  audit_rubric --> blocked: block_task
+  audit_local_ci --> blocked: block_task
   planning --> blocked: block_task
-  provisioning --> blocked: block_task
-  doing_subtask --> blocked: block_task
+  audit_architecture --> blocked: block_task
+  rebasing_to_main --> blocked: block_task
+  audit_behavior --> blocked: block_task
+  pushing --> blocked: block_task
+  fixup_planning --> blocked: block_task
+  audit_standards --> blocked: block_task
+  doing_subtask --> rebasing_to_main: parent_merged_or_conflict
+  checking_subtask --> rebasing_to_main: parent_merged_or_conflict
+  provisioning --> rebasing_to_main: parent_merged_or_conflict
+  triaging_subtask --> rebasing_to_main: parent_merged_or_conflict
   committing --> rebasing_to_main: parent_merged_or_conflict
   pr_opening --> rebasing_to_main: parent_merged_or_conflict
-  pushing --> rebasing_to_main: parent_merged_or_conflict
-  checking_subtask --> rebasing_to_main: parent_merged_or_conflict
-  pre_pr_auditing --> rebasing_to_main: parent_merged_or_conflict
-  fixup_planning --> rebasing_to_main: parent_merged_or_conflict
-  addressing_feedback --> rebasing_to_main: parent_merged_or_conflict
-  triaging_subtask --> rebasing_to_main: parent_merged_or_conflict
   local_ci_checking --> rebasing_to_main: parent_merged_or_conflict
-  planning --> rebasing_to_main: parent_merged_or_conflict
-  provisioning --> rebasing_to_main: parent_merged_or_conflict
+  audit_rubric --> rebasing_to_main: parent_merged_or_conflict
   conflict_resolving --> rebasing_to_main: parent_merged_or_conflict
-  doing_subtask --> rebasing_to_main: parent_merged_or_conflict
+  audit_local_ci --> rebasing_to_main: parent_merged_or_conflict
+  planning --> rebasing_to_main: parent_merged_or_conflict
+  audit_architecture --> rebasing_to_main: parent_merged_or_conflict
+  audit_behavior --> rebasing_to_main: parent_merged_or_conflict
+  pushing --> rebasing_to_main: parent_merged_or_conflict
+  fixup_planning --> rebasing_to_main: parent_merged_or_conflict
+  audit_standards --> rebasing_to_main: parent_merged_or_conflict
 ```
 
 ## Store

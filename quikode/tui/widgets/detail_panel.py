@@ -289,7 +289,13 @@ def _subtask_state_cell(state: str) -> str:
 # the phase explicitly.
 _WHOLE_TASK_STATES = {
     "fixup_planning",
-    "addressing_feedback",
+    # Plan 58: audit-stage states are also whole-task phases (the active
+    # agent is a per-stage auditor, no per-subtask row to highlight).
+    "audit_local_ci",
+    "audit_rubric",
+    "audit_standards",
+    "audit_architecture",
+    "audit_behavior",
     "rebasing_to_main",
 }
 
@@ -357,10 +363,16 @@ def _phase_state_extra(snap: DetailSnapshot, state: str) -> str | None:
     since "round 3 · 2 threads" is more useful at-a-glance than a
     truncated transition note."""
     note = snap.last_state_note
-    if state == "addressing_feedback":
-        if snap.review_round is not None and snap.review_threads_count is not None:
-            return f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads"
-        return None
+    # Plan 58: ADDRESSING_FEEDBACK retired; surface review-round context
+    # when the audit-stage states reflect PR_REVIEW phase work.
+    if state in {
+        "audit_local_ci",
+        "audit_rubric",
+        "audit_standards",
+        "audit_architecture",
+        "audit_behavior",
+    } and (snap.review_round is not None and snap.review_threads_count is not None):
+        return f"round [b]{snap.review_round}[/] · [b]{snap.review_threads_count}[/] threads"
     if not note:
         return None
     return f"[dim]{note[:80]}[/]"
@@ -403,16 +415,18 @@ def _agent_in_flight_line(snap: DetailSnapshot) -> str | None:
 
 _STATE_LONG_DESCRIPTION = {
     # Plan 38 PR-C: "running per-subtask doer" (and similar synthesized
-    # "running ..." labels) are gone from the FSM-state map. The doer
-    # being in flight vs returned is observed reality, surfaced by the
-    # structured `agent_in_flight_status` line below — never synthesized
-    # from FSM state alone.
+    # "running ..." labels) are gone from the FSM-state map.
+    # Plan 58: PRE_PR_AUDITING / ADDRESSING_FEEDBACK retired; audit-stage
+    # states surface per-stage activity directly.
     "checking_subtask": "per-subtask checker phase",
     "triaging_subtask": "per-subtask triage phase",
     "local_ci_checking": "local CI gate (just ci)",
-    "pre_pr_auditing": "pre-PR audit gauntlet",
+    "audit_local_ci": "audit gauntlet · local CI stage",
+    "audit_rubric": "audit gauntlet · rubric stage",
+    "audit_standards": "audit gauntlet · standards stage",
+    "audit_architecture": "audit gauntlet · architecture stage",
+    "audit_behavior": "audit gauntlet · behavior stage",
     "fixup_planning": "planning fixup subtasks",
-    "addressing_feedback": "fixup planner + per-subtask doer (CI fail or CHANGES_REQUESTED)",
     "conflict_resolving": "conflict-resolver phase",
     "rebasing_to_main": "rebasing onto main (parent merged)",
     "pending_ci": "PR open · CI running",
@@ -454,7 +468,13 @@ _GAUNTLET_STAGES = [
 # misleads the operator into thinking the audit is the active phase.
 _GAUNTLET_RELEVANT_STATES = frozenset(
     {
-        "pre_pr_auditing",
+        # Plan 58: audit-stage states replace PRE_PR_AUDITING for the
+        # relevant pipeline-progress view.
+        "audit_local_ci",
+        "audit_rubric",
+        "audit_standards",
+        "audit_architecture",
+        "audit_behavior",
         "local_ci_checking",
         "fixup_planning",
         "committing",
@@ -516,7 +536,7 @@ def _phase_color(state: str) -> str:
         ("green", {"merged"}),
         ("blue", {"awaiting_review"}),
         ("red", {"blocked", "failed", "aborted"}),
-        ("cyan", {"addressing_feedback"} | _WHOLE_TASK_STATES | {"doing_subtask", "checking_subtask"}),
+        ("cyan", _WHOLE_TASK_STATES | {"doing_subtask", "checking_subtask"}),
         (
             "yellow",
             {"pending_ci", "rebasing_to_main", "triaging_subtask", "conflict_resolving"},

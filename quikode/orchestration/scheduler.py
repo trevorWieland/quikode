@@ -33,7 +33,14 @@ STACK_READY_STATES = frozenset(
         *(s.value for s in FSM_STACK_READY_STATES),
         State.PENDING_CI.value,
         State.PR_OPENING.value,
-        State.ADDRESSING_FEEDBACK.value,
+        # Plan 58: ADDRESSING_FEEDBACK retired. Audit-stage states are
+        # stack-ready: a child can fork off as soon as the parent has a
+        # branch + PR/audit machinery running.
+        State.AUDIT_LOCAL_CI.value,
+        State.AUDIT_RUBRIC.value,
+        State.AUDIT_STANDARDS.value,
+        State.AUDIT_ARCHITECTURE.value,
+        State.AUDIT_BEHAVIOR.value,
         State.PROVISIONING.value,
         State.FIXUP_PLANNING.value,
     }

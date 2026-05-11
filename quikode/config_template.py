@@ -29,9 +29,9 @@ pre_pr_architecture_max_high_findings = 0
 pre_pr_architecture_max_critical_findings = 0
 pre_pr_audit_output_retries = 5
 planner_retries_on_transient = 3
-pre_pr_release_valve_after_cycles = 5
-pre_pr_release_valve_defer_stages = ["rubric", "standards", "architecture"]
-pre_pr_release_valve_max_critical_findings = 0
+release_valve_after_cycles = 5
+release_valve_defer_stages = ["rubric", "standards", "architecture"]
+release_valve_max_critical_findings = 0
 
 [execution]
 # Reserved for future remote backends ("ssh-docker", "vm-sandbox").
@@ -91,9 +91,9 @@ pre_pr_architecture_max_high_findings = 0
 pre_pr_architecture_max_critical_findings = 0
 pre_pr_audit_output_retries = 5
 planner_retries_on_transient = 3
-pre_pr_release_valve_after_cycles = 5
-pre_pr_release_valve_defer_stages = ["rubric", "standards", "architecture"]
-pre_pr_release_valve_max_critical_findings = 0
+release_valve_after_cycles = 5
+release_valve_defer_stages = ["rubric", "standards", "architecture"]
+release_valve_max_critical_findings = 0
 playwright_cache_dir = "~/.cache/ms-playwright"
 
 [execution]
