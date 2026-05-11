@@ -401,6 +401,13 @@ Plans 47–59 (the May 9–10 batch — comprehensive refactor):
 - **Plan 57** — typed FSM `enter_*` guards. Helpers return `State | None` and silently skip with INFO log on invalid source state.
 - **Plan 58** — FSM flatten + lifecycle phases. `PRE_PR_AUDITING` + `ADDRESSING_FEEDBACK` removed; 5 audit-stage states added (`AUDIT_LOCAL_CI` / `AUDIT_RUBRIC` / `AUDIT_STANDARDS` / `AUDIT_ARCHITECTURE` / `AUDIT_BEHAVIOR`); unified `workers/audit_driver.py:_run_audit_cycle(trigger_source)`; `tasks.phase` / `cycle_in_phase` / `pr_review_trigger` columns; `pre_pr_release_valve_*` → `release_valve_*`; `fsm_runtime.force_recover_to_pending_ci`; hard cutover via `plans/58-migration.sql`.
 - **Plan 59** — quota handling refactor. In-transport quota sleep retired (plan 19A's design dead); chain returns fast; `cfg.transient_retry_delays_s` at worker layer; `agent_calls.status` ∈ `{running, backoff_auth, backoff_container}` for TUI honesty; TUI pending-eligible calls `collect_pick_candidates` directly (refactored to `quikode/orchestration/stacking_helpers.py`) → exact count, not upper bound.
+- **Plan 60** (commit `e225876`) — fixup_ci gate promotion + Claude fallback chains + 3 TUI/data-model fixes. Five fixes from the 2026-05-11 AM investigation, all shipped together (no deferrals):
+  - **Fix 1**: `kind="fixup_ci"` / `"fixup-ci"` subtasks now use `cfg.local_ci_command` (`just ci`) as the objective gate, alongside `Z-99-stabilize-spec-gate`. Catches R-0019-class Playwright BDD failures that `just check` misses.
+  - **Fix 2**: `claude-opus-4-7` chains to `claude-sonnet-4-6 → gpt-5.5`; `claude-sonnet-4-6` chains to `gpt-5.5 → gpt-5.3-codex`. New `_is_provider_unavailable` sibling detector (matches Invalid API key / authentication failed / session expired / 401 / 403 / `/login` required / credit balance) is OR'd alongside `_is_quota_exhausted` so Claude auth outages cascade to OpenAI fallback automatically.
+  - **Fix 3**: fixup subtask IDs gain `F-c<CYCLE>-` prefix on NEW emissions; `infer_planning_provenance` extracted to `quikode/planning_provenance.py` and recognizes both shapes. Eliminates cross-cycle ID collisions like R-0019's two `F-2-3-*` rows.
+  - **Fix 4**: TUI subtasks DataTable wrapped in `VerticalScroll` so 40+ row tasks are fully reachable.
+  - **Fix 5**: `force_recover_to_pending_ci` setdefault-clears `last_error` + `failure_reason` so stale "exhausted 50 attempts" messages don't survive subtask-row wipes.
+- **Plan 60 follow-up: rebase_branch thread-safety hotfix** (commit `951d5af`). R-0025 failed during planning with `sqlite3.InterfaceError: bad parameter or other API misuse` from `quikode/workers/rebase_branch.py:67` — the worker was accessing `self.store.conn.execute(...)` directly, bypassing `Store._tx_lock`. Extracted to a new Store method `has_active_fixup_review_subtask` (with the lock) so the worker goes through the API like every other call site. Only one offender existed in the worker tree.
 
 Plans `01–27` and `29` are pre-`optimizations`-branch context; see `plans/00-INDEX.md` for the full historical list.
 
@@ -486,4 +493,28 @@ Persistent operational lessons (still apply):
 - **No in-transport quota sleep.** Plan 59 retired plan 19A's design; quota retry cadence is at the worker layer via `cfg.transient_retry_delays_s`.
 - **No `PRE_PR_AUDITING` / `ADDRESSING_FEEDBACK` states.** Plan 58 retired the umbrellas; audit-stage states are first-class.
 - **Tanren workspace** runs `max_parallel=12, mem_per_task_gb=10` (capped by coding-agent subscription, not host capacity).
+
+### 9.6 Operational lessons from 2026-05-11 AM
+
+- **Auth-outage class is real and bidirectional.** Today saw both Claude (00:18 CDT) and OpenAI codex (`token_invalidated` at 10:45 CDT) go down for separate reasons within the same 11-hour window. Plan 60's fix 2 protects Claude-tier roles via fallback chain, but OpenAI codex going down still hits the chain floor — no provider is unconditionally reliable. The operator workflow when any provider goes down: stop daemon (avoid burning cycles on fast-fails), re-auth, recover failed tasks via `qk retry`. The daemon is safe to stop mid-flight; orphan recovery + plan 48's `qk resume` clears stale retry counters on the way back up.
+- **Provider chain depth needs at least one "always-works" floor — and "always works" is aspirational.** When EVERY chain link is in outage, worker-layer `cfg.transient_retry_delays_s["quota_exhausted"]` (default 600s) is the only sleep cadence — the operator's "wait 10 min and try the whole chain again" pattern. Workers re-walk the chain on every attempt, so a recovered provider at the TOP picks back up immediately on the next attempt without operator action.
+- **`fixup_ci` subtasks must reproduce GitHub's failing recipe locally.** Plan 60's fix 1 made this an objective-gate requirement, not just a doer-prompt suggestion. The reproduce-before-fix flow lives in plan 53's §6a prompt block; the gate-side enforcement lives in plan 60's fix 1. Both stay in force.
+- **Cross-cycle subtask IDs use `F-c<CYCLE>-` prefix.** New emissions only. Pre-plan-60 subtask rows keep their original IDs; the TUI shows both shapes without confusion since the cycle number is now part of the ID itself.
+- **DataTable scroll fixed.** TUI subtask tables can be navigated to the bottom even on 50+ row tasks.
+
+### 9.7 Plan 61 candidate (queued, not shipped) — rebase correctness audit + unification
+
+Operator-identified architectural issue (not yet planned): today's two parallel rebase mechanisms (`_handle_branch_divergence_if_needed` self-check vs orchestrator-stamped `needs_parent_rebase` flag) duplicate effort and risk disagreement on the correct base. Operator's stated bar: "ALL rebases successful or clean-failure with operator recovery" — not "mostly successful." Proposed plan 61 scope:
+
+1. **Single primitive** `qk rebase` operating on `cfg.task.rebase_base` (computed: `origin/<parent_branch>` if any parent unmerged, else `origin/main`). Eliminates the `target_kind="main"|"parent_tip"` branching in `_rebase_inline`.
+2. **Subtask-boundary cadence + impact assessor.** At every subtask commit boundary, if the base advanced, fire a lightweight assessor agent that classifies into one of three outcomes:
+   - **no-op** → file-overlap empty; fast-forward rebase, continue.
+   - **minor** → file overlap but safe (format-only, additive imports, etc.); auto-rebase + verification pass (re-run the most recent subtask's `just check`); green → continue, red → escalate.
+   - **full replan** → semantic conflict (interface change, moved logic); STOP the subtask loop, clear pending subtasks for the current cycle, fire the fixup-planner with "your prior plan is partially obsolete due to base advance" context; new cycle preserves done subtasks if their commits are independent.
+3. **Atomic apply** — worktree-snapshot + restore; no half-merged state ever reaches the next subtask.
+4. **Post-rebase verification step** before resuming the worker — runs the most recent passing tests + behavior witnesses against the new base. Failure escalates to `BLOCKED-FOR-REBASE`.
+5. **Clean `BLOCKED-FOR-REBASE` state** with structured forensics (which commits couldn't merge, what the resolver/assessor tried, why verification failed) + `qk rebase-recovery <task>` primitive with options: accept-resolver-output, accept-base-only, accept-task-only, manual-resolve-and-resume.
+6. **Provenance trail** — every rebase records `base_sha → result_sha → verification_proof` for audit.
+
+Plan 61 has not yet been written or scheduled. Operator will decide timing.
 - **Restart cost** is unchanged from plan 34: per-task ~10–30 min lost (one in-flight agent call); subtask-level commits preserved on the branch.
